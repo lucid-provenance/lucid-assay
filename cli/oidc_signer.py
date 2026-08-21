@@ -9,6 +9,7 @@ Hardened against:
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import urllib.parse
@@ -52,7 +53,7 @@ def fetch_ambient_oidc_token(audience: str = "sigstore") -> str:
 
     if request_url and request_token:
         parsed = urllib.parse.urlparse(request_url)
-        # SSRF Guard: Enforce HTTPS and restrict domain
+        # SSRF Guard: Enforce HTTPS and restrict scheme
         if parsed.scheme != "https":
             raise AmbientIdentityError(f"Refusing to fetch OIDC token over insecure scheme: {parsed.scheme}")
 
@@ -101,27 +102,40 @@ def sign_statement(statement_json_bytes: bytes, dry_run: bool = False) -> DSSEEn
     oidc_token = fetch_ambient_oidc_token()
 
     try:
-        from sigstore.sign import SigningContext
         from sigstore.oidc import IdentityToken
-
-        identity = IdentityToken(oidc_token)
-        ctx = SigningContext.production()
-
-        with ctx.signer(identity) as signer:
-            result = signer.sign_artifact(statement_json_bytes)
-
-        log_index = getattr(result.log_entry, "log_index", None) if result.log_entry else None
-        log_id = getattr(result.log_entry, "log_id", None) if result.log_entry else None
-
-        return DSSEEnvelope(
-            payload_type="application/vnd.in-toto+json",
-            payload_b64=result.statement_b64 if hasattr(result, "statement_b64") else payload_b64,
-            signatures=[{
-                "sig": result.signature_b64,
-                "certificate": result.certificate_pem,
-            }],
-            rekor_log_index=log_index,
-            rekor_log_id=log_id,
-        )
+        from sigstore.sign import Signer
     except ImportError:
         raise RuntimeError("sigstore package not installed. Run `pip install sigstore`.")
+
+    identity = IdentityToken(oidc_token)
+    signer = Signer.production()
+
+    # Sign the in-toto payload
+    bundle = signer.sign(
+        input_=io.BytesIO(statement_json_bytes),
+        identity_token=identity,
+    )
+
+    # Extract signature and certificate from the signed bundle
+    sig_b64 = base64.b64encode(bundle.message_signature.signature).decode("ascii")
+    cert_pem = bundle.signing_certificate.to_pem()
+
+    # Extract Rekor transparency log metadata if present
+    log_index = None
+    log_id = None
+    if bundle.log_entry is not None:
+        log_index = getattr(bundle.log_entry, "log_index", None)
+        log_id = getattr(bundle.log_entry, "log_id", None)
+        if log_id is not None and isinstance(log_id, bytes):
+            log_id = log_id.hex()
+
+    return DSSEEnvelope(
+        payload_type="application/vnd.in-toto+json",
+        payload_b64=payload_b64,
+        signatures=[{
+            "sig": sig_b64,
+            "certificate": cert_pem,
+        }],
+        rekor_log_index=log_index,
+        rekor_log_id=log_id,
+    )

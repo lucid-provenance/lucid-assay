@@ -1,17 +1,20 @@
 """
-Keyless signing of the in-toto Statement using ambient OIDC identity.
+Keyless signing of the in-toto Statement using ambient OIDC identity via Sigstore CLI.
 
 Hardened against:
   - SSRF / Hostile redirect attacks on the OIDC token endpoint
   - Malformed URL query string assembly
   - Forked PR / Non-OIDC pipeline crashes via explicit dry-run support
+  - Upstream Python library API drift by using the stable CLI contract
 """
 from __future__ import annotations
 
 import base64
-import io
 import json
 import os
+import subprocess
+import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -87,7 +90,7 @@ def fetch_ambient_oidc_token(audience: str = "sigstore") -> str:
 
 
 def sign_statement(statement_json_bytes: bytes, dry_run: bool = False) -> DSSEEnvelope:
-    """Keyless-sign an in-toto Statement into a DSSE envelope."""
+    """Keyless-sign an in-toto Statement into a DSSE envelope via Sigstore."""
     payload_b64 = base64.b64encode(statement_json_bytes).decode("ascii")
 
     if dry_run:
@@ -101,33 +104,63 @@ def sign_statement(statement_json_bytes: bytes, dry_run: bool = False) -> DSSEEn
 
     oidc_token = fetch_ambient_oidc_token()
 
-    try:
-        from sigstore.oidc import IdentityToken
-        from sigstore.sign import Signer
-    except ImportError:
-        raise RuntimeError("sigstore package not installed. Run `pip install sigstore`.")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "statement.json")
+        bundle_path = os.path.join(tmpdir, "statement.sigstore.json")
 
-    identity = IdentityToken(oidc_token)
-    signer = Signer.production()
+        with open(input_path, "wb") as f:
+            f.write(statement_json_bytes)
 
-    # Sign the in-toto payload
-    bundle = signer.sign(
-        input_=io.BytesIO(statement_json_bytes),
-        identity_token=identity,
-    )
+        # Run sigstore CLI subprocess
+        cmd = [
+            sys.executable,
+            "-m",
+            "sigstore",
+            "sign",
+            "--identity-token",
+            oidc_token,
+            "--bundle",
+            bundle_path,
+            input_path,
+        ]
 
-    # Extract signature and certificate from the signed bundle
-    sig_b64 = base64.b64encode(bundle.message_signature.signature).decode("ascii")
-    cert_pem = bundle.signing_certificate.to_pem()
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"Sigstore signing failed (exit code {proc.returncode}):\n{proc.stderr}\n{proc.stdout}")
 
-    # Extract Rekor transparency log metadata if present
+        with open(bundle_path, "r", encoding="utf-8") as f:
+            bundle_data = json.load(f)
+
+    # Extract signature and certificate from the standard Sigstore bundle format
+    # Supports both Protobuf JSON spec and legacy bundle schemas
+    sig_b64 = ""
+    cert_pem = ""
     log_index = None
     log_id = None
-    if bundle.log_entry is not None:
-        log_index = getattr(bundle.log_entry, "log_index", None)
-        log_id = getattr(bundle.log_entry, "log_id", None)
-        if log_id is not None and isinstance(log_id, bytes):
-            log_id = log_id.hex()
+
+    if "messageSignature" in bundle_data:
+        sig_b64 = bundle_data["messageSignature"].get("signature", "")
+    elif "dsseEnvelope" in bundle_data:
+        sigs = bundle_data["dsseEnvelope"].get("signatures", [])
+        if sigs:
+            sig_b64 = sigs[0].get("sig", "")
+
+    # Extract signing certificate (PEM or DER/Base64)
+    verification_material = bundle_data.get("verificationMaterial", {})
+    if "certificate" in verification_material:
+        raw_cert = verification_material["certificate"].get("rawBytes", "")
+        cert_pem = f"-----BEGIN CERTIFICATE-----\n{raw_cert}\n-----END CERTIFICATE-----"
+    elif "x509CertificateChain" in verification_material:
+        certs = verification_material["x509CertificateChain"].get("certificates", [])
+        if certs:
+            raw_cert = certs[0].get("rawBytes", "")
+            cert_pem = f"-----BEGIN CERTIFICATE-----\n{raw_cert}\n-----END CERTIFICATE-----"
+
+    # Extract Rekor transparency log metadata
+    tlog_entries = verification_material.get("tlogEntries", [])
+    if tlog_entries:
+        log_index = tlog_entries[0].get("logIndex")
+        log_id = tlog_entries[0].get("logId", {}).get("keyId")
 
     return DSSEEnvelope(
         payload_type="application/vnd.in-toto+json",

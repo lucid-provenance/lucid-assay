@@ -13,6 +13,7 @@ schema/
 cli/
   parsers/junit.py        # streaming JUnit XML -> TestTotals
   parsers/coverage.py     # Cobertura XML + LCOV -> CoverageReport (per-line hit maps)
+  parsers/ast_inspector.py # AST-walks test files -> assertion integrity metrics
   patch_coverage.py       # git diff base...head, intersected with coverage hit maps
   hashing.py              # SHA-256 content hashing + WORM key derivation
   scorer.py               # pure, deterministic Release Confidence Score (RCS)
@@ -21,6 +22,7 @@ cli/
   main.py                 # CLI entrypoint wiring it all together
 tests/
   test_scorer.py          # adversarial edge-case tests for the RCS algorithm
+  test_ast_inspector.py   # real/tautological/empty assertion detection tests
   fixtures/                # sample junit.xml, cobertura.xml, and rendered statement
 ```
 
@@ -141,11 +143,6 @@ installed — outside CI there's no ambient identity to fetch, by design.)
 
 ## Not yet built (flagged, not hidden)
 
-- `_estimate_assertion_density()` in `main.py` is a stub returning
-  `(0, 0)`; the schema and scorer both already handle that as "zero test
-  functions" gracefully, but the real AST-walking pass (scoped to
-  diff-touched test files only, to stay proportional to patch size) is
-  Task 2 work.
 - `main.py`'s `pipeline.run_id` / `workflow_ref` are placeholders pending
   wiring to `GITHUB_RUN_ID`/`GITHUB_WORKFLOW_REF` or GitLab CI equivalents.
 - The WORM upload body in `upload_to_worm_async()` is an integration

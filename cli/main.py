@@ -15,10 +15,11 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from .builder import build_statement
 from .hashing import sha256_file, worm_uri
+from .parsers.ast_inspector import inspect_test_suite
 from .parsers.coverage import parse_cobertura, parse_lcov
 from .parsers.junit import parse_junit_xml
 from .patch_coverage import compute_patch_coverage
@@ -34,11 +35,6 @@ def upload_to_worm_async(local_path: str, sha256_hex: str, bucket: str = "eviden
         pass
 
     return _executor.submit(_upload)
-
-
-def _estimate_assertion_density(repo_dir: str) -> Tuple[int, int]:
-    """Lightweight AST assertion density estimator."""
-    return 0, 0
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -90,9 +86,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if image_digest.startswith("sha256:"):
         image_digest = image_digest[7:]
 
-    # 5. Assertion metrics
-    total_assertions, total_test_functions = _estimate_assertion_density(args.repo_dir)
-    empty_bodies, tautological = 0, 0
+    # 5. Assertion metrics (AST-walked test suite scoped to args.repo_dir)
+    ast_metrics = inspect_test_suite(args.repo_dir)
+    total_assertions = ast_metrics.total_assertions
+    total_test_functions = ast_metrics.total_test_functions
+    empty_bodies = ast_metrics.empty_test_bodies
+    tautological = ast_metrics.tautological_assertions
 
     # 6. Deterministic scoring
     pr_approvers = [a.strip() for a in args.pr_approvers.split(",") if a.strip()]

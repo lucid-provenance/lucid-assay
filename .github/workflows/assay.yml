@@ -43,14 +43,21 @@ jobs:
 
       - name: Mint Signed Plinth Attestation
         env:
+          EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           EXTRA_ARGS=""
-          if [ -n "$BASE_SHA" ]; then
-            EXTRA_ARGS="$EXTRA_ARGS --base-sha $BASE_SHA --pr-number $PR_NUMBER"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # If base.sha is somehow unset, fall back to git merge-base with origin/main
+            if [ -z "$BASE_SHA" ]; then
+              BASE_SHA=$(git merge-base origin/main HEAD)
+            fi
+            EXTRA_ARGS="--base-sha $BASE_SHA --pr-number $PR_NUMBER"
           fi
+
+          echo "Running with EXTRA_ARGS: $EXTRA_ARGS"
 
           python -m cli.main \
             --junit-xml build/junit.xml \

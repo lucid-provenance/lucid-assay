@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.0.0",
     "cryptography>=41.0.0",
+    "sigstore>=3.0.0",
 ]
 
 [project.optional-dependencies]

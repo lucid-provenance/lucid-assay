@@ -80,6 +80,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    raw_argv = argv if argv is not None else sys.argv[1:]
+
+    # `plinth`/`plinth-assay verify ...` dispatches to the standalone
+    # admission gatekeeper instead of the attestation-building pipeline below.
+    if raw_argv and raw_argv[0] == "verify":
+        from .verify import main as verify_main
+
+        return verify_main(raw_argv[1:])
+
     args = parse_args(argv or sys.argv[1:])
     t_start = time.perf_counter()
 

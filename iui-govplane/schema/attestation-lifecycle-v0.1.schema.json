@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://iui.dev/attestation/lifecycle/v0.1",
+  "title": "IUI Pipeline Lifecycle Attestation Predicate v0.1",
+  "description": "In-toto predicate carried inside a DSSE-wrapped in-toto Statement (predicateType = this $id). Captures VCS provenance, supply-chain artifact identity, test verification, coverage, assertion-quality heuristics, and the derived Release Confidence Score (RCS) for a single CI pipeline run.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "predicate_version",
+    "pipeline",
+    "vcs",
+    "artifact",
+    "test_verification",
+    "coverage",
+    "assertion_density",
+    "release_confidence_score"
+  ],
+  "properties": {
+    "predicate_version": {
+      "const": "0.1.0",
+      "description": "Schema/predicate semantic version, pinned per attestation for forward-compatible verification."
+    },
+
+    "pipeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ci_provider", "run_id", "run_attempt", "workflow_ref", "started_at", "finished_at"],
+      "properties": {
+        "ci_provider": { "type": "string", "enum": ["github-actions", "gitlab-ci", "other"] },
+        "run_id": { "type": "string", "minLength": 1 },
+        "run_attempt": { "type": "integer", "minimum": 1 },
+        "workflow_ref": { "type": "string", "minLength": 1, "description": "e.g. org/repo/.github/workflows/ci.yml@refs/heads/main" },
+        "runner_environment": { "type": "string", "enum": ["github-hosted", "self-hosted", "gitlab-shared", "gitlab-self-managed", "unknown"], "default": "unknown" },
+        "started_at": { "type": "string", "format": "date-time" },
+        "finished_at": { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "vcs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "repository", "branch", "commit_sha"],
+      "properties": {
+        "provider": { "type": "string", "enum": ["github", "gitlab", "bitbucket", "other"] },
+        "repository": { "type": "string", "description": "owner/repo or namespace/project path", "minLength": 1 },
+        "branch": { "type": "string", "minLength": 1 },
+        "commit_sha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "base_commit_sha": {
+          "type": ["string", "null"],
+          "pattern": "^[a-f0-9]{40}$",
+          "description": "Merge-base commit against the target branch, used for patch coverage diffing. Null when unavailable (e.g. push to default branch, shallow clone with no base)."
+        },
+        "pull_request": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "number": { "type": "integer", "minimum": 1 },
+            "target_branch": { "type": "string", "minLength": 1 },
+            "approvers": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Handles of reviewers who approved, deduplicated, as of attestation time."
+            },
+            "required_approvals": { "type": "integer", "minimum": 0 },
+            "review_state": { "type": "string", "enum": ["approved", "changes_requested", "pending", "not_applicable"] }
+          },
+          "required": ["approvers", "required_approvals", "review_state"]
+        }
+      }
+    },
+
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject"],
+      "properties": {
+        "subject": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "digest"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1, "description": "OCI image ref or artifact name, e.g. registry/org/svc" },
+            "digest": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["sha256"],
+              "properties": {
+                "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+              }
+            }
+          }
+        },
+        "sbom": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "format": { "type": "string", "enum": ["spdx-json", "cyclonedx-json", "syft-json"] },
+            "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "uri": { "type": "string", "format": "uri", "description": "Content-addressed WORM storage URI, e.g. s3://evidence/sha256/<hash>" }
+          },
+          "required": ["format", "sha256", "uri"]
+        }
+      }
+    },
+
+    "test_verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["framework", "report_format", "report_sha256", "totals", "duration_ms"],
+      "properties": {
+        "framework": { "type": "string", "examples": ["jest", "pytest", "junit5", "go-test"] },
+        "report_format": { "type": "string", "enum": ["junit-xml", "jest-json", "tap"] },
+        "report_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "report_uri": { "type": "string", "format": "uri" },
+        "totals": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tests", "passed", "failed", "errored", "skipped"],
+          "properties": {
+            "tests": { "type": "integer", "minimum": 0 },
+            "passed": { "type": "integer", "minimum": 0 },
+            "failed": { "type": "integer", "minimum": 0 },
+            "errored": { "type": "integer", "minimum": 0 },
+            "skipped": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "flaky_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Count of test cases that failed at least once then passed on retry within this run."
+        },
+        "duration_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "report_sha256", "overall", "patch", "thresholds"],
+      "properties": {
+        "format": { "type": "string", "enum": ["cobertura-xml", "lcov", "jacoco-xml"] },
+        "report_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "report_uri": { "type": "string", "format": "uri" },
+        "overall": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["line_rate", "branch_rate"],
+          "properties": {
+            "line_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+            "branch_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+          }
+        },
+        "patch": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["available", "line_rate", "lines_changed", "lines_covered"],
+          "properties": {
+            "available": { "type": "boolean", "description": "False when base_commit_sha is unavailable or diff yields zero coverable changed lines." },
+            "line_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+            "lines_changed": { "type": "integer", "minimum": 0 },
+            "lines_covered": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "thresholds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["overall_min", "patch_min", "overall_met", "patch_met"],
+          "properties": {
+            "overall_min": { "type": "number", "minimum": 0, "maximum": 1 },
+            "patch_min": { "type": "number", "minimum": 0, "maximum": 1 },
+            "overall_met": { "type": "boolean" },
+            "patch_met": { "type": "boolean" }
+          }
+        }
+      }
+    },
+
+    "assertion_density": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_assertions", "total_test_functions", "density_ratio", "heuristics"],
+      "properties": {
+        "total_assertions": { "type": "integer", "minimum": 0 },
+        "total_test_functions": { "type": "integer", "minimum": 0 },
+        "density_ratio": { "type": ["number", "null"], "minimum": 0, "description": "assertions / test_functions; null when total_test_functions is 0." },
+        "heuristics": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "empty_test_bodies": { "type": "integer", "minimum": 0, "description": "Test functions with zero assertions and zero meaningful statements." },
+            "assertion_only_true": { "type": "integer", "minimum": 0, "description": "Suspicious tautological assertions, e.g. assert True / expect(true).toBe(true)." },
+            "skipped_or_disabled_ratio": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      }
+    },
+
+    "release_confidence_score": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "algorithm_version", "components", "computed_at"],
+      "properties": {
+        "value": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "algorithm_version": { "type": "string", "const": "rcs-v0.1" },
+        "components": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["test_health", "patch_coverage", "overall_coverage", "assertion_integrity", "governance"],
+          "properties": {
+            "test_health": { "$ref": "#/$defs/scoreComponent" },
+            "patch_coverage": { "$ref": "#/$defs/scoreComponent" },
+            "overall_coverage": { "$ref": "#/$defs/scoreComponent" },
+            "assertion_integrity": { "$ref": "#/$defs/scoreComponent" },
+            "governance": { "$ref": "#/$defs/scoreComponent" }
+          }
+        },
+        "degraded": {
+          "type": "boolean",
+          "default": false,
+          "description": "True if any component fell back to a penalized default due to missing/unavailable input data."
+        },
+        "computed_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+
+  "$defs": {
+    "scoreComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["weight", "raw_score", "weighted_score", "reason"],
+      "properties": {
+        "weight": { "type": "number", "minimum": 0, "maximum": 1 },
+        "raw_score": { "type": "number", "minimum": 0, "maximum": 100 },
+        "weighted_score": { "type": "number", "minimum": 0, "maximum": 100 },
+        "reason": { "type": "string", "description": "Human/auditor-readable justification, e.g. 'zero tests executed', 'patch coverage unavailable, fell back to overall*0.7'." }
+      }
+    }
+  }
+}

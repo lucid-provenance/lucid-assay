@@ -1,0 +1,134 @@
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+    {
+      "name": "registry.example.com/org/svc",
+      "digest": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  ],
+  "predicateType": "https://iui.dev/attestation/lifecycle/v0.1",
+  "predicate": {
+    "predicate_version": "0.1.0",
+    "pipeline": {
+      "ci_provider": "github-actions",
+      "run_id": "PLACEHOLDER_RUN_ID",
+      "run_attempt": 1,
+      "workflow_ref": "PLACEHOLDER_WORKFLOW_REF",
+      "runner_environment": "unknown",
+      "started_at": "2026-08-20T02:18:40Z",
+      "finished_at": "2026-08-20T02:18:40Z"
+    },
+    "vcs": {
+      "provider": "github",
+      "repository": "org/svc",
+      "branch": "feature/x",
+      "commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "base_commit_sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "pull_request": {
+        "number": 42,
+        "target_branch": "main",
+        "approvers": [
+          "alice",
+          "bob"
+        ],
+        "required_approvals": 2,
+        "review_state": "approved"
+      }
+    },
+    "artifact": {
+      "subject": {
+        "name": "registry.example.com/org/svc",
+        "digest": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "sbom": null
+    },
+    "test_verification": {
+      "framework": "pytest",
+      "report_format": "junit-xml",
+      "report_sha256": "209d38afd1a1fd142b57f83f827c1e0320abd7a48b2d5fff3aad9c7a95869b23",
+      "report_uri": "s3://evidence/sha256/209d38afd1a1fd142b57f83f827c1e0320abd7a48b2d5fff3aad9c7a95869b23",
+      "totals": {
+        "tests": 4,
+        "passed": 3,
+        "failed": 0,
+        "errored": 0,
+        "skipped": 1
+      },
+      "flaky_retries": 1,
+      "duration_ms": 110
+    },
+    "coverage": {
+      "format": "cobertura-xml",
+      "report_sha256": "371c308fb59cd9b9bbf9bb4a68b59f55fc67002cb02aa264deb6be8621e42a6a",
+      "report_uri": "s3://evidence/sha256/371c308fb59cd9b9bbf9bb4a68b59f55fc67002cb02aa264deb6be8621e42a6a",
+      "overall": {
+        "line_rate": 0.85,
+        "branch_rate": 0.7
+      },
+      "patch": {
+        "available": true,
+        "line_rate": 0.9,
+        "lines_changed": 10,
+        "lines_covered": 9
+      },
+      "thresholds": {
+        "overall_min": 0.6,
+        "patch_min": 0.8,
+        "overall_met": true,
+        "patch_met": true
+      }
+    },
+    "assertion_density": {
+      "total_assertions": 50,
+      "total_test_functions": 4,
+      "density_ratio": 12.5,
+      "heuristics": {
+        "empty_test_bodies": 0,
+        "assertion_only_true": 0,
+        "skipped_or_disabled_ratio": 0.25
+      }
+    },
+    "release_confidence_score": {
+      "value": 85,
+      "algorithm_version": "rcs-v0.1",
+      "components": {
+        "test_health": {
+          "weight": 0.35,
+          "raw_score": 71.0,
+          "weighted_score": 24.85,
+          "reason": "pass_rate=0.750 (3/4), -4.0pts flaky-retry penalty (1 case(s) needed retry)"
+        },
+        "patch_coverage": {
+          "weight": 0.25,
+          "raw_score": 90.0,
+          "weighted_score": 22.5,
+          "reason": "patch_line_rate=0.900 (9/10 changed lines), threshold=0.80 MET"
+        },
+        "overall_coverage": {
+          "weight": 0.15,
+          "raw_score": 85.0,
+          "weighted_score": 12.75,
+          "reason": "overall_line_rate=0.850, threshold=0.60 MET"
+        },
+        "assertion_integrity": {
+          "weight": 0.1,
+          "raw_score": 100.0,
+          "weighted_score": 10.0,
+          "reason": "density=12.50 assertions/test (target=1.5)"
+        },
+        "governance": {
+          "weight": 0.15,
+          "raw_score": 100.0,
+          "weighted_score": 15.0,
+          "reason": "2/2 required approvals (approved)"
+        }
+      },
+      "degraded": false,
+      "computed_at": "2026-08-20T02:18:40Z"
+    }
+  }
+}

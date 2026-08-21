@@ -1,4 +1,4 @@
-# IUI Continuous Governance Control Plane — Foundation (Task 1)
+# Plinth Assay — Continuous Governance Control Plane (Foundation)
 
 MVP foundation for bridging CI/CD execution to SOC 2 / FedRAMP / ISO 27001
 evidence: cryptographically signed in-toto attestations of test, coverage,
@@ -9,11 +9,11 @@ in WORM storage.
 
 ```
 schema/
-  attestation-lifecycle-v0.1.schema.json   # in-toto predicate JSON Schema
+  plinth-attestation-v1.schema.json   # in-toto predicate JSON Schema
 cli/
   parsers/junit.py        # streaming JUnit XML -> TestTotals
   parsers/coverage.py     # Cobertura XML + LCOV -> CoverageReport (per-line hit maps)
-  parsers/ast_inspector.py # AST-walks test files -> assertion integrity metrics
+  parsers/ast_inspector.py # scoped AST walk of test files -> assertion integrity metrics
   patch_coverage.py       # git diff base...head, intersected with coverage hit maps
   hashing.py              # SHA-256 content hashing + WORM key derivation
   scorer.py               # pure, deterministic Release Confidence Score (RCS)
@@ -22,7 +22,9 @@ cli/
   main.py                 # CLI entrypoint wiring it all together
 tests/
   test_scorer.py          # adversarial edge-case tests for the RCS algorithm
+  test_builder.py         # in-toto Statement assembly tests
   test_ast_inspector.py   # real/tautological/empty assertion detection tests
+  test_adversarial_ast.py # adversarial bypass suite for the AST inspector
   fixtures/                # sample junit.xml, cobertura.xml, and rendered statement
 ```
 
@@ -121,7 +123,7 @@ a hard pipeline failure.
 ## Try it
 
 ```bash
-cd iui-govplane
+cd plinth-assay
 python3 -m unittest tests.test_scorer -v
 
 python3 -m cli.main \

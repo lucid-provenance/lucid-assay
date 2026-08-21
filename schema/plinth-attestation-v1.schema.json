@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://iui.dev/attestation/lifecycle/v0.1",
-  "title": "IUI Pipeline Lifecycle Attestation Predicate v0.1",
+  "$id": "https://plinth.dev/attestation/v1",
+  "title": "Plinth Pipeline Lifecycle Attestation Predicate v1",
   "description": "In-toto predicate carried inside a DSSE-wrapped in-toto Statement (predicateType = this $id). Captures VCS provenance, supply-chain artifact identity, test verification, coverage, assertion-quality heuristics, and the derived Release Confidence Score (RCS) for a single CI pipeline run.",
   "type": "object",
   "additionalProperties": false,

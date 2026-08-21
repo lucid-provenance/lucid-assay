@@ -8,7 +8,7 @@
       }
     }
   ],
-  "predicateType": "https://iui.dev/attestation/lifecycle/v0.1",
+  "predicateType": "https://plinth.dev/attestation/v1",
   "predicate": {
     "predicate_version": "0.1.0",
     "pipeline": {

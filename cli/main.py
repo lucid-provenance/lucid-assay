@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-iui-attest: single-binary CI attestation & governance engine.
+plinth-assay: single-binary CI attestation & governance engine.
 
 Hardened against:
   - Unsafe output filename collision during DSSE envelope output
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +27,20 @@ from .scorer import score_pipeline
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="worm-upload")
 
 
+def derive_signed_path(out_path: str) -> str:
+    """Derive the DSSE signed envelope path from --out, without
+    double-appending the .dsse.json suffix when --out already ends in
+    .dsse.json or .json (e.g. avoid *.dsse.dsse.json)."""
+    if out_path.endswith(".dsse.json"):
+        return out_path
+    if out_path.endswith(".json"):
+        base_out = out_path[: -len(".json")]
+        if base_out.endswith(".unsigned"):
+            base_out = base_out[: -len(".unsigned")]
+        return f"{base_out}.dsse.json"
+    return f"{out_path}.dsse.json"
+
+
 def upload_to_worm_async(local_path: str, sha256_hex: str, bucket: str = "evidence"):
     """Fire-and-forget evidence storage dispatch."""
     def _upload():
@@ -38,7 +51,10 @@ def upload_to_worm_async(local_path: str, sha256_hex: str, bucket: str = "eviden
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(prog="iui-attest")
+    p = argparse.ArgumentParser(
+        prog="plinth-assay",
+        description="plinth-assay: single-binary CI attestation & governance engine.",
+    )
     p.add_argument("--junit-xml", required=True)
     p.add_argument("--coverage-format", choices=["cobertura", "lcov"], default="cobertura")
     p.add_argument("--coverage-report", required=True, dest="coverage_report")
@@ -157,10 +173,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         with open(args.out, "rb") as f:
             envelope = sign_statement(f.read(), dry_run=args.dry_run_sign)
 
-        base_out, _ = os.path.splitext(args.out)
-        if base_out.endswith(".unsigned"):
-            base_out = base_out[:-9]
-        signed_path = f"{base_out}.dsse.json"
+        signed_path = derive_signed_path(args.out)
 
         with open(signed_path, "w", encoding="utf-8") as f:
             f.write(envelope.to_json())

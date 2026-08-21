@@ -1,6 +1,6 @@
 """
 Assembles the unsigned in-toto Statement (predicateType =
-https://iui.dev/attestation/lifecycle/v0.1) from parsed inputs.
+https://plinth.dev/attestation/v1) from parsed inputs.
 
 Hardened against:
   - TypeError on boolean evaluation of NoneType line rates
@@ -18,6 +18,8 @@ from .parsers.coverage import CoverageReport
 from .parsers.junit import TestTotals
 from .patch_coverage import PatchCoverageResult
 from .scorer import RCSResult
+
+DEFAULT_PREDICATE_TYPE = "https://plinth.dev/attestation/v1"
 
 
 def _now_iso() -> str:
@@ -178,7 +180,7 @@ def build_statement(
     statement = {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [{"name": subject_name, "digest": {"sha256": clean_subj_sha}}],
-        "predicateType": "https://iui.dev/attestation/lifecycle/v0.1",
+        "predicateType": DEFAULT_PREDICATE_TYPE,
         "predicate": predicate,
     }
     return statement

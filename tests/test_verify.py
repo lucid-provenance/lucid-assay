@@ -198,3 +198,7 @@ if __name__ == "__main__":
     unittest.main()
 
 # Verified PR gate trigger test
+
+def test_pr_patch_marker():
+    from cli.verify import pr_patch_marker
+    assert pr_patch_marker() == "patch-verified"

@@ -417,3 +417,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+def pr_patch_marker() -> str:
+    """Helper to exercise patch coverage calculation."""
+    return "patch-verified"

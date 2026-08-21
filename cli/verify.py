@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -282,7 +283,6 @@ def verify_dsse_attestation(
         rcs_value = rcs_block.get("value")
         
         # Check non-standard numeric scores for rcs_value
-        import math
         if not isinstance(rcs_value, (int, float)) or isinstance(rcs_value, bool) or math.isnan(rcs_value) or math.isinf(rcs_value):
             violations.append(f"invalid release_confidence_score.value: {rcs_value!r}")
             rcs_value = None

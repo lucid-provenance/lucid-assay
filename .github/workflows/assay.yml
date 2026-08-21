@@ -44,6 +44,7 @@ jobs:
       - name: Mint Signed Plinth Attestation
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           EXTRA_ARGS=""
@@ -54,15 +55,24 @@ jobs:
           python -m cli.main \
             --junit-xml build/junit.xml \
             --coverage-report build/coverage.xml \
-            --image-ref "ghcr.io/${{ github.repository }}:${{ github.sha }}" \
+            --image-ref "ghcr.io/${{ github.repository }}:${HEAD_SHA}" \
             --image-digest "sha256:$(git rev-parse HEAD | sha256sum | awk '{print $1}')" \
-            --head-sha "${{ github.sha }}" \
+            --head-sha "${HEAD_SHA}" \
             --repository "${{ github.repository }}" \
             --branch "${{ github.ref_name }}" \
             --min-rcs 65 \
             --sign \
             --out build/plinth-assay.dsse.json \
             $EXTRA_ARGS
+
+      - name: Verify Plinth Attestation Gate
+        run: |
+          VERIFY_ARGS="--min-rcs 65"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            VERIFY_ARGS="$VERIFY_ARGS --disallow-degraded"
+          fi
+
+          python -m cli.verify build/plinth-assay.dsse.json $VERIFY_ARGS
 
       - name: Upload In-Toto Attestation Artifact
         uses: actions/upload-artifact@v4

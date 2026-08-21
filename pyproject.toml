@@ -22,3 +22,7 @@ dev = [
 [project.scripts]
 plinth = "cli.main:main"
 plinth-assay = "cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cli*", "schema*"]

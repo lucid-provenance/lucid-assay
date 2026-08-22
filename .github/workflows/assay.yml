@@ -5,11 +5,18 @@ name: Plinth Assay
 # restricted, no-secrets context `pull_request` provides for fork PRs.
 # `pull_request_target` runs with base-branch permissions/secrets against
 # untrusted fork code and must never be substituted here.
+
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Enable stage profiling output'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -96,7 +103,7 @@ jobs:
           # rules apply to); github.ref_name is only correct on a direct push.
           BRANCH_NAME: ${{ github.event.pull_request.base.ref || github.ref_name }}
         run: |
-          EXTRA_ARGS=()
+          EXTRA_ARGS=(--debug)
           if [ "$EVENT_NAME" = "pull_request" ]; then
             if [ -z "$BASE_SHA" ]; then
               echo "ERROR: github.event.pull_request.base.sha was empty on a pull_request event; refusing to guess a base commit" >&2

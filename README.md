@@ -26,6 +26,7 @@ cli/
   main.py                     # CLI entrypoint wiring it all together (`plinth-assay verify` dispatches to verify.py)
 tests/
   test_scorer.py               # adversarial edge-case tests for the RCS algorithm
+  test_patch_coverage.py        # git-diff/coverage intersection + reason_code tests (real git repo)
   test_builder.py               # in-toto Statement assembly tests
   test_ast_inspector.py          # real/tautological/empty assertion detection tests
   test_adversarial_ast.py         # adversarial bypass suite for the AST inspector
@@ -104,7 +105,7 @@ strings, so identical inputs always produce an identical score):
 | Component | Weight | Edge case handling |
 |---|---|---|
 | Test health | 35% | `pass_rate = passed / (passed+failed+errored)`. Zero executed tests **floors to 0** with an explicit reason distinguishing "all skipped" from "broken/bypassed gate" (never a neutral default — a broken test gate is a strong negative signal). Flaky retries (same `classname`+`name` seen more than once, final attempt passed) penalize 4pts/case, capped at −30, without being able to zero the run outright. |
-| Patch coverage | 20% | Line-rate over just the lines touched by `git diff base...head`, intersected with the coverage report's hit map. Unavailable (no base SHA, or a docs/config-only diff with zero coverable changed lines) **falls back to overall coverage × 0.70**, and flags the whole result `degraded: true` — a proxy signal can never outscore the real measurement it's standing in for. |
+| Patch coverage | 20% | Line-rate over just the lines touched by `git diff base...head`, intersected with the coverage report's hit map. Unavailable (no base SHA, or a docs/config-only diff with zero coverable changed lines) **falls back to overall coverage × 0.70**, and flags the whole result `degraded: true` — a proxy signal can never outscore the real measurement it's standing in for. A docs/config-only diff is tagged with its own `reason_code` (`no_coverable_lines`), since there's no code in it for coverage to be missing over — see `--disallow-degraded` below. |
 | Overall coverage | 15% | Straight line-rate vs. configurable threshold (default 0.60). |
 | Assertion integrity | 10% | `assertions / test_functions` normalized against a target density (1.5), capped at 100; zero test functions floors to 0. Fed by the AST inspector (below), which filters out tautological/empty assertions before counting. |
 | Governance | 15% | No PR/MR context scores a **neutral 50**, not full credit, and flags `degraded`. `changes_requested` and unresolved zeroes the component outright; a required-approvals count of 0 caps at 60 (flagged as a weak control). Independently, a **live GitHub branch-governance check** docks −35pts if it finds the branch would let the same change land unreviewed regardless of this PR's own state (see below) — **and docks the same −35pts if that check couldn't run at all** (missing/invalid `GITHUB_TOKEN`, API failure, or GitHub's own plan/visibility feature gate on rulesets), so omitting the token is never a cheaper way to dodge the penalty than a confirmed bypass. |
@@ -117,13 +118,15 @@ separate top-level `degraded: true` flag (distinct from the score itself)
 is set whenever any component fell back to a proxy or a check couldn't be
 verified — a 95/100 that's quietly degraded stays visibly distinguishable
 from a clean 95. Alongside it, `degraded_reasons` lists *which* independent
-trigger(s) fired (`patch_coverage_unavailable`, `no_pr_context`,
-`sarif_unavailable`, `branch_governance_unverified` / a namespaced
-`branch_governance:<reason_code>` when the governance check identifies a
-specific known cause, or `branch_governance_bypass_permitted`) — a run can
-be degraded for more than one reason at once, and each shows up as its own
-entry, not a single opaque flag. NaN/Inf arithmetic anywhere in the
-pipeline clamps to the score floor rather than propagating.
+trigger(s) fired (`patch_coverage_unavailable` / a namespaced
+`patch_coverage:<reason_code>` for a specific known cause,
+`no_pr_context`, `sarif_unavailable`, `branch_governance_unverified` / a
+namespaced `branch_governance:<reason_code>` when the governance check
+identifies a specific known cause, or
+`branch_governance_bypass_permitted`) — a run can be degraded for more
+than one reason at once, and each shows up as its own entry, not a
+single opaque flag. NaN/Inf arithmetic anywhere in the pipeline clamps
+to the score floor rather than propagating.
 
 Run the edge-case suite:
 
@@ -272,17 +275,19 @@ Policy gates:
 - `--disallow-degraded` — fails a degraded run, but isn't a flat
   `degraded == true` check: it inspects `degraded_reasons` and only lets a
   degraded run through when that list is non-empty **and every entry** is
-  the one known, unavoidable platform limitation
-  (`branch_governance:platform_unsupported_tier` — a private repo on
-  GitHub Free, where branch rulesets simply aren't supported at any token
-  scope). Any other cause present — a real governance gap, missing PR
-  context, a broken SARIF/patch-coverage input, or `degraded_reasons`
-  missing/malformed entirely (e.g. an older attestation predating this
-  field) — still blocks. This deliberately can't be satisfied by
-  visibility alone (`private == true`): private repos on GitHub
-  Pro/Team/Enterprise *do* support rulesets, so a repo-visibility check
-  would wrongly waive strict enforcement for a paid private repo with a
-  real, fixable governance problem too.
+  one of a small, deliberate allowlist of known, unavoidable states —
+  currently `branch_governance:platform_unsupported_tier` (a private repo
+  on GitHub Free, where branch rulesets simply aren't supported at any
+  token scope) and `patch_coverage:no_coverable_lines` (a docs/config-only
+  diff with no code for patch coverage to be missing over). Any other
+  cause present — a real governance gap, missing PR context, a broken
+  SARIF input, or `degraded_reasons` missing/malformed entirely (e.g. an
+  older attestation predating this field) — still blocks. This
+  deliberately can't be approximated by simpler proxies like repo
+  visibility (`private == true`): private repos on GitHub Pro/Team/
+  Enterprise *do* support rulesets, so a repo-visibility check would
+  wrongly waive strict enforcement for a paid private repo with a real,
+  fixable governance problem too.
 
 Identity verification (best-effort, four possible outcomes):
 - **`verified`** — cryptographic signature *and* asserted identity checks
@@ -344,7 +349,7 @@ installed — outside CI there's no ambient identity to fetch, by design.
 
 ## Test suite
 
-~210 test cases across 9 modules, including dedicated adversarial suites:
+~230 test cases across 10 modules, including dedicated adversarial suites:
 `test_adversarial_ast.py` (assertion-integrity bypass attempts),
 `test_security_boundaries.py` and `test_verify_boundaries.py`
 (malformed/hostile-input hardening), and `test_github_rules.py` (auth

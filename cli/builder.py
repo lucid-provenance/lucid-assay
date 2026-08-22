@@ -188,6 +188,8 @@ def build_statement(
                 "line_rate": patch_coverage.line_rate,
                 "lines_changed": patch_coverage.lines_changed,
                 "lines_covered": patch_coverage.lines_covered,
+                "reason": patch_coverage.reason,
+                "reason_code": patch_coverage.reason_code,
             },
             "thresholds": {
                 "overall_min": overall_coverage_min,

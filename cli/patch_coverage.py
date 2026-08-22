@@ -11,6 +11,13 @@ Hardened against:
   - Relative-root discrepancies between git diff paths (repo-root-relative,
     e.g. "cli/verify.py") and coverage tool keys (source-root-relative,
     e.g. Cobertura's "verify.py" when <source>cli</source> is configured)
+  - Conflating "a docs/config-only diff has no coverable lines to measure"
+    (benign -- there's no code in the diff for coverage to be missing
+    over) with "patch coverage genuinely couldn't be computed" (missing
+    base SHA, a failed git diff): PatchCoverageResult.reason_code
+    distinguishes the former via REASON_CODE_NO_COVERABLE_LINES so
+    downstream policy (e.g. cli.verify's --disallow-degraded) doesn't
+    have to treat every unavailable result identically
 """
 from __future__ import annotations
 
@@ -32,6 +39,20 @@ _HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _DIFF_PLUS = re.compile(r"^\+\+\+ b/(.*)$")
 
 
+# Machine-readable PatchCoverageResult.reason_code value for a diff that
+# genuinely contains zero coverable changed lines (docs/config-only change,
+# e.g. a README/CLAUDE.md-only PR) -- as opposed to patch coverage being
+# unavailable for a *real* reason (missing base SHA, a failed git diff).
+# There is no code in this diff to have coverage over, so this is not a
+# gap the way the other causes are. Threaded through to the attestation
+# predicate (cli.builder) and, like
+# cli.parsers.github_rules.REASON_CODE_PLATFORM_UNSUPPORTED_TIER, lets
+# cli.verify's --disallow-degraded distinguish this from an actual
+# unverifiable-coverage problem instead of treating every unavailable
+# result identically.
+REASON_CODE_NO_COVERABLE_LINES = "no_coverable_lines"
+
+
 @dataclass
 class PatchCoverageResult:
     __test__ = False
@@ -40,6 +61,13 @@ class PatchCoverageResult:
     lines_changed: int
     lines_covered: int
     reason: str
+    # Machine-readable classification of *why* available=False, when it's
+    # known to be something more specific than "generic failure" -- see
+    # REASON_CODE_NO_COVERABLE_LINES. None for every other unavailable
+    # case (missing base SHA, git diff failure): callers must not infer
+    # anything from an absent reason_code beyond "not this specific,
+    # identified condition".
+    reason_code: Optional[str] = None
 
 
 def _changed_lines_by_file(base_sha: str, head_sha: str, cwd: str) -> Dict[str, List[int]]:
@@ -217,6 +245,7 @@ def compute_patch_coverage(
             lines_changed=0,
             lines_covered=0,
             reason="diff contained no coverable changed lines (docs/config-only change)",
+            reason_code=REASON_CODE_NO_COVERABLE_LINES,
         )
 
     return PatchCoverageResult(

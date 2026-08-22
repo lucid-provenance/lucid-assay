@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cli.parsers.github_rules import BranchGovernanceReport, REASON_CODE_PLATFORM_UNSUPPORTED_TIER
 from cli.parsers.junit import TestTotals
 from cli.parsers.sarif import SarifSummaryReport
-from cli.patch_coverage import PatchCoverageResult
+from cli.patch_coverage import PatchCoverageResult, REASON_CODE_NO_COVERABLE_LINES
 from cli.scorer import (
     score_pipeline,
     WEIGHTS,
@@ -214,6 +214,19 @@ class DegradedReasonsTests(unittest.TestCase):
             ),
         ))
         self.assertEqual(result.degraded_reasons, [DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE])
+
+    def test_docs_only_diff_reason_code_is_namespaced(self):
+        # This is the exact string cli.verify's --disallow-degraded gate
+        # allowlists -- if this namespacing ever changes, that gate's
+        # allowed-reasons set must be updated to match.
+        result = score_pipeline(**_base_kwargs(
+            patch_coverage=PatchCoverageResult(
+                available=False, line_rate=None, lines_changed=0, lines_covered=0,
+                reason="diff contained no coverable changed lines (docs/config-only change)",
+                reason_code=REASON_CODE_NO_COVERABLE_LINES,
+            ),
+        ))
+        self.assertEqual(result.degraded_reasons, ["patch_coverage:no_coverable_lines"])
 
     def test_no_pr_context_reason(self):
         result = score_pipeline(**_base_kwargs(pr_present=False, branch_governance=_clean_branch_governance()))

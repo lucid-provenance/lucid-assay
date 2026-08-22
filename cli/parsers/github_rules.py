@@ -371,53 +371,24 @@ def _collect_bypass_actors(repository: str, token: str, timeout: int) -> List[Di
     return actors
 
 
-def inspect_branch_governance(
-    repository: str,
-    branch: str = "main",
-    token: Optional[str] = None,
-    timeout: int = DEFAULT_TIMEOUT,
-) -> BranchGovernanceReport:
-    """Inspects the effective branch protection rules for `branch` on
-    `repository` (as "owner/repo") via GitHub's rules-for-branch
-    (`GET /repos/{repository}/rules/branches/{branch}`) and rulesets
-    (`GET /repos/{repository}/rulesets`) REST endpoints, authenticating
-    with the ambient GITHUB_TOKEN when `token` isn't supplied explicitly.
-
-    When `available` is False because GitHub's own error body identifies
-    the platform/plan-tier feature gate specifically (a private repo on
-    GitHub Free -- see REASON_CODE_PLATFORM_UNSUPPORTED_TIER), the
-    returned report's `reason_code` is set to that value; it's None for
-    every other unavailable case (missing token, network failure, an
-    under-scoped-but-otherwise-valid token, ambiguous 404, ...).
-    """
-    if not isinstance(repository, str) or not _REPO_RE.match(repository):
-        return _unavailable(
-            branch,
-            f"invalid repository identifier {repository!r}; expected 'owner/repo' "
-            f"matching {_REPO_RE.pattern!r}",
-        )
-
-    resolved_token = token if token is not None else os.environ.get("GITHUB_TOKEN")
-    if not resolved_token:
-        return _unavailable(
-            branch,
-            "no GITHUB_TOKEN available (neither passed explicitly nor set in the environment); "
-            "branch governance could not be verified",
-        )
-
+def _fetch_rules_for_branch(
+    repository: str, branch: str, token: str, timeout: int
+) -> Tuple[Optional[List[Any]], Optional[BranchGovernanceReport]]:
+    """Fetches the effective rules for `branch`, resolving the 404
+    ambiguity (no rules configured vs. a nonexistent repo/branch) via a
+    secondary branch-existence check. Returns (rules, None) on success --
+    an empty list is a valid, successful result (no rules configured) --
+    or (None, early_report) when the whole inspection must fail closed
+    right here."""
     try:
-        raw_rules = _github_api_get(
-            f"/repos/{repository}/rules/branches/{_quote_ref(branch)}", resolved_token, timeout
-        )
+        raw_rules = _github_api_get(f"/repos/{repository}/rules/branches/{_quote_ref(branch)}", token, timeout)
     except GitHubAPIError as e:
         if e.status_code in (401, 403):
-            reason_code = (
-                REASON_CODE_PLATFORM_UNSUPPORTED_TIER if _is_platform_tier_limitation(str(e)) else None
-            )
-            return _unavailable(
+            reason_code = REASON_CODE_PLATFORM_UNSUPPORTED_TIER if _is_platform_tier_limitation(str(e)) else None
+            return None, _unavailable(
                 branch, _actionable_auth_failure_reason(e, "querying rules for branch"), reason_code
             )
-        return _unavailable(branch, f"GitHub rules API request failed: {e}")
+        return None, _unavailable(branch, f"GitHub rules API request failed: {e}")
 
     if raw_rules is None:
         # rules-for-branch 404'd. GitHub returns 404 both for "no rules
@@ -425,43 +396,51 @@ def inspect_branch_governance(
         # (a caller typo that must not be silently reported as "clean").
         # Only trust the benign interpretation once branch existence is
         # independently confirmed; otherwise fail closed.
-        exists = _branch_exists(repository, branch, resolved_token, timeout)
+        exists = _branch_exists(repository, branch, token, timeout)
         if exists is False:
-            return _unavailable(
+            return None, _unavailable(
                 branch,
                 f"repository '{repository}' or branch '{branch}' does not exist "
                 "(branch lookup returned 404); cannot verify branch governance",
             )
         if exists is None:
-            return _unavailable(
+            return None, _unavailable(
                 branch,
                 "could not confirm repository/branch existence after an empty rules-for-branch "
                 "response; failing closed rather than assuming no rules apply",
             )
-        rules: List[Any] = []
-    else:
-        rules = raw_rules if isinstance(raw_rules, list) else []
+        return [], None
 
-    bypass_fetch_warning: Optional[str] = None
+    return (raw_rules if isinstance(raw_rules, list) else []), None
+
+
+def _fetch_bypass_actors_with_fallback(
+    repository: str, branch: str, token: str, timeout: int
+) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[BranchGovernanceReport]]:
+    """Fetches bypass actors across active branch rulesets. Returns
+    (bypass_actors, bypass_fetch_warning, None) on success -- an auth
+    failure taints the whole report closed (returns ([], None,
+    early_report) instead, since the rules-for-branch call may well have
+    "succeeded" only via its own 404-is-benign short-circuit), while any
+    other failure degrades to "no bypass-actor visibility" (empty list +
+    a warning) without discarding the rules data already in hand."""
     try:
-        bypass_actors = _collect_bypass_actors(repository, resolved_token, timeout)
+        bypass_actors = _collect_bypass_actors(repository, token, timeout)
     except GitHubAPIError as e:
         if e.status_code in (401, 403):
-            # A bad/under-scoped token taints the whole report, not just
-            # this one lookup -- the rules-for-branch call above may well
-            # have "succeeded" only via its own 404-is-benign short-circuit.
-            reason_code = (
-                REASON_CODE_PLATFORM_UNSUPPORTED_TIER if _is_platform_tier_limitation(str(e)) else None
-            )
-            return _unavailable(
+            reason_code = REASON_CODE_PLATFORM_UNSUPPORTED_TIER if _is_platform_tier_limitation(str(e)) else None
+            return [], None, _unavailable(
                 branch, _actionable_auth_failure_reason(e, "enumerating rulesets"), reason_code
             )
-        # Any other (non-auth) failure enumerating rulesets doesn't invalidate
-        # the rules data already in hand -- degrade to "no bypass-actor
-        # visibility" rather than discarding an otherwise-successful lookup.
-        bypass_actors = []
-        bypass_fetch_warning = f"could not enumerate ruleset bypass actors: {e}"
+        return [], f"could not enumerate ruleset bypass actors: {e}", None
+    return bypass_actors, None, None
 
+
+def _derive_pr_requirements(rules: List[Any]) -> Tuple[bool, int, bool]:
+    """Returns (pull_request_required, approvals_required,
+    direct_push_prevented) from the rules-for-branch response. A
+    "pull_request" rule is what actually blocks a direct (non-PR) push to
+    the branch; no other rule type in the response has that effect."""
     pr_rule = next((r for r in rules if isinstance(r, dict) and r.get("type") == "pull_request"), None)
     pull_request_required = pr_rule is not None
 
@@ -473,23 +452,38 @@ def inspect_branch_governance(
         except (TypeError, ValueError):
             approvals_required = 0
 
-    # A "pull_request" rule is what actually blocks a direct (non-PR) push
-    # to the branch; no other rule type in the rules-for-branch response
-    # has that effect.
     direct_push_prevented = pull_request_required
+    return pull_request_required, approvals_required, direct_push_prevented
 
+
+def _classify_bypass_actors(
+    bypass_actors: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], bool]:
+    """Returns (always_bypass, pr_only_bypass, unknown_mode_bypass,
+    admin_enforced). Allowlist, not blocklist: admin_enforced is True only
+    when *every* bypass actor is restricted to the one known-least-
+    dangerous mode (pull_request); "always" and any unrecognized/missing
+    mode value both fail closed to "not enforced"."""
     always_bypass = [a for a in bypass_actors if a.get("bypass_mode") == BYPASS_MODE_ALWAYS]
     pr_only_bypass = [a for a in bypass_actors if a.get("bypass_mode") == BYPASS_MODE_PULL_REQUEST]
     unknown_mode_bypass = [
         a for a in bypass_actors if a.get("bypass_mode") not in (BYPASS_MODE_ALWAYS, BYPASS_MODE_PULL_REQUEST)
     ]
-    bypass_actors_count = len(bypass_actors)
-    # Whitelist, not blocklist: admin_enforced is True only when *every*
-    # bypass actor is restricted to the one known-least-dangerous mode
-    # (pull_request). "always" and any unrecognized/missing mode value
-    # both fail closed to "not enforced".
     admin_enforced = len(always_bypass) + len(unknown_mode_bypass) == 0
+    return always_bypass, pr_only_bypass, unknown_mode_bypass, admin_enforced
 
+
+def _build_governance_warnings(
+    *,
+    bypass_fetch_warning: Optional[str],
+    rules: List[Any],
+    branch: str,
+    pull_request_required: bool,
+    approvals_required: int,
+    always_bypass: List[Dict[str, Any]],
+    unknown_mode_bypass: List[Dict[str, Any]],
+    pr_only_bypass: List[Dict[str, Any]],
+) -> List[str]:
     warnings: List[str] = []
     if bypass_fetch_warning:
         warnings.append(bypass_fetch_warning)
@@ -522,6 +516,75 @@ def inspect_branch_governance(
             f"{len(pr_only_bypass)} bypass actor(s) can bypass pull-request review requirements "
             "(bypass_mode=pull_request)"
         )
+    return warnings
+
+
+def inspect_branch_governance(
+    repository: str,
+    branch: str = "main",
+    token: Optional[str] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> BranchGovernanceReport:
+    """Inspects the effective branch protection rules for `branch` on
+    `repository` (as "owner/repo") via GitHub's rules-for-branch
+    (`GET /repos/{repository}/rules/branches/{branch}`) and rulesets
+    (`GET /repos/{repository}/rulesets`) REST endpoints, authenticating
+    with the ambient GITHUB_TOKEN when `token` isn't supplied explicitly.
+
+    When `available` is False because GitHub's own error body identifies
+    the platform/plan-tier feature gate specifically (a private repo on
+    GitHub Free -- see REASON_CODE_PLATFORM_UNSUPPORTED_TIER), the
+    returned report's `reason_code` is set to that value; it's None for
+    every other unavailable case (missing token, network failure, an
+    under-scoped-but-otherwise-valid token, ambiguous 404, ...).
+
+    Orchestrates (see each helper's own docstring): input validation stays
+    inline below; rules-for-branch fetch delegates to
+    _fetch_rules_for_branch(), bypass-actor enumeration to
+    _fetch_bypass_actors_with_fallback(), PR-requirement derivation to
+    _derive_pr_requirements(), bypass-mode classification to
+    _classify_bypass_actors(), and warning-list assembly to
+    _build_governance_warnings().
+    """
+    if not isinstance(repository, str) or not _REPO_RE.match(repository):
+        return _unavailable(
+            branch,
+            f"invalid repository identifier {repository!r}; expected 'owner/repo' "
+            f"matching {_REPO_RE.pattern!r}",
+        )
+
+    resolved_token = token if token is not None else os.environ.get("GITHUB_TOKEN")
+    if not resolved_token:
+        return _unavailable(
+            branch,
+            "no GITHUB_TOKEN available (neither passed explicitly nor set in the environment); "
+            "branch governance could not be verified",
+        )
+
+    rules, early_report = _fetch_rules_for_branch(repository, branch, resolved_token, timeout)
+    if early_report is not None:
+        return early_report
+
+    bypass_actors, bypass_fetch_warning, early_report = _fetch_bypass_actors_with_fallback(
+        repository, branch, resolved_token, timeout
+    )
+    if early_report is not None:
+        return early_report
+
+    pull_request_required, approvals_required, direct_push_prevented = _derive_pr_requirements(rules)
+    always_bypass, pr_only_bypass, unknown_mode_bypass, admin_enforced = _classify_bypass_actors(bypass_actors)
+    bypass_actors_count = len(bypass_actors)
+
+    warnings = _build_governance_warnings(
+        bypass_fetch_warning=bypass_fetch_warning,
+        rules=rules,
+        branch=branch,
+        pull_request_required=pull_request_required,
+        approvals_required=approvals_required,
+        always_bypass=always_bypass,
+        unknown_mode_bypass=unknown_mode_bypass,
+        pr_only_bypass=pr_only_bypass,
+    )
 
     reason = (
         f"queried GitHub rules for {repository}@{branch}: {len(rules)} applicable rule(s), "

@@ -375,6 +375,201 @@ def _extract_sonarqube_extension(run: Dict[str, Any]) -> Optional[Dict[str, Any]
     return result or None
 
 
+def _init_tool_state() -> Dict[str, Any]:
+    return {
+        "version": None,
+        "information_uri": None,
+        "counts": {"error": 0, "warning": 0, "note": 0, "none": 0},
+        "rules": {},  # rule_id -> {"count": int, "category": ..., "tags": [...]}
+        "extensions": {},
+    }
+
+
+def _extract_driver_info(run: Dict[str, Any]) -> Tuple[Dict[str, Optional[str]], Dict[str, Any]]:
+    """Returns (driver_metadata, raw_driver_dict) for one SARIF run --
+    driver_metadata is the same shape _extract_driver_metadata() always
+    produced; raw_driver_dict is handed back too since callers (rule
+    descriptor extraction) need the full driver node, not just its
+    normalized name/version/informationUri."""
+    tool = run.get("tool")
+    driver = tool.get("driver") if isinstance(tool, dict) else None
+    driver = driver if isinstance(driver, dict) else {}
+    return _extract_driver_metadata(driver), driver
+
+
+def _update_tool_state_metadata(state: Dict[str, Any], meta: Dict[str, Optional[str]], run: Dict[str, Any]) -> None:
+    """Merges one run's driver metadata (version/informationUri --
+    first-seen-wins across every run driven by the same tool) and any
+    embedded SonarQube-style extension data into `state` in place."""
+    if state["version"] is None and meta["version"]:
+        state["version"] = meta["version"]
+    if state["information_uri"] is None and meta["information_uri"]:
+        state["information_uri"] = meta["information_uri"]
+
+    sonarqube_ext = _extract_sonarqube_extension(run)
+    if sonarqube_ext:
+        merged = dict(state["extensions"].get("sonarqube") or {})
+        merged.update(sonarqube_ext)
+        state["extensions"]["sonarqube"] = merged
+
+
+def _build_finding(
+    result: Dict[str, Any],
+    tool_name: str,
+    rule_descriptors: Dict[str, Dict[str, Any]],
+    patch_modified_lines: Dict[str, Set[int]],
+) -> SarifFinding:
+    """Parses one SARIF `result` object into a SarifFinding: resolves its
+    rule's category/tags from the driver's descriptors and whether it
+    lands on a patch-modified line."""
+    rule_id = result.get("ruleId")
+    rule_id = str(rule_id) if rule_id else "unknown-rule"
+
+    level = _normalize_level(result.get("level"))
+
+    message_obj = result.get("message")
+    message = message_obj.get("text") if isinstance(message_obj, dict) else None
+    message = str(message) if message else ""
+
+    file_path_norm, start_line = _extract_location(result)
+
+    descriptor = rule_descriptors.get(rule_id, {})
+    category = descriptor.get("category")
+    tags = list(descriptor.get("tags") or [])
+
+    is_new = False
+    if file_path_norm and start_line:
+        modified = _lookup_modified_lines(patch_modified_lines, file_path_norm)
+        if modified and start_line in modified:
+            is_new = True
+
+    return SarifFinding(
+        tool_name=tool_name,
+        rule_id=rule_id,
+        level=level,
+        message=message,
+        file_path=file_path_norm,
+        start_line=start_line,
+        is_new_in_patch=is_new,
+        category=category,
+        tags=tags,
+    )
+
+
+def _record_finding_in_tool_state(state: Dict[str, Any], finding: SarifFinding) -> None:
+    state["counts"][finding.level] += 1
+    rule_state = state["rules"].setdefault(
+        finding.rule_id, {"count": 0, "category": finding.category, "tags": finding.tags}
+    )
+    rule_state["count"] += 1
+    if not rule_state["category"] and finding.category:
+        rule_state["category"] = finding.category
+    if not rule_state["tags"] and finding.tags:
+        rule_state["tags"] = finding.tags
+
+
+def _extract_results(
+    run: Dict[str, Any],
+    tool_name: str,
+    rule_descriptors: Dict[str, Dict[str, Any]],
+    state: Dict[str, Any],
+    patch_modified_lines: Dict[str, Set[int]],
+) -> List[SarifFinding]:
+    """Parses one run's `results` array into SarifFindings, updating
+    `state`'s per-level counts and per-rule grouping in place as it goes.
+    Returns [] (not an error) when `results` is missing/malformed -- SARIF
+    allows a run with no results at all."""
+    results = run.get("results")
+    if not isinstance(results, list):
+        return []
+
+    findings: List[SarifFinding] = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        finding = _build_finding(result, tool_name, rule_descriptors, patch_modified_lines)
+        findings.append(finding)
+        _record_finding_in_tool_state(state, finding)
+    return findings
+
+
+def _process_run(
+    run: Dict[str, Any],
+    tool_state: Dict[str, Dict[str, Any]],
+    tools_scanned: List[str],
+    patch_modified_lines: Dict[str, Set[int]],
+) -> List[SarifFinding]:
+    """Processes one SARIF run: resolves its tool identity, merges driver
+    metadata/SonarQube extension data into that tool's accumulated state
+    (creating it on first sight, keyed by tool name so multiple runs from
+    the same tool merge), and parses its results into findings.
+    tool_state/tools_scanned are updated in place; returns the findings
+    parsed from this run."""
+    meta, driver = _extract_driver_info(run)
+    tool_name = meta["name"]
+    if tool_name not in tools_scanned:
+        tools_scanned.append(tool_name)
+
+    state = tool_state.setdefault(tool_name, _init_tool_state())
+    _update_tool_state_metadata(state, meta, run)
+
+    rule_descriptors = _extract_rule_descriptors(driver)
+    return _extract_results(run, tool_name, rule_descriptors, state, patch_modified_lines)
+
+
+def _count_findings_by_level(findings: List[SarifFinding]) -> Dict[str, int]:
+    return {
+        "errors_count": sum(1 for f in findings if f.level == "error"),
+        "warnings_count": sum(1 for f in findings if f.level == "warning"),
+        "notes_count": sum(1 for f in findings if f.level == "note"),
+        "none_count": sum(1 for f in findings if f.level == "none"),
+    }
+
+
+def _count_patch_differential_findings(findings: List[SarifFinding]) -> Dict[str, int]:
+    return {
+        "patch_errors_count": sum(1 for f in findings if f.is_new_in_patch and f.level == "error"),
+        "patch_warnings_count": sum(1 for f in findings if f.is_new_in_patch and f.level == "warning"),
+    }
+
+
+def _summarize_findings(findings: List[SarifFinding]) -> Dict[str, int]:
+    """The six aggregate counts (errors/warnings/notes/none, and
+    patch-differential errors/warnings) derived from a findings list --
+    shared by parse_sarif_file and aggregate_sarif_reports so the two
+    can never drift out of sync with each other."""
+    return {**_count_findings_by_level(findings), **_count_patch_differential_findings(findings)}
+
+
+def _build_tool_summaries(
+    tools_scanned: List[str], tool_state: Dict[str, Dict[str, Any]], report_hash: Dict[str, str]
+) -> List[SarifToolSummary]:
+    tools: List[SarifToolSummary] = []
+    for name in tools_scanned:
+        state = tool_state[name]
+        counts = state["counts"]
+        rule_groups = [
+            SarifRuleGroup(rule_id=rid, count=info["count"], category=info["category"], tags=info["tags"])
+            for rid, info in sorted(state["rules"].items())
+        ]
+        tools.append(
+            SarifToolSummary(
+                name=name,
+                version=state["version"],
+                information_uri=state["information_uri"],
+                errors_count=counts["error"],
+                warnings_count=counts["warning"],
+                notes_count=counts["note"],
+                none_count=counts["none"],
+                total_findings=sum(counts.values()),
+                rules=rule_groups,
+                extensions=state["extensions"],
+                report_hash=dict(report_hash),
+            )
+        )
+    return tools
+
+
 def parse_sarif_file(
     file_path: Union[str, Path],
     patch_modified_lines: Optional[Dict[str, Set[int]]] = None,
@@ -387,7 +582,15 @@ def parse_sarif_file(
     grouping, any embedded SonarQube-style extension data, and the SHA-256
     of the raw file. Never raises: missing files, unreadable files, and
     malformed JSON all degrade to `available=False` with the failure
-    captured in `reasons`."""
+    captured in `reasons`.
+
+    Orchestrates (see each helper's own docstring): file loading/
+    validation stays inline below (a flat sequence of guard clauses, not
+    itself a complexity source); per-run processing delegates to
+    _process_run() (-> _extract_driver_info()/_update_tool_state_metadata()/
+    _extract_results()/_build_finding()/_record_finding_in_tool_state());
+    final per-tool assembly delegates to _build_tool_summaries().
+    """
     patch_modified_lines = patch_modified_lines or {}
 
     try:
@@ -431,136 +634,54 @@ def parse_sarif_file(
     for run in runs:
         if not isinstance(run, dict):
             continue
+        findings.extend(_process_run(run, tool_state, tools_scanned, patch_modified_lines))
 
-        tool = run.get("tool")
-        driver = tool.get("driver") if isinstance(tool, dict) else None
-        driver = driver if isinstance(driver, dict) else {}
-        meta = _extract_driver_metadata(driver)
-        tool_name = meta["name"]
-        if tool_name not in tools_scanned:
-            tools_scanned.append(tool_name)
-
-        state = tool_state.setdefault(
-            tool_name,
-            {
-                "version": None,
-                "information_uri": None,
-                "counts": {"error": 0, "warning": 0, "note": 0, "none": 0},
-                "rules": {},  # rule_id -> {"count": int, "category": ..., "tags": [...]}
-                "extensions": {},
-            },
-        )
-        if state["version"] is None and meta["version"]:
-            state["version"] = meta["version"]
-        if state["information_uri"] is None and meta["information_uri"]:
-            state["information_uri"] = meta["information_uri"]
-
-        sonarqube_ext = _extract_sonarqube_extension(run)
-        if sonarqube_ext:
-            merged = dict(state["extensions"].get("sonarqube") or {})
-            merged.update(sonarqube_ext)
-            state["extensions"]["sonarqube"] = merged
-
-        rule_descriptors = _extract_rule_descriptors(driver)
-
-        results = run.get("results")
-        if not isinstance(results, list):
-            continue
-
-        for result in results:
-            if not isinstance(result, dict):
-                continue
-
-            rule_id = result.get("ruleId")
-            rule_id = str(rule_id) if rule_id else "unknown-rule"
-
-            level = _normalize_level(result.get("level"))
-
-            message_obj = result.get("message")
-            message = message_obj.get("text") if isinstance(message_obj, dict) else None
-            message = str(message) if message else ""
-
-            file_path_norm, start_line = _extract_location(result)
-
-            descriptor = rule_descriptors.get(rule_id, {})
-            category = descriptor.get("category")
-            tags = list(descriptor.get("tags") or [])
-
-            is_new = False
-            if file_path_norm and start_line:
-                modified = _lookup_modified_lines(patch_modified_lines, file_path_norm)
-                if modified and start_line in modified:
-                    is_new = True
-
-            findings.append(
-                SarifFinding(
-                    tool_name=tool_name,
-                    rule_id=rule_id,
-                    level=level,
-                    message=message,
-                    file_path=file_path_norm,
-                    start_line=start_line,
-                    is_new_in_patch=is_new,
-                    category=category,
-                    tags=tags,
-                )
-            )
-
-            state["counts"][level] += 1
-            rule_state = state["rules"].setdefault(
-                rule_id, {"count": 0, "category": category, "tags": tags}
-            )
-            rule_state["count"] += 1
-            if not rule_state["category"] and category:
-                rule_state["category"] = category
-            if not rule_state["tags"] and tags:
-                rule_state["tags"] = tags
-
-    tools: List[SarifToolSummary] = []
-    for name in tools_scanned:
-        state = tool_state[name]
-        counts = state["counts"]
-        rule_groups = [
-            SarifRuleGroup(rule_id=rid, count=info["count"], category=info["category"], tags=info["tags"])
-            for rid, info in sorted(state["rules"].items())
-        ]
-        tools.append(
-            SarifToolSummary(
-                name=name,
-                version=state["version"],
-                information_uri=state["information_uri"],
-                errors_count=counts["error"],
-                warnings_count=counts["warning"],
-                notes_count=counts["note"],
-                none_count=counts["none"],
-                total_findings=sum(counts.values()),
-                rules=rule_groups,
-                extensions=state["extensions"],
-                report_hash=dict(report_hash),
-            )
-        )
-
-    errors_count = sum(1 for f in findings if f.level == "error")
-    warnings_count = sum(1 for f in findings if f.level == "warning")
-    notes_count = sum(1 for f in findings if f.level == "note")
-    none_count = sum(1 for f in findings if f.level == "none")
-    patch_errors_count = sum(1 for f in findings if f.is_new_in_patch and f.level == "error")
-    patch_warnings_count = sum(1 for f in findings if f.is_new_in_patch and f.level == "warning")
+    tools = _build_tool_summaries(tools_scanned, tool_state, report_hash)
+    counts = _summarize_findings(findings)
 
     return SarifSummaryReport(
         available=True,
         total_findings=len(findings),
-        errors_count=errors_count,
-        warnings_count=warnings_count,
-        notes_count=notes_count,
-        none_count=none_count,
-        patch_errors_count=patch_errors_count,
-        patch_warnings_count=patch_warnings_count,
         findings=findings,
         tools_scanned=tools_scanned,
         tools=tools,
         reasons=[],
+        **counts,
     )
+
+
+def _collect_unavailable_reasons(reports: List[SarifSummaryReport]) -> Tuple[bool, List[str]]:
+    """Returns (any_unavailable, reasons). `reasons` accumulates every
+    input report's own `.reasons` unconditionally (available or not);
+    when at least one input is unavailable and none of them supplied a
+    reason of their own, a generic fallback summary is used instead of
+    an empty list."""
+    reasons: List[str] = []
+    for r in reports:
+        reasons.extend(r.reasons)
+
+    unavailable = [r for r in reports if not r.available]
+    if unavailable and not reasons:
+        reasons = [f"{len(unavailable)} of {len(reports)} SARIF report(s) were unavailable"]
+    return bool(unavailable), reasons
+
+
+def _merge_reports(
+    reports: List[SarifSummaryReport],
+) -> Tuple[List[SarifFinding], List[str], List[SarifToolSummary]]:
+    """Concatenates findings/tools across reports and unions tools_scanned
+    (preserving first-seen order). Assumes every input is already known
+    available -- see aggregate_sarif_reports' fail-closed check above this."""
+    findings: List[SarifFinding] = []
+    tools_scanned: List[str] = []
+    tools: List[SarifToolSummary] = []
+    for r in reports:
+        findings.extend(r.findings)
+        tools.extend(r.tools)
+        for t in r.tools_scanned:
+            if t not in tools_scanned:
+                tools_scanned.append(t)
+    return findings, tools_scanned, tools
 
 
 def aggregate_sarif_reports(reports: List[SarifSummaryReport]) -> SarifSummaryReport:
@@ -584,46 +705,21 @@ def aggregate_sarif_reports(reports: List[SarifSummaryReport]) -> SarifSummaryRe
     if not reports:
         return SarifSummaryReport(available=False, reasons=["no SARIF reports supplied"])
 
-    reasons: List[str] = []
-    for r in reports:
-        reasons.extend(r.reasons)
-
-    unavailable = [r for r in reports if not r.available]
-    if unavailable:
-        if not reasons:
-            reasons = [f"{len(unavailable)} of {len(reports)} SARIF report(s) were unavailable"]
+    any_unavailable, reasons = _collect_unavailable_reasons(reports)
+    if any_unavailable:
         return SarifSummaryReport(available=False, reasons=reasons)
 
-    findings: List[SarifFinding] = []
-    tools_scanned: List[str] = []
-    tools: List[SarifToolSummary] = []
-    for r in reports:
-        findings.extend(r.findings)
-        tools.extend(r.tools)
-        for t in r.tools_scanned:
-            if t not in tools_scanned:
-                tools_scanned.append(t)
-
-    errors_count = sum(1 for f in findings if f.level == "error")
-    warnings_count = sum(1 for f in findings if f.level == "warning")
-    notes_count = sum(1 for f in findings if f.level == "note")
-    none_count = sum(1 for f in findings if f.level == "none")
-    patch_errors_count = sum(1 for f in findings if f.is_new_in_patch and f.level == "error")
-    patch_warnings_count = sum(1 for f in findings if f.is_new_in_patch and f.level == "warning")
+    findings, tools_scanned, tools = _merge_reports(reports)
+    counts = _summarize_findings(findings)
 
     return SarifSummaryReport(
         available=True,
         total_findings=len(findings),
-        errors_count=errors_count,
-        warnings_count=warnings_count,
-        notes_count=notes_count,
-        none_count=none_count,
-        patch_errors_count=patch_errors_count,
-        patch_warnings_count=patch_warnings_count,
         findings=findings,
         tools_scanned=tools_scanned,
         tools=tools,
         reasons=reasons,
+        **counts,
     )
 
 

@@ -106,6 +106,7 @@ class VerificationResult:
     metrics: Dict[str, Any] = field(default_factory=dict)
     identity_status: str = "skipped"
     identity_detail: str = ""
+    static_analysis_tools: List[Dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -119,6 +120,7 @@ class VerificationResult:
             "metrics": self.metrics,
             "identity_status": self.identity_status,
             "identity_detail": self.identity_detail,
+            "static_analysis_tools": self.static_analysis_tools,
         }
 
 
@@ -162,6 +164,57 @@ def _extract_metrics(predicate: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(assertion_density, dict):
         metrics["assertion_density"] = assertion_density
     return metrics
+
+
+def _extract_static_analysis_tools(predicate: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Defensively pulls the per-tool SARIF breakdown out of the predicate
+    for display purposes only (never raises, never gates -- static_analysis
+    is optional in the schema and this is purely informational). Malformed
+    or missing entries are skipped individually rather than discarding the
+    whole list."""
+    static_analysis = predicate.get("static_analysis")
+    if not isinstance(static_analysis, dict):
+        return []
+
+    tools = static_analysis.get("tools")
+    if not isinstance(tools, list):
+        return []
+
+    return [t for t in tools if isinstance(t, dict)]
+
+
+def _format_static_analysis_table(tools: List[Dict[str, Any]]) -> List[str]:
+    """Renders a clean, fixed-width summary table (tool, error/warning
+    counts, SonarQube quality gate status when present) for --verify's
+    human-readable (non-JSON) output. Missing/malformed fields degrade to
+    '-' rather than raising -- this is a display helper over data that
+    `_extract_static_analysis_tools` already validated defensively."""
+    if not tools:
+        return []
+
+    rows = []
+    for t in tools:
+        name = str(t.get("name") or "unknown")
+        summary = t.get("summary") if isinstance(t.get("summary"), dict) else {}
+        errors = summary.get("errors")
+        warnings = summary.get("warnings")
+        extensions = t.get("extensions") if isinstance(t.get("extensions"), dict) else {}
+        sonarqube = extensions.get("sonarqube") if isinstance(extensions.get("sonarqube"), dict) else {}
+        quality_gate = sonarqube.get("quality_gate")
+        rows.append((
+            name,
+            str(errors) if isinstance(errors, int) else "-",
+            str(warnings) if isinstance(warnings, int) else "-",
+            str(quality_gate) if isinstance(quality_gate, str) else "-",
+        ))
+
+    header = ("TOOL", "ERRORS", "WARNINGS", "QUALITY GATE")
+    widths = [max(len(header[i]), *(len(r[i]) for r in rows)) for i in range(len(header))]
+
+    def _fmt_row(cells: tuple) -> str:
+        return "    " + "  ".join(c.ljust(w) for c, w in zip(cells, widths))
+
+    return [_fmt_row(header)] + [_fmt_row(r) for r in rows]
 
 
 def _pem_to_der_b64(pem: str) -> str:
@@ -573,6 +626,7 @@ def verify_dsse_attestation(
     degraded_reasons: Optional[List[str]] = None
     subject_digests: List[str] = []
     metrics: Dict[str, Any] = {}
+    static_analysis_tools: List[Dict[str, Any]] = []
 
     if statement is not None:
         statement_type = statement.get("_type")
@@ -612,6 +666,7 @@ def verify_dsse_attestation(
             degraded_reasons = None
 
         metrics = _extract_metrics(predicate)
+        static_analysis_tools = _extract_static_analysis_tools(predicate)
 
         if rcs_value is None:
             violations.append(
@@ -680,6 +735,7 @@ def verify_dsse_attestation(
         metrics=metrics,
         identity_status=identity_status,
         identity_detail=identity_detail,
+        static_analysis_tools=static_analysis_tools,
     )
 
 
@@ -783,6 +839,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if result.subject_digests:
             print(f"  subject_digests={result.subject_digests}", file=sys.stderr)
         print(f"  identity: {result.identity_status} ({result.identity_detail})", file=sys.stderr)
+        if result.static_analysis_tools:
+            print("  static analysis:", file=sys.stderr)
+            for line in _format_static_analysis_table(result.static_analysis_tools):
+                print(line, file=sys.stderr)
         for v in result.violations:
             print(f"  VIOLATION: {v}", file=sys.stderr)
         for w in result.warnings:

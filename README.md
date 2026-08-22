@@ -290,12 +290,37 @@ distinguishes that ("no non-skipped test functions ... (N skipped/disabled)")
 from the genuinely-no-tests-exist case.
 
 **`parsers/sarif.py`** ingests one or more `--sarif` 2.1.0 reports (semgrep,
-trivy, CodeQL, ...), normalizing `level` (defaults to `warning` per spec)
-and artifact paths, then cross-references each finding's file/line against
-the diff's changed lines to flag `is_new_in_patch`. Aggregation across
-multiple `--sarif` inputs **fails closed**: one unreadable/corrupt input
-taints the whole aggregate to `available=False` rather than silently
-scoring on the good subset.
+trivy, CodeQL, SonarQube, ESLint, ...), normalizing `level` (`error`/
+`warning`/`note`/`none`; missing defaults to `warning` per spec) and
+artifact paths, then cross-references each finding's file/line against the
+diff's changed lines to flag `is_new_in_patch`. Aggregation across multiple
+`--sarif` inputs **fails closed**: one unreadable/corrupt input taints the
+whole aggregate to `available=False` rather than silently scoring on the
+good subset.
+
+On top of that differential per-finding scan, it also builds a per-tool
+breakdown (`SarifSummaryReport.tools`, embedded in the predicate as
+`static_analysis.tools[]`): driver metadata (name/version/informationUri),
+findings grouped by rule ID with category/tags (sourced from the SARIF
+driver's own `rules[]` descriptors), a SHA-256 integrity hash of the raw
+report file, and an extensible `extensions` bag for tool-specific
+enrichments. Currently that's SonarQube's quality gate / cognitive
+complexity / technical debt, read from a SARIF run's own `properties`
+bag (`properties.sonarqube.*`, or the flat bag itself if a tool writes
+these keys directly) — and, for a scanner whose SARIF export doesn't embed
+them, `--sonar-metrics <path>` ingests a SonarQube
+`api/measures/component` JSON export separately (`parse_sonar_metrics_file`
++ `merge_sonar_metrics_into_tools`) and merges it into the SonarQube-named
+tool (or the sole tool, if there's only one and none match by name — an
+ambiguous multi-tool match is skipped with a warning, never guessed at).
+Multiple `--sarif` inputs' `.tools` entries are **concatenated, not merged
+by name**: each keeps its own file's `report_hash`, since collapsing two
+same-named tools from two different files would leave no single honest
+hash to attach to the merged entry.
+
+`tenax-assay run` is an explicit alias for the pipeline above (it's also
+what runs with no subcommand at all, so `run` is optional, not required —
+existing invocations with no subcommand keep working unchanged).
 
 **`parsers/github_rules.py`** (~450 lines, the most defensively written
 module, since it's the one genuine live-API client in the ingestion path)
@@ -384,6 +409,13 @@ identity, and enforces admission policy gates against the embedded RCS —
 never raising on malformed or hostile input; every problem surfaces as a
 `violations`/`warnings` entry so a CI gate always gets a clean pass/fail.
 
+When the predicate carries a `static_analysis.tools[]` block, the
+human-readable (non-`--json`) output prints a clean summary table —
+per-tool error/warning counts and SonarQube quality-gate status when
+present — purely for display; it's never a gating input, so a malformed or
+missing table never affects `passed`. `--json` output carries the same
+data as `static_analysis_tools`.
+
 Policy gates:
 - `--min-rcs N` — fail if `release_confidence_score.value < N`.
 - `--require-digest sha256:<hex>` — fail unless that digest is among the
@@ -445,8 +477,12 @@ python3 -m cli.main \
   --head-sha $(python3 -c "print('b'*40)") \
   --repository org/svc --branch feature/x \
   --pr-number 42 --pr-approvers alice,bob --pr-required-approvals 2 --pr-review-state approved \
+  --sarif path/to/semgrep.sarif.json --sarif path/to/sonarqube.sarif.json \
+  --sonar-metrics path/to/sonar-measures.json \
   --skip-perf-budget-check --debug \
   --out /tmp/attestation.unsigned.json
+# `tenax-assay run --sarif ... --sonar-metrics ...` is an equivalent, explicit
+# spelling of the same pipeline invocation above.
 
 # Admission gate against the unsigned statement's DSSE-shaped output
 # (only meaningful once --sign/--dry-run-sign has produced a real envelope):

@@ -367,6 +367,13 @@ delegate to internally:
    (`ACTIONS_ID_TOKEN_REQUEST_URL`/`_TOKEN` on GitHub Actions;
    `SIGSTORE_ID_TOKEN`/`CI_JOB_JWT_V2` on GitLab CI), with an SSRF guard
    forcing HTTPS on the token endpoint. **No static secret is ever read.**
+   The GitHub Actions branch retries a transient failure (timeout,
+   connection error, non-2xx) up to 3 times with a short capped
+   exponential backoff between attempts, each attempt bounded by its own
+   10s timeout — a brief blip talking to the ambient endpoint doesn't fail
+   the whole run, but the retry is provably bounded (fixed attempt count,
+   fixed per-attempt timeout, fixed backoff cap), never an unbounded or
+   tight retry loop.
 2. Ephemeral in-memory keypair; exchanged with Fulcio for a short-lived
    cert binding the key to the OIDC identity (`repo:org/repo:ref:...`).
 3. Sign the DSSE PAE of the Statement via `Signer.sign_dsse()`; submit to
@@ -408,6 +415,27 @@ decodes a signed DSSE envelope, best-effort verifies the Sigstore signing
 identity, and enforces admission policy gates against the embedded RCS —
 never raising on malformed or hostile input; every problem surfaces as a
 `violations`/`warnings` entry so a CI gate always gets a clean pass/fail.
+
+**Envelope size guard**: `load_envelope()` rejects any envelope file over
+`MAX_ENVELOPE_SIZE` (10MB) via a `stat()` size check *before* opening or
+reading a single byte of it — a hostile or corrupt multi-GB "envelope"
+can't exhaust memory just by being pointed at. Reported as a clear
+`ERROR: Attestation file exceeds maximum allowed size (10MB)` on stderr
+and exit code `1`, the same as any other file error.
+
+**Formal schema validation** (optional, diagnostic): when `jsonschema` is
+installed, the extracted predicate is validated against
+`schema/tenax-attestation-v1.schema.json` before policy/score evaluation,
+and surfaced as `schema_validation_status` (`"passed"` / `"failed"` /
+`"skipped"`). This is deliberately a `warnings` entry, **not** a blocking
+gate: the predicate schema evolves over time (`branch_governance`,
+`degraded_reasons`, and `static_analysis` were all added to the schema
+after real, already-signed attestations existed without them), so a
+mismatch alone must never fail an otherwise-valid `--min-rcs` run.
+`jsonschema` not being installed, the packaged schema file being
+unavailable, or validation itself raising unexpectedly all degrade to
+`"skipped"` with a diagnostic `warnings` entry — never a crash, and never
+treated as a failure.
 
 When the predicate carries a `static_analysis.tools[]` block, the
 human-readable (non-`--json`) output prints a clean summary table —
@@ -501,12 +529,14 @@ installed — outside CI there's no ambient identity to fetch, by design.
 
 ## Test suite
 
-~290 test cases across 13 modules, including dedicated adversarial suites:
+~355 test cases across 16 modules, including dedicated adversarial suites:
 `test_adversarial_ast.py` (Python assertion-integrity bypass attempts),
 `test_ast_assertions.py` (the multi-language engine: on-disk fixtures for
 every supported language, per-language gaming heuristics, registry
-dispatch, and DSSE predicate telemetry), `test_security_boundaries.py` and
-`test_verify_boundaries.py` (malformed/hostile-input hardening), and
+dispatch, and DSSE predicate telemetry), `test_security_boundaries.py`,
+`test_verify_boundaries.py`, and `test_sarif_adversarial.py` (malformed/
+hostile-input hardening), `test_verify_hardening.py` (envelope size guard,
+diagnostic schema validation, OIDC fetch retry bounding), and
 `test_github_rules.py` (auth failure modes, pagination limits, bypass-mode
 edge cases against a mocked GitHub API).
 

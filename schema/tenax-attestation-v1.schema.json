@@ -9,6 +9,7 @@
     "predicate_version",
     "pipeline",
     "vcs",
+    "branch_governance",
     "artifact",
     "test_verification",
     "coverage",
@@ -65,6 +66,31 @@
             "review_state": { "type": "string", "enum": ["approved", "changes_requested", "pending", "not_applicable"] }
           },
           "required": ["approvers", "required_approvals", "review_state"]
+        }
+      }
+    },
+
+    "branch_governance": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Live GitHub branch-governance check (cli/parsers/github_rules.py): whether the target branch would actually let this change land unreviewed, independent of this PR's own approval state. A top-level predicate field, always present (not nested under vcs).",
+      "required": [
+        "available", "branch", "pull_request_required", "approvals_required",
+        "direct_push_prevented", "bypass_actors_count", "admin_enforced", "warnings", "reason"
+      ],
+      "properties": {
+        "available": { "type": "boolean" },
+        "branch": { "type": "string" },
+        "pull_request_required": { "type": "boolean" },
+        "approvals_required": { "type": "integer", "minimum": 0 },
+        "direct_push_prevented": { "type": "boolean" },
+        "bypass_actors_count": { "type": "integer", "minimum": 0 },
+        "admin_enforced": { "type": "boolean" },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "reason": { "type": "string" },
+        "reason_code": {
+          "type": ["string", "null"],
+          "description": "Machine-readable classification of a specific known available=false cause (e.g. platform_unsupported_tier). Null/absent for every other case -- must not be inferred as a generic failure."
         }
       }
     },
@@ -154,12 +180,17 @@
         "patch": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["available", "line_rate", "lines_changed", "lines_covered"],
+          "required": ["available", "line_rate", "lines_changed", "lines_covered", "reason"],
           "properties": {
             "available": { "type": "boolean", "description": "False when base_commit_sha is unavailable or diff yields zero coverable changed lines." },
             "line_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
             "lines_changed": { "type": "integer", "minimum": 0 },
-            "lines_covered": { "type": "integer", "minimum": 0 }
+            "lines_covered": { "type": "integer", "minimum": 0 },
+            "reason": { "type": "string" },
+            "reason_code": {
+              "type": ["string", "null"],
+              "description": "Machine-readable classification of a specific known available=false cause (e.g. no_coverable_lines). Null/absent for every other case."
+            }
           }
         },
         "thresholds": {
@@ -355,6 +386,11 @@
           "type": "boolean",
           "default": false,
           "description": "True if any component fell back to a penalized default due to missing/unavailable input data."
+        },
+        "degraded_reasons": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Which independent trigger(s) caused degraded=true (e.g. no_pr_context, sarif_unavailable, a namespaced branch_governance:<reason_code> / patch_coverage:<reason_code>). Empty when degraded=false. Absent/malformed on an attestation predating this field -- cli/verify.py's --disallow-degraded treats that as non-exempt."
         },
         "computed_at": { "type": "string", "format": "date-time" }
       }

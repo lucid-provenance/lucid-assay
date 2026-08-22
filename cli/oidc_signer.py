@@ -25,6 +25,19 @@ class AmbientIdentityError(RuntimeError):
     """Raised when no ambient OIDC token is available and signing is strictly required."""
 
 
+# Bounded retry for the GitHub Actions ambient token fetch: a brief blip
+# talking to the ambient token endpoint (or a transient rate-limit/5xx)
+# must not fail an entire CI run outright on the first hiccup, but the
+# retry itself must be provably bounded -- fixed attempt count, fixed
+# per-attempt timeout, fixed capped backoff -- so a persistently
+# unreachable endpoint still fails in well under a minute rather than
+# hanging or busy-looping indefinitely.
+_OIDC_FETCH_MAX_ATTEMPTS = 3
+_OIDC_FETCH_TIMEOUT_SECONDS = 10
+_OIDC_FETCH_BACKOFF_BASE_SECONDS = 1.0
+_OIDC_FETCH_BACKOFF_CAP_SECONDS = 5.0
+
+
 @dataclass
 class DSSEEnvelope:
     __test__ = False
@@ -59,7 +72,15 @@ class DSSEEnvelope:
 
 
 def fetch_ambient_oidc_token(audience: str = "sigstore") -> str:
-    """Resolve an ambient OIDC ID token from the current CI environment with SSRF guards."""
+    """Resolve an ambient OIDC ID token from the current CI environment with
+    SSRF guards.
+
+    The GitHub Actions branch retries up to _OIDC_FETCH_MAX_ATTEMPTS times
+    on a transient failure (timeout, connection error, non-2xx response),
+    each attempt bounded by _OIDC_FETCH_TIMEOUT_SECONDS, with a short
+    capped exponential backoff between attempts -- see the constants'
+    docstring above for why this is provably bounded rather than an
+    unbounded retry loop."""
     request_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
     request_token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
 
@@ -79,12 +100,25 @@ def fetch_ambient_oidc_token(audience: str = "sigstore") -> str:
             target_url,
             headers={"Authorization": f"bearer {request_token}"},
         )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-                return body["value"]
-        except Exception as e:
-            raise AmbientIdentityError(f"Failed to fetch GitHub Actions OIDC token: {e}") from e
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, _OIDC_FETCH_MAX_ATTEMPTS + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=_OIDC_FETCH_TIMEOUT_SECONDS) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                    return body["value"]
+            except Exception as e:
+                last_error = e
+                if attempt < _OIDC_FETCH_MAX_ATTEMPTS:
+                    backoff = min(
+                        _OIDC_FETCH_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)),
+                        _OIDC_FETCH_BACKOFF_CAP_SECONDS,
+                    )
+                    time.sleep(backoff)
+
+        raise AmbientIdentityError(
+            f"Failed to fetch GitHub Actions OIDC token after {_OIDC_FETCH_MAX_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
 
     # GitLab CI
     gitlab_token = os.environ.get("SIGSTORE_ID_TOKEN") or os.environ.get("CI_JOB_JWT_V2")

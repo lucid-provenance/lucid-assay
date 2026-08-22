@@ -139,12 +139,30 @@ def _pem_to_der_b64(pem: str) -> str:
 
 
 def _envelope_to_bundle_json(envelope: Dict[str, Any]) -> str:
-    """Best-effort reconstruction of a Sigstore bundle (bundle_v1 schema)
-    from plinth-assay's minimal DSSE envelope. The envelope intentionally
-    keeps only sig/certificate/rekor log coordinates (see cli.oidc_signer),
-    so this reconstruction is necessarily incomplete relative to a full
-    Sigstore-CLI bundle (no inclusion proof/checkpoint) -- verification may
-    still degrade to "unavailable" even when the network is reachable."""
+    """Returns the raw JSON of the Sigstore bundle to feed to
+    `sigstore.models.Bundle.from_json()`.
+
+    Preferred path: cli.oidc_signer embeds the complete, untouched bundle
+    produced by `sigstore sign --bundle` under `_sigstore_bundle` -- that
+    object already satisfies Bundle's schema in full (mediaType,
+    verificationMaterial.tlogEntries with kindVersion/inclusionProof/
+    canonicalizedBody, dsseEnvelope, ...), so it's re-serialized and handed
+    to Bundle.from_json() verbatim, with no field-by-field reconstruction.
+
+    Fallback path: envelopes minted before `_sigstore_bundle` existed (or a
+    --dry-run-sign envelope that never went through real signing) carry
+    only sig/certificate/rekor log coordinates. That's necessarily
+    incomplete relative to a full bundle -- notably it can never supply a
+    tlogEntries entry's required kindVersion/inclusionProof/
+    canonicalizedBody -- so Bundle.from_json() will reject it whenever a
+    real transparency-log entry is present, and verification degrades to
+    "unavailable" rather than crashing. This path exists only for
+    backward-compatibility with those older envelopes; new envelopes always
+    take the preferred path above."""
+    sigstore_bundle = envelope.get("_sigstore_bundle")
+    if isinstance(sigstore_bundle, dict) and sigstore_bundle:
+        return json.dumps(sigstore_bundle)
+
     sig0 = envelope["signatures"][0]
     cert_der_b64 = _pem_to_der_b64(sig0.get("certificate", ""))
 

@@ -16,6 +16,7 @@ from cli.verify import (
     main,
     verify_dsse_attestation,
     _build_identity_policy,
+    _envelope_to_bundle_json,
     _extract_cert_ref,
 )
 
@@ -436,6 +437,127 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
         )
         self.assertFalse(unsafe)
         policy.verify(cert)
+
+
+def _b64(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _fake_cert_pem() -> str:
+    """A syntactically valid (but not Fulcio-issued) self-signed PEM
+    certificate, for tests that only need `_pem_to_der_b64` to succeed --
+    not a real Sigstore identity/trust-chain check."""
+    from cryptography.hazmat.primitives import serialization
+
+    return _make_fulcio_style_cert().public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
+def _schema_valid_sigstore_bundle() -> dict:
+    """A full, schema-shaped Sigstore bundle dict -- i.e. exactly what
+    `sigstore sign --bundle` writes to disk and cli.oidc_signer now embeds
+    verbatim under `_sigstore_bundle`. The signature/log-entry material is
+    placeholder (not cryptographically valid -- this doesn't exercise
+    signature/inclusion-proof *verification*), but every field
+    sigstore.models.Bundle requires to construct -- a real DER certificate,
+    plus tlogEntries' kindVersion/inclusionProof (with checkpoint)/
+    inclusionPromise/canonicalizedBody -- is present and correctly typed,
+    so Bundle.from_json() must accept it structurally."""
+    from cryptography.hazmat.primitives import serialization
+
+    cert_der = _make_fulcio_style_cert().public_bytes(serialization.Encoding.DER)
+
+    return {
+        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+        "verificationMaterial": {
+            "certificate": {"rawBytes": _b64(cert_der)},
+            "tlogEntries": [
+                {
+                    "logIndex": "0",
+                    "logId": {"keyId": _b64(b"fake-log-id")},
+                    "kindVersion": {"kind": "dsse", "version": "0.0.2"},
+                    "integratedTime": "1700000000",
+                    "inclusionPromise": {"signedEntryTimestamp": _b64(b"fake-set")},
+                    "inclusionProof": {
+                        "logIndex": "0",
+                        "rootHash": _b64(b"fake-root-hash"),
+                        "treeSize": "1",
+                        "hashes": [_b64(b"fake-hash")],
+                        "checkpoint": {"envelope": "fake-checkpoint-envelope"},
+                    },
+                    "canonicalizedBody": _b64(b"fake-canonicalized-body"),
+                }
+            ],
+        },
+        "dsseEnvelope": {
+            "payload": _b64(b'{"fake": "statement"}'),
+            "payloadType": "application/vnd.in-toto+json",
+            "signatures": [{"sig": _b64(b"fake-signature")}],
+        },
+    }
+
+
+class EnvelopeToBundleJsonTests(unittest.TestCase):
+    """Regression coverage for the Sigstore bundle round-trip: cli.verify
+    must hand a full, previously-embedded bundle straight to
+    sigstore.models.Bundle.from_json() rather than hand-reconstructing a
+    partial one from a handful of extracted fields (which can never satisfy
+    Bundle's schema, since tlogEntries' kindVersion/inclusionProof/
+    canonicalizedBody are required, not optional)."""
+
+    def test_embedded_full_bundle_round_trips_verbatim(self):
+        full_bundle = _schema_valid_sigstore_bundle()
+        envelope = _envelope(_statement(), signatures=[{"sig": "s", "certificate": "c"}])
+        envelope["_sigstore_bundle"] = full_bundle
+
+        raw_json = _envelope_to_bundle_json(envelope)
+
+        self.assertEqual(json.loads(raw_json), full_bundle)
+
+    def test_embedded_full_bundle_satisfies_sigstore_bundle_schema(self):
+        from sigstore.models import Bundle
+
+        full_bundle = _schema_valid_sigstore_bundle()
+        envelope = _envelope(_statement(), signatures=[{"sig": "s", "certificate": "c"}])
+        envelope["_sigstore_bundle"] = full_bundle
+
+        # Must not raise: every field Bundle's pydantic schema requires
+        # (including the tlogEntries fields the old hand-reconstruction
+        # dropped) is present in the embedded bundle.
+        Bundle.from_json(_envelope_to_bundle_json(envelope))
+
+    def test_missing_embedded_bundle_falls_back_to_legacy_reconstruction(self):
+        # Envelopes minted before `_sigstore_bundle` existed (no key at
+        # all) must still produce *some* bundle JSON via the legacy
+        # sig/certificate/_rekor reconstruction, not raise a KeyError.
+        envelope = _envelope(
+            _statement(),
+            signatures=[{"sig": "s", "certificate": _fake_cert_pem()}],
+        )
+        self.assertNotIn("_sigstore_bundle", envelope)
+
+        raw_json = _envelope_to_bundle_json(envelope)
+
+        reconstructed = json.loads(raw_json)
+        self.assertEqual(
+            reconstructed["mediaType"], "application/vnd.dev.sigstore.bundle.v0.3+json"
+        )
+
+    def test_null_embedded_bundle_falls_back_to_legacy_reconstruction(self):
+        # cli.oidc_signer always writes the `_sigstore_bundle` key, but it's
+        # null for --dry-run-sign envelopes; null must be treated the same
+        # as "absent", not handed to Bundle.from_json() as-is.
+        envelope = _envelope(
+            _statement(),
+            signatures=[{"sig": "s", "certificate": _fake_cert_pem()}],
+        )
+        envelope["_sigstore_bundle"] = None
+
+        raw_json = _envelope_to_bundle_json(envelope)
+
+        reconstructed = json.loads(raw_json)
+        self.assertEqual(
+            reconstructed["mediaType"], "application/vnd.dev.sigstore.bundle.v0.3+json"
+        )
 
 
 if __name__ == "__main__":

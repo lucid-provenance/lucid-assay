@@ -48,6 +48,7 @@ jobs:
 
       - name: Mint Signed Plinth Attestation
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
           # Event-driven SHA resolution: base.sha is populated by GitHub
           # directly on the pull_request event payload itself, at the time

@@ -33,6 +33,14 @@ class DSSEEnvelope:
     signatures: List[Dict[str, str]]  # [{"sig": <b64>, "certificate": <pem>}]
     rekor_log_index: Optional[int] = None
     rekor_log_id: Optional[str] = None
+    # The complete, untouched Sigstore bundle (`sigstore sign --bundle`
+    # output) as parsed JSON, when one was actually minted. Preserved
+    # verbatim -- including tlogEntries' kindVersion/inclusionProof/
+    # canonicalizedBody -- so cli.verify can hand it straight to
+    # sigstore.models.Bundle.from_json() rather than hand-reconstructing a
+    # partial bundle from a handful of extracted fields, which can never
+    # satisfy Bundle's schema (those fields are required, not optional).
+    sigstore_bundle: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -43,6 +51,7 @@ class DSSEEnvelope:
                 "logIndex": self.rekor_log_index,
                 "logId": self.rekor_log_id,
             },
+            "_sigstore_bundle": self.sigstore_bundle,
         }
 
     def to_json(self) -> str:
@@ -171,4 +180,5 @@ def sign_statement(statement_json_bytes: bytes, dry_run: bool = False) -> DSSEEn
         }],
         rekor_log_index=log_index,
         rekor_log_id=log_id,
+        sigstore_bundle=bundle_data,
     )

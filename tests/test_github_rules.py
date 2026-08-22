@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import sys
@@ -12,6 +13,7 @@ from cli.parsers.github_rules import (
     GitHubAPIError,
     bypass_permits_unreviewed_change,
     inspect_branch_governance,
+    _extract_http_error_detail,
     _github_api_get,
     _quote_ref,
 )
@@ -230,6 +232,34 @@ class InspectBranchGovernanceTests(unittest.TestCase):
         self.assertIn("authentication/authorization failed", report.reason)
         self.assertIn("Administration: Read", report.reason)
         self.assertIn("querying rules for branch", report.reason)
+
+    @patch("cli.parsers.github_rules._github_api_get")
+    def test_403_on_free_plan_private_repo_degrades_cleanly_without_raising(self, mock_get):
+        # GitHub returns the identical HTTP 403 whether the token is
+        # under-scoped or the token is fine but rulesets simply aren't
+        # supported for this repo at all (a private repo on GitHub Free).
+        # _github_api_get captures GitHub's own error-body message (see
+        # _extract_http_error_detail) and _actionable_auth_failure_reason
+        # leads with it -- so a real Free-plan 403 must surface that exact
+        # message, not just the generic "Administration: Read" guess, and
+        # must never raise: available=False plus a warning-carrying reason
+        # is a normal degraded state, not an error condition.
+        mock_get.side_effect = _api_get_router({
+            "/repos/acme/widgets/rules/branches/main": GitHubAPIError(
+                "GET /repos/acme/widgets/rules/branches/main -> HTTP 403: "
+                "Upgrade to GitHub Pro or make this repository public to enable this feature.",
+                status_code=403,
+            ),
+        })
+
+        report = inspect_branch_governance("acme/widgets", "main", token="correctly-scoped-app-token")
+
+        self.assertIsInstance(report, BranchGovernanceReport)
+        self.assertFalse(report.available)
+        self.assertIn("Upgrade to GitHub Pro", report.reason)
+        # Still mentions the token-permission possibility as a secondary
+        # hint -- the status code alone can't distinguish the two causes.
+        self.assertIn("Administration: Read", report.reason)
 
     @patch("cli.parsers.github_rules._github_api_get")
     def test_401_on_rules_endpoint_gives_actionable_administration_read_diagnostic(self, mock_get):
@@ -480,6 +510,67 @@ class GitHubApiGetTransportTests(unittest.TestCase):
         with self.assertRaises(GitHubAPIError):
             _github_api_get("/repos/acme/widgets/rulesets", "tok")
 
+    @patch("cli.parsers.github_rules.urllib.request.urlopen")
+    def test_403_error_body_message_is_surfaced_in_diagnostic(self, mock_urlopen):
+        # GitHub's actual 403 response body for rulesets on a private
+        # Free-plan repo carries a specific, human-readable `message` (e.g.
+        # "Upgrade to GitHub Pro or make this repository public to enable
+        # this feature.") that's far more useful than the bare status
+        # code -- it must be pulled out of the body and included verbatim.
+        body = json.dumps(
+            {"message": "Upgrade to GitHub Pro or make this repository public to enable this feature."}
+        ).encode("utf-8")
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="https://api.github.com/repos/acme/widgets/rules/branches/main",
+            code=403, msg="Forbidden", hdrs=None, fp=io.BytesIO(body),
+        )
+
+        with self.assertRaises(GitHubAPIError) as ctx:
+            _github_api_get("/repos/acme/widgets/rules/branches/main", "tok")
+
+        self.assertIn("Upgrade to GitHub Pro", str(ctx.exception))
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    @patch("cli.parsers.github_rules.urllib.request.urlopen")
+    def test_error_body_that_is_not_json_falls_back_to_reason_phrase(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="https://api.github.com/repos/acme/widgets/rulesets",
+            code=403, msg="Forbidden", hdrs=None, fp=io.BytesIO(b"not json"),
+        )
+
+        with self.assertRaises(GitHubAPIError) as ctx:
+            _github_api_get("/repos/acme/widgets/rulesets", "tok")
+
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertIn("Forbidden", str(ctx.exception))
+
+
+class ExtractHttpErrorDetailTests(unittest.TestCase):
+    """Unit coverage for _extract_http_error_detail in isolation, separate
+    from the full _github_api_get round-trip above."""
+
+    def test_extracts_message_field_from_json_body(self):
+        body = json.dumps({"message": "Upgrade to GitHub Pro or make this repository public."}).encode()
+        e = urllib.error.HTTPError(url="https://api.github.com/x", code=403, msg="Forbidden", hdrs=None, fp=io.BytesIO(body))
+
+        self.assertEqual(_extract_http_error_detail(e), "Upgrade to GitHub Pro or make this repository public.")
+
+    def test_falls_back_to_reason_when_body_is_not_json(self):
+        e = urllib.error.HTTPError(url="https://api.github.com/x", code=403, msg="Forbidden", hdrs=None, fp=io.BytesIO(b"<html>nope</html>"))
+
+        self.assertEqual(_extract_http_error_detail(e), "Forbidden")
+
+    def test_falls_back_to_reason_when_body_unreadable(self):
+        e = urllib.error.HTTPError(url="https://api.github.com/x", code=403, msg="Forbidden", hdrs=None, fp=None)
+
+        self.assertEqual(_extract_http_error_detail(e), "Forbidden")
+
+    def test_falls_back_to_reason_when_message_field_missing_or_blank(self):
+        body = json.dumps({"documentation_url": "https://docs.github.com/"}).encode()
+        e = urllib.error.HTTPError(url="https://api.github.com/x", code=403, msg="Forbidden", hdrs=None, fp=io.BytesIO(body))
+
+        self.assertEqual(_extract_http_error_detail(e), "Forbidden")
+
 
 class BypassPermitsUnreviewedChangeTests(unittest.TestCase):
 
@@ -560,6 +651,33 @@ class ScorerFailClosedIntegrationTests(unittest.TestCase):
             ),
         })
         report = inspect_branch_governance("acme/widgets", "main", token="bad-token")
+        self.assertFalse(report.available)
+
+        clean = score_pipeline(**self._pipeline_kwargs(self._CLEAN_REPORT))
+        result = score_pipeline(**self._pipeline_kwargs(report))
+
+        self.assertTrue(result.degraded)
+        self.assertAlmostEqual(
+            result.components["governance"].raw_score,
+            clean.components["governance"].raw_score - BRANCH_GOVERNANCE_UNVERIFIED_PENALTY,
+            places=6,
+        )
+
+    @patch("cli.parsers.github_rules._github_api_get")
+    def test_free_plan_403_forces_degraded_and_scorer_penalty(self, mock_get):
+        # The real-world case this is guarding against: a correctly-scoped
+        # token still gets a 403 because branch rulesets simply aren't a
+        # supported feature for a private repo on GitHub Free. That must
+        # dock the governance score exactly like any other unverifiable
+        # report -- a plan limitation is not a loophole to a clean score.
+        mock_get.side_effect = _api_get_router({
+            "/repos/acme/widgets/rules/branches/main": GitHubAPIError(
+                "GET /repos/acme/widgets/rules/branches/main -> HTTP 403: "
+                "Upgrade to GitHub Pro or make this repository public to enable this feature.",
+                status_code=403,
+            ),
+        })
+        report = inspect_branch_governance("acme/widgets", "main", token="correctly-scoped-app-token")
         self.assertFalse(report.available)
 
         clean = score_pipeline(**self._pipeline_kwargs(self._CLEAN_REPORT))

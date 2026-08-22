@@ -23,7 +23,12 @@ from .parsers.ast import inspect_test_suite
 from .parsers.coverage import parse_cobertura, parse_lcov
 from .parsers.github_rules import bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
-from .parsers.sarif import aggregate_sarif_reports, parse_sarif_file
+from .parsers.sarif import (
+    aggregate_sarif_reports,
+    merge_sonar_metrics_into_tools,
+    parse_sarif_file,
+    parse_sonar_metrics_file,
+)
 from .patch_coverage import compute_patch_coverage, compute_patch_modified_lines
 from .scorer import score_pipeline
 
@@ -155,7 +160,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="append",
         type=str,
         default=None,
-        help="path to a SARIF 2.1.0 static-analysis report (repeatable; e.g. semgrep, trivy)",
+        help="path to a SARIF 2.1.0 static-analysis report (repeatable; e.g. semgrep, trivy, SonarQube)",
+    )
+    p.add_argument(
+        "--sonar-metrics",
+        default=None,
+        dest="sonar_metrics",
+        help="path to a SonarQube 'api/measures/component' JSON export; merges quality-gate/cognitive-complexity/"
+        "technical-debt metrics into the SonarQube tool's extensions when a --sarif input didn't already embed "
+        "them (requires at least one --sarif input to attach to)",
     )
     p.add_argument("--patch-coverage-min", type=float, default=0.80)
     p.add_argument("--overall-coverage-min", type=float, default=0.60)
@@ -184,7 +197,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         return verify_main(raw_argv[1:])
 
-    args = parse_args(argv or sys.argv[1:])
+    # `tenax-assay run ...` is an explicit alias for the attestation
+    # pipeline below -- it's also what runs with no subcommand at all, so
+    # `run` is stripped rather than required, keeping `tenax-assay --sarif
+    # ...` (no subcommand) working exactly as before.
+    if raw_argv and raw_argv[0] == "run":
+        raw_argv = raw_argv[1:]
+
+    args = parse_args(raw_argv)
     t_start = time.perf_counter()
     t_start_ns = time.perf_counter_ns()
     stage_ns: Dict[str, int] = {}
@@ -231,6 +251,28 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"WARNING: static analysis (SARIF) ingestion degraded: {'; '.join(sarif_report.reasons)}",
                 file=sys.stderr,
             )
+        elif args.sonar_metrics:
+            # --sonar-metrics enriches an existing SARIF tool's extensions;
+            # it never creates a new tool entry or a scoring input of its
+            # own, so a parse/merge failure here only ever warns.
+            sonar_extension = parse_sonar_metrics_file(args.sonar_metrics)
+            if sonar_extension is None:
+                print(
+                    f"WARNING: --sonar-metrics '{args.sonar_metrics}' could not be read/parsed; "
+                    "skipping SonarQube metrics enrichment",
+                    file=sys.stderr,
+                )
+            elif not merge_sonar_metrics_into_tools(sarif_report.tools, sonar_extension):
+                print(
+                    f"WARNING: --sonar-metrics '{args.sonar_metrics}' had no unambiguous SARIF tool to attach to "
+                    "(no tool named like 'sonar*' and more than one tool was scanned); skipping enrichment",
+                    file=sys.stderr,
+                )
+    elif args.sonar_metrics:
+        print(
+            "WARNING: --sonar-metrics was given without any --sarif input to attach it to; ignoring",
+            file=sys.stderr,
+        )
 
     # 4. Hash evidence artifacts
     test_report_sha = sha256_file(args.junit_xml)

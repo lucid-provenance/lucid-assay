@@ -103,11 +103,18 @@ def build_statement(
     if sarif_report is not None:
         static_analysis = {
             "available": sarif_report.available,
+            "format": "sarif-2.1.0",
             "tools_scanned": sarif_report.tools_scanned,
             "total_findings": sarif_report.total_findings,
+            "errors_count": sarif_report.errors_count,
+            "warnings_count": sarif_report.warnings_count,
+            "notes_count": sarif_report.notes_count,
+            "none_count": sarif_report.none_count,
             "patch_errors_count": sarif_report.patch_errors_count,
             "patch_warnings_count": sarif_report.patch_warnings_count,
             "findings": [f.as_dict() for f in sarif_report.findings],
+            "tools": [t.as_dict() for t in sarif_report.tools],
+            "reasons": sarif_report.reasons,
         }
     else:
         # No --sarif flags were configured for this run at all -- an empty,
@@ -115,11 +122,18 @@ def build_statement(
         # failure state. Mirrors cli.scorer._score_sarif_findings(None).
         static_analysis = {
             "available": True,
+            "format": "sarif-2.1.0",
             "tools_scanned": [],
             "total_findings": 0,
+            "errors_count": 0,
+            "warnings_count": 0,
+            "notes_count": 0,
+            "none_count": 0,
             "patch_errors_count": 0,
             "patch_warnings_count": 0,
             "findings": [],
+            "tools": [],
+            "reasons": [],
         }
 
     predicate = {

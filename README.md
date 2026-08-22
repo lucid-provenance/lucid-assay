@@ -290,12 +290,37 @@ distinguishes that ("no non-skipped test functions ... (N skipped/disabled)")
 from the genuinely-no-tests-exist case.
 
 **`parsers/sarif.py`** ingests one or more `--sarif` 2.1.0 reports (semgrep,
-trivy, CodeQL, ...), normalizing `level` (defaults to `warning` per spec)
-and artifact paths, then cross-references each finding's file/line against
-the diff's changed lines to flag `is_new_in_patch`. Aggregation across
-multiple `--sarif` inputs **fails closed**: one unreadable/corrupt input
-taints the whole aggregate to `available=False` rather than silently
-scoring on the good subset.
+trivy, CodeQL, SonarQube, ESLint, ...), normalizing `level` (`error`/
+`warning`/`note`/`none`; missing defaults to `warning` per spec) and
+artifact paths, then cross-references each finding's file/line against the
+diff's changed lines to flag `is_new_in_patch`. Aggregation across multiple
+`--sarif` inputs **fails closed**: one unreadable/corrupt input taints the
+whole aggregate to `available=False` rather than silently scoring on the
+good subset.
+
+On top of that differential per-finding scan, it also builds a per-tool
+breakdown (`SarifSummaryReport.tools`, embedded in the predicate as
+`static_analysis.tools[]`): driver metadata (name/version/informationUri),
+findings grouped by rule ID with category/tags (sourced from the SARIF
+driver's own `rules[]` descriptors), a SHA-256 integrity hash of the raw
+report file, and an extensible `extensions` bag for tool-specific
+enrichments. Currently that's SonarQube's quality gate / cognitive
+complexity / technical debt, read from a SARIF run's own `properties`
+bag (`properties.sonarqube.*`, or the flat bag itself if a tool writes
+these keys directly) — and, for a scanner whose SARIF export doesn't embed
+them, `--sonar-metrics <path>` ingests a SonarQube
+`api/measures/component` JSON export separately (`parse_sonar_metrics_file`
++ `merge_sonar_metrics_into_tools`) and merges it into the SonarQube-named
+tool (or the sole tool, if there's only one and none match by name — an
+ambiguous multi-tool match is skipped with a warning, never guessed at).
+Multiple `--sarif` inputs' `.tools` entries are **concatenated, not merged
+by name**: each keeps its own file's `report_hash`, since collapsing two
+same-named tools from two different files would leave no single honest
+hash to attach to the merged entry.
+
+`tenax-assay run` is an explicit alias for the pipeline above (it's also
+what runs with no subcommand at all, so `run` is optional, not required —
+existing invocations with no subcommand keep working unchanged).
 
 **`parsers/github_rules.py`** (~450 lines, the most defensively written
 module, since it's the one genuine live-API client in the ingestion path)
@@ -342,6 +367,13 @@ delegate to internally:
    (`ACTIONS_ID_TOKEN_REQUEST_URL`/`_TOKEN` on GitHub Actions;
    `SIGSTORE_ID_TOKEN`/`CI_JOB_JWT_V2` on GitLab CI), with an SSRF guard
    forcing HTTPS on the token endpoint. **No static secret is ever read.**
+   The GitHub Actions branch retries a transient failure (timeout,
+   connection error, non-2xx) up to 3 times with a short capped
+   exponential backoff between attempts, each attempt bounded by its own
+   10s timeout — a brief blip talking to the ambient endpoint doesn't fail
+   the whole run, but the retry is provably bounded (fixed attempt count,
+   fixed per-attempt timeout, fixed backoff cap), never an unbounded or
+   tight retry loop.
 2. Ephemeral in-memory keypair; exchanged with Fulcio for a short-lived
    cert binding the key to the OIDC identity (`repo:org/repo:ref:...`).
 3. Sign the DSSE PAE of the Statement via `Signer.sign_dsse()`; submit to
@@ -383,6 +415,34 @@ decodes a signed DSSE envelope, best-effort verifies the Sigstore signing
 identity, and enforces admission policy gates against the embedded RCS —
 never raising on malformed or hostile input; every problem surfaces as a
 `violations`/`warnings` entry so a CI gate always gets a clean pass/fail.
+
+**Envelope size guard**: `load_envelope()` rejects any envelope file over
+`MAX_ENVELOPE_SIZE` (10MB) via a `stat()` size check *before* opening or
+reading a single byte of it — a hostile or corrupt multi-GB "envelope"
+can't exhaust memory just by being pointed at. Reported as a clear
+`ERROR: Attestation file exceeds maximum allowed size (10MB)` on stderr
+and exit code `1`, the same as any other file error.
+
+**Formal schema validation** (optional, diagnostic): when `jsonschema` is
+installed, the extracted predicate is validated against
+`schema/tenax-attestation-v1.schema.json` before policy/score evaluation,
+and surfaced as `schema_validation_status` (`"passed"` / `"failed"` /
+`"skipped"`). This is deliberately a `warnings` entry, **not** a blocking
+gate: the predicate schema evolves over time (`branch_governance`,
+`degraded_reasons`, and `static_analysis` were all added to the schema
+after real, already-signed attestations existed without them), so a
+mismatch alone must never fail an otherwise-valid `--min-rcs` run.
+`jsonschema` not being installed, the packaged schema file being
+unavailable, or validation itself raising unexpectedly all degrade to
+`"skipped"` with a diagnostic `warnings` entry — never a crash, and never
+treated as a failure.
+
+When the predicate carries a `static_analysis.tools[]` block, the
+human-readable (non-`--json`) output prints a clean summary table —
+per-tool error/warning counts and SonarQube quality-gate status when
+present — purely for display; it's never a gating input, so a malformed or
+missing table never affects `passed`. `--json` output carries the same
+data as `static_analysis_tools`.
 
 Policy gates:
 - `--min-rcs N` — fail if `release_confidence_score.value < N`.
@@ -445,8 +505,12 @@ python3 -m cli.main \
   --head-sha $(python3 -c "print('b'*40)") \
   --repository org/svc --branch feature/x \
   --pr-number 42 --pr-approvers alice,bob --pr-required-approvals 2 --pr-review-state approved \
+  --sarif path/to/semgrep.sarif.json --sarif path/to/sonarqube.sarif.json \
+  --sonar-metrics path/to/sonar-measures.json \
   --skip-perf-budget-check --debug \
   --out /tmp/attestation.unsigned.json
+# `tenax-assay run --sarif ... --sonar-metrics ...` is an equivalent, explicit
+# spelling of the same pipeline invocation above.
 
 # Admission gate against the unsigned statement's DSSE-shaped output
 # (only meaningful once --sign/--dry-run-sign has produced a real envelope):
@@ -465,12 +529,14 @@ installed — outside CI there's no ambient identity to fetch, by design.
 
 ## Test suite
 
-~290 test cases across 13 modules, including dedicated adversarial suites:
+~355 test cases across 16 modules, including dedicated adversarial suites:
 `test_adversarial_ast.py` (Python assertion-integrity bypass attempts),
 `test_ast_assertions.py` (the multi-language engine: on-disk fixtures for
 every supported language, per-language gaming heuristics, registry
-dispatch, and DSSE predicate telemetry), `test_security_boundaries.py` and
-`test_verify_boundaries.py` (malformed/hostile-input hardening), and
+dispatch, and DSSE predicate telemetry), `test_security_boundaries.py`,
+`test_verify_boundaries.py`, and `test_sarif_adversarial.py` (malformed/
+hostile-input hardening), `test_verify_hardening.py` (envelope size guard,
+diagnostic schema validation, OIDC fetch retry bounding), and
 `test_github_rules.py` (auth failure modes, pagination limits, bypass-mode
 edge cases against a mocked GitHub API).
 

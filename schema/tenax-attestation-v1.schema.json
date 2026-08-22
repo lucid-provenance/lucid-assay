@@ -9,6 +9,7 @@
     "predicate_version",
     "pipeline",
     "vcs",
+    "branch_governance",
     "artifact",
     "test_verification",
     "coverage",
@@ -65,6 +66,31 @@
             "review_state": { "type": "string", "enum": ["approved", "changes_requested", "pending", "not_applicable"] }
           },
           "required": ["approvers", "required_approvals", "review_state"]
+        }
+      }
+    },
+
+    "branch_governance": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Live GitHub branch-governance check (cli/parsers/github_rules.py): whether the target branch would actually let this change land unreviewed, independent of this PR's own approval state. A top-level predicate field, always present (not nested under vcs).",
+      "required": [
+        "available", "branch", "pull_request_required", "approvals_required",
+        "direct_push_prevented", "bypass_actors_count", "admin_enforced", "warnings", "reason"
+      ],
+      "properties": {
+        "available": { "type": "boolean" },
+        "branch": { "type": "string" },
+        "pull_request_required": { "type": "boolean" },
+        "approvals_required": { "type": "integer", "minimum": 0 },
+        "direct_push_prevented": { "type": "boolean" },
+        "bypass_actors_count": { "type": "integer", "minimum": 0 },
+        "admin_enforced": { "type": "boolean" },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "reason": { "type": "string" },
+        "reason_code": {
+          "type": ["string", "null"],
+          "description": "Machine-readable classification of a specific known available=false cause (e.g. platform_unsupported_tier). Null/absent for every other case -- must not be inferred as a generic failure."
         }
       }
     },
@@ -154,12 +180,17 @@
         "patch": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["available", "line_rate", "lines_changed", "lines_covered"],
+          "required": ["available", "line_rate", "lines_changed", "lines_covered", "reason"],
           "properties": {
             "available": { "type": "boolean", "description": "False when base_commit_sha is unavailable or diff yields zero coverable changed lines." },
             "line_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
             "lines_changed": { "type": "integer", "minimum": 0 },
-            "lines_covered": { "type": "integer", "minimum": 0 }
+            "lines_covered": { "type": "integer", "minimum": 0 },
+            "reason": { "type": "string" },
+            "reason_code": {
+              "type": ["string", "null"],
+              "description": "Machine-readable classification of a specific known available=false cause (e.g. no_coverable_lines). Null/absent for every other case."
+            }
           }
         },
         "thresholds": {
@@ -213,6 +244,121 @@
       }
     },
 
+    "static_analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "SARIF 2.1.0 static-analysis findings (see cli/parsers/sarif.py), differential-scored against the patch. available=true with empty tools/findings when no --sarif input was configured for this run at all (a control that was never invoked isn't penalized) -- distinct from available=false, which means a --sarif input was configured but couldn't be read/parsed. Absent entirely on attestations predating this feature.",
+      "required": [
+        "available", "format", "total_findings", "errors_count", "warnings_count",
+        "notes_count", "patch_errors_count", "patch_warnings_count", "findings"
+      ],
+      "properties": {
+        "available": { "type": "boolean" },
+        "format": { "type": "string", "enum": ["sarif-2.1.0"] },
+        "total_findings": { "type": "integer", "minimum": 0 },
+        "errors_count": { "type": "integer", "minimum": 0 },
+        "warnings_count": { "type": "integer", "minimum": 0 },
+        "notes_count": { "type": "integer", "minimum": 0 },
+        "none_count": { "type": "integer", "minimum": 0 },
+        "patch_errors_count": {
+          "type": "integer", "minimum": 0,
+          "description": "Findings at level=error whose file/line intersects the diff's changed lines -- weighed far more heavily by the scorer than a pre-existing baseline finding."
+        },
+        "patch_warnings_count": { "type": "integer", "minimum": 0 },
+        "tools_scanned": { "type": "array", "items": { "type": "string" } },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Human-readable causes when available=false (e.g. an unreadable/corrupt --sarif input); aggregation fails closed, so any one bad input taints the whole report."
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["tool_name", "rule_id", "level", "message", "file_path", "start_line", "is_new_in_patch"],
+            "properties": {
+              "tool_name": { "type": "string" },
+              "rule_id": { "type": "string" },
+              "level": { "type": "string", "enum": ["error", "warning", "note", "none"] },
+              "message": { "type": "string" },
+              "file_path": { "type": "string" },
+              "start_line": { "type": "integer", "minimum": 0 },
+              "is_new_in_patch": { "type": "boolean" },
+              "category": { "type": ["string", "null"] },
+              "tags": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "tools": {
+          "type": "array",
+          "description": "Per-tool breakdown: driver metadata, rule-ID/category/tag grouping, a raw-report integrity hash, and an extensible bag for tool-specific enrichments (e.g. SonarQube quality gate). Concatenated across multiple --sarif inputs, one entry per (file, tool) pair -- each keeps its own file's report_hash rather than being merged across files.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "summary", "report_hash"],
+            "properties": {
+              "name": { "type": "string" },
+              "version": { "type": ["string", "null"] },
+              "information_uri": { "type": ["string", "null"] },
+              "summary": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["errors", "warnings", "notes", "none", "total_findings"],
+                "properties": {
+                  "errors": { "type": "integer", "minimum": 0 },
+                  "warnings": { "type": "integer", "minimum": 0 },
+                  "notes": { "type": "integer", "minimum": 0 },
+                  "none": { "type": "integer", "minimum": 0 },
+                  "total_findings": { "type": "integer", "minimum": 0 }
+                }
+              },
+              "rules": {
+                "type": "array",
+                "description": "Findings for this tool, grouped by rule ID.",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["rule_id", "count"],
+                  "properties": {
+                    "rule_id": { "type": "string" },
+                    "count": { "type": "integer", "minimum": 0 },
+                    "category": { "type": ["string", "null"] },
+                    "tags": { "type": "array", "items": { "type": "string" } }
+                  }
+                }
+              },
+              "extensions": {
+                "type": "object",
+                "description": "Tool-specific metadata not part of the core SARIF result shape, e.g. SonarQube's quality gate or complexity/debt metrics -- sourced from a SARIF run's own properties bag, or merged in externally via --sonar-metrics for a scanner that doesn't embed them.",
+                "properties": {
+                  "sonarqube": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "quality_gate": { "type": "string", "enum": ["PASSED", "FAILED", "WARN", "NONE"] },
+                      "cognitive_complexity": { "type": "integer" },
+                      "technical_debt_minutes": { "type": "integer" }
+                    }
+                  }
+                }
+              },
+              "report_hash": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["algorithm", "value"],
+                "description": "SHA-256 of the raw SARIF file this tool's results were parsed from.",
+                "properties": {
+                  "algorithm": { "type": "string" },
+                  "value": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
     "release_confidence_score": {
       "type": "object",
       "additionalProperties": false,
@@ -229,13 +375,22 @@
             "patch_coverage": { "$ref": "#/$defs/scoreComponent" },
             "overall_coverage": { "$ref": "#/$defs/scoreComponent" },
             "assertion_integrity": { "$ref": "#/$defs/scoreComponent" },
-            "governance": { "$ref": "#/$defs/scoreComponent" }
+            "governance": { "$ref": "#/$defs/scoreComponent" },
+            "static_analysis": {
+              "$ref": "#/$defs/scoreComponent",
+              "description": "Not in `required`: absent on attestations predating the SARIF static-analysis component (cli/scorer.py WEIGHTS)."
+            }
           }
         },
         "degraded": {
           "type": "boolean",
           "default": false,
           "description": "True if any component fell back to a penalized default due to missing/unavailable input data."
+        },
+        "degraded_reasons": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Which independent trigger(s) caused degraded=true (e.g. no_pr_context, sarif_unavailable, a namespaced branch_governance:<reason_code> / patch_coverage:<reason_code>). Empty when degraded=false. Absent/malformed on an attestation predating this field -- cli/verify.py's --disallow-degraded treats that as non-exempt."
         },
         "computed_at": { "type": "string", "format": "date-time" }
       }

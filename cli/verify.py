@@ -33,9 +33,23 @@ import base64
 import fnmatch
 import json
 import math
+import os
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# jsonschema is an optional dependency (pyproject.toml [dev] extra) -- this
+# module is meant to work as a lightweight, dependency-minimal standalone
+# admission gate, so formal schema validation degrades to "skipped" rather
+# than making jsonschema a hard runtime requirement. See
+# _validate_against_schema()'s docstring for the full fail-open contract.
+try:
+    import jsonschema
+
+    _JSONSCHEMA_AVAILABLE = True
+except ImportError:
+    _JSONSCHEMA_AVAILABLE = False
 
 EXPECTED_PAYLOAD_TYPE = "application/vnd.in-toto+json"
 EXPECTED_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
@@ -67,6 +81,25 @@ _OIDC_SOURCE_REPOSITORY_URI_OID = "1.3.6.1.4.1.57264.1.12"
 EXIT_PASS = 0
 EXIT_POLICY_VIOLATION = 2
 EXIT_FILE_ERROR = 1
+
+# A signed attestation envelope is a small JSON document by construction
+# (a DSSE-wrapped RCS predicate); anything approaching this ceiling is
+# either corrupt or hostile. Enforced via a stat() size check *before* any
+# of the file's bytes are read into memory -- see load_envelope().
+MAX_ENVELOPE_SIZE = 10 * 1024 * 1024  # 10MB
+
+# Packaged predicate JSON Schema, resolved relative to this module rather
+# than the process's CWD so `tenax-assay verify` works from any directory.
+_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schema" / "tenax-attestation-v1.schema.json"
+_schema_cache: Optional[Dict[str, Any]] = None
+
+
+class EnvelopeTooLargeError(Exception):
+    """Raised by load_envelope() when the file exceeds MAX_ENVELOPE_SIZE.
+    Deliberately not an OSError subclass, so callers that broadly catch
+    OSError for file-system errors don't accidentally swallow this as one
+    -- an oversized file is a distinct, policy-driven rejection, not an
+    I/O failure."""
 
 # degraded_reasons entries --disallow-degraded treats as non-blocking:
 # known, unavoidable states that aren't a real governance/quality gap --
@@ -106,6 +139,8 @@ class VerificationResult:
     metrics: Dict[str, Any] = field(default_factory=dict)
     identity_status: str = "skipped"
     identity_detail: str = ""
+    static_analysis_tools: List[Dict[str, Any]] = field(default_factory=list)
+    schema_validation_status: str = "skipped"
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -119,6 +154,8 @@ class VerificationResult:
             "metrics": self.metrics,
             "identity_status": self.identity_status,
             "identity_detail": self.identity_detail,
+            "static_analysis_tools": self.static_analysis_tools,
+            "schema_validation_status": self.schema_validation_status,
         }
 
 
@@ -162,6 +199,114 @@ def _extract_metrics(predicate: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(assertion_density, dict):
         metrics["assertion_density"] = assertion_density
     return metrics
+
+
+def _extract_static_analysis_tools(predicate: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Defensively pulls the per-tool SARIF breakdown out of the predicate
+    for display purposes only (never raises, never gates -- static_analysis
+    is optional in the schema and this is purely informational). Malformed
+    or missing entries are skipped individually rather than discarding the
+    whole list."""
+    static_analysis = predicate.get("static_analysis")
+    if not isinstance(static_analysis, dict):
+        return []
+
+    tools = static_analysis.get("tools")
+    if not isinstance(tools, list):
+        return []
+
+    return [t for t in tools if isinstance(t, dict)]
+
+
+def _load_schema() -> Optional[Dict[str, Any]]:
+    """Best-effort load of the packaged predicate JSON Schema, cached after
+    the first call. Returns None (never raises) if the file is missing,
+    unreadable, or not valid JSON -- schema validation is an optional guard
+    layered on top of everything else in this module, and a broken/absent
+    schema file must degrade to "skipped", not crash the gate."""
+    global _schema_cache
+    if _schema_cache is not None:
+        return _schema_cache
+    try:
+        with open(_SCHEMA_PATH, "r", encoding="utf-8") as f:
+            _schema_cache = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return _schema_cache
+
+
+def _validate_against_schema(predicate: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Best-effort structural validation of the predicate against the
+    packaged JSON Schema (schema/tenax-attestation-v1.schema.json).
+
+    Returns (status, messages):
+      - "passed": schema loaded, jsonschema ran, zero violations. messages=[].
+      - "failed": schema loaded, jsonschema ran, real violations found.
+        messages is one human-readable "<path>: <detail>" entry per
+        violation. The caller surfaces these as non-blocking `warnings`,
+        not `violations` -- this predicate schema evolves over time (see
+        the call site's comment), so a mismatch is diagnostic signal, not
+        proof of a hostile or corrupt payload on its own.
+      - "skipped": jsonschema isn't installed, the schema file is
+        unavailable, or validation itself raised unexpectedly (e.g. a
+        corrupt packaged schema). messages is exactly one diagnostic
+        entry explaining why. Either way (failed or skipped), a schema
+        problem alone must never be able to fail an otherwise-valid
+        attestation's admission gate.
+    """
+    if not _JSONSCHEMA_AVAILABLE:
+        return "skipped", ["jsonschema package is not installed"]
+
+    schema = _load_schema()
+    if schema is None:
+        return "skipped", [f"predicate schema file unavailable or unreadable at {_SCHEMA_PATH}"]
+
+    try:
+        validator = jsonschema.Draft202012Validator(schema)
+        errors = sorted(validator.iter_errors(predicate), key=str)
+    except Exception as e:  # noqa: BLE001 -- a broken schema/validator must degrade, never crash the gate
+        return "skipped", [f"schema validation raised unexpectedly ({e}); treating as unavailable"]
+
+    if not errors:
+        return "passed", []
+
+    return "failed", [
+        f"{'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors
+    ]
+
+
+def _format_static_analysis_table(tools: List[Dict[str, Any]]) -> List[str]:
+    """Renders a clean, fixed-width summary table (tool, error/warning
+    counts, SonarQube quality gate status when present) for --verify's
+    human-readable (non-JSON) output. Missing/malformed fields degrade to
+    '-' rather than raising -- this is a display helper over data that
+    `_extract_static_analysis_tools` already validated defensively."""
+    if not tools:
+        return []
+
+    rows = []
+    for t in tools:
+        name = str(t.get("name") or "unknown")
+        summary = t.get("summary") if isinstance(t.get("summary"), dict) else {}
+        errors = summary.get("errors")
+        warnings = summary.get("warnings")
+        extensions = t.get("extensions") if isinstance(t.get("extensions"), dict) else {}
+        sonarqube = extensions.get("sonarqube") if isinstance(extensions.get("sonarqube"), dict) else {}
+        quality_gate = sonarqube.get("quality_gate")
+        rows.append((
+            name,
+            str(errors) if isinstance(errors, int) else "-",
+            str(warnings) if isinstance(warnings, int) else "-",
+            str(quality_gate) if isinstance(quality_gate, str) else "-",
+        ))
+
+    header = ("TOOL", "ERRORS", "WARNINGS", "QUALITY GATE")
+    widths = [max(len(header[i]), *(len(r[i]) for r in rows)) for i in range(len(header))]
+
+    def _fmt_row(cells: tuple) -> str:
+        return "    " + "  ".join(c.ljust(w) for c, w in zip(cells, widths))
+
+    return [_fmt_row(header)] + [_fmt_row(r) for r in rows]
 
 
 def _pem_to_der_b64(pem: str) -> str:
@@ -573,6 +718,8 @@ def verify_dsse_attestation(
     degraded_reasons: Optional[List[str]] = None
     subject_digests: List[str] = []
     metrics: Dict[str, Any] = {}
+    static_analysis_tools: List[Dict[str, Any]] = []
+    schema_validation_status = "skipped"
 
     if statement is not None:
         statement_type = statement.get("_type")
@@ -587,6 +734,30 @@ def verify_dsse_attestation(
 
         predicate = statement.get("predicate")
         predicate = predicate if isinstance(predicate, dict) else {}
+
+        # Formal schema validation, ahead of policy evaluation/score checks
+        # per this guard's purpose: catch a structurally malformed predicate
+        # before any of the checks below try to read fields out of it.
+        # Fails open, never blocking: jsonschema not being installed, the
+        # packaged schema file being unavailable/unreadable, or validation
+        # itself raising unexpectedly all degrade to "skipped" with a
+        # diagnostic warning -- only an actual, successfully-run schema
+        # mismatch becomes a blocking violation.
+        # Diagnostic, not a gate: this predicate schema has evolved (and
+        # will keep evolving -- see e.g. static_analysis/degraded_reasons/
+        # branch_governance, all added after the first attestations that
+        # lacked them were already signed) and hand-built partial predicates
+        # are a legitimate, deliberate testing pattern elsewhere in this
+        # codebase. A schema mismatch surfaces as a `warnings` entry with
+        # the precise violation, never as a blocking `violations` one --
+        # otherwise every older real attestation predating a schema change,
+        # and every test fixture that only populates the fields relevant to
+        # what it's testing, would start failing --min-rcs runs outright.
+        schema_validation_status, schema_messages = _validate_against_schema(predicate)
+        if schema_validation_status == "failed":
+            warnings.extend(f"predicate schema violation: {m}" for m in schema_messages)
+        elif schema_validation_status == "skipped":
+            warnings.extend(f"schema validation skipped: {m}" for m in schema_messages)
 
         rcs_block = predicate.get("release_confidence_score")
         rcs_block = rcs_block if isinstance(rcs_block, dict) else {}
@@ -612,6 +783,7 @@ def verify_dsse_attestation(
             degraded_reasons = None
 
         metrics = _extract_metrics(predicate)
+        static_analysis_tools = _extract_static_analysis_tools(predicate)
 
         if rcs_value is None:
             violations.append(
@@ -680,6 +852,8 @@ def verify_dsse_attestation(
         metrics=metrics,
         identity_status=identity_status,
         identity_detail=identity_detail,
+        static_analysis_tools=static_analysis_tools,
+        schema_validation_status=schema_validation_status,
     )
 
 
@@ -738,6 +912,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def load_envelope(path: str) -> Any:
+    """Reads and JSON-decodes an envelope file, rejecting anything over
+    MAX_ENVELOPE_SIZE *before* reading a single byte of it -- a size check
+    done after loading the file into memory defeats the entire point of
+    the guard (a hostile or corrupt multi-GB "envelope" must never be able
+    to exhaust memory just by being pointed at)."""
+    size = os.path.getsize(path)  # raises FileNotFoundError/OSError, same as open() would
+    if size > MAX_ENVELOPE_SIZE:
+        raise EnvelopeTooLargeError(
+            f"attestation file exceeds maximum allowed size "
+            f"({MAX_ENVELOPE_SIZE // (1024 * 1024)}MB): {size} bytes"
+        )
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -749,6 +934,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         envelope = load_envelope(args.envelope)
     except FileNotFoundError:
         print(f"ERROR: envelope file not found: {args.envelope}", file=sys.stderr)
+        return EXIT_FILE_ERROR
+    except EnvelopeTooLargeError as e:
+        print(f"ERROR: Attestation file exceeds maximum allowed size (10MB): {e}", file=sys.stderr)
         return EXIT_FILE_ERROR
     except (OSError, json.JSONDecodeError) as e:
         print(f"ERROR: failed to read/parse envelope file {args.envelope}: {e}", file=sys.stderr)
@@ -783,6 +971,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if result.subject_digests:
             print(f"  subject_digests={result.subject_digests}", file=sys.stderr)
         print(f"  identity: {result.identity_status} ({result.identity_detail})", file=sys.stderr)
+        if result.static_analysis_tools:
+            print("  static analysis:", file=sys.stderr)
+            for line in _format_static_analysis_table(result.static_analysis_tools):
+                print(line, file=sys.stderr)
         for v in result.violations:
             print(f"  VIOLATION: {v}", file=sys.stderr)
         for w in result.warnings:

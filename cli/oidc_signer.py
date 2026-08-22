@@ -1,20 +1,19 @@
 """
-Keyless signing of the in-toto Statement using ambient OIDC identity via Sigstore CLI.
+Keyless signing of the in-toto Statement using ambient OIDC identity via
+Sigstore's `Signer.sign_dsse()` library API (see sign_statement()'s docstring
+for why this uses the library API rather than shelling out to the `sigstore`
+CLI, unlike cli.verify's use of the CLI's underlying verification classes).
 
 Hardened against:
   - SSRF / Hostile redirect attacks on the OIDC token endpoint
   - Malformed URL query string assembly
   - Forked PR / Non-OIDC pipeline crashes via explicit dry-run support
-  - Upstream Python library API drift by using the stable CLI contract
 """
 from __future__ import annotations
 
 import base64
 import json
 import os
-import subprocess
-import sys
-import tempfile
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -33,9 +32,9 @@ class DSSEEnvelope:
     signatures: List[Dict[str, str]]  # [{"sig": <b64>, "certificate": <pem>}]
     rekor_log_index: Optional[int] = None
     rekor_log_id: Optional[str] = None
-    # The complete, untouched Sigstore bundle (`sigstore sign --bundle`
-    # output) as parsed JSON, when one was actually minted. Preserved
-    # verbatim -- including tlogEntries' kindVersion/inclusionProof/
+    # The complete, untouched Sigstore bundle (`Bundle.to_json()` output of
+    # the DSSE-signed result) as parsed JSON, when one was actually minted.
+    # Preserved verbatim -- including tlogEntries' kindVersion/inclusionProof/
     # canonicalizedBody -- so cli.verify can hand it straight to
     # sigstore.models.Bundle.from_json() rather than hand-reconstructing a
     # partial bundle from a handful of extracted fields, which can never
@@ -113,32 +112,41 @@ def sign_statement(statement_json_bytes: bytes, dry_run: bool = False) -> DSSEEn
 
     oidc_token = fetch_ambient_oidc_token()
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "statement.json")
-        bundle_path = os.path.join(tmpdir, "statement.sigstore.json")
+    # NOTE: this deliberately does NOT shell out to `sigstore sign` (as an
+    # earlier version of this function did). `sigstore sign` always produces
+    # a hashedrekord/messageSignature bundle -- signing over the *artifact
+    # bytes* -- never a DSSE envelope, regardless of what's passed on the
+    # input file. cli.verify expects (and calls `Verifier.verify_dsse` on) a
+    # real DSSE-enveloped in-toto attestation, so a hashedrekord bundle fails
+    # verification with "cannot perform DSSE verification on a bundle
+    # without a DSSE envelope" every time, no matter how the CLI is invoked.
+    # `sigstore attest` *does* produce a DSSE envelope, but this sigstore
+    # version's CLI restricts --predicate-type to the SLSA provenance enum
+    # and derives the subject from a hash of the predicate file itself --
+    # neither fits a custom predicateType (plinth.dev/attestation/v1) over
+    # an already-fully-assembled Statement whose subject is a container
+    # image digest, not a local file's hash. `Signer.sign_dsse()` is the
+    # public library entry point both CLI subcommands themselves delegate
+    # to under the hood (see sigstore._cli._sign_file_threaded), so this
+    # calls it directly, wrapping the caller's exact Statement bytes
+    # unmodified via `dsse.Statement(bytes)` -- no re-derivation of the
+    # subject or predicate, no restriction on predicate type.
+    from sigstore.dsse import Statement
+    from sigstore.models import ClientTrustConfig
+    from sigstore.oidc import IdentityToken
+    from sigstore.sign import SigningContext
 
-        with open(input_path, "wb") as f:
-            f.write(statement_json_bytes)
+    try:
+        trust_config = ClientTrustConfig.production()
+        signing_ctx = SigningContext.from_trust_config(trust_config)
+        identity = IdentityToken(oidc_token)
+        statement = Statement(statement_json_bytes)
+        with signing_ctx.signer(identity) as signer:
+            bundle = signer.sign_dsse(statement)
+    except Exception as e:  # noqa: BLE001 - surface any signing failure uniformly
+        raise RuntimeError(f"Sigstore signing failed: {e}") from e
 
-        # Run sigstore CLI subprocess
-        cmd = [
-            sys.executable,
-            "-m",
-            "sigstore",
-            "sign",
-            "--identity-token",
-            oidc_token,
-            "--bundle",
-            bundle_path,
-            input_path,
-        ]
-
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(f"Sigstore signing failed (exit code {proc.returncode}):\n{proc.stderr}\n{proc.stdout}")
-
-        with open(bundle_path, "r", encoding="utf-8") as f:
-            bundle_data = json.load(f)
+    bundle_data = json.loads(bundle.to_json())
 
     # Extract signature and certificate from the standard Sigstore bundle format
     # Supports both Protobuf JSON spec and legacy bundle schemas

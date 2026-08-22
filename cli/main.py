@@ -14,7 +14,8 @@ import json
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional
+from contextlib import contextmanager
+from typing import Dict, Iterator, List, Optional
 
 from .builder import build_statement
 from .hashing import sha256_file, worm_uri
@@ -27,6 +28,79 @@ from .patch_coverage import compute_patch_coverage, compute_patch_modified_lines
 from .scorer import score_pipeline
 
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="worm-upload")
+
+# Ordered (stage_ns key, display label) pairs for the --debug stage-timing
+# report. A stage's key can be accumulated into from more than one code
+# block (e.g. "parse_inputs" covers both the JUnit/coverage parse *and* the
+# SARIF report parse, even though the latter runs later in main() -- it
+# needs compute_patch_modified_lines()'s git diff first) -- _stage() adds
+# to any existing value under the same key rather than overwriting it, so
+# splitting a logical stage across multiple `with _stage(...)` blocks is
+# safe and its total is still reported as one line.
+_STAGE_LABELS = [
+    ("parse_inputs", "Inputs & Parsing"),
+    ("diff_patch_analysis", "Diff & Patch Coverage"),
+    ("ast_inspection", "AST Assertion Walking"),
+    ("github_rules_api", "GitHub Ruleset API"),
+    ("rcs_scoring", "RCS Scoring Engine"),
+    ("predicate_assembly", "Predicate Serialization"),
+    ("worm_upload", "WORM Upload Dispatch"),
+]
+
+
+@contextmanager
+def _stage(stage_ns: Dict[str, int], name: str) -> Iterator[None]:
+    """High-resolution (perf_counter_ns) timer for one profiling stage.
+    Accumulates into stage_ns[name] (rather than overwriting) so a logical
+    stage spread across multiple non-adjacent code blocks still reports as
+    a single total -- see _STAGE_LABELS above."""
+    t0 = time.perf_counter_ns()
+    try:
+        yield
+    finally:
+        stage_ns[name] = stage_ns.get(name, 0) + (time.perf_counter_ns() - t0)
+
+
+def _fmt_ms(elapsed_ns: int) -> str:
+    return f"{elapsed_ns / 1_000_000.0:,.1f} ms"
+
+
+def _fmt_s(elapsed_ns: int) -> str:
+    return f"{elapsed_ns / 1_000_000_000.0:.2f} s"
+
+
+def _emit_stage_profile(
+    stage_ns: Dict[str, int],
+    sign_total_ns: Optional[int],
+    sign_sub_ns: Dict[str, int],
+    blocking_elapsed_ms: float,
+    wall_elapsed_ns: int,
+) -> None:
+    """Prints the formatted per-stage timing breakdown to stderr (--debug
+    only). Sigstore signing -- the dominant cost on a typical CI run, since
+    it's a real network round-trip to Fulcio + Rekor -- is broken out into
+    its own OIDC-fetch / Fulcio-Rekor sub-lines rather than folded into the
+    single blocking-overhead figure the 50ms budget check already covers;
+    see cli/oidc_signer.py::sign_statement's `timing` param."""
+    label_w = 28
+    print("=== Plinth Assay Stage Profiling ===", file=sys.stderr)
+    for key, label in _STAGE_LABELS:
+        print(f"- {label + ':':<{label_w}}{_fmt_ms(stage_ns.get(key, 0)):>12}", file=sys.stderr)
+    if sign_total_ns is not None:
+        print(f"- {'Sigstore Signing (Total):':<{label_w}}{_fmt_ms(sign_total_ns):>12}", file=sys.stderr)
+        sub_rows = [
+            ("OIDC Token Fetch:", sign_sub_ns.get("oidc_token_fetch_ns", 0)),
+            ("Fulcio/Rekor Round-Trip:", sign_sub_ns.get("fulcio_rekor_ns", 0)),
+        ]
+        sub_w = max(len(sub_label) for sub_label, _ in sub_rows) + 1
+        for sub_label, sub_ns in sub_rows:
+            print(f"    ↳ {sub_label:<{sub_w}}{_fmt_ms(sub_ns):>12}", file=sys.stderr)
+    print(
+        f"Total Blocking Overhead: {blocking_elapsed_ms:>10,.1f} ms (excluding Sigstore network)",
+        file=sys.stderr,
+    )
+    print(f"Total Wall-Clock Time:   {_fmt_s(wall_elapsed_ns):>13}", file=sys.stderr)
+    print("====================================", file=sys.stderr)
 
 
 def derive_signed_path(out_path: str) -> str:
@@ -90,6 +164,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--sign", action="store_true", help="perform keyless Sigstore signing")
     p.add_argument("--dry-run-sign", action="store_true", help="simulate DSSE envelope creation without OIDC")
     p.add_argument("--skip-perf-budget-check", action="store_true")
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="emit a high-resolution per-stage timing breakdown (parsing, diff/patch "
+        "coverage, AST walk, GitHub ruleset API, scoring, predicate assembly, WORM "
+        "dispatch, Sigstore signing) to stderr",
+    )
     return p.parse_args(argv)
 
 
@@ -105,39 +186,46 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = parse_args(argv or sys.argv[1:])
     t_start = time.perf_counter()
+    t_start_ns = time.perf_counter_ns()
+    stage_ns: Dict[str, int] = {}
 
     # 1. Parse test report
-    test_totals = parse_junit_xml(args.junit_xml)
+    with _stage(stage_ns, "parse_inputs"):
+        test_totals = parse_junit_xml(args.junit_xml)
 
-    # 2. Parse coverage report
-    if args.coverage_format == "cobertura":
-        coverage = parse_cobertura(args.coverage_report)
-    else:
-        coverage = parse_lcov(args.coverage_report)
+        # 2. Parse coverage report
+        if args.coverage_format == "cobertura":
+            coverage = parse_cobertura(args.coverage_report)
+        else:
+            coverage = parse_lcov(args.coverage_report)
 
     # 3. Patch coverage via git diff
-    patch_cov = compute_patch_coverage(args.base_sha, args.head_sha, args.repo_dir, coverage)
+    with _stage(stage_ns, "diff_patch_analysis"):
+        patch_cov = compute_patch_coverage(args.base_sha, args.head_sha, args.repo_dir, coverage)
 
     # 3b. Branch governance / ruleset inspection (ambient GITHUB_TOKEN unless overridden)
-    branch_governance = inspect_branch_governance(args.repository, args.branch, token=args.github_token)
+    with _stage(stage_ns, "github_rules_api"):
+        branch_governance = inspect_branch_governance(args.repository, args.branch, token=args.github_token)
 
     # 3c. SARIF static-analysis ingestion (optional, --sarif may repeat).
     # sarif_report stays None when --sarif wasn't passed at all -- scorer
     # and builder both treat that as "not configured", not as a failure.
     sarif_report = None
     if args.sarif:
-        patch_modified_lines = compute_patch_modified_lines(args.base_sha, args.head_sha, args.repo_dir)
-        parsed_reports = []
-        for sarif_path in args.sarif:
-            report = parse_sarif_file(sarif_path, patch_modified_lines=patch_modified_lines)
-            if not report.available:
-                print(
-                    f"WARNING: SARIF report '{sarif_path}' could not be read/parsed: "
-                    f"{'; '.join(report.reasons)}",
-                    file=sys.stderr,
-                )
-            parsed_reports.append(report)
-        sarif_report = aggregate_sarif_reports(parsed_reports)
+        with _stage(stage_ns, "diff_patch_analysis"):
+            patch_modified_lines = compute_patch_modified_lines(args.base_sha, args.head_sha, args.repo_dir)
+        with _stage(stage_ns, "parse_inputs"):
+            parsed_reports = []
+            for sarif_path in args.sarif:
+                report = parse_sarif_file(sarif_path, patch_modified_lines=patch_modified_lines)
+                if not report.available:
+                    print(
+                        f"WARNING: SARIF report '{sarif_path}' could not be read/parsed: "
+                        f"{'; '.join(report.reasons)}",
+                        file=sys.stderr,
+                    )
+                parsed_reports.append(report)
+            sarif_report = aggregate_sarif_reports(parsed_reports)
         if not sarif_report.available:
             print(
                 f"WARNING: static analysis (SARIF) ingestion degraded: {'; '.join(sarif_report.reasons)}",
@@ -152,85 +240,100 @@ def main(argv: Optional[List[str]] = None) -> int:
         image_digest = image_digest[7:]
 
     # 5. Assertion metrics (AST-walked test suite scoped to args.repo_dir)
-    ast_metrics = inspect_test_suite(args.repo_dir)
-    total_assertions = ast_metrics.total_assertions
-    total_test_functions = ast_metrics.total_test_functions
-    empty_bodies = ast_metrics.empty_test_bodies
-    tautological = ast_metrics.tautological_assertions
+    with _stage(stage_ns, "ast_inspection"):
+        ast_metrics = inspect_test_suite(args.repo_dir)
+        total_assertions = ast_metrics.total_assertions
+        total_test_functions = ast_metrics.total_test_functions
+        empty_bodies = ast_metrics.empty_test_bodies
+        tautological = ast_metrics.tautological_assertions
 
     # 6. Deterministic scoring
     pr_approvers = [a.strip() for a in args.pr_approvers.split(",") if a.strip()]
-    rcs = score_pipeline(
-        test_totals=test_totals,
-        patch_coverage=patch_cov,
-        overall_line_rate=coverage.overall_line_rate,
-        total_assertions=total_assertions,
-        total_test_functions=total_test_functions,
-        pr_present=args.pr_number is not None,
-        approvers_count=len(pr_approvers),
-        required_approvals=args.pr_required_approvals,
-        review_state=args.pr_review_state,
-        patch_coverage_min=args.patch_coverage_min,
-        overall_coverage_min=args.overall_coverage_min,
-        branch_governance=branch_governance,
-        sarif_report=sarif_report,
-    )
+    with _stage(stage_ns, "rcs_scoring"):
+        rcs = score_pipeline(
+            test_totals=test_totals,
+            patch_coverage=patch_cov,
+            overall_line_rate=coverage.overall_line_rate,
+            total_assertions=total_assertions,
+            total_test_functions=total_test_functions,
+            pr_present=args.pr_number is not None,
+            approvers_count=len(pr_approvers),
+            required_approvals=args.pr_required_approvals,
+            review_state=args.pr_review_state,
+            patch_coverage_min=args.patch_coverage_min,
+            overall_coverage_min=args.overall_coverage_min,
+            branch_governance=branch_governance,
+            sarif_report=sarif_report,
+        )
 
     # 7. Build unsigned in-toto Statement
-    statement = build_statement(
-        subject_name=args.image_ref,
-        subject_sha256=image_digest,
-        vcs_provider="github",
-        repository=args.repository,
-        branch=args.branch,
-        commit_sha=args.head_sha,
-        base_commit_sha=args.base_sha,
-        pr_number=args.pr_number,
-        pr_target_branch=args.branch,
-        pr_approvers=pr_approvers,
-        pr_required_approvals=args.pr_required_approvals,
-        pr_review_state=args.pr_review_state,
-        branch_governance=branch_governance,
-        test_framework="junit",
-        test_report_sha256=test_report_sha,
-        test_report_uri=worm_uri(test_report_sha),
-        test_totals=test_totals,
-        coverage_format=f"{args.coverage_format}-xml" if args.coverage_format == "cobertura" else "lcov",
-        coverage_report_sha256=coverage_report_sha,
-        coverage_report_uri=worm_uri(coverage_report_sha),
-        coverage=coverage,
-        patch_coverage=patch_cov,
-        patch_coverage_min=args.patch_coverage_min,
-        overall_coverage_min=args.overall_coverage_min,
-        total_assertions=total_assertions,
-        total_test_functions=total_test_functions,
-        empty_test_bodies=empty_bodies,
-        assertion_only_true=tautological,
-        rcs=rcs,
-        sarif_report=sarif_report,
-    )
+    with _stage(stage_ns, "predicate_assembly"):
+        statement = build_statement(
+            subject_name=args.image_ref,
+            subject_sha256=image_digest,
+            vcs_provider="github",
+            repository=args.repository,
+            branch=args.branch,
+            commit_sha=args.head_sha,
+            base_commit_sha=args.base_sha,
+            pr_number=args.pr_number,
+            pr_target_branch=args.branch,
+            pr_approvers=pr_approvers,
+            pr_required_approvals=args.pr_required_approvals,
+            pr_review_state=args.pr_review_state,
+            branch_governance=branch_governance,
+            test_framework="junit",
+            test_report_sha256=test_report_sha,
+            test_report_uri=worm_uri(test_report_sha),
+            test_totals=test_totals,
+            coverage_format=f"{args.coverage_format}-xml" if args.coverage_format == "cobertura" else "lcov",
+            coverage_report_sha256=coverage_report_sha,
+            coverage_report_uri=worm_uri(coverage_report_sha),
+            coverage=coverage,
+            patch_coverage=patch_cov,
+            patch_coverage_min=args.patch_coverage_min,
+            overall_coverage_min=args.overall_coverage_min,
+            total_assertions=total_assertions,
+            total_test_functions=total_test_functions,
+            empty_test_bodies=empty_bodies,
+            assertion_only_true=tautological,
+            rcs=rcs,
+            sarif_report=sarif_report,
+        )
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(statement, f, indent=2)
 
-    # 8. Async WORM uploads
-    upload_to_worm_async(args.junit_xml, test_report_sha)
-    upload_to_worm_async(args.coverage_report, coverage_report_sha)
+    # 8. Async WORM uploads (fire-and-forget: the timed cost here is only
+    # the dispatch/submission overhead, not the background upload itself)
+    with _stage(stage_ns, "worm_upload"):
+        upload_to_worm_async(args.junit_xml, test_report_sha)
+        upload_to_worm_async(args.coverage_report, coverage_report_sha)
 
     # 9. Keyless signing
+    sign_total_ns: Optional[int] = None
+    sign_sub_ns: Dict[str, int] = {}
     if args.sign or args.dry_run_sign:
         from .oidc_signer import sign_statement
 
         with open(args.out, "rb") as f:
-            envelope = sign_statement(f.read(), dry_run=args.dry_run_sign)
+            envelope_bytes = f.read()
+
+        _sign_t0 = time.perf_counter_ns()
+        envelope = sign_statement(envelope_bytes, dry_run=args.dry_run_sign, timing=sign_sub_ns)
+        sign_total_ns = time.perf_counter_ns() - _sign_t0
 
         signed_path = derive_signed_path(args.out)
 
         with open(signed_path, "w", encoding="utf-8") as f:
             f.write(envelope.to_json())
         print(f"signed envelope written to {signed_path}", file=sys.stderr)
+
+    if args.debug:
+        wall_elapsed_ns = time.perf_counter_ns() - t_start_ns
+        _emit_stage_profile(stage_ns, sign_total_ns, sign_sub_ns, blocking_elapsed_ms, wall_elapsed_ns)
 
     print(
         f"RCS={rcs.value} blocking_overhead_ms={blocking_elapsed_ms:.2f} degraded={rcs.degraded}",

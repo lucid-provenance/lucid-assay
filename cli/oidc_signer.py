@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -97,11 +98,30 @@ def fetch_ambient_oidc_token(audience: str = "sigstore") -> str:
     )
 
 
-def sign_statement(statement_json_bytes: bytes, dry_run: bool = False) -> DSSEEnvelope:
-    """Keyless-sign an in-toto Statement into a DSSE envelope via Sigstore."""
+def sign_statement(
+    statement_json_bytes: bytes,
+    dry_run: bool = False,
+    timing: Optional[Dict[str, int]] = None,
+) -> DSSEEnvelope:
+    """Keyless-sign an in-toto Statement into a DSSE envelope via Sigstore.
+
+    `timing`, when passed a dict, is populated in place with high-resolution
+    (`time.perf_counter_ns()`) sub-stage durations so a caller (cli.main's
+    stage profiler) can break the "sigstore_signing" stage down further:
+      - "oidc_token_fetch_ns": ambient OIDC ID token acquisition.
+      - "fulcio_rekor_ns": the Fulcio cert issuance + Rekor inclusion
+        round-trip performed inside `signer.sign_dsse()`. Note this is
+        *not* a `python3 -m sigstore sign` subprocess -- see the module
+        docstring and the try/except block below for why this deliberately
+        calls the `Signer.sign_dsse()` library API in-process instead.
+    On dry_run, both keys are set to 0 (no network I/O occurs).
+    """
     payload_b64 = base64.b64encode(statement_json_bytes).decode("ascii")
 
     if dry_run:
+        if timing is not None:
+            timing["oidc_token_fetch_ns"] = 0
+            timing["fulcio_rekor_ns"] = 0
         return DSSEEnvelope(
             payload_type="application/vnd.in-toto+json",
             payload_b64=payload_b64,
@@ -110,7 +130,10 @@ def sign_statement(statement_json_bytes: bytes, dry_run: bool = False) -> DSSEEn
             rekor_log_id=None,
         )
 
+    _t0 = time.perf_counter_ns()
     oidc_token = fetch_ambient_oidc_token()
+    if timing is not None:
+        timing["oidc_token_fetch_ns"] = time.perf_counter_ns() - _t0
 
     # NOTE: this deliberately does NOT shell out to `sigstore sign` (as an
     # earlier version of this function did). `sigstore sign` always produces
@@ -136,6 +159,7 @@ def sign_statement(statement_json_bytes: bytes, dry_run: bool = False) -> DSSEEn
     from sigstore.oidc import IdentityToken
     from sigstore.sign import SigningContext
 
+    _t1 = time.perf_counter_ns()
     try:
         trust_config = ClientTrustConfig.production()
         signing_ctx = SigningContext.from_trust_config(trust_config)
@@ -145,6 +169,9 @@ def sign_statement(statement_json_bytes: bytes, dry_run: bool = False) -> DSSEEn
             bundle = signer.sign_dsse(statement)
     except Exception as e:  # noqa: BLE001 - surface any signing failure uniformly
         raise RuntimeError(f"Sigstore signing failed: {e}") from e
+    finally:
+        if timing is not None:
+            timing["fulcio_rekor_ns"] = time.perf_counter_ns() - _t1
 
     bundle_data = json.loads(bundle.to_json())
 

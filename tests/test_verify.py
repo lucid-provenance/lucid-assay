@@ -25,7 +25,19 @@ from cli.verify import (
 SUBJECT_DIGEST = "a" * 64
 
 
-def _statement(*, rcs_value=85, degraded=False, subject_sha256=SUBJECT_DIGEST):
+_DEGRADED_REASONS_OMITTED = object()  # sentinel: distinct from None/[] -- key left out of the predicate entirely
+
+
+def _statement(*, rcs_value=85, degraded=False, degraded_reasons=_DEGRADED_REASONS_OMITTED, subject_sha256=SUBJECT_DIGEST):
+    rcs_block = {
+        "value": rcs_value,
+        "algorithm_version": "rcs-v0.1",
+        "components": {},
+        "degraded": degraded,
+        "computed_at": "2026-08-20T02:18:40Z",
+    }
+    if degraded_reasons is not _DEGRADED_REASONS_OMITTED:
+        rcs_block["degraded_reasons"] = degraded_reasons
     return {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [
@@ -37,13 +49,7 @@ def _statement(*, rcs_value=85, degraded=False, subject_sha256=SUBJECT_DIGEST):
         "predicateType": "https://plinth.dev/attestation/v1",
         "predicate": {
             "predicate_version": "0.1.0",
-            "release_confidence_score": {
-                "value": rcs_value,
-                "algorithm_version": "rcs-v0.1",
-                "components": {},
-                "degraded": degraded,
-                "computed_at": "2026-08-20T02:18:40Z",
-            },
+            "release_confidence_score": rcs_block,
             "test_verification": {
                 "totals": {"tests": 4, "passed": 4, "failed": 0, "errored": 0, "skipped": 0},
             },
@@ -121,6 +127,90 @@ class VerifyDsseAttestationTests(unittest.TestCase):
         result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
 
         self.assertFalse(result.passed)
+        self.assertTrue(any("disallow-degraded" in v for v in result.violations), result.violations)
+
+    def test_disallow_degraded_allows_sole_platform_unsupported_tier_cause(self):
+        # The one case --disallow-degraded is meant to let through: the run
+        # is degraded *solely* because of GitHub's Free-plan rulesets
+        # limitation, not a real governance gap.
+        envelope = _envelope(_statement(
+            degraded=True, degraded_reasons=["branch_governance:platform_unsupported_tier"]
+        ))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+
+        self.assertTrue(result.passed, result.violations)
+        self.assertFalse(any("disallow-degraded" in v for v in result.violations))
+        self.assertTrue(any("platform_unsupported_tier" in w for w in result.warnings), result.warnings)
+
+    def test_disallow_degraded_still_blocks_when_platform_tier_is_not_the_only_cause(self):
+        # A second, unrelated degradation cause alongside the platform-tier
+        # one must still block -- the exemption is only for "this is the
+        # *sole* reason", never "this is present among others".
+        envelope = _envelope(_statement(
+            degraded=True,
+            degraded_reasons=["branch_governance:platform_unsupported_tier", "no_pr_context"],
+        ))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("disallow-degraded" in v for v in result.violations), result.violations)
+
+    def test_disallow_degraded_blocks_generic_branch_governance_unverified(self):
+        # A generic "couldn't verify branch governance at all" (missing
+        # token, network failure, an under-scoped-but-not-platform-limited
+        # token, ...) is NOT the exempted case and must still block.
+        envelope = _envelope(_statement(
+            degraded=True, degraded_reasons=["branch_governance_unverified"]
+        ))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("disallow-degraded" in v for v in result.violations), result.violations)
+
+    def test_disallow_degraded_blocks_when_degraded_reasons_missing(self):
+        # Fail closed: degraded=True with no degraded_reasons at all (an
+        # older attestation predating this field, or a malformed one)
+        # can't prove the sole cause is the exempted one, so it must not
+        # be silently waved through.
+        envelope = _envelope(_statement(degraded=True))  # degraded_reasons omitted entirely
+        decoded_payload = json.loads(base64.b64decode(envelope["payload"]))
+        self.assertNotIn("degraded_reasons", decoded_payload["predicate"]["release_confidence_score"])
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("disallow-degraded" in v for v in result.violations), result.violations)
+
+    def test_disallow_degraded_blocks_when_degraded_reasons_is_empty_list(self):
+        # Same fail-closed principle, but the field is present and
+        # explicitly empty rather than absent -- also can't prove the
+        # exempted cause, also must block.
+        envelope = _envelope(_statement(degraded=True, degraded_reasons=[]))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("disallow-degraded" in v for v in result.violations), result.violations)
+
+    def test_disallow_degraded_permissive_when_flag_not_set(self):
+        # Sanity check: without --disallow-degraded, none of the above
+        # matters -- a degraded run always passes regardless of cause.
+        envelope = _envelope(_statement(degraded=True, degraded_reasons=["no_pr_context"]))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=False, dry_run=True)
+
+        self.assertTrue(result.passed, result.violations)
+
+    def test_invalid_degraded_reasons_type_is_a_violation_and_still_blocks(self):
+        envelope = _envelope(_statement(degraded=True, degraded_reasons="not-a-list"))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("invalid" in v and "degraded_reasons" in v for v in result.violations), result.violations)
         self.assertTrue(any("disallow-degraded" in v for v in result.violations), result.violations)
 
     def test_invalid_payload_type_rejected(self):

@@ -212,6 +212,7 @@ def build_statement(
             "algorithm_version": rcs.algorithm_version,
             "components": {k: v.as_dict() for k, v in rcs.components.items()},
             "degraded": rcs.degraded,
+            "degraded_reasons": rcs.degraded_reasons,
             "computed_at": _now_iso(),
         },
     }

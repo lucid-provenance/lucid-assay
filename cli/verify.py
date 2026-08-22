@@ -68,6 +68,20 @@ EXIT_PASS = 0
 EXIT_POLICY_VIOLATION = 2
 EXIT_FILE_ERROR = 1
 
+# The one degraded_reasons entry --disallow-degraded treats as non-blocking:
+# a known, unavoidable GitHub platform/plan-tier limitation on branch
+# rulesets (private repo, Free plan -- see
+# cli.parsers.github_rules.REASON_CODE_PLATFORM_UNSUPPORTED_TIER), not a
+# real governance gap. Deliberately duplicated here as a literal rather
+# than imported from cli.scorer/cli.parsers.github_rules: this module
+# verifies only the decoded JSON predicate, with no dependency on the
+# pipeline's Python types, and this string is a stable, versioned part of
+# the attestation's own schema (predicate.release_confidence_score.
+# degraded_reasons), not an implementation detail of those modules. If
+# either module's construction of this string changes, this constant must
+# be updated to match.
+_ALLOWED_DEGRADED_REASON_PLATFORM_UNSUPPORTED_TIER = "branch_governance:platform_unsupported_tier"
+
 
 @dataclass
 class VerificationResult:
@@ -78,6 +92,7 @@ class VerificationResult:
     statement: Optional[Dict[str, Any]] = None
     rcs_value: Optional[int] = None
     degraded: Optional[bool] = None
+    degraded_reasons: Optional[List[str]] = None
     subject_digests: List[str] = field(default_factory=list)
     metrics: Dict[str, Any] = field(default_factory=dict)
     identity_status: str = "skipped"
@@ -90,6 +105,7 @@ class VerificationResult:
             "warnings": self.warnings,
             "rcs_value": self.rcs_value,
             "degraded": self.degraded,
+            "degraded_reasons": self.degraded_reasons,
             "subject_digests": self.subject_digests,
             "metrics": self.metrics,
             "identity_status": self.identity_status,
@@ -545,6 +561,7 @@ def verify_dsse_attestation(
 
     rcs_value: Optional[int] = None
     degraded: Optional[bool] = None
+    degraded_reasons: Optional[List[str]] = None
     subject_digests: List[str] = []
     metrics: Dict[str, Any] = {}
 
@@ -576,6 +593,15 @@ def verify_dsse_attestation(
             violations.append(f"invalid release_confidence_score.degraded type, expected boolean: {degraded!r}")
             degraded = False
 
+        degraded_reasons = rcs_block.get("degraded_reasons")
+        if degraded_reasons is not None and not (
+            isinstance(degraded_reasons, list) and all(isinstance(r, str) for r in degraded_reasons)
+        ):
+            violations.append(
+                f"invalid release_confidence_score.degraded_reasons, expected a list of strings: {degraded_reasons!r}"
+            )
+            degraded_reasons = None
+
         metrics = _extract_metrics(predicate)
 
         if rcs_value is None:
@@ -593,7 +619,29 @@ def verify_dsse_attestation(
                 )
 
         if disallow_degraded and degraded is True:
-            violations.append("release_confidence_score.degraded is true and --disallow-degraded was set")
+            # Fail-closed by default: --disallow-degraded blocks unless
+            # degraded_reasons proves the *only* cause is the one known,
+            # unavoidable platform limitation. A missing/malformed
+            # degraded_reasons (older attestations predating this field,
+            # or the type-violation case above) can't prove that, so it
+            # blocks too -- silently trusting an absent explanation would
+            # be exactly the kind of loophole this gate exists to prevent.
+            non_exempt_reasons = (
+                [r for r in degraded_reasons if r != _ALLOWED_DEGRADED_REASON_PLATFORM_UNSUPPORTED_TIER]
+                if degraded_reasons
+                else None
+            )
+            if not degraded_reasons or non_exempt_reasons:
+                violations.append(
+                    "release_confidence_score.degraded is true and --disallow-degraded was set "
+                    f"(degraded_reasons={degraded_reasons!r})"
+                )
+            else:
+                warnings.append(
+                    "release_confidence_score.degraded is true, but --disallow-degraded allows it: "
+                    f"the only cause is {_ALLOWED_DEGRADED_REASON_PLATFORM_UNSUPPORTED_TIER!r} "
+                    "(a GitHub Free-plan branch-rulesets limitation, not a real governance gap)"
+                )
 
     identity_status, identity_detail = _verify_sigstore_identity(
         envelope,
@@ -617,6 +665,7 @@ def verify_dsse_attestation(
         statement=statement,
         rcs_value=rcs_value,
         degraded=degraded,
+        degraded_reasons=degraded_reasons,
         subject_digests=subject_digests,
         metrics=metrics,
         identity_status=identity_status,
@@ -719,6 +768,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"plinth-assay verify: {'PASS' if result.passed else 'FAIL'}", file=sys.stderr)
         if result.rcs_value is not None:
             print(f"  RCS={result.rcs_value} degraded={result.degraded}", file=sys.stderr)
+            if result.degraded and result.degraded_reasons:
+                print(f"  degraded_reasons={result.degraded_reasons}", file=sys.stderr)
         if result.subject_digests:
             print(f"  subject_digests={result.subject_digests}", file=sys.stderr)
         print(f"  identity: {result.identity_status} ({result.identity_detail})", file=sys.stderr)

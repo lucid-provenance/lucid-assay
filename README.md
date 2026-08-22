@@ -490,3 +490,7 @@ python3 -m pytest -n auto -v tests/
   `minio-py`), intentionally left unimplemented here since it's
   infra-credential-dependent and out of scope for the schema/scoring
   foundation this task covers.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

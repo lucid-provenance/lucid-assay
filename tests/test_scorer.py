@@ -4,10 +4,21 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cli.parsers.github_rules import BranchGovernanceReport
+from cli.parsers.github_rules import BranchGovernanceReport, REASON_CODE_PLATFORM_UNSUPPORTED_TIER
 from cli.parsers.junit import TestTotals
+from cli.parsers.sarif import SarifSummaryReport
 from cli.patch_coverage import PatchCoverageResult
-from cli.scorer import score_pipeline, WEIGHTS, BRANCH_GOVERNANCE_BYPASS_PENALTY, BRANCH_GOVERNANCE_UNVERIFIED_PENALTY
+from cli.scorer import (
+    score_pipeline,
+    WEIGHTS,
+    BRANCH_GOVERNANCE_BYPASS_PENALTY,
+    BRANCH_GOVERNANCE_UNVERIFIED_PENALTY,
+    DEGRADED_REASON_BRANCH_GOVERNANCE_BYPASS,
+    DEGRADED_REASON_BRANCH_GOVERNANCE_UNVERIFIED,
+    DEGRADED_REASON_NO_PR_CONTEXT,
+    DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE,
+    DEGRADED_REASON_SARIF_UNAVAILABLE,
+)
 
 
 def _clean_branch_governance(**overrides) -> BranchGovernanceReport:
@@ -182,6 +193,91 @@ class RCSScorerTests(unittest.TestCase):
         ))
         self.assertTrue(result.degraded)
         self.assertIn("branch governance penalty", result.components["governance"].reason)
+
+
+class DegradedReasonsTests(unittest.TestCase):
+    """Coverage for RCSResult.degraded_reasons: cli.verify's
+    --disallow-degraded gate relies on this being an accurate, complete
+    list of *why* a run is degraded (not just that it is), so each
+    independent trigger must append its own distinct reason -- and only
+    that reason, not a generic catch-all."""
+
+    def test_clean_run_has_no_degraded_reasons(self):
+        result = score_pipeline(**_base_kwargs())
+        self.assertFalse(result.degraded)
+        self.assertEqual(result.degraded_reasons, [])
+
+    def test_missing_patch_coverage_reason(self):
+        result = score_pipeline(**_base_kwargs(
+            patch_coverage=PatchCoverageResult(
+                available=False, line_rate=None, lines_changed=0, lines_covered=0, reason="no base_commit_sha"
+            ),
+        ))
+        self.assertEqual(result.degraded_reasons, [DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE])
+
+    def test_no_pr_context_reason(self):
+        result = score_pipeline(**_base_kwargs(pr_present=False, branch_governance=_clean_branch_governance()))
+        self.assertEqual(result.degraded_reasons, [DEGRADED_REASON_NO_PR_CONTEXT])
+
+    def test_sarif_unavailable_reason(self):
+        result = score_pipeline(**_base_kwargs(
+            sarif_report=SarifSummaryReport(available=False, reasons=["SARIF file not found: x.json"]),
+        ))
+        self.assertEqual(result.degraded_reasons, [DEGRADED_REASON_SARIF_UNAVAILABLE])
+
+    def test_missing_branch_governance_reason(self):
+        result = score_pipeline(**_base_kwargs(branch_governance=None))
+        self.assertEqual(result.degraded_reasons, [DEGRADED_REASON_BRANCH_GOVERNANCE_UNVERIFIED])
+
+    def test_branch_governance_unavailable_without_reason_code_uses_generic_reason(self):
+        result = score_pipeline(**_base_kwargs(
+            branch_governance=BranchGovernanceReport(
+                available=False, branch="main", pull_request_required=False, approvals_required=0,
+                direct_push_prevented=False, bypass_actors_count=0, admin_enforced=False,
+                warnings=[], reason="no GITHUB_TOKEN available", reason_code=None,
+            ),
+        ))
+        self.assertEqual(result.degraded_reasons, [DEGRADED_REASON_BRANCH_GOVERNANCE_UNVERIFIED])
+
+    def test_branch_governance_unavailable_with_platform_reason_code_is_namespaced(self):
+        # This is the exact string cli.verify's --disallow-degraded gate
+        # matches against -- if this namespacing ever changes, that gate's
+        # allowlisted constant must be updated to match (see its comment).
+        result = score_pipeline(**_base_kwargs(
+            branch_governance=BranchGovernanceReport(
+                available=False, branch="main", pull_request_required=False, approvals_required=0,
+                direct_push_prevented=False, bypass_actors_count=0, admin_enforced=False,
+                warnings=[], reason="Upgrade to GitHub Pro or make this repository public to enable this feature.",
+                reason_code=REASON_CODE_PLATFORM_UNSUPPORTED_TIER,
+            ),
+        ))
+        self.assertEqual(result.degraded_reasons, ["branch_governance:platform_unsupported_tier"])
+
+    def test_branch_governance_bypass_reason(self):
+        result = score_pipeline(**_base_kwargs(
+            branch_governance=_clean_branch_governance(
+                bypass_actors_count=1, admin_enforced=False,
+                warnings=["1 bypass actor(s) can bypass branch rules entirely (bypass_mode=always)"],
+            ),
+        ))
+        self.assertEqual(result.degraded_reasons, [DEGRADED_REASON_BRANCH_GOVERNANCE_BYPASS])
+
+    def test_multiple_simultaneous_causes_all_appear(self):
+        result = score_pipeline(**_base_kwargs(
+            pr_present=False,
+            patch_coverage=PatchCoverageResult(
+                available=False, line_rate=None, lines_changed=0, lines_covered=0, reason="no base_commit_sha"
+            ),
+            branch_governance=None,
+        ))
+        self.assertEqual(
+            set(result.degraded_reasons),
+            {
+                DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE,
+                DEGRADED_REASON_NO_PR_CONTEXT,
+                DEGRADED_REASON_BRANCH_GOVERNANCE_UNVERIFIED,
+            },
+        )
 
 
 if __name__ == "__main__":

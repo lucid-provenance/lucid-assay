@@ -236,6 +236,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"RCS={rcs.value} blocking_overhead_ms={blocking_elapsed_ms:.2f} degraded={rcs.degraded}",
         file=sys.stderr,
     )
+    if rcs.degraded and rcs.degraded_reasons:
+        print(f"degraded_reasons={rcs.degraded_reasons}", file=sys.stderr)
 
     if not branch_governance.available:
         print(

@@ -15,8 +15,8 @@ Hardened against:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change
 from .parsers.junit import TestTotals
@@ -24,6 +24,18 @@ from .parsers.sarif import SarifSummaryReport
 from .patch_coverage import PatchCoverageResult
 
 ALGORITHM_VERSION = "rcs-v0.1"
+
+# Machine-readable causes of `RCSResult.degraded`, one entry per independent
+# trigger that fired (a run can be degraded for more than one reason at
+# once). `--disallow-degraded` (cli.verify) uses these to distinguish "the
+# only reason this run is degraded is a known, unavoidable platform
+# limitation" (branch_governance:<REASON_CODE_PLATFORM_UNSUPPORTED_TIER>,
+# from cli.parsers.github_rules) from every other cause, which still blocks.
+DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE = "patch_coverage_unavailable"
+DEGRADED_REASON_NO_PR_CONTEXT = "no_pr_context"
+DEGRADED_REASON_SARIF_UNAVAILABLE = "sarif_unavailable"
+DEGRADED_REASON_BRANCH_GOVERNANCE_UNVERIFIED = "branch_governance_unverified"
+DEGRADED_REASON_BRANCH_GOVERNANCE_BYPASS = "branch_governance_bypass_permitted"
 
 WEIGHTS = {
     "test_health": 0.35,
@@ -85,6 +97,13 @@ class RCSResult:
     algorithm_version: str
     components: Dict[str, ScoreComponent]
     degraded: bool
+    # One entry per independent trigger that set `degraded=True` -- see the
+    # DEGRADED_REASON_* / "branch_governance:<reason_code>" constants above.
+    # Empty whenever degraded is False. Deliberately a flat list, not a
+    # bool-per-cause mapping: order doesn't matter and duplicates can't
+    # occur (each trigger appends at most once), so a list is the simplest
+    # shape that round-trips cleanly through JSON.
+    degraded_reasons: List[str] = field(default_factory=list)
 
     def as_dict(self) -> Dict:
         return {
@@ -92,6 +111,7 @@ class RCSResult:
             "algorithm_version": self.algorithm_version,
             "components": {k: v.as_dict() for k, v in self.components.items()},
             "degraded": self.degraded,
+            "degraded_reasons": self.degraded_reasons,
         }
 
 
@@ -269,6 +289,7 @@ def score_pipeline(
     sarif_report: Optional[SarifSummaryReport] = None,
 ) -> RCSResult:
     degraded = False
+    degraded_reasons: List[str] = []
 
     test_health = _score_test_health(test_totals)
 
@@ -283,6 +304,7 @@ def score_pipeline(
             f"{patch_component.reason}; fell back to overall_coverage*{PATCH_COVERAGE_FALLBACK_MULTIPLIER} proxy",
         )
         degraded = True
+        degraded_reasons.append(DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE)
 
     overall_component = _score_overall_coverage(overall_line_rate, overall_coverage_min)
     assertion_component = _score_assertion_integrity(total_assertions, total_test_functions)
@@ -293,9 +315,11 @@ def score_pipeline(
 
     if not pr_present:
         degraded = True
+        degraded_reasons.append(DEGRADED_REASON_NO_PR_CONTEXT)
 
     if sarif_report is not None and not sarif_report.available:
         degraded = True
+        degraded_reasons.append(DEGRADED_REASON_SARIF_UNAVAILABLE)
 
     # branch_governance is a distinct, independently-fetched signal (repo
     # ruleset/API state) from the per-PR approvals above -- either it
@@ -304,8 +328,19 @@ def score_pipeline(
     # not just to dock the governance component's raw score.
     if branch_governance is None or not branch_governance.available:
         degraded = True
+        # A specific, known reason_code (see cli.parsers.github_rules,
+        # e.g. REASON_CODE_PLATFORM_UNSUPPORTED_TIER) is namespaced so
+        # --disallow-degraded can recognize *why* branch governance is
+        # unverified, not just that it is; anything else (missing token,
+        # network failure, a merely under-scoped token, ...) falls back to
+        # the generic "unverified" reason, which still blocks the gate.
+        if branch_governance is not None and branch_governance.reason_code:
+            degraded_reasons.append(f"branch_governance:{branch_governance.reason_code}")
+        else:
+            degraded_reasons.append(DEGRADED_REASON_BRANCH_GOVERNANCE_UNVERIFIED)
     elif bypass_permits_unreviewed_change(branch_governance):
         degraded = True
+        degraded_reasons.append(DEGRADED_REASON_BRANCH_GOVERNANCE_BYPASS)
 
     components = {
         "test_health": test_health,
@@ -319,4 +354,10 @@ def score_pipeline(
     total_weighted = sum(c.weighted_score for c in components.values())
     value = int(round(_clamp(total_weighted)))
 
-    return RCSResult(value=value, algorithm_version=ALGORITHM_VERSION, components=components, degraded=degraded)
+    return RCSResult(
+        value=value,
+        algorithm_version=ALGORITHM_VERSION,
+        components=components,
+        degraded=degraded,
+        degraded_reasons=degraded_reasons,
+    )

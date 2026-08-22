@@ -35,6 +35,14 @@ Hardened against:
     explicitly-known least-dangerous mode (bypass_mode="pull_request") is
     treated as not fully bypassing the branch's rules; anything else
     (bypass_mode="always", missing, or a novel value) fails closed
+  - Conflating "the token is under-scoped" with "this repo's plan/
+    visibility doesn't support rulesets at all" (a private repo on
+    GitHub Free): both produce an identical HTTP 403, so `reason_code`
+    is set to REASON_CODE_PLATFORM_UNSUPPORTED_TIER specifically when
+    GitHub's own error body says so, rather than leaving every 403
+    looking like the same generic auth failure to callers (e.g.
+    cli.verify's --disallow-degraded gate) that may want to treat the
+    two differently
 """
 from __future__ import annotations
 
@@ -58,6 +66,32 @@ MAX_PAGES = 10
 # both segments. Rejects anything that could smuggle extra path segments,
 # query strings, or traversal sequences into the request URL.
 _REPO_RE = re.compile(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
+
+# Machine-readable `BranchGovernanceReport.reason_code` value for a 403
+# caused by GitHub's own plan/visibility feature gate (rulesets aren't
+# supported on this repo at all -- see _is_platform_tier_limitation),
+# distinct from an actual under-scoped/invalid token. Threaded through to
+# the attestation predicate (cli.builder) so downstream policy -- e.g.
+# cli.verify's --disallow-degraded -- can tell the two apart instead of
+# treating every unavailable governance report identically.
+REASON_CODE_PLATFORM_UNSUPPORTED_TIER = "platform_unsupported_tier"
+
+# Substrings of GitHub's own 403 error-body message (see
+# _extract_http_error_detail) that identify the platform/plan-tier
+# limitation specifically -- confirmed against GitHub's actual wording:
+# "Upgrade to GitHub Pro or make this repository public to enable this
+# feature." Matched case-insensitively; either substring alone is
+# sufficient (GitHub's wording could vary slightly by context).
+_PLATFORM_TIER_LIMITATION_MARKERS = ("upgrade to github pro", "make this repository public")
+
+
+def _is_platform_tier_limitation(detail: str) -> bool:
+    """True when a 403's error-body detail (from _extract_http_error_detail)
+    identifies GitHub's plan/visibility feature gate on rulesets, rather
+    than an actual auth/permission failure. Never raises on odd input."""
+    lowered = (detail or "").lower()
+    return any(marker in lowered for marker in _PLATFORM_TIER_LIMITATION_MARKERS)
+
 
 # A bypass actor with this mode can skip the ruleset entirely, including
 # outside of a pull request (i.e. a genuine unreviewed direct push).
@@ -144,6 +178,13 @@ class BranchGovernanceReport:
     admin_enforced: bool
     warnings: List[str]
     reason: str
+    # Machine-readable classification of *why* available=False, when it's
+    # known to be something more specific than "generic failure" -- e.g.
+    # REASON_CODE_PLATFORM_UNSUPPORTED_TIER. None for every other case
+    # (missing token, network error, ambiguous 404, under-scoped token,
+    # ...): callers must not infer anything from an absent reason_code
+    # beyond "not this specific, identified condition".
+    reason_code: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -156,6 +197,7 @@ class BranchGovernanceReport:
             "admin_enforced": self.admin_enforced,
             "warnings": self.warnings,
             "reason": self.reason,
+            "reason_code": self.reason_code,
         }
 
 
@@ -178,7 +220,7 @@ def bypass_permits_unreviewed_change(report: BranchGovernanceReport) -> bool:
     )
 
 
-def _unavailable(branch: str, reason: str) -> BranchGovernanceReport:
+def _unavailable(branch: str, reason: str, reason_code: Optional[str] = None) -> BranchGovernanceReport:
     return BranchGovernanceReport(
         available=False,
         branch=branch,
@@ -189,6 +231,7 @@ def _unavailable(branch: str, reason: str) -> BranchGovernanceReport:
         admin_enforced=False,
         warnings=[],
         reason=reason,
+        reason_code=reason_code,
     )
 
 
@@ -339,6 +382,13 @@ def inspect_branch_governance(
     (`GET /repos/{repository}/rules/branches/{branch}`) and rulesets
     (`GET /repos/{repository}/rulesets`) REST endpoints, authenticating
     with the ambient GITHUB_TOKEN when `token` isn't supplied explicitly.
+
+    When `available` is False because GitHub's own error body identifies
+    the platform/plan-tier feature gate specifically (a private repo on
+    GitHub Free -- see REASON_CODE_PLATFORM_UNSUPPORTED_TIER), the
+    returned report's `reason_code` is set to that value; it's None for
+    every other unavailable case (missing token, network failure, an
+    under-scoped-but-otherwise-valid token, ambiguous 404, ...).
     """
     if not isinstance(repository, str) or not _REPO_RE.match(repository):
         return _unavailable(
@@ -361,7 +411,12 @@ def inspect_branch_governance(
         )
     except GitHubAPIError as e:
         if e.status_code in (401, 403):
-            return _unavailable(branch, _actionable_auth_failure_reason(e, "querying rules for branch"))
+            reason_code = (
+                REASON_CODE_PLATFORM_UNSUPPORTED_TIER if _is_platform_tier_limitation(str(e)) else None
+            )
+            return _unavailable(
+                branch, _actionable_auth_failure_reason(e, "querying rules for branch"), reason_code
+            )
         return _unavailable(branch, f"GitHub rules API request failed: {e}")
 
     if raw_rules is None:
@@ -395,7 +450,12 @@ def inspect_branch_governance(
             # A bad/under-scoped token taints the whole report, not just
             # this one lookup -- the rules-for-branch call above may well
             # have "succeeded" only via its own 404-is-benign short-circuit.
-            return _unavailable(branch, _actionable_auth_failure_reason(e, "enumerating rulesets"))
+            reason_code = (
+                REASON_CODE_PLATFORM_UNSUPPORTED_TIER if _is_platform_tier_limitation(str(e)) else None
+            )
+            return _unavailable(
+                branch, _actionable_auth_failure_reason(e, "enumerating rulesets"), reason_code
+            )
         # Any other (non-auth) failure enumerating rulesets doesn't invalidate
         # the rules data already in hand -- degrade to "no bypass-actor
         # visibility" rather than discarding an otherwise-successful lookup.

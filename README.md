@@ -96,6 +96,50 @@ network/filesystem calls that also happen inside `main.py`'s pipeline but
 are **not** covered by the 50ms budget or its warning — the budget only
 tracks parse+score+build, matching what the perf table above measures.
 
+### Stage timing diagnostics (`--debug`)
+
+`--debug` emits a high-resolution (`time.perf_counter_ns()`) per-stage
+breakdown to stderr after a run, for diagnosing where wall-clock time
+actually goes in a slow CI job (this is additive — output is identical to
+a normal run when `--debug` is omitted):
+
+```text
+=== Plinth Assay Stage Profiling ===
+- Inputs & Parsing:                 0.2 ms
+- Diff & Patch Coverage:            0.0 ms
+- AST Assertion Walking:           36.6 ms
+- GitHub Ruleset API:             182.0 ms
+- RCS Scoring Engine:               0.0 ms
+- Predicate Serialization:          0.1 ms
+- WORM Upload Dispatch:              0.4 ms
+- Sigstore Signing (Total):    24,120.0 ms
+    ↳ OIDC Token Fetch:            150.0 ms
+    ↳ Fulcio/Rekor Round-Trip:  23,970.0 ms
+Total Blocking Overhead:         219.3 ms (excluding Sigstore network)
+Total Wall-Clock Time:            24.34 s
+====================================
+```
+
+Stages map onto the pipeline steps in `main.py`'s numbered comments:
+`parse_inputs` (JUnit + coverage + SARIF parsing — the SARIF portion is
+timed where it actually runs, after patch analysis, but still reported
+under this one line since it's still "parsing"), `diff_patch_analysis`
+(`git diff`-based patch coverage, plus the separate diff SARIF uses to
+cross-reference changed lines), `ast_inspection`, `github_rules_api`,
+`rcs_scoring`, `predicate_assembly`, and `worm_upload` (the fire-and-forget
+dispatch cost only, not the background upload itself). `Total Blocking
+Overhead` is the same figure the 50ms budget check above measures — it
+does not change based on `--debug`.
+
+Sigstore signing (`--sign`/`--dry-run-sign`) is broken out separately by
+`cli/oidc_signer.py::sign_statement`'s `timing` param into ambient OIDC
+token acquisition and the Fulcio-cert-issuance/Rekor-inclusion round trip.
+That round trip is a real network call made through `Signer.sign_dsse()`
+in-process — **not** a `python3 -m sigstore sign` subprocess; see
+"Why this decomposition" below for why a CLI subprocess can't produce a
+usable DSSE envelope here at all, so profiling deliberately measures the
+actual code path rather than reintroducing one just to time it.
+
 ## Deterministic scoring (RCS)
 
 `cli/scorer.py` computes a weighted rollup of **six** components (pure
@@ -329,7 +373,7 @@ python3 -m cli.main \
   --head-sha $(python3 -c "print('b'*40)") \
   --repository org/svc --branch feature/x \
   --pr-number 42 --pr-approvers alice,bob --pr-required-approvals 2 --pr-review-state approved \
-  --skip-perf-budget-check \
+  --skip-perf-budget-check --debug \
   --out /tmp/attestation.unsigned.json
 
 # Admission gate against the unsigned statement's DSSE-shaped output
@@ -349,7 +393,7 @@ installed — outside CI there's no ambient identity to fetch, by design.
 
 ## Test suite
 
-~230 test cases across 10 modules, including dedicated adversarial suites:
+~250 test cases across 11 modules, including dedicated adversarial suites:
 `test_adversarial_ast.py` (assertion-integrity bypass attempts),
 `test_security_boundaries.py` and `test_verify_boundaries.py`
 (malformed/hostile-input hardening), and `test_github_rules.py` (auth

@@ -152,8 +152,8 @@ def _envelope_to_bundle_json(envelope: Dict[str, Any]) -> str:
     `sigstore.models.Bundle.from_json()`.
 
     Preferred path: cli.oidc_signer embeds the complete, untouched bundle
-    produced by `sigstore sign --bundle` under `_sigstore_bundle` -- that
-    object already satisfies Bundle's schema in full (mediaType,
+    produced by `Signer.sign_dsse()` (via `Bundle.to_json()`) under
+    `_sigstore_bundle` -- that object already satisfies Bundle's schema in full (mediaType,
     verificationMaterial.tlogEntries with kindVersion/inclusionProof/
     canonicalizedBody, dsseEnvelope, ...), so it's re-serialized and handed
     to Bundle.from_json() verbatim, with no field-by-field reconstruction.

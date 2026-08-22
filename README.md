@@ -201,24 +201,34 @@ key, free dedup and idempotent uploads across re-attested runs).
 ## Signing flow (keyless / Sigstore)
 
 `oidc_signer.py` implements the ambient-credential keyless model end to
-end at the interface level (delegating cert-transparency and DSSE PAE
-construction to the `sigstore` CLI subprocess rather than hand-rolling it
-or coupling tightly to `sigstore-python`'s library API, which drifts
-across versions more than its CLI contract does):
+end via `sigstore-python`'s `Signer.sign_dsse()` library call — the same
+public entry point the `sigstore` CLI's own `sign`/`attest` subcommands
+delegate to internally:
 
 1. Fetch a short-lived OIDC token from the CI provider's ambient endpoint
    (`ACTIONS_ID_TOKEN_REQUEST_URL`/`_TOKEN` on GitHub Actions;
    `SIGSTORE_ID_TOKEN`/`CI_JOB_JWT_V2` on GitLab CI), with an SSRF guard
    forcing HTTPS on the token endpoint. **No static secret is ever read.**
 2. Ephemeral in-memory keypair; exchanged with Fulcio for a short-lived
-   cert binding the key to the OIDC identity (`repo:org/repo:ref:...`),
-   via `python3 -m sigstore sign --bundle`.
-3. Sign the DSSE PAE of the Statement; submit to Rekor for an inclusion
-   proof.
+   cert binding the key to the OIDC identity (`repo:org/repo:ref:...`).
+3. Sign the DSSE PAE of the Statement via `Signer.sign_dsse()`; submit to
+   Rekor for an inclusion proof.
 4. Discard the ephemeral private key — no long-lived signing key exists
    to rotate or leak.
 
-The complete, untouched Sigstore bundle (`sigstore sign --bundle` output,
+The library call is used deliberately over the `sigstore sign` CLI
+subcommand: `sigstore sign` always produces a hashedrekord/messageSignature
+bundle (an artifact signature), never a DSSE envelope, no matter what's
+passed as input — verification would then fail outright ("cannot perform
+DSSE verification on a bundle without a DSSE envelope"). `sigstore attest`
+does produce a DSSE envelope, but restricts `--predicate-type` to the SLSA
+provenance enum and derives its subject from a hash of the predicate file
+itself, neither of which fits a custom predicate type over an
+already-assembled Statement whose subject is a container image digest, not
+a local file's hash. `Signer.sign_dsse()` takes the caller's exact Statement
+bytes directly (`sigstore.dsse.Statement(bytes)`), with no such restriction.
+
+The complete, untouched Sigstore bundle (`Bundle.to_json()` output,
 including full `tlogEntries` inclusion-proof material) is preserved
 verbatim in the envelope's `_sigstore_bundle` field, specifically so
 `verify.py` can hand it straight to `sigstore.models.Bundle.from_json()`

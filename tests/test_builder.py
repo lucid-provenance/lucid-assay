@@ -104,14 +104,14 @@ def _base_kwargs(**overrides):
 
 class BuilderStatementTests(unittest.TestCase):
 
-    def test_predicate_type_matches_plinth_v1(self):
+    def test_predicate_type_matches_tenax_v1(self):
         statement = build_statement(**_base_kwargs())
-        self.assertEqual(statement["predicateType"], "https://plinth.dev/attestation/v1")
+        self.assertEqual(statement["predicateType"], "https://tenax.io/attestations/assay/v1")
 
     def test_predicate_type_uses_default_predicate_type_constant(self):
         statement = build_statement(**_base_kwargs())
         self.assertEqual(statement["predicateType"], DEFAULT_PREDICATE_TYPE)
-        self.assertEqual(DEFAULT_PREDICATE_TYPE, "https://plinth.dev/attestation/v1")
+        self.assertEqual(DEFAULT_PREDICATE_TYPE, "https://tenax.io/attestations/assay/v1")
 
     def test_statement_type_is_in_toto_v1(self):
         statement = build_statement(**_base_kwargs())

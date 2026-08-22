@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-plinth-assay verify: admission gatekeeper for signed DSSE in-toto attestations.
+tenax-assay verify: admission gatekeeper for signed DSSE in-toto attestations.
 
 Decodes a DSSE envelope (`payloadType: application/vnd.in-toto+json`) produced
-by `plinth-assay` (see cli.oidc_signer / cli.builder), best-effort verifies the
+by `tenax-assay` (see cli.oidc_signer / cli.builder), best-effort verifies the
 Sigstore keyless signing identity, and enforces admission policy gates against
 the embedded Release Confidence Score (RCS) predicate.
 
@@ -39,7 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 EXPECTED_PAYLOAD_TYPE = "application/vnd.in-toto+json"
 EXPECTED_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
-EXPECTED_PREDICATE_TYPE = "https://plinth.dev/attestation/v1"
+EXPECTED_PREDICATE_TYPE = "https://tenax.io/attestations/assay/v1"
 
 # GitHub Actions' well-known OIDC token issuer. GitHub-Actions-specific
 # identity claims (repository/workflow/ref) are only meaningful -- and only
@@ -685,8 +685,8 @@ def verify_dsse_attestation(
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="plinth-assay verify",
-        description="Verify a plinth-assay DSSE in-toto attestation envelope against admission policy gates.",
+        prog="tenax-assay verify",
+        description="Verify a tenax-assay DSSE in-toto attestation envelope against admission policy gates.",
     )
     p.add_argument("envelope", help="path to the signed DSSE envelope JSON file")
     p.add_argument("--min-rcs", type=int, default=0, help="minimum acceptable RCS score (default: 0)")
@@ -775,7 +775,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.json_output:
         print(json.dumps(result.as_dict(), indent=2))
     else:
-        print(f"plinth-assay verify: {'PASS' if result.passed else 'FAIL'}", file=sys.stderr)
+        print(f"tenax-assay verify: {'PASS' if result.passed else 'FAIL'}", file=sys.stderr)
         if result.rcs_value is not None:
             print(f"  RCS={result.rcs_value} degraded={result.degraded}", file=sys.stderr)
             if result.degraded and result.degraded_reasons:

@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "plinth-assay"
+name = "tenax-assay"
 version = "0.1.0"
 description = "Deterministic quality scoring and in-toto attestation engine"
 readme = "README.md"
@@ -25,7 +25,14 @@ dev = [
     "pytest-cov>=4.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/tenax-io/tenax-assay"
+Repository = "https://github.com/tenax-io/tenax-assay"
+
 [project.scripts]
+tenax = "cli.main:main"
+tenax-assay = "cli.main:main"
+# Backwards-compatible aliases for the pre-rebrand Plinth Assay name.
 plinth = "cli.main:main"
 plinth-assay = "cli.main:main"
 

@@ -1,6 +1,6 @@
 """
 Assembles the unsigned in-toto Statement (predicateType =
-https://plinth.dev/attestation/v1) from parsed inputs.
+https://tenax.io/attestations/assay/v1) from parsed inputs.
 
 Hardened against:
   - TypeError on boolean evaluation of NoneType line rates
@@ -21,7 +21,7 @@ from .parsers.sarif import SarifSummaryReport
 from .patch_coverage import PatchCoverageResult
 from .scorer import RCSResult
 
-DEFAULT_PREDICATE_TYPE = "https://plinth.dev/attestation/v1"
+DEFAULT_PREDICATE_TYPE = "https://tenax.io/attestations/assay/v1"
 
 
 def _now_iso() -> str:

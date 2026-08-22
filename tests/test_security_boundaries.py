@@ -23,7 +23,7 @@ def _create_mock_dsse_envelope(
 def _get_valid_statement_base(rcs_value=100, degraded=False):
     return {
         "_type": "https://in-toto.io/Statement/v1",
-        "predicateType": "https://plinth.dev/attestation/v1",
+        "predicateType": "https://tenax.io/attestations/assay/v1",
         "subject": [{"name": "test", "digest": {"sha256": "abcdef"}}],
         "predicate": {
             "release_confidence_score": {

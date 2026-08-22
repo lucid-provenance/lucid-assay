@@ -1,4 +1,4 @@
-# Plinth Assay — Continuous Governance Control Plane (Foundation)
+# Tenax Assay — Continuous Governance Control Plane (Foundation)
 
 MVP foundation for bridging CI/CD execution to SOC 2 / FedRAMP / ISO 27001
 evidence: cryptographically signed in-toto attestations of test, coverage,
@@ -10,7 +10,7 @@ verifies those attestations before a deploy/merge is allowed to proceed.
 
 ```
 schema/
-  plinth-attestation-v1.schema.json   # in-toto predicate JSON Schema
+  tenax-attestation-v1.schema.json    # in-toto predicate JSON Schema
 cli/
   parsers/junit.py          # streaming JUnit XML -> TestTotals (flaky-retry aware)
   parsers/coverage.py       # Cobertura XML + LCOV -> CoverageReport (per-line hit maps)
@@ -30,7 +30,7 @@ cli/
   builder.py                 # assembles the unsigned in-toto Statement
   oidc_signer.py              # ambient OIDC -> Fulcio cert -> DSSE sign -> Rekor log
   verify.py                   # admission gatekeeper: DSSE decode + Sigstore identity + policy gates
-  main.py                     # CLI entrypoint wiring it all together (`plinth-assay verify` dispatches to verify.py)
+  main.py                     # CLI entrypoint wiring it all together (`tenax-assay verify` dispatches to verify.py)
 tests/
   test_scorer.py               # adversarial edge-case tests for the RCS algorithm
   test_patch_coverage.py        # git-diff/coverage intersection + reason_code tests (real git repo)
@@ -117,7 +117,7 @@ actually goes in a slow CI job (this is additive — output is identical to
 a normal run when `--debug` is omitted):
 
 ```text
-=== Plinth Assay Stage Profiling ===
+=== Tenax Assay Stage Profiling ===
 - Inputs & Parsing:                 0.2 ms
 - Diff & Patch Coverage:            0.0 ms
 - AST Assertion Walking:           36.6 ms
@@ -378,7 +378,7 @@ a hard pipeline failure. `--dry-run-sign` produces an explicitly-marked
 ## Verification (admission gate)
 
 `cli/verify.py` (the largest module, ~740 lines) is the deploy/merge-time
-counterpart to signing: `plinth-assay verify <envelope.json> [flags]`
+counterpart to signing: `tenax-assay verify <envelope.json> [flags]`
 decodes a signed DSSE envelope, best-effort verifies the Sigstore signing
 identity, and enforces admission policy gates against the embedded RCS —
 never raising on malformed or hostile input; every problem surfaces as a
@@ -433,7 +433,7 @@ Exit codes: `0` = pass, `1` = file/parse error, `2` = policy violation.
 ## Try it
 
 ```bash
-cd plinth-assay
+cd tenax-assay
 python3 -m unittest discover -s tests -v
 
 python3 -m cli.main \

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-plinth-assay: single-binary CI attestation & governance engine.
+tenax-assay: single-binary CI attestation & governance engine.
 
 Hardened against:
   - Unsafe output filename collision during DSSE envelope output
@@ -83,7 +83,7 @@ def _emit_stage_profile(
     single blocking-overhead figure the 50ms budget check already covers;
     see cli/oidc_signer.py::sign_statement's `timing` param."""
     label_w = 28
-    print("=== Plinth Assay Stage Profiling ===", file=sys.stderr)
+    print("=== Tenax Assay Stage Profiling ===", file=sys.stderr)
     for key, label in _STAGE_LABELS:
         print(f"- {label + ':':<{label_w}}{_fmt_ms(stage_ns.get(key, 0)):>12}", file=sys.stderr)
     if sign_total_ns is not None:
@@ -128,8 +128,8 @@ def upload_to_worm_async(local_path: str, sha256_hex: str, bucket: str = "eviden
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="plinth-assay",
-        description="plinth-assay: single-binary CI attestation & governance engine.",
+        prog="tenax-assay",
+        description="tenax-assay: single-binary CI attestation & governance engine.",
     )
     p.add_argument("--junit-xml", required=True)
     p.add_argument("--coverage-format", choices=["cobertura", "lcov"], default="cobertura")
@@ -177,7 +177,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     raw_argv = argv if argv is not None else sys.argv[1:]
 
-    # `plinth`/`plinth-assay verify ...` dispatches to the standalone
+    # `tenax`/`tenax-assay verify ...` dispatches to the standalone
     # admission gatekeeper instead of the attestation-building pipeline below.
     if raw_argv and raw_argv[0] == "verify":
         from .verify import main as verify_main

@@ -8,7 +8,7 @@
       }
     }
   ],
-  "predicateType": "https://plinth.dev/attestation/v1",
+  "predicateType": "https://tenax.io/attestations/assay/v1",
   "predicate": {
     "predicate_version": "0.1.0",
     "pipeline": {

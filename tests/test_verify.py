@@ -46,7 +46,7 @@ def _statement(*, rcs_value=85, degraded=False, degraded_reasons=_DEGRADED_REASO
                 "digest": {"sha256": subject_sha256},
             }
         ],
-        "predicateType": "https://plinth.dev/attestation/v1",
+        "predicateType": "https://tenax.io/attestations/assay/v1",
         "predicate": {
             "predicate_version": "0.1.0",
             "release_confidence_score": rcs_block,
@@ -352,7 +352,7 @@ def _make_fulcio_style_cert(
     from cryptography.x509.oid import NameOID
 
     key = ed25519.Ed25519PrivateKey.generate()
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "plinth-assay-test")])
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "tenax-assay-test")])
     now = datetime.datetime.now(datetime.timezone.utc)
 
     builder = (
@@ -411,7 +411,7 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
             san_uri="https://github.com/acme/widgets/.github/workflows/assay.yml@refs/heads/main",
             issuer=GITHUB_ACTIONS_OIDC_ISSUER,
             repository="acme/widgets",
-            workflow_name="Plinth Assay",
+            workflow_name="Tenax Assay",
             ref="refs/heads/main",
         )
         defaults.update(overrides)
@@ -424,7 +424,7 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
             cert_oidc_issuer=None,
             expected_issuer=None,
             expected_repository="acme/widgets",
-            expected_workflow="Plinth Assay",
+            expected_workflow="Tenax Assay",
             expected_ref="refs/heads/main",
         )
         self.assertFalse(unsafe)
@@ -457,7 +457,7 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
         cert = self._cert(workflow_name="Some Other Workflow")
         policy, _, _ = _build_identity_policy(
             cert_identity=None, cert_oidc_issuer=None, expected_issuer=None,
-            expected_repository=None, expected_workflow="Plinth Assay", expected_ref=None,
+            expected_repository=None, expected_workflow="Tenax Assay", expected_ref=None,
         )
         from sigstore.errors import VerificationError
 
@@ -694,7 +694,7 @@ class DescribeActualCertClaimsTests(unittest.TestCase):
             san_uri="https://github.com/acme/widgets/.github/workflows/assay.yml@refs/heads/main",
             issuer=GITHUB_ACTIONS_OIDC_ISSUER,
             repository="acme/widgets",
-            workflow_name="Plinth Assay",
+            workflow_name="Tenax Assay",
             ref="refs/heads/main",
         )
 
@@ -702,7 +702,7 @@ class DescribeActualCertClaimsTests(unittest.TestCase):
 
         self.assertIn("acme/widgets", summary)
         self.assertIn(GITHUB_ACTIONS_OIDC_ISSUER, summary)
-        self.assertIn("Plinth Assay", summary)
+        self.assertIn("Tenax Assay", summary)
         self.assertIn("refs/heads/main", summary)
         self.assertIn(
             "https://github.com/acme/widgets/.github/workflows/assay.yml@refs/heads/main", summary
@@ -750,7 +750,7 @@ class VerifySigstoreIdentityDiagnosticsTests(unittest.TestCase):
             san_uri="https://github.com/acme/widgets/.github/workflows/assay.yml@refs/heads/main",
             issuer=GITHUB_ACTIONS_OIDC_ISSUER,
             repository="acme/widgets",
-            workflow_name="Plinth Assay",
+            workflow_name="Tenax Assay",
             ref="refs/heads/main",
         )
         fake_bundle = mock.Mock()

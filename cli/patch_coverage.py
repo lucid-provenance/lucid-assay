@@ -18,7 +18,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from .parsers.coverage import CoverageReport, FileCoverage
 
@@ -103,6 +103,24 @@ def _changed_lines_by_file(base_sha: str, head_sha: str, cwd: str) -> Dict[str, 
             pass  # "\ No newline at end of file"
 
     return result
+
+
+def compute_patch_modified_lines(
+    base_sha: Optional[str], head_sha: str, repo_dir: str
+) -> Dict[str, Set[int]]:
+    """Public wrapper around _changed_lines_by_file for callers (e.g. SARIF
+    differential scoring, see cli.parsers.sarif) that only need "which
+    lines changed", independent of any coverage report. Returns {} when no
+    base_commit_sha is available or the diff itself fails -- callers should
+    treat an empty mapping as "nothing known to be new", the same fail-open
+    behavior compute_patch_coverage uses for a missing base SHA."""
+    if not base_sha:
+        return {}
+    try:
+        changed = _changed_lines_by_file(base_sha, head_sha, repo_dir)
+    except subprocess.CalledProcessError:
+        return {}
+    return {path: set(lines) for path, lines in changed.items()}
 
 
 def _path_components(path_str: str) -> List[str]:

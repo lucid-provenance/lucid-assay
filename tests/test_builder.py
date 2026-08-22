@@ -6,9 +6,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cli.builder import DEFAULT_PREDICATE_TYPE, build_statement
 from cli.parsers.coverage import CoverageReport
+from cli.parsers.github_rules import BranchGovernanceReport
 from cli.parsers.junit import TestTotals
 from cli.patch_coverage import PatchCoverageResult
 from cli.scorer import score_pipeline
+
+
+def _default_branch_governance() -> BranchGovernanceReport:
+    return BranchGovernanceReport(
+        available=True,
+        branch="main",
+        pull_request_required=True,
+        approvals_required=2,
+        direct_push_prevented=True,
+        bypass_actors_count=0,
+        admin_enforced=True,
+        warnings=[],
+        reason="queried GitHub rules for example/app@main: 1 applicable rule(s), 0 bypass actor(s)",
+    )
 
 
 def _base_kwargs(**overrides):
@@ -32,6 +47,7 @@ def _base_kwargs(**overrides):
     pr_approvers = overrides.pop("pr_approvers", [])
     pr_required_approvals = overrides.pop("pr_required_approvals", 0)
     pr_review_state = overrides.pop("pr_review_state", "not_applicable")
+    branch_governance = overrides.pop("branch_governance", _default_branch_governance())
 
     rcs = overrides.pop(
         "rcs",
@@ -47,6 +63,7 @@ def _base_kwargs(**overrides):
             review_state=pr_review_state,
             patch_coverage_min=patch_coverage_min,
             overall_coverage_min=overall_coverage_min,
+            branch_governance=branch_governance,
         ),
     )
 
@@ -63,6 +80,7 @@ def _base_kwargs(**overrides):
         pr_approvers=pr_approvers,
         pr_required_approvals=pr_required_approvals,
         pr_review_state=pr_review_state,
+        branch_governance=branch_governance,
         test_framework="junit",
         test_report_sha256="d" * 64,
         test_report_uri="worm://evidence/d" * 1,
@@ -247,6 +265,30 @@ class BuilderStatementTests(unittest.TestCase):
         self.assertIn("algorithm_version", rcs_block)
         self.assertIn("components", rcs_block)
         self.assertIn("degraded", rcs_block)
+
+    def test_branch_governance_is_embedded(self):
+        statement = build_statement(**_base_kwargs())
+        bg_block = statement["predicate"]["branch_governance"]
+        self.assertTrue(bg_block["available"])
+        self.assertEqual(bg_block["branch"], "main")
+        self.assertTrue(bg_block["pull_request_required"])
+        self.assertEqual(bg_block["approvals_required"], 2)
+        self.assertTrue(bg_block["direct_push_prevented"])
+        self.assertEqual(bg_block["bypass_actors_count"], 0)
+        self.assertTrue(bg_block["admin_enforced"])
+        self.assertEqual(bg_block["warnings"], [])
+
+    def test_branch_governance_warnings_are_passed_through(self):
+        bg = _default_branch_governance()
+        bg.available = True
+        bg.bypass_actors_count = 1
+        bg.admin_enforced = False
+        bg.warnings = ["1 bypass actor(s) can bypass branch rules entirely (bypass_mode=always)"]
+        statement = build_statement(**_base_kwargs(branch_governance=bg))
+        bg_block = statement["predicate"]["branch_governance"]
+        self.assertEqual(bg_block["bypass_actors_count"], 1)
+        self.assertFalse(bg_block["admin_enforced"])
+        self.assertIn("bypass_mode=always", bg_block["warnings"][0])
 
 
 if __name__ == "__main__":

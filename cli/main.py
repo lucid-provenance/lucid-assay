@@ -20,8 +20,10 @@ from .builder import build_statement
 from .hashing import sha256_file, worm_uri
 from .parsers.ast_inspector import inspect_test_suite
 from .parsers.coverage import parse_cobertura, parse_lcov
+from .parsers.github_rules import bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
-from .patch_coverage import compute_patch_coverage
+from .parsers.sarif import aggregate_sarif_reports, parse_sarif_file
+from .patch_coverage import compute_patch_coverage, compute_patch_modified_lines
 from .scorer import score_pipeline
 
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="worm-upload")
@@ -69,6 +71,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--pr-approvers", default="", help="comma-separated handles")
     p.add_argument("--pr-required-approvals", type=int, default=0)
     p.add_argument("--pr-review-state", default="not_applicable")
+    p.add_argument(
+        "--github-token",
+        default=None,
+        help="GitHub token for branch governance/ruleset inspection (default: ambient GITHUB_TOKEN env var)",
+    )
+    p.add_argument(
+        "--sarif",
+        action="append",
+        type=str,
+        default=None,
+        help="path to a SARIF 2.1.0 static-analysis report (repeatable; e.g. semgrep, trivy)",
+    )
     p.add_argument("--patch-coverage-min", type=float, default=0.80)
     p.add_argument("--overall-coverage-min", type=float, default=0.60)
     p.add_argument("--min-rcs", type=int, default=0, help="Minimum acceptable RCS score threshold")
@@ -104,6 +118,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 3. Patch coverage via git diff
     patch_cov = compute_patch_coverage(args.base_sha, args.head_sha, args.repo_dir, coverage)
 
+    # 3b. Branch governance / ruleset inspection (ambient GITHUB_TOKEN unless overridden)
+    branch_governance = inspect_branch_governance(args.repository, args.branch, token=args.github_token)
+
+    # 3c. SARIF static-analysis ingestion (optional, --sarif may repeat).
+    # sarif_report stays None when --sarif wasn't passed at all -- scorer
+    # and builder both treat that as "not configured", not as a failure.
+    sarif_report = None
+    if args.sarif:
+        patch_modified_lines = compute_patch_modified_lines(args.base_sha, args.head_sha, args.repo_dir)
+        parsed_reports = []
+        for sarif_path in args.sarif:
+            report = parse_sarif_file(sarif_path, patch_modified_lines=patch_modified_lines)
+            if not report.available:
+                print(
+                    f"WARNING: SARIF report '{sarif_path}' could not be read/parsed: "
+                    f"{'; '.join(report.reasons)}",
+                    file=sys.stderr,
+                )
+            parsed_reports.append(report)
+        sarif_report = aggregate_sarif_reports(parsed_reports)
+        if not sarif_report.available:
+            print(
+                f"WARNING: static analysis (SARIF) ingestion degraded: {'; '.join(sarif_report.reasons)}",
+                file=sys.stderr,
+            )
+
     # 4. Hash evidence artifacts
     test_report_sha = sha256_file(args.junit_xml)
     coverage_report_sha = sha256_file(args.coverage_report)
@@ -132,6 +172,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         review_state=args.pr_review_state,
         patch_coverage_min=args.patch_coverage_min,
         overall_coverage_min=args.overall_coverage_min,
+        branch_governance=branch_governance,
+        sarif_report=sarif_report,
     )
 
     # 7. Build unsigned in-toto Statement
@@ -148,6 +190,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         pr_approvers=pr_approvers,
         pr_required_approvals=args.pr_required_approvals,
         pr_review_state=args.pr_review_state,
+        branch_governance=branch_governance,
         test_framework="junit",
         test_report_sha256=test_report_sha,
         test_report_uri=worm_uri(test_report_sha),
@@ -164,6 +207,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         empty_test_bodies=empty_bodies,
         assertion_only_true=tautological,
         rcs=rcs,
+        sarif_report=sarif_report,
     )
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
@@ -192,6 +236,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"RCS={rcs.value} blocking_overhead_ms={blocking_elapsed_ms:.2f} degraded={rcs.degraded}",
         file=sys.stderr,
     )
+
+    if not branch_governance.available:
+        print(
+            f"WARNING: branch governance for '{args.branch}' could not be verified: {branch_governance.reason}",
+            file=sys.stderr,
+        )
+    elif bypass_permits_unreviewed_change(branch_governance):
+        print(
+            f"WARNING: branch '{args.branch}' rules permit an unreviewed bypass", file=sys.stderr
+        )
+    for w in branch_governance.warnings:
+        print(f"WARNING: branch governance: {w}", file=sys.stderr)
 
     if not args.skip_perf_budget_check and blocking_elapsed_ms > 50.0:
         print(

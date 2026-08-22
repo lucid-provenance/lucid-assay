@@ -15,7 +15,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from .parsers.coverage import CoverageReport
+from .parsers.github_rules import BranchGovernanceReport
 from .parsers.junit import TestTotals
+from .parsers.sarif import SarifSummaryReport
 from .patch_coverage import PatchCoverageResult
 from .scorer import RCSResult
 
@@ -48,6 +50,7 @@ def build_statement(
     pr_approvers: List[str],
     pr_required_approvals: int,
     pr_review_state: str,
+    branch_governance: BranchGovernanceReport,
     test_framework: str,
     test_report_sha256: str,
     test_report_uri: str,
@@ -65,6 +68,7 @@ def build_statement(
     assertion_only_true: int,
     rcs: RCSResult,
     sbom: Optional[Dict[str, Any]] = None,
+    sarif_report: Optional[SarifSummaryReport] = None,
 ) -> Dict[str, Any]:
     """Returns a dict matching the lifecycle/v0.1 predicate schema, wrapped
     in a standard in-toto Statement envelope."""
@@ -94,6 +98,28 @@ def build_statement(
 
     clean_subj_sha = _clean_sha256(subject_sha256)
 
+    if sarif_report is not None:
+        static_analysis = {
+            "available": sarif_report.available,
+            "tools_scanned": sarif_report.tools_scanned,
+            "total_findings": sarif_report.total_findings,
+            "patch_errors_count": sarif_report.patch_errors_count,
+            "patch_warnings_count": sarif_report.patch_warnings_count,
+            "findings": [f.as_dict() for f in sarif_report.findings],
+        }
+    else:
+        # No --sarif flags were configured for this run at all -- an empty,
+        # available=True block (nothing scanned, nothing to report), not a
+        # failure state. Mirrors cli.scorer._score_sarif_findings(None).
+        static_analysis = {
+            "available": True,
+            "tools_scanned": [],
+            "total_findings": 0,
+            "patch_errors_count": 0,
+            "patch_warnings_count": 0,
+            "findings": [],
+        }
+
     predicate = {
         "predicate_version": "0.1.0",
         "pipeline": {
@@ -114,6 +140,17 @@ def build_statement(
                 base_commit_sha.strip().lower() if base_commit_sha else None
             ),
             "pull_request": pull_request,
+        },
+        "branch_governance": {
+            "available": branch_governance.available,
+            "branch": branch_governance.branch,
+            "pull_request_required": branch_governance.pull_request_required,
+            "approvals_required": branch_governance.approvals_required,
+            "direct_push_prevented": branch_governance.direct_push_prevented,
+            "bypass_actors_count": branch_governance.bypass_actors_count,
+            "admin_enforced": branch_governance.admin_enforced,
+            "warnings": branch_governance.warnings,
+            "reason": branch_governance.reason,
         },
         "artifact": {
             "subject": {
@@ -168,6 +205,7 @@ def build_statement(
                 "skipped_or_disabled_ratio": skipped_ratio,
             },
         },
+        "static_analysis": static_analysis,
         "release_confidence_score": {
             "value": rcs.value,
             "algorithm_version": rcs.algorithm_version,

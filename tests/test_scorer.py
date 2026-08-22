@@ -4,9 +4,26 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from cli.parsers.github_rules import BranchGovernanceReport
 from cli.parsers.junit import TestTotals
 from cli.patch_coverage import PatchCoverageResult
-from cli.scorer import score_pipeline, WEIGHTS
+from cli.scorer import score_pipeline, WEIGHTS, BRANCH_GOVERNANCE_BYPASS_PENALTY, BRANCH_GOVERNANCE_UNVERIFIED_PENALTY
+
+
+def _clean_branch_governance(**overrides) -> BranchGovernanceReport:
+    kwargs = dict(
+        available=True,
+        branch="main",
+        pull_request_required=True,
+        approvals_required=2,
+        direct_push_prevented=True,
+        bypass_actors_count=0,
+        admin_enforced=True,
+        warnings=[],
+        reason="queried GitHub rules for example/app@main: 1 applicable rule(s), 0 bypass actor(s)",
+    )
+    kwargs.update(overrides)
+    return BranchGovernanceReport(**kwargs)
 
 
 def _base_kwargs(**overrides):
@@ -20,6 +37,7 @@ def _base_kwargs(**overrides):
         approvers_count=2,
         required_approvals=2,
         review_state="approved",
+        branch_governance=_clean_branch_governance(),
     )
     kwargs.update(overrides)
     return kwargs
@@ -101,6 +119,69 @@ class RCSScorerTests(unittest.TestCase):
             approvers_count=0,
         ))
         self.assertLess(result.value, 35)
+
+    def test_clean_branch_governance_does_not_penalize(self):
+        result = score_pipeline(**_base_kwargs())
+        self.assertNotIn("branch governance penalty", result.components["governance"].reason)
+        self.assertFalse(result.degraded)
+
+    def test_missing_branch_governance_flags_degraded_and_penalizes_score(self):
+        # Fail closed: omitting branch_governance entirely (never fetched)
+        # must cost real points, the same as a confirmed bypass would --
+        # otherwise omitting GITHUB_TOKEN is a free way to dodge the penalty.
+        with_bg = score_pipeline(**_base_kwargs())
+        without_bg = score_pipeline(**_base_kwargs(branch_governance=None))
+        self.assertTrue(without_bg.degraded)
+        self.assertLess(
+            without_bg.components["governance"].raw_score, with_bg.components["governance"].raw_score
+        )
+        self.assertIn("unverified branch governance penalty", without_bg.components["governance"].reason)
+
+    def test_branch_governance_unavailable_flags_degraded_and_penalizes_score(self):
+        clean = score_pipeline(**_base_kwargs())
+        result = score_pipeline(**_base_kwargs(
+            branch_governance=BranchGovernanceReport(
+                available=False, branch="main", pull_request_required=False, approvals_required=0,
+                direct_push_prevented=False, bypass_actors_count=0, admin_enforced=False,
+                warnings=[], reason="no GITHUB_TOKEN available",
+            ),
+        ))
+        self.assertTrue(result.degraded)
+        self.assertIn("unverified branch governance penalty", result.components["governance"].reason)
+        # Omitting/breaking GITHUB_TOKEN must not score any better than a
+        # confirmed bypass -- both penalties are equal by design.
+        self.assertAlmostEqual(
+            result.components["governance"].raw_score,
+            clean.components["governance"].raw_score - BRANCH_GOVERNANCE_UNVERIFIED_PENALTY,
+            places=6,
+        )
+
+    def test_branch_governance_bypass_penalizes_governance_and_flags_degraded(self):
+        clean = score_pipeline(**_base_kwargs())
+        bypassable = score_pipeline(**_base_kwargs(
+            branch_governance=_clean_branch_governance(
+                bypass_actors_count=1,
+                admin_enforced=False,
+                warnings=["1 bypass actor(s) can bypass branch rules entirely (bypass_mode=always)"],
+            ),
+        ))
+        self.assertTrue(bypassable.degraded)
+        self.assertIn("branch governance penalty", bypassable.components["governance"].reason)
+        self.assertAlmostEqual(
+            bypassable.components["governance"].raw_score,
+            clean.components["governance"].raw_score - BRANCH_GOVERNANCE_BYPASS_PENALTY,
+            places=6,
+        )
+
+    def test_branch_governance_no_pr_required_penalizes_governance(self):
+        result = score_pipeline(**_base_kwargs(
+            branch_governance=_clean_branch_governance(
+                pull_request_required=False, approvals_required=0, direct_push_prevented=False,
+                warnings=["branch 'main' does not require a pull request"],
+            ),
+        ))
+        self.assertTrue(result.degraded)
+        self.assertIn("branch governance penalty", result.components["governance"].reason)
 
 
 if __name__ == "__main__":

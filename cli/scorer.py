@@ -6,6 +6,11 @@ Hardened against:
   - Skipped test denominator skew in test health calculation
   - Governance review state ambiguity
   - Unbounded coverage input rates
+  - Gaming the score by omitting/breaking GITHUB_TOKEN: a branch_governance
+    report that is missing or unavailable docks the *same* governance
+    points as a confirmed unreviewed-bypass finding, so there is no score
+    incentive to suppress branch governance data (only `degraded` differed
+    before -- unverified governance now costs real points too)
 """
 from __future__ import annotations
 
@@ -13,17 +18,20 @@ import math
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change
 from .parsers.junit import TestTotals
+from .parsers.sarif import SarifSummaryReport
 from .patch_coverage import PatchCoverageResult
 
 ALGORITHM_VERSION = "rcs-v0.1"
 
 WEIGHTS = {
     "test_health": 0.35,
-    "patch_coverage": 0.25,
+    "patch_coverage": 0.20,
     "overall_coverage": 0.15,
     "assertion_integrity": 0.10,
     "governance": 0.15,
+    "static_analysis": 0.05,
 }
 assert math.isclose(sum(WEIGHTS.values()), 1.0, abs_tol=1e-9), "RCS weights must sum to 1.0"
 
@@ -33,6 +41,24 @@ PATCH_COVERAGE_FALLBACK_MULTIPLIER = 0.70
 FLAKY_RETRY_PENALTY_PER_CASE = 4.0
 FLAKY_RETRY_PENALTY_CAP = 30.0
 ASSERTION_DENSITY_TARGET = 1.5
+BRANCH_GOVERNANCE_BYPASS_PENALTY = 35.0
+# Applied when branch_governance couldn't be verified at all (missing/invalid
+# token, API failure, ...). Kept >= BRANCH_GOVERNANCE_BYPASS_PENALTY so that
+# omitting GITHUB_TOKEN is never a cheaper way to avoid the bypass penalty.
+BRANCH_GOVERNANCE_UNVERIFIED_PENALTY = 35.0
+
+# Differential static-analysis (SARIF) penalties. A finding "new in patch"
+# (introduced or touched by this change) costs far more than a pre-existing
+# baseline one -- the goal is to block *newly introduced* problems without
+# making a legacy-heavy repo un-shippable on day one.
+STATIC_ANALYSIS_PATCH_ERROR_PENALTY = 25.0
+STATIC_ANALYSIS_PATCH_WARNING_PENALTY = 5.0
+STATIC_ANALYSIS_LEGACY_ERROR_PENALTY = 2.0
+STATIC_ANALYSIS_LEGACY_ERROR_PENALTY_CAP = 15.0
+# Applied when --sarif was configured but the report came back unavailable
+# (missing/corrupt file). Fails closed like BRANCH_GOVERNANCE_UNVERIFIED_PENALTY:
+# a broken scanner input must never score better than a real, clean scan.
+STATIC_ANALYSIS_UNAVAILABLE_PENALTY = 25.0
 
 
 @dataclass
@@ -144,16 +170,15 @@ def _score_governance(
     approvers_count: int,
     required_approvals: int,
     review_state: str,
+    branch_governance: Optional[BranchGovernanceReport] = None,
 ) -> ScoreComponent:
     w = WEIGHTS["governance"]
 
     if not pr_present:
-        return ScoreComponent(w, 50.0, 50.0 * w, "no pull/merge request context on this run (governance not evaluated)")
-
-    if review_state == "changes_requested":
-        return ScoreComponent(w, 0.0, 0.0, "changes requested and not re-approved")
-
-    if required_approvals == 0:
+        raw, reason = 50.0, "no pull/merge request context on this run (governance not evaluated)"
+    elif review_state == "changes_requested":
+        raw, reason = 0.0, "changes requested and not re-approved"
+    elif required_approvals == 0:
         raw = 60.0
         reason = "branch protection requires 0 approvals (weak governance control)"
     else:
@@ -165,6 +190,65 @@ def _score_governance(
             reason = f"{approvers_count}/{required_approvals} required approvals ({review_state})"
         raw = ratio * 100.0
 
+    # A clean PR review record on *this* run doesn't matter if the target
+    # branch's rules would have let the same change land unreviewed (no PR
+    # required, direct pushes not blocked, or a bypass actor/role exists) --
+    # dock the governance score whenever that's independently confirmed.
+    # Equally, an *unverified* branch_governance report (missing/invalid
+    # token, API failure) must dock the same points -- fail closed, so
+    # there's no way to score higher by simply not providing GITHUB_TOKEN
+    # than by having a confirmed bypass.
+    if branch_governance is None or not branch_governance.available:
+        raw = _clamp(raw - BRANCH_GOVERNANCE_UNVERIFIED_PENALTY)
+        detail = branch_governance.reason if branch_governance is not None else "branch governance was not evaluated for this run"
+        reason += f"; -{BRANCH_GOVERNANCE_UNVERIFIED_PENALTY:.0f}pts unverified branch governance penalty: {detail}"
+    elif bypass_permits_unreviewed_change(branch_governance):
+        raw = _clamp(raw - BRANCH_GOVERNANCE_BYPASS_PENALTY)
+        bg_detail = "; ".join(branch_governance.warnings) or f"unreviewed bypass permitted on '{branch_governance.branch}'"
+        reason += f"; -{BRANCH_GOVERNANCE_BYPASS_PENALTY:.0f}pts branch governance penalty: {bg_detail}"
+
+    return ScoreComponent(w, raw, raw * w, reason)
+
+
+def _score_sarif_findings(sarif_report: Optional[SarifSummaryReport]) -> ScoreComponent:
+    w = WEIGHTS["static_analysis"]
+
+    if sarif_report is None:
+        # Static analysis was never wired into this run at all (no --sarif
+        # flags configured) -- score the full baseline with nothing to
+        # dock, the same way branch_governance's pr_present=False "not
+        # evaluated" case doesn't get penalized for a control that was
+        # never asked to run. This is intentionally indistinguishable from
+        # an explicit, genuinely clean SarifSummaryReport(available=True,
+        # findings=[]) below.
+        return ScoreComponent(w, 100.0, 100.0 * w, "no --sarif reports configured for this run")
+
+    if not sarif_report.available:
+        # Configured but the report came back broken (missing/corrupt
+        # file(s)) -- fail closed, dock real points. score_pipeline flags
+        # the whole run degraded for this case (see below).
+        detail = "; ".join(sarif_report.reasons) or "SARIF report unavailable"
+        raw = _clamp(100.0 - STATIC_ANALYSIS_UNAVAILABLE_PENALTY)
+        reason = (
+            f"static analysis (SARIF) unavailable: {detail}; "
+            f"-{STATIC_ANALYSIS_UNAVAILABLE_PENALTY:.0f}pts unavailable-scan penalty"
+        )
+        return ScoreComponent(w, raw, raw * w, reason)
+
+    patch_errors = sarif_report.patch_errors_count
+    patch_warnings = sarif_report.patch_warnings_count
+    legacy_errors = max(sarif_report.errors_count - sarif_report.patch_errors_count, 0)
+
+    penalty = patch_errors * STATIC_ANALYSIS_PATCH_ERROR_PENALTY
+    penalty += patch_warnings * STATIC_ANALYSIS_PATCH_WARNING_PENALTY
+    penalty += min(legacy_errors * STATIC_ANALYSIS_LEGACY_ERROR_PENALTY, STATIC_ANALYSIS_LEGACY_ERROR_PENALTY_CAP)
+
+    raw = _clamp(100.0 - penalty)
+    reason = (
+        f"{sarif_report.total_findings} finding(s) across {len(sarif_report.tools_scanned)} tool(s) "
+        f"({patch_errors} new patch error(s), {patch_warnings} new patch warning(s), "
+        f"{legacy_errors} legacy error(s)); -{penalty:.1f}pts"
+    )
     return ScoreComponent(w, raw, raw * w, reason)
 
 
@@ -181,6 +265,8 @@ def score_pipeline(
     review_state: str = "not_applicable",
     patch_coverage_min: float = PATCH_COVERAGE_MIN_DEFAULT,
     overall_coverage_min: float = OVERALL_COVERAGE_MIN_DEFAULT,
+    branch_governance: Optional[BranchGovernanceReport] = None,
+    sarif_report: Optional[SarifSummaryReport] = None,
 ) -> RCSResult:
     degraded = False
 
@@ -200,9 +286,25 @@ def score_pipeline(
 
     overall_component = _score_overall_coverage(overall_line_rate, overall_coverage_min)
     assertion_component = _score_assertion_integrity(total_assertions, total_test_functions)
-    governance_component = _score_governance(pr_present, approvers_count, required_approvals, review_state)
+    governance_component = _score_governance(
+        pr_present, approvers_count, required_approvals, review_state, branch_governance
+    )
+    static_analysis_component = _score_sarif_findings(sarif_report)
 
     if not pr_present:
+        degraded = True
+
+    if sarif_report is not None and not sarif_report.available:
+        degraded = True
+
+    # branch_governance is a distinct, independently-fetched signal (repo
+    # ruleset/API state) from the per-PR approvals above -- either it
+    # couldn't be verified at all, or it was verified and shows unreviewed
+    # bypasses are permitted. Both are reasons to flag the run degraded,
+    # not just to dock the governance component's raw score.
+    if branch_governance is None or not branch_governance.available:
+        degraded = True
+    elif bypass_permits_unreviewed_change(branch_governance):
         degraded = True
 
     components = {
@@ -211,6 +313,7 @@ def score_pipeline(
         "overall_coverage": overall_component,
         "assertion_integrity": assertion_component,
         "governance": governance_component,
+        "static_analysis": static_analysis_component,
     }
 
     total_weighted = sum(c.weighted_score for c in components.values())

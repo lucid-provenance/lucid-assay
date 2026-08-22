@@ -15,11 +15,22 @@ Hardened against:
   - Envelopes signed via --dry-run-sign being mistaken for cryptographically
     verified signatures
   - Ambiguous exit codes on file errors vs. policy breaches
+  - A signature that verifies cryptographically but was minted for a
+    different repository, workflow, ref, or OIDC issuer than expected
+    (--expected-issuer/--expected-repository/--expected-workflow/
+    --expected-ref strictly match the Fulcio certificate's SAN and its
+    GitHub Actions OIDC extension claims; any mismatch is an explicit,
+    gate-blocking failure, not a warning)
+  - Silently falling back to signature-only (identity-unchecked)
+    verification: when no identity assertion is provided at all, the
+    UnsafeNoOp fallback is called out explicitly in identity_detail
+    rather than being indistinguishable from a real identity check
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import fnmatch
 import json
 import math
 import sys
@@ -29,6 +40,20 @@ from typing import Any, Dict, List, Optional, Tuple
 EXPECTED_PAYLOAD_TYPE = "application/vnd.in-toto+json"
 EXPECTED_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 EXPECTED_PREDICATE_TYPE = "https://plinth.dev/attestation/v1"
+
+# GitHub Actions' well-known OIDC token issuer. GitHub-Actions-specific
+# identity claims (repository/workflow/ref) are only meaningful -- and only
+# safe to trust -- when they came from this issuer, so any of those claims
+# being asserted pins the issuer here unless the caller explicitly overrides it.
+GITHUB_ACTIONS_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
+
+# Fulcio's GitHub Actions OIDC certificate extension OIDs used for ref
+# matching (see https://github.com/sigstore/fulcio/blob/main/docs/oid-info.md).
+# The legacy (v1) extension's value is the raw UTF-8 bytes of the ref; the
+# current (v2) extension DER-encodes it as an ASN.1 UTF8String. Which OID is
+# present depends on the Fulcio/token version that minted the certificate.
+_GITHUB_WORKFLOW_REF_OID = "1.3.6.1.4.1.57264.1.6"
+_OIDC_SOURCE_REPOSITORY_REF_OID = "1.3.6.1.4.1.57264.1.14"
 
 EXIT_PASS = 0
 EXIT_POLICY_VIOLATION = 2
@@ -145,12 +170,161 @@ def _envelope_to_bundle_json(envelope: Dict[str, Any]) -> str:
     return json.dumps(bundle)
 
 
+def _der_decode_short_utf8_string(raw: bytes) -> Optional[str]:
+    """Minimal DER decoder for a primitive UTF8String (tag 0x0C) with a
+    short-form length (i.e. under 128 bytes -- true for every Fulcio v2
+    claim value checked here: repo/ref names never approach that). Returns
+    None if `raw` doesn't match that exact shape, rather than guessing at a
+    more general (and unnecessary, for our purposes) ASN.1 decoder."""
+    if len(raw) < 2 or raw[0] != 0x0C:
+        return None
+    length = raw[1]
+    if length & 0x80 or len(raw) != 2 + length:
+        return None
+    try:
+        return raw[2:].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _extract_cert_ref(cert: Any) -> Optional[str]:
+    """Extracts the GitHub Actions ref from a Fulcio certificate, checking
+    both the legacy v1 extension (raw UTF-8 bytes) and the current v2
+    extension (DER-encoded UTF8String) -- whichever version minted the
+    cert. Returns None if neither extension is present."""
+    from cryptography.x509 import ExtensionNotFound, ObjectIdentifier
+
+    try:
+        raw = cert.extensions.get_extension_for_oid(ObjectIdentifier(_GITHUB_WORKFLOW_REF_OID)).value.value
+        return raw.decode("utf-8")
+    except ExtensionNotFound:
+        pass
+    except UnicodeDecodeError:
+        return None
+
+    try:
+        raw = cert.extensions.get_extension_for_oid(ObjectIdentifier(_OIDC_SOURCE_REPOSITORY_REF_OID)).value.value
+    except ExtensionNotFound:
+        return None
+    return _der_decode_short_utf8_string(raw)
+
+
+class _RefPatternPolicy:
+    """Sigstore VerificationPolicy: matches the certificate's GitHub Actions
+    ref against a glob pattern (e.g. "refs/heads/main", "refs/tags/v*").
+    Fails closed if neither the legacy nor current Fulcio ref extension is
+    present on the certificate -- an absent claim is never treated as a
+    match."""
+
+    def __init__(self, pattern: str):
+        self._pattern = pattern
+
+    def verify(self, cert: Any) -> None:
+        from sigstore.errors import VerificationError as SigstoreVerificationError
+
+        ref = _extract_cert_ref(cert)
+        if ref is None:
+            raise SigstoreVerificationError(
+                "certificate contains neither a GitHub Workflow Ref "
+                f"({_GITHUB_WORKFLOW_REF_OID}) nor an OIDC Source Repository Ref "
+                f"({_OIDC_SOURCE_REPOSITORY_REF_OID}) extension"
+            )
+        if not fnmatch.fnmatchcase(ref, self._pattern):
+            raise SigstoreVerificationError(
+                f"certificate's ref {ref!r} does not match expected ref pattern {self._pattern!r}"
+            )
+
+
+def _build_identity_policy(
+    *,
+    cert_identity: Optional[str],
+    cert_oidc_issuer: Optional[str],
+    expected_issuer: Optional[str],
+    expected_repository: Optional[str],
+    expected_workflow: Optional[str],
+    expected_ref: Optional[str],
+) -> Tuple[Any, bool, str]:
+    """Composes a strict Sigstore identity-verification policy from the
+    caller's assertion flags, requiring the sigstore package (raises
+    ImportError if unavailable -- callers handle that the same way they
+    already handle every other sigstore import).
+
+    Every asserted claim is AND-ed together (sigstore.verify.policy.AllOf):
+    a certificate must satisfy *all* of them, not merely one. Repository is
+    checked against both the legacy GitHubWorkflowRepository extension and
+    the current OIDCSourceRepositoryURI extension (AnyOf) since which one a
+    given Fulcio certificate carries depends on its minting version.
+
+    Returns (policy, unsafe, detail):
+      policy - the composed VerificationPolicy to pass to Verifier.verify_dsse
+      unsafe - True iff no identity assertion was requested at all, so
+               `policy` is UnsafeNoOp: the signature is checked but the
+               signer's identity is NOT
+      detail - human-readable summary of what was (or wasn't) asserted, for
+               identity_detail/logging
+    """
+    from sigstore.verify import policy as sp
+
+    # A GitHub-Actions-specific claim is only meaningful -- and only safe to
+    # trust -- coming from GitHub's own OIDC issuer. Pin it by default
+    # whenever such a claim is asserted, unless the caller explicitly chose
+    # a different issuer (e.g. verifying a non-GitHub-Actions attestation).
+    resolved_issuer = expected_issuer or cert_oidc_issuer
+    if resolved_issuer is None and (expected_repository or expected_workflow or expected_ref):
+        resolved_issuer = GITHUB_ACTIONS_OIDC_ISSUER
+
+    children: List[Any] = []
+    asserted: List[str] = []
+
+    if cert_identity:
+        children.append(sp.Identity(identity=cert_identity, issuer=resolved_issuer))
+        asserted.append(f"identity={cert_identity!r}" + (f" issuer={resolved_issuer!r}" if resolved_issuer else ""))
+    elif resolved_issuer:
+        children.append(sp.OIDCIssuer(resolved_issuer))
+        asserted.append(f"issuer={resolved_issuer!r}")
+
+    if expected_repository:
+        children.append(
+            sp.AnyOf(
+                [
+                    sp.GitHubWorkflowRepository(expected_repository),
+                    sp.OIDCSourceRepositoryURI(f"https://github.com/{expected_repository}"),
+                ]
+            )
+        )
+        asserted.append(f"repository={expected_repository!r}")
+
+    if expected_workflow:
+        children.append(sp.GitHubWorkflowName(expected_workflow))
+        asserted.append(f"workflow={expected_workflow!r}")
+
+    if expected_ref:
+        children.append(_RefPatternPolicy(expected_ref))
+        asserted.append(f"ref={expected_ref!r}")
+
+    if not children:
+        return (
+            sp.UnsafeNoOp(),
+            True,
+            "no identity assertions provided (--cert-identity / --expected-issuer / "
+            "--expected-repository / --expected-workflow / --expected-ref); the signature "
+            "was checked but the signer's identity was NOT",
+        )
+
+    composed = children[0] if len(children) == 1 else sp.AllOf(children)
+    return composed, False, "asserted " + ", ".join(asserted)
+
+
 def _verify_sigstore_identity(
     envelope: Dict[str, Any],
     *,
     dry_run: bool,
     cert_identity: Optional[str],
     cert_oidc_issuer: Optional[str],
+    expected_issuer: Optional[str] = None,
+    expected_repository: Optional[str] = None,
+    expected_workflow: Optional[str] = None,
+    expected_ref: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Best-effort keyless Sigstore identity verification.
 
@@ -186,20 +360,28 @@ def _verify_sigstore_identity(
         from sigstore.errors import VerificationError as SigstoreVerificationError
         from sigstore.models import Bundle
         from sigstore.verify import Verifier
-        from sigstore.verify.policy import Identity, UnsafeNoOp
+    except ImportError as e:
+        return "unavailable", f"sigstore package unavailable; skipping identity verification: {e}"
+
+    try:
+        policy, unsafe, policy_detail = _build_identity_policy(
+            cert_identity=cert_identity,
+            cert_oidc_issuer=cert_oidc_issuer,
+            expected_issuer=expected_issuer,
+            expected_repository=expected_repository,
+            expected_workflow=expected_workflow,
+            expected_ref=expected_ref,
+        )
     except ImportError as e:
         return "unavailable", f"sigstore package unavailable; skipping identity verification: {e}"
 
     try:
         bundle = Bundle.from_json(_envelope_to_bundle_json(envelope))
         verifier = Verifier.production(offline=False)
-        policy = (
-            Identity(identity=cert_identity, issuer=cert_oidc_issuer)
-            if cert_identity
-            else UnsafeNoOp()
-        )
         verifier.verify_dsse(bundle, policy)
-        return "verified", "Sigstore identity verification succeeded"
+        if unsafe:
+            return "verified", f"Sigstore signature verification succeeded, but {policy_detail}"
+        return "verified", f"Sigstore identity verification succeeded ({policy_detail})"
     except SigstoreVerificationError as e:
         return "failed", f"Sigstore identity verification failed: {e}"
     except (NetworkError, TUFError, MetadataError) as e:
@@ -217,6 +399,10 @@ def verify_dsse_attestation(
     dry_run: bool = False,
     cert_identity: Optional[str] = None,
     cert_oidc_issuer: Optional[str] = None,
+    expected_issuer: Optional[str] = None,
+    expected_repository: Optional[str] = None,
+    expected_workflow: Optional[str] = None,
+    expected_ref: Optional[str] = None,
 ) -> VerificationResult:
     """Validates a DSSE envelope's structure, decodes its in-toto Statement
     payload, best-effort verifies the Sigstore signing identity, and enforces
@@ -316,6 +502,10 @@ def verify_dsse_attestation(
         dry_run=dry_run,
         cert_identity=cert_identity,
         cert_oidc_issuer=cert_oidc_issuer,
+        expected_issuer=expected_issuer,
+        expected_repository=expected_repository,
+        expected_workflow=expected_workflow,
+        expected_ref=expected_ref,
     )
     if identity_status == "failed":
         violations.append(identity_detail)
@@ -361,6 +551,30 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--cert-identity", default=None, help="expected Sigstore signing identity (certificate SAN)")
     p.add_argument("--cert-oidc-issuer", default=None, help="expected OIDC issuer for the signing identity")
     p.add_argument(
+        "--expected-issuer",
+        default=None,
+        help=(
+            "expected OIDC issuer for the signing identity; defaults to GitHub Actions' "
+            f"issuer ({GITHUB_ACTIONS_OIDC_ISSUER!r}) automatically whenever --expected-repository, "
+            "--expected-workflow, or --expected-ref is set and this flag isn't"
+        ),
+    )
+    p.add_argument(
+        "--expected-repository",
+        default=None,
+        help="require the certificate's GitHub Actions workflow/source repository to be this 'owner/repo'",
+    )
+    p.add_argument(
+        "--expected-workflow",
+        default=None,
+        help="require the certificate's GitHub Actions workflow name (the workflow file's 'name:') to match",
+    )
+    p.add_argument(
+        "--expected-ref",
+        default=None,
+        help="require the certificate's GitHub Actions ref to match this glob pattern, e.g. 'refs/heads/main'",
+    )
+    p.add_argument(
         "--json", action="store_true", dest="json_output", help="emit the machine-readable result as JSON on stdout"
     )
     return p.parse_args(argv)
@@ -395,6 +609,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         dry_run=args.dry_run,
         cert_identity=args.cert_identity,
         cert_oidc_issuer=args.cert_oidc_issuer,
+        expected_issuer=args.expected_issuer,
+        expected_repository=args.expected_repository,
+        expected_workflow=args.expected_workflow,
+        expected_ref=args.expected_ref,
     )
 
     if args.json_output:

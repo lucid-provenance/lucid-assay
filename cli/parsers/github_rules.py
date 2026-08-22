@@ -1,0 +1,423 @@
+"""
+GitHub branch governance / ruleset inspection.
+
+Queries GitHub's REST API for the *effective* rules on a branch (the
+union of every applicable repository + organization ruleset) and cross-
+references active rulesets' bypass actors, so a run can tell whether
+"branch protection" actually prevents an unreviewed direct commit or
+merge, as opposed to merely appearing to.
+
+Hardened against:
+  - Missing/expired GITHUB_TOKEN (degrades to available=False, never raises)
+  - Path/URL injection via `repository` (strict `owner/repo` allowlist regex,
+    checked before any URL is built) and via `branch`/ref values (always
+    percent-encoded with urllib.parse.quote(..., safe=""))
+  - 404 responses that are genuinely "no rulesets configured" vs. a
+    nonexistent repository/branch masquerading as a clean report: an
+    ambiguous 404 on rules-for-branch is only trusted once branch
+    existence is independently confirmed; otherwise the result fails
+    closed (available=False) rather than reporting a false-clean bill
+    of health
+  - Auth failures (401/403) anywhere in the flow -- including secondary
+    ruleset/bypass-actor enrichment -- invalidate the whole report
+    (available=False), since a bad/under-scoped token can't be trusted
+    to have reported the rest of the data faithfully either
+  - Unbounded/adversarial pagination (bounded to MAX_PAGES, following
+    only same-origin HTTPS `Link: rel="next"` targets)
+  - Transport/timeout/malformed-JSON failures on either endpoint (degrades
+    to available=False with the failure captured in `reason`)
+  - Bypass actors with an unrecognized/unknown `bypass_mode`: only the
+    explicitly-known least-dangerous mode (bypass_mode="pull_request") is
+    treated as not fully bypassing the branch's rules; anything else
+    (bypass_mode="always", missing, or a novel value) fails closed
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+GITHUB_API_BASE = "https://api.github.com"
+DEFAULT_TIMEOUT = 10
+
+# Safeguard against unbounded/adversarial pagination (e.g. a compromised or
+# misbehaving API response looping `Link: rel="next"` forever).
+MAX_PAGES = 10
+
+# Strict "owner/repo" allowlist -- matches GitHub's own permitted charset for
+# both segments. Rejects anything that could smuggle extra path segments,
+# query strings, or traversal sequences into the request URL.
+_REPO_RE = re.compile(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
+
+# A bypass actor with this mode can skip the ruleset entirely, including
+# outside of a pull request (i.e. a genuine unreviewed direct push).
+BYPASS_MODE_ALWAYS = "always"
+# A bypass actor with this mode can only skip PR-specific rules (e.g. merge
+# without the required approvals) but still has to go through a pull request.
+# This is the *only* mode treated as not fully bypassing branch rules --
+# anything else (including modes we don't recognize) fails closed.
+BYPASS_MODE_PULL_REQUEST = "pull_request"
+
+
+class GitHubAPIError(RuntimeError):
+    """Raised when a GitHub REST API request fails: a non-404 error status,
+    a transport failure, or an unparseable response body."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@dataclass
+class BranchGovernanceReport:
+    __test__ = False
+    available: bool
+    branch: str
+    pull_request_required: bool
+    approvals_required: int
+    direct_push_prevented: bool
+    bypass_actors_count: int
+    admin_enforced: bool
+    warnings: List[str]
+    reason: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "available": self.available,
+            "branch": self.branch,
+            "pull_request_required": self.pull_request_required,
+            "approvals_required": self.approvals_required,
+            "direct_push_prevented": self.direct_push_prevented,
+            "bypass_actors_count": self.bypass_actors_count,
+            "admin_enforced": self.admin_enforced,
+            "warnings": self.warnings,
+            "reason": self.reason,
+        }
+
+
+def bypass_permits_unreviewed_change(report: BranchGovernanceReport) -> bool:
+    """True when this report's branch can, in practice, receive an
+    unreviewed change: no PR is required, direct pushes aren't blocked,
+    a bypass actor exists (of *any* mode, known or unrecognized -- see
+    `admin_enforced`), or bypass-capable roles aren't enforced.
+
+    Fails closed: an unavailable/unverifiable report is not this
+    function's concern (callers must check `report.available` themselves
+    -- see cli.scorer, which docks points for unavailable reports too);
+    given an available report, any ambiguity here resolves to "permits".
+    """
+    return (
+        not report.pull_request_required
+        or not report.direct_push_prevented
+        or report.bypass_actors_count > 0
+        or not report.admin_enforced
+    )
+
+
+def _unavailable(branch: str, reason: str) -> BranchGovernanceReport:
+    return BranchGovernanceReport(
+        available=False,
+        branch=branch,
+        pull_request_required=False,
+        approvals_required=0,
+        direct_push_prevented=False,
+        bypass_actors_count=0,
+        admin_enforced=False,
+        warnings=[],
+        reason=reason,
+    )
+
+
+def _parse_link_header(link_header: str) -> Dict[str, str]:
+    """Parses an RFC 5988 `Link` header (as used for GitHub REST pagination)
+    into {rel: url}. Malformed segments are skipped rather than raising."""
+    links: Dict[str, str] = {}
+    if not link_header:
+        return links
+    for part in link_header.split(","):
+        segments = [s.strip() for s in part.split(";")]
+        if len(segments) < 2 or not (segments[0].startswith("<") and segments[0].endswith(">")):
+            continue
+        url = segments[0][1:-1]
+        rel = None
+        for seg in segments[1:]:
+            if seg.startswith("rel="):
+                rel = seg[len("rel="):].strip('"')
+        if rel:
+            links[rel] = url
+    return links
+
+
+def _is_same_origin_as_api(url: str) -> bool:
+    """SSRF guard: a paginated `next` link must stay on the GitHub API host
+    over HTTPS -- a Link header is technically attacker-influenceable data
+    (the response body of a request we made), so it's never followed
+    off-host."""
+    parsed = urllib.parse.urlparse(url)
+    expected = urllib.parse.urlparse(GITHUB_API_BASE)
+    return parsed.scheme == "https" and parsed.netloc == expected.netloc
+
+
+def _github_api_get(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) -> Any:
+    """GET a GitHub REST API path and return the parsed JSON body.
+
+    Returns None for a 404 on the *first* page -- callers treat "not found"
+    as "no rules/rulesets configured", a normal state, not a transport
+    failure. Any other non-2xx status or transport/parse error raises
+    GitHubAPIError (tagged with `.status_code` when an HTTP status is
+    available, so callers can special-case auth failures).
+
+    List-shaped (JSON array) responses are transparently paginated by
+    following the standard GitHub `Link: rel="next"` header, up to
+    MAX_PAGES pages, and only when the next link stays on the GitHub API
+    host. Single-resource (JSON object) responses are returned as-is from
+    the first page; GitHub never paginates those.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "plinth-assay",
+    }
+
+    url: Optional[str] = f"{GITHUB_API_BASE}{path}"
+    aggregated: Optional[List[Any]] = None
+    page = 0
+
+    while url and page < MAX_PAGES:
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                link_header = resp.headers.get("Link", "")
+        except urllib.error.HTTPError as e:
+            if e.code == 404 and page == 0:
+                return None
+            if e.code == 404:
+                break  # ran out of pages mid-pagination; return what we have so far
+            raise GitHubAPIError(f"GET {path} -> HTTP {e.code}: {e.reason}", status_code=e.code) from e
+        except urllib.error.URLError as e:
+            raise GitHubAPIError(f"GET {path} failed: {e.reason}") from e
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            raise GitHubAPIError(f"GET {path} failed: {e}") from e
+
+        page += 1
+
+        if not isinstance(body, list):
+            return body  # single-resource response: no pagination applies
+
+        aggregated = (aggregated or []) + body
+
+        next_url = _parse_link_header(link_header).get("next")
+        url = next_url if next_url and _is_same_origin_as_api(next_url) else None
+
+    return aggregated if aggregated is not None else []
+
+
+def _quote_ref(ref: str) -> str:
+    return urllib.parse.quote(ref, safe="")
+
+
+def _branch_exists(repository: str, branch: str, token: str, timeout: int) -> Optional[bool]:
+    """Returns True/False when branch existence could be conclusively
+    determined via GET /repos/{repository}/branches/{branch}, or None when
+    the check itself failed (network/auth/parse error) and existence
+    could not be determined either way -- callers must fail closed on
+    None, the same as on a confirmed False."""
+    try:
+        detail = _github_api_get(f"/repos/{repository}/branches/{_quote_ref(branch)}", token, timeout)
+    except GitHubAPIError:
+        return None
+    return detail is not None
+
+
+def _collect_bypass_actors(repository: str, token: str, timeout: int) -> List[Dict[str, Any]]:
+    """Fetch bypass actors from every *active*, branch-targeting ruleset
+    defined on the repo. The list endpoint doesn't inline bypass_actors, so
+    each qualifying ruleset needs one detail fetch."""
+    summaries = _github_api_get(f"/repos/{repository}/rulesets", token, timeout)
+    if not isinstance(summaries, list):
+        return []
+
+    actors: List[Dict[str, Any]] = []
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        if summary.get("enforcement") != "active":
+            continue
+        if summary.get("target") not in (None, "branch"):
+            continue
+        ruleset_id = summary.get("id")
+        # Defense in depth: only follow ruleset ids that are genuinely
+        # integers from GitHub's own response, never a value that could
+        # smuggle extra path segments into the detail-fetch URL.
+        if not isinstance(ruleset_id, int) or isinstance(ruleset_id, bool):
+            continue
+
+        detail = _github_api_get(f"/repos/{repository}/rulesets/{ruleset_id}", token, timeout)
+        if not isinstance(detail, dict):
+            continue
+        for actor in detail.get("bypass_actors") or []:
+            if isinstance(actor, dict):
+                actors.append(actor)
+    return actors
+
+
+def inspect_branch_governance(
+    repository: str,
+    branch: str = "main",
+    token: Optional[str] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> BranchGovernanceReport:
+    """Inspects the effective branch protection rules for `branch` on
+    `repository` (as "owner/repo") via GitHub's rules-for-branch
+    (`GET /repos/{repository}/rules/branches/{branch}`) and rulesets
+    (`GET /repos/{repository}/rulesets`) REST endpoints, authenticating
+    with the ambient GITHUB_TOKEN when `token` isn't supplied explicitly.
+    """
+    if not isinstance(repository, str) or not _REPO_RE.match(repository):
+        return _unavailable(
+            branch,
+            f"invalid repository identifier {repository!r}; expected 'owner/repo' "
+            f"matching {_REPO_RE.pattern!r}",
+        )
+
+    resolved_token = token if token is not None else os.environ.get("GITHUB_TOKEN")
+    if not resolved_token:
+        return _unavailable(
+            branch,
+            "no GITHUB_TOKEN available (neither passed explicitly nor set in the environment); "
+            "branch governance could not be verified",
+        )
+
+    try:
+        raw_rules = _github_api_get(
+            f"/repos/{repository}/rules/branches/{_quote_ref(branch)}", resolved_token, timeout
+        )
+    except GitHubAPIError as e:
+        return _unavailable(branch, f"GitHub rules API request failed: {e}")
+
+    if raw_rules is None:
+        # rules-for-branch 404'd. GitHub returns 404 both for "no rules
+        # apply to this branch" (benign) and for a nonexistent repo/branch
+        # (a caller typo that must not be silently reported as "clean").
+        # Only trust the benign interpretation once branch existence is
+        # independently confirmed; otherwise fail closed.
+        exists = _branch_exists(repository, branch, resolved_token, timeout)
+        if exists is False:
+            return _unavailable(
+                branch,
+                f"repository '{repository}' or branch '{branch}' does not exist "
+                "(branch lookup returned 404); cannot verify branch governance",
+            )
+        if exists is None:
+            return _unavailable(
+                branch,
+                "could not confirm repository/branch existence after an empty rules-for-branch "
+                "response; failing closed rather than assuming no rules apply",
+            )
+        rules: List[Any] = []
+    else:
+        rules = raw_rules if isinstance(raw_rules, list) else []
+
+    bypass_fetch_warning: Optional[str] = None
+    try:
+        bypass_actors = _collect_bypass_actors(repository, resolved_token, timeout)
+    except GitHubAPIError as e:
+        if e.status_code in (401, 403):
+            # A bad/under-scoped token taints the whole report, not just
+            # this one lookup -- the rules-for-branch call above may well
+            # have "succeeded" only via its own 404-is-benign short-circuit.
+            return _unavailable(
+                branch,
+                f"GitHub API authentication/authorization failed while enumerating rulesets "
+                f"(HTTP {e.status_code}); token may be invalid or insufficiently scoped: {e}",
+            )
+        # Any other (non-auth) failure enumerating rulesets doesn't invalidate
+        # the rules data already in hand -- degrade to "no bypass-actor
+        # visibility" rather than discarding an otherwise-successful lookup.
+        bypass_actors = []
+        bypass_fetch_warning = f"could not enumerate ruleset bypass actors: {e}"
+
+    pr_rule = next((r for r in rules if isinstance(r, dict) and r.get("type") == "pull_request"), None)
+    pull_request_required = pr_rule is not None
+
+    approvals_required = 0
+    if pr_rule is not None:
+        params = pr_rule.get("parameters") or {}
+        try:
+            approvals_required = int(params.get("required_approving_review_count") or 0)
+        except (TypeError, ValueError):
+            approvals_required = 0
+
+    # A "pull_request" rule is what actually blocks a direct (non-PR) push
+    # to the branch; no other rule type in the rules-for-branch response
+    # has that effect.
+    direct_push_prevented = pull_request_required
+
+    always_bypass = [a for a in bypass_actors if a.get("bypass_mode") == BYPASS_MODE_ALWAYS]
+    pr_only_bypass = [a for a in bypass_actors if a.get("bypass_mode") == BYPASS_MODE_PULL_REQUEST]
+    unknown_mode_bypass = [
+        a for a in bypass_actors if a.get("bypass_mode") not in (BYPASS_MODE_ALWAYS, BYPASS_MODE_PULL_REQUEST)
+    ]
+    bypass_actors_count = len(bypass_actors)
+    # Whitelist, not blocklist: admin_enforced is True only when *every*
+    # bypass actor is restricted to the one known-least-dangerous mode
+    # (pull_request). "always" and any unrecognized/missing mode value
+    # both fail closed to "not enforced".
+    admin_enforced = len(always_bypass) + len(unknown_mode_bypass) == 0
+
+    warnings: List[str] = []
+    if bypass_fetch_warning:
+        warnings.append(bypass_fetch_warning)
+
+    if not rules:
+        warnings.append(
+            f"no branch rules found for '{branch}'; direct unreviewed pushes are not prevented by any ruleset"
+        )
+    elif not pull_request_required:
+        warnings.append(
+            f"branch '{branch}' does not require a pull request; direct unreviewed commits are permitted"
+        )
+    elif approvals_required == 0:
+        warnings.append(
+            f"branch '{branch}' requires a pull request but 0 approving reviews; unreviewed merges are permitted"
+        )
+
+    if always_bypass:
+        warnings.append(
+            f"{len(always_bypass)} bypass actor(s) can bypass branch rules entirely (bypass_mode=always), "
+            "permitting an unreviewed direct push"
+        )
+    if unknown_mode_bypass:
+        warnings.append(
+            f"{len(unknown_mode_bypass)} bypass actor(s) have an unrecognized bypass_mode; "
+            "treated as a full bypass (fail-closed)"
+        )
+    if pr_only_bypass:
+        warnings.append(
+            f"{len(pr_only_bypass)} bypass actor(s) can bypass pull-request review requirements "
+            "(bypass_mode=pull_request)"
+        )
+
+    reason = (
+        f"queried GitHub rules for {repository}@{branch}: {len(rules)} applicable rule(s), "
+        f"{bypass_actors_count} bypass actor(s) across active branch rulesets"
+    )
+
+    return BranchGovernanceReport(
+        available=True,
+        branch=branch,
+        pull_request_required=pull_request_required,
+        approvals_required=approvals_required,
+        direct_push_prevented=direct_push_prevented,
+        bypass_actors_count=bypass_actors_count,
+        admin_enforced=admin_enforced,
+        warnings=warnings,
+        reason=reason,
+    )

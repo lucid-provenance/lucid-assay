@@ -290,6 +290,23 @@ class BuilderStatementTests(unittest.TestCase):
         self.assertFalse(bg_block["admin_enforced"])
         self.assertIn("bypass_mode=always", bg_block["warnings"][0])
 
+    def test_branch_governance_reason_code_defaults_to_none(self):
+        statement = build_statement(**_base_kwargs())
+        bg_block = statement["predicate"]["branch_governance"]
+        self.assertIn("reason_code", bg_block)
+        self.assertIsNone(bg_block["reason_code"])
+
+    def test_branch_governance_reason_code_is_passed_through(self):
+        from cli.parsers.github_rules import REASON_CODE_PLATFORM_UNSUPPORTED_TIER
+
+        bg = _default_branch_governance()
+        bg.available = False
+        bg.reason = "GitHub API authentication/authorization failed ... Upgrade to GitHub Pro ..."
+        bg.reason_code = REASON_CODE_PLATFORM_UNSUPPORTED_TIER
+        statement = build_statement(**_base_kwargs(branch_governance=bg))
+        bg_block = statement["predicate"]["branch_governance"]
+        self.assertEqual(bg_block["reason_code"], "platform_unsupported_tier")
+
 
 if __name__ == "__main__":
     unittest.main()

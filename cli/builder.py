@@ -151,6 +151,7 @@ def build_statement(
             "admin_enforced": branch_governance.admin_enforced,
             "warnings": branch_governance.warnings,
             "reason": branch_governance.reason,
+            "reason_code": branch_governance.reason_code,
         },
         "artifact": {
             "subject": {

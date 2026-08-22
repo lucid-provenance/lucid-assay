@@ -10,9 +10,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cli.parsers.github_rules import (
     BranchGovernanceReport,
     GitHubAPIError,
+    REASON_CODE_PLATFORM_UNSUPPORTED_TIER,
     bypass_permits_unreviewed_change,
     inspect_branch_governance,
     _github_api_get,
+    _is_platform_tier_limitation,
     _quote_ref,
 )
 from cli.parsers.junit import TestTotals
@@ -230,6 +232,50 @@ class InspectBranchGovernanceTests(unittest.TestCase):
         self.assertIn("authentication/authorization failed", report.reason)
         self.assertIn("Administration: Read", report.reason)
         self.assertIn("querying rules for branch", report.reason)
+        # A generic 403 (no plan-limitation marker in the message) must not
+        # be misclassified as the platform/plan-tier condition.
+        self.assertIsNone(report.reason_code)
+
+    @patch("cli.parsers.github_rules._github_api_get")
+    def test_403_free_plan_message_sets_platform_unsupported_tier_reason_code(self, mock_get):
+        # GitHub returns the identical HTTP 403 whether the token is
+        # under-scoped or the token is fine but rulesets simply aren't
+        # supported for this repo at all (a private repo on GitHub Free).
+        # reason_code must distinguish the two so downstream policy (e.g.
+        # cli.verify's --disallow-degraded) can tell them apart, rather
+        # than treating every unavailable governance report identically.
+        mock_get.side_effect = _api_get_router({
+            "/repos/acme/widgets/rules/branches/main": GitHubAPIError(
+                "GET /repos/acme/widgets/rules/branches/main -> HTTP 403: "
+                "Upgrade to GitHub Pro or make this repository public to enable this feature.",
+                status_code=403,
+            ),
+        })
+
+        report = inspect_branch_governance("acme/widgets", "main", token="correctly-scoped-app-token")
+
+        self.assertFalse(report.available)
+        self.assertEqual(report.reason_code, REASON_CODE_PLATFORM_UNSUPPORTED_TIER)
+        self.assertIn("Upgrade to GitHub Pro", report.reason)
+
+    @patch("cli.parsers.github_rules._github_api_get")
+    def test_403_free_plan_message_during_ruleset_enumeration_sets_reason_code(self, mock_get):
+        # Same condition, but hit during the secondary bypass-actor
+        # enrichment call rather than the primary rules-for-branch call --
+        # reason_code must be set there too, not just on the first call site.
+        mock_get.side_effect = _api_get_router({
+            "/repos/acme/widgets/rules/branches/main": [_pull_request_rule(2)],
+            "/repos/acme/widgets/rulesets": GitHubAPIError(
+                "GET /repos/acme/widgets/rulesets -> HTTP 403: "
+                "Upgrade to GitHub Pro or make this repository public to enable this feature.",
+                status_code=403,
+            ),
+        })
+
+        report = inspect_branch_governance("acme/widgets", "main", token="correctly-scoped-app-token")
+
+        self.assertFalse(report.available)
+        self.assertEqual(report.reason_code, REASON_CODE_PLATFORM_UNSUPPORTED_TIER)
 
     @patch("cli.parsers.github_rules._github_api_get")
     def test_401_on_rules_endpoint_gives_actionable_administration_read_diagnostic(self, mock_get):
@@ -378,6 +424,35 @@ class QuoteRefTests(unittest.TestCase):
 
     def test_slash_is_percent_encoded(self):
         self.assertEqual(_quote_ref("release/1.0"), "release%2F1.0")
+
+
+class IsPlatformTierLimitationTests(unittest.TestCase):
+    """Unit coverage for the marker-matching that classifies a 403's error
+    body as GitHub's plan/visibility feature gate, in isolation from the
+    full inspect_branch_governance() round-trip."""
+
+    def test_matches_real_github_wording(self):
+        self.assertTrue(_is_platform_tier_limitation(
+            "Upgrade to GitHub Pro or make this repository public to enable this feature."
+        ))
+
+    def test_matches_case_insensitively(self):
+        self.assertTrue(_is_platform_tier_limitation("UPGRADE TO GITHUB PRO to unlock this"))
+
+    def test_either_marker_alone_is_sufficient(self):
+        self.assertTrue(_is_platform_tier_limitation("please make this repository public first"))
+
+    def test_generic_forbidden_does_not_match(self):
+        self.assertFalse(_is_platform_tier_limitation("Forbidden"))
+
+    def test_administration_scope_message_does_not_match(self):
+        self.assertFalse(_is_platform_tier_limitation(
+            "Resource not accessible by integration; token needs 'Administration: Read'"
+        ))
+
+    def test_empty_or_none_does_not_raise_or_match(self):
+        self.assertFalse(_is_platform_tier_limitation(""))
+        self.assertFalse(_is_platform_tier_limitation(None))
 
 
 class GitHubApiGetTransportTests(unittest.TestCase):

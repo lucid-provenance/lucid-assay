@@ -46,6 +46,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
 
+MAX_SARIF_FILE_SIZE = 10 * 1024 * 1024  # 10MB limit
+
 VALID_LEVELS = {"error", "warning", "note", "none"}
 DEFAULT_LEVEL = "warning"
 
@@ -192,8 +194,14 @@ def _normalize_sarif_path(uri: str) -> str:
         p = urllib.parse.unquote(p)
     except (ValueError, UnicodeDecodeError):
         pass
+    # Guard against traversal - os.path.normpath on "../../etc/passwd" is still "../../etc/passwd"
+    # We want to ensure it doesn't escape the repo root if interpreted as relative.
     p = os.path.normpath(p)
-    return p.lstrip(os.sep)
+    # If it's absolute (starts with / or \ after normpath), strip it to make it relative.
+    # If it still has ../ at the beginning, it's a traversal attempt or outside repo.
+    while p.startswith("..") or p.startswith(os.sep):
+        p = p.lstrip(".").lstrip(os.sep)
+    return p
 
 
 def _path_components(path_str: str) -> List[str]:
@@ -274,6 +282,8 @@ def _extract_location(result: Dict[str, Any]) -> tuple:
     region = region if isinstance(region, dict) else {}
     try:
         start_line = int(region.get("startLine") or 0)
+        if start_line < 0:
+            start_line = 0
     except (TypeError, ValueError):
         start_line = 0
 
@@ -354,7 +364,8 @@ def _extract_sonarqube_extension(run: Dict[str, Any]) -> Optional[Dict[str, Any]
         for in_key in in_keys:
             if in_key in bag and bag[in_key] is not None:
                 try:
-                    result[out_key] = int(float(bag[in_key]))
+                    val = int(float(bag[in_key]))
+                    result[out_key] = max(0, val)  # Clamp to non-negative
                 except (TypeError, ValueError):
                     pass
                 break
@@ -379,6 +390,11 @@ def parse_sarif_file(
     patch_modified_lines = patch_modified_lines or {}
 
     try:
+        if path.stat().st_size > MAX_SARIF_FILE_SIZE:
+            return SarifSummaryReport(
+                available=False,
+                reasons=[f"SARIF file {path} exceeds size limit of {MAX_SARIF_FILE_SIZE} bytes"]
+            )
         with open(path, "rb") as f:
             raw_bytes = f.read()
     except FileNotFoundError:

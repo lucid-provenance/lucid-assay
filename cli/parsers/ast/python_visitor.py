@@ -97,6 +97,107 @@ def _same_expr(a: ast.expr, b: ast.expr) -> bool:
     return ast.dump(a) == ast.dump(b)
 
 
+def _fold_unary_op(expr: ast.UnaryOp) -> Tuple[bool, Any]:
+    ok, val = _fold_constant(expr.operand)
+    if not ok:
+        return False, None
+    if isinstance(expr.op, ast.Not):
+        return True, not val
+    if isinstance(expr.op, ast.UAdd):
+        return True, +val
+    if isinstance(expr.op, ast.USub):
+        return True, -val
+    return False, None
+
+
+def _fold_container_literal(expr: ast.expr) -> Tuple[bool, Any]:
+    """Folds an ast.List/Tuple/Set literal of themselves-foldable elements."""
+    values = []
+    for elt in expr.elts:  # type: ignore[attr-defined]
+        ok, val = _fold_constant(elt)
+        if not ok:
+            return False, None
+        values.append(val)
+    container = {ast.List: list, ast.Tuple: tuple, ast.Set: set}[type(expr)]
+    try:
+        return True, container(values)
+    except TypeError:
+        return False, None
+
+
+def _fold_dict_literal(expr: ast.Dict) -> Tuple[bool, Any]:
+    result: dict = {}
+    for key_expr, val_expr in zip(expr.keys, expr.values):
+        if key_expr is None:  # `**unpacking` inside the literal
+            return False, None
+        ok_k, key = _fold_constant(key_expr)
+        ok_v, val = _fold_constant(val_expr)
+        if not (ok_k and ok_v):
+            return False, None
+        try:
+            result[key] = val
+        except TypeError:
+            return False, None
+    return True, result
+
+
+def _fold_bool_op(expr: ast.BoolOp) -> Tuple[bool, Any]:
+    values = []
+    for sub in expr.values:
+        ok, val = _fold_constant(sub)
+        if not ok:
+            return False, None
+        values.append(val)
+    if isinstance(expr.op, ast.And):
+        result = values[0]
+        for val in values[1:]:
+            result = result and val
+        return True, result
+    if isinstance(expr.op, ast.Or):
+        result = values[0]
+        for val in values[1:]:
+            result = result or val
+        return True, result
+    return False, None
+
+
+def _fold_compare_step(op: ast.cmpop, current: Any, right: Any) -> Tuple[bool, Any]:
+    """One step of a chained comparison (`a OP b OP c ...`): returns
+    (ok, step_result) for a single (op, current, right) triple. ok=False
+    for both an unsupported operator and a TypeError during evaluation
+    (e.g. comparing incompatible types) -- the caller treats either the
+    same way, as "can't fold"."""
+    try:
+        if isinstance(op, ast.Eq):
+            return True, current == right
+        if isinstance(op, ast.NotEq):
+            return True, current != right
+        if isinstance(op, ast.In):
+            return True, current in right
+        if isinstance(op, ast.NotIn):
+            return True, current not in right
+    except TypeError:
+        return False, None
+    return False, None
+
+
+def _fold_compare(expr: ast.Compare) -> Tuple[bool, Any]:
+    ok, current = _fold_constant(expr.left)
+    if not ok:
+        return False, None
+    overall = True
+    for op, comparator in zip(expr.ops, expr.comparators):
+        ok, right = _fold_constant(comparator)
+        if not ok:
+            return False, None
+        ok, step = _fold_compare_step(op, current, right)
+        if not ok:
+            return False, None
+        overall = overall and step
+        current = right
+    return True, overall
+
+
 def _fold_constant(expr: ast.expr) -> Tuple[bool, Any]:
     """Best-effort compile-time evaluation of `expr`, restricted to
     operations that are safe and meaningful without executing any code:
@@ -110,95 +211,22 @@ def _fold_constant(expr: ast.expr) -> Tuple[bool, Any]:
     fold arithmetic (`2 - 1`) or `is`/`is not` -- those require either real
     evaluation semantics or aren't safe to approximate with the folded
     value's Python identity, and are conservatively left as "real" checks.
+
+    Dispatches by node type to a same-named `_fold_*` helper per case,
+    each handling exactly one AST node kind (see each helper's docstring).
     """
     if isinstance(expr, ast.Constant):
         return True, expr.value
-
     if isinstance(expr, ast.UnaryOp):
-        ok, val = _fold_constant(expr.operand)
-        if not ok:
-            return False, None
-        if isinstance(expr.op, ast.Not):
-            return True, not val
-        if isinstance(expr.op, ast.UAdd):
-            return True, +val
-        if isinstance(expr.op, ast.USub):
-            return True, -val
-        return False, None
-
+        return _fold_unary_op(expr)
     if isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
-        values = []
-        for elt in expr.elts:
-            ok, val = _fold_constant(elt)
-            if not ok:
-                return False, None
-            values.append(val)
-        container = {ast.List: list, ast.Tuple: tuple, ast.Set: set}[type(expr)]
-        try:
-            return True, container(values)
-        except TypeError:
-            return False, None
-
+        return _fold_container_literal(expr)
     if isinstance(expr, ast.Dict):
-        result: dict = {}
-        for key_expr, val_expr in zip(expr.keys, expr.values):
-            if key_expr is None:  # `**unpacking` inside the literal
-                return False, None
-            ok_k, key = _fold_constant(key_expr)
-            ok_v, val = _fold_constant(val_expr)
-            if not (ok_k and ok_v):
-                return False, None
-            try:
-                result[key] = val
-            except TypeError:
-                return False, None
-        return True, result
-
+        return _fold_dict_literal(expr)
     if isinstance(expr, ast.BoolOp):
-        values = []
-        for sub in expr.values:
-            ok, val = _fold_constant(sub)
-            if not ok:
-                return False, None
-            values.append(val)
-        if isinstance(expr.op, ast.And):
-            result = values[0]
-            for val in values[1:]:
-                result = result and val
-            return True, result
-        if isinstance(expr.op, ast.Or):
-            result = values[0]
-            for val in values[1:]:
-                result = result or val
-            return True, result
-        return False, None
-
+        return _fold_bool_op(expr)
     if isinstance(expr, ast.Compare):
-        ok, current = _fold_constant(expr.left)
-        if not ok:
-            return False, None
-        overall = True
-        for op, comparator in zip(expr.ops, expr.comparators):
-            ok, right = _fold_constant(comparator)
-            if not ok:
-                return False, None
-            try:
-                if isinstance(op, ast.Eq):
-                    step = current == right
-                elif isinstance(op, ast.NotEq):
-                    step = current != right
-                elif isinstance(op, ast.In):
-                    step = current in right
-                elif isinstance(op, ast.NotIn):
-                    step = current not in right
-                else:
-                    return False, None
-            except TypeError:
-                return False, None
-            overall = overall and step
-            current = right
-        return True, overall
-
+        return _fold_compare(expr)
     return False, None
 
 

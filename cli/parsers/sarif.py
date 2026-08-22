@@ -46,6 +46,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
 
+from ..common import UnsafePathError, safe_resolve_path
+
 MAX_SARIF_FILE_SIZE = 10 * 1024 * 1024  # 10MB limit
 
 VALID_LEVELS = {"error", "warning", "note", "none"}
@@ -386,8 +388,12 @@ def parse_sarif_file(
     of the raw file. Never raises: missing files, unreadable files, and
     malformed JSON all degrade to `available=False` with the failure
     captured in `reasons`."""
-    path = Path(file_path)
     patch_modified_lines = patch_modified_lines or {}
+
+    try:
+        path = safe_resolve_path(file_path)
+    except UnsafePathError as e:
+        return SarifSummaryReport(available=False, reasons=[f"unsafe SARIF file path: {e}"])
 
     try:
         if path.stat().st_size > MAX_SARIF_FILE_SIZE:
@@ -631,9 +637,10 @@ def parse_sonar_metrics_file(file_path: Union[str, Path]) -> Optional[Dict[str, 
     returns None rather than propagating, since this is enrichment data
     only and must never be able to fail a run."""
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
+        resolved = safe_resolve_path(file_path)
+        with open(resolved, "r", encoding="utf-8") as f:
             doc = json.load(f)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, UnsafePathError):
         return None
 
     if not isinstance(doc, dict):

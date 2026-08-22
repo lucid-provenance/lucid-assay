@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from typing import Dict, Iterator, List, Optional
 
 from .builder import build_statement
+from .common import safe_resolve_path
 from .hashing import sha256_file, worm_uri
 from .parsers.ast import inspect_test_suite
 from .parsers.coverage import parse_cobertura, parse_lcov
@@ -350,7 +351,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
-    with open(args.out, "w", encoding="utf-8") as f:
+    out_path = safe_resolve_path(args.out)
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(statement, f, indent=2)
 
     # 8. Async WORM uploads (fire-and-forget: the timed cost here is only
@@ -365,14 +367,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.sign or args.dry_run_sign:
         from .oidc_signer import sign_statement
 
-        with open(args.out, "rb") as f:
+        with open(out_path, "rb") as f:
             envelope_bytes = f.read()
 
         _sign_t0 = time.perf_counter_ns()
         envelope = sign_statement(envelope_bytes, dry_run=args.dry_run_sign, timing=sign_sub_ns)
         sign_total_ns = time.perf_counter_ns() - _sign_t0
 
-        signed_path = derive_signed_path(args.out)
+        signed_path = safe_resolve_path(derive_signed_path(str(out_path)))
 
         with open(signed_path, "w", encoding="utf-8") as f:
             f.write(envelope.to_json())

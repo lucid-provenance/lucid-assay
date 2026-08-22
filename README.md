@@ -12,6 +12,7 @@ verifies those attestations before a deploy/merge is allowed to proceed.
 schema/
   tenax-attestation-v1.schema.json    # in-toto predicate JSON Schema
 cli/
+  common.py                 # safe_resolve_path(): path-safety guard shared by every module below that opens an operator-supplied file
   parsers/junit.py          # streaming JUnit XML -> TestTotals (flaky-retry aware)
   parsers/coverage.py       # Cobertura XML + LCOV -> CoverageReport (per-line hit maps)
   parsers/ast_inspector.py  # backward-compat shim -> re-exports parsers/ast/
@@ -43,7 +44,9 @@ tests/
   test_github_rules.py              # branch governance API client tests (auth, pagination, bypass modes)
   test_verify.py                     # DSSE/Sigstore verification + policy-gate tests
   test_verify_boundaries.py           # verify.py hardening/edge-case suite
+  test_verify_hardening.py             # envelope size guard, diagnostic schema validation, OIDC fetch retry
   test_security_boundaries.py          # cross-cutting adversarial-input suite
+  test_common_path_safety.py            # safe_resolve_path() + its wiring into every open()/getsize() call site
   fixtures/                             # sample cobertura.xml and a rendered statement
   fixtures/ast_assertions/                # per-language source-text fixtures for the AST engine
                                            # (python/, typescript/, javascript/, go/, java/) --
@@ -61,6 +64,17 @@ Every module is a pure function or a thin, swappable I/O boundary:
   trivially unit-testable in isolation. `parsers/github_rules.py` is the
   one exception (it's a live GitHub API client by necessity), which is why
   it's the most defensively written module in the repo — see below.
+- `common.py::safe_resolve_path()` is the one path-safety choke point every
+  module reads an operator-supplied file through (`--junit-xml`,
+  `--coverage-report`, `--sarif`, `--sonar-metrics`, `--out`, the `verify`
+  envelope argument): resolves to an absolute, symlink-normalized `Path`
+  and rejects null bytes/malformed input before it ever reaches
+  `open()`/`os.path.getsize()`/`ET.parse()`. It does not enforce a single
+  root/allowlist directory — these are CLI arguments an operator supplies
+  at invocation time, the same as any file-taking CLI tool's, not
+  attacker-controlled remote input — so this guards against a value that
+  can't safely become a real filesystem path at all, not "escaping" a
+  directory that was never fixed to begin with.
 - `oidc_signer.py` and the WORM upload path in `main.py` are the **only**
   network-touching pieces in the *ingestion* pipeline, and they're isolated
   so the <50ms blocking budget can be measured and enforced on everything
@@ -214,6 +228,14 @@ versus git's repo-root-relative path (`cli/verify.py`) via suffix-matching
 on path components — an ambiguous tie is treated as no match rather than
 guessed at. Hardened against git CLI option injection (`--end-of-options`
 before the revision range) and quoted/escaped filenames in diff headers.
+`base_sha`/`head_sha` are additionally validated against a strict
+allowlist regex (`^[a-zA-Z0-9_./-]+$`) before ever reaching
+`subprocess.run()` — defense in depth on top of, not instead of,
+`--end-of-options`; every `subprocess.run()` call here takes a list of
+argv tokens, never a shell string, so `shell=True`/shell metacharacter
+injection isn't reachable to begin with. A ref that fails validation
+degrades exactly like a failed `git diff` would (`available=False`, or an
+empty mapping from `compute_patch_modified_lines`), never a raw crash.
 
 **`parsers/ast/`** is a language-agnostic registry/dispatcher for assertion
 integrity: `inspect_test_suite()` discovers test files across four

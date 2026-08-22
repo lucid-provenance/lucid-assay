@@ -7,7 +7,13 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cli.parsers.coverage import CoverageReport, FileCoverage
-from cli.patch_coverage import REASON_CODE_NO_COVERABLE_LINES, compute_patch_coverage
+from cli.patch_coverage import (
+    REASON_CODE_NO_COVERABLE_LINES,
+    UnsafeGitRefError,
+    _validate_git_ref,
+    compute_patch_coverage,
+    compute_patch_modified_lines,
+)
 
 
 def _git(args, cwd):
@@ -98,6 +104,67 @@ class ComputePatchCoverageReasonCodeTests(unittest.TestCase):
 
         self.assertTrue(result.available)
         self.assertIsNone(result.reason_code)
+
+
+class ValidateGitRefTests(unittest.TestCase):
+    """_validate_git_ref: the allowlist regex guard in front of every git
+    CLI argument, on top of (not instead of) --end-of-options and
+    shell=False."""
+
+    def test_accepts_a_real_commit_sha(self):
+        self.assertEqual(_validate_git_ref("a" * 40, "head_sha"), "a" * 40)
+
+    def test_accepts_branch_names_with_slashes_and_hyphens(self):
+        self.assertEqual(_validate_git_ref("feat/my-branch_v2", "head_sha"), "feat/my-branch_v2")
+
+    def test_rejects_shell_metacharacters(self):
+        for bad in ["$(whoami)", "; rm -rf /", "`id`", "a && b", "a|b", "a;b"]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(UnsafeGitRefError):
+                    _validate_git_ref(bad, "head_sha")
+
+    def test_rejects_whitespace(self):
+        with self.assertRaises(UnsafeGitRefError):
+            _validate_git_ref("sha with spaces", "head_sha")
+
+    def test_rejects_empty_string(self):
+        with self.assertRaises(UnsafeGitRefError):
+            _validate_git_ref("", "head_sha")
+
+    def test_rejects_non_string(self):
+        with self.assertRaises(UnsafeGitRefError):
+            _validate_git_ref(None, "head_sha")  # type: ignore[arg-type]
+
+    def test_error_message_includes_the_label(self):
+        with self.assertRaises(UnsafeGitRefError) as cm:
+            _validate_git_ref("bad ref", "base_sha")
+        self.assertIn("base_sha", str(cm.exception))
+
+
+class GitRefValidationEndToEndTests(unittest.TestCase):
+    """A malicious base_sha/head_sha is refused before ever reaching
+    subprocess.run(), and both public entry points degrade the same way
+    they already do for a failed git diff (fail closed, never raise)."""
+
+    def test_compute_patch_coverage_degrades_on_unsafe_base_sha(self):
+        with _TempGitRepo() as repo:
+            result = compute_patch_coverage("$(touch /tmp/pwned)", repo.base_sha, repo.path, _EMPTY_COVERAGE)
+
+        self.assertFalse(result.available)
+        self.assertIn("git diff refused", result.reason)
+
+    def test_compute_patch_coverage_degrades_on_unsafe_head_sha(self):
+        with _TempGitRepo() as repo:
+            result = compute_patch_coverage(repo.base_sha, "; rm -rf /", repo.path, _EMPTY_COVERAGE)
+
+        self.assertFalse(result.available)
+        self.assertIn("git diff refused", result.reason)
+
+    def test_compute_patch_modified_lines_degrades_to_empty_on_unsafe_ref(self):
+        with _TempGitRepo() as repo:
+            result = compute_patch_modified_lines("$(touch /tmp/pwned)", repo.base_sha, repo.path)
+
+        self.assertEqual(result, {})
 
 
 if __name__ == "__main__":

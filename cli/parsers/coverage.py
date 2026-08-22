@@ -15,6 +15,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+from ..common import safe_resolve_path
+
 
 def _normalize_path(path_str: str) -> str:
     """Normalize file paths so git diff keys and coverage report keys match."""
@@ -39,7 +41,7 @@ class CoverageReport:
 
 def parse_cobertura(path: str) -> CoverageReport:
     """Cobertura XML stream/tree parser with strict attribute validation."""
-    tree = ET.parse(path)
+    tree = ET.parse(safe_resolve_path(path))
     root = tree.getroot()
 
     try:
@@ -95,7 +97,7 @@ def parse_lcov(path: str) -> CoverageReport:
     total_lines = 0
     covered_lines = 0
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(safe_resolve_path(path), "r", encoding="utf-8", errors="replace") as f:
         for raw_line in f:
             line = raw_line.rstrip("\n").strip()
             if not line:

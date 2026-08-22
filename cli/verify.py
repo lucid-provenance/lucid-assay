@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .common import UnsafePathError, safe_resolve_path
+
 # jsonschema is an optional dependency (pyproject.toml [dev] extra) -- this
 # module is meant to work as a lightweight, dependency-minimal standalone
 # admission gate, so formal schema validation degrades to "skipped" rather
@@ -81,6 +83,12 @@ _OIDC_SOURCE_REPOSITORY_URI_OID = "1.3.6.1.4.1.57264.1.12"
 EXIT_PASS = 0
 EXIT_POLICY_VIOLATION = 2
 EXIT_FILE_ERROR = 1
+
+# Placeholder used throughout _describe_actual_cert_claims() for a
+# certificate claim that's absent, unparseable, or hit an unexpected cert
+# shape -- one constant instead of five duplicated literals so a caller
+# comparing against it (or a future rename) has a single place to look.
+UNPARSEABLE_LITERAL = "<unparseable>"
 
 # A signed attestation envelope is a small JSON document by construction
 # (a DSSE-wrapped RCS predicate); anything approaching this ceiling is
@@ -434,31 +442,31 @@ def _describe_actual_cert_claims(cert: Any) -> str:
     except ExtensionNotFound:
         pass
     except Exception:  # noqa: BLE001 - diagnostics must never themselves crash the gate
-        san = "<unparseable>"
+        san = UNPARSEABLE_LITERAL
 
     try:
         issuer = _extract_cert_ext_v1_or_v2(cert, _OIDC_ISSUER_V1_OID, _OIDC_ISSUER_V2_OID)
     except Exception:  # noqa: BLE001
-        issuer = "<unparseable>"
+        issuer = UNPARSEABLE_LITERAL
 
     try:
         repository = _extract_cert_ext_v1_or_v2(
             cert, _GITHUB_WORKFLOW_REPOSITORY_OID, _OIDC_SOURCE_REPOSITORY_URI_OID
         )
     except Exception:  # noqa: BLE001
-        repository = "<unparseable>"
+        repository = UNPARSEABLE_LITERAL
 
     try:
         # Workflow name has no v2 successor extension, so re-use the v1/v2
         # helper with the same OID twice -- it'll simply take the v1 branch.
         workflow = _extract_cert_ext_v1_or_v2(cert, _GITHUB_WORKFLOW_NAME_OID, _GITHUB_WORKFLOW_NAME_OID)
     except Exception:  # noqa: BLE001
-        workflow = "<unparseable>"
+        workflow = UNPARSEABLE_LITERAL
 
     try:
         ref = _extract_cert_ref(cert)
     except Exception:  # noqa: BLE001
-        ref = "<unparseable>"
+        ref = UNPARSEABLE_LITERAL
 
     return f"SAN={san!r} issuer={issuer!r} repository={repository!r} workflow={workflow!r} ref={ref!r}"
 
@@ -629,6 +637,21 @@ def _verify_sigstore_identity(
     except ImportError as e:
         return "unavailable", f"sigstore package unavailable; skipping identity verification: {e}"
 
+    return _attempt_sigstore_verification(envelope, policy, unsafe, policy_detail)
+
+
+def _attempt_sigstore_verification(envelope: Dict[str, Any], policy: Any, unsafe: bool, policy_detail: str) -> Tuple[str, str]:
+    """Performs the actual Bundle.from_json() + Verifier.verify_dsse() call
+    and classifies the outcome into (status, detail). Split out of
+    _verify_sigstore_identity so that function's own complexity stays in
+    its guard-clause/setup logic, not this exception fan-out. Requires the
+    sigstore package (callers reach this only after _verify_sigstore_identity's
+    own earlier import check already confirmed it's available)."""
+    from sigstore.errors import MetadataError, NetworkError, TUFError
+    from sigstore.errors import VerificationError as SigstoreVerificationError
+    from sigstore.models import Bundle
+    from sigstore.verify import Verifier
+
     try:
         bundle = Bundle.from_json(_envelope_to_bundle_json(envelope))
         verifier = Verifier.production(offline=False)
@@ -658,34 +681,13 @@ def _verify_sigstore_identity(
         return "unavailable", f"Sigstore verification unavailable: {e}"
 
 
-def verify_dsse_attestation(
-    envelope: Dict[str, Any],
-    *,
-    min_rcs: int = 0,
-    require_digest: Optional[str] = None,
-    disallow_degraded: bool = False,
-    dry_run: bool = False,
-    cert_identity: Optional[str] = None,
-    cert_oidc_issuer: Optional[str] = None,
-    expected_issuer: Optional[str] = None,
-    expected_repository: Optional[str] = None,
-    expected_workflow: Optional[str] = None,
-    expected_ref: Optional[str] = None,
-) -> VerificationResult:
-    """Validates a DSSE envelope's structure, decodes its in-toto Statement
-    payload, best-effort verifies the Sigstore signing identity, and enforces
-    the admission policy gates. Never raises for malformed/hostile input --
-    problems are reported as `violations` on the returned result."""
+def _decode_envelope_statement(envelope: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], List[str], List[str]]:
+    """Validates DSSE envelope structure (payloadType, signatures, payload)
+    and decodes the base64+JSON payload into the in-toto Statement dict.
+    Returns (statement_or_None, violations, warnings) -- never raises;
+    every problem degrades to a violations entry with statement left None."""
     violations: List[str] = []
     warnings: List[str] = []
-
-    if not isinstance(envelope, dict):
-        return VerificationResult(
-            passed=False,
-            violations=["DSSE envelope is not a JSON object"],
-            identity_status="skipped",
-            identity_detail="envelope malformed; identity verification not attempted",
-        )
 
     payload_type = envelope.get("payloadType")
     if payload_type != EXPECTED_PAYLOAD_TYPE:
@@ -712,6 +714,140 @@ def verify_dsse_attestation(
                 violations.append("decoded DSSE payload is not a JSON object")
             else:
                 statement = decoded
+
+    return statement, violations, warnings
+
+
+def _validate_rcs_block(
+    predicate: Dict[str, Any],
+) -> Tuple[Optional[int], Optional[bool], Optional[List[str]], List[str]]:
+    """Extracts and type/range-validates release_confidence_score.{value,
+    degraded,degraded_reasons} from the predicate. An invalid value resets
+    to a safe default (None/False/None respectively) alongside a violation
+    entry, never raised. Returns (rcs_value, degraded, degraded_reasons,
+    violations)."""
+    violations: List[str] = []
+
+    rcs_block = predicate.get("release_confidence_score")
+    rcs_block = rcs_block if isinstance(rcs_block, dict) else {}
+    rcs_value = rcs_block.get("value")
+
+    # Check non-standard numeric scores for rcs_value
+    if not isinstance(rcs_value, (int, float)) or isinstance(rcs_value, bool) or math.isnan(rcs_value) or math.isinf(rcs_value):
+        violations.append(f"invalid release_confidence_score.value: {rcs_value!r}")
+        rcs_value = None
+
+    degraded = rcs_block.get("degraded")
+    if degraded is not None and not isinstance(degraded, bool):
+        violations.append(f"invalid release_confidence_score.degraded type, expected boolean: {degraded!r}")
+        degraded = False
+
+    degraded_reasons = rcs_block.get("degraded_reasons")
+    if degraded_reasons is not None and not (
+        isinstance(degraded_reasons, list) and all(isinstance(r, str) for r in degraded_reasons)
+    ):
+        violations.append(
+            f"invalid release_confidence_score.degraded_reasons, expected a list of strings: {degraded_reasons!r}"
+        )
+        degraded_reasons = None
+
+    return rcs_value, degraded, degraded_reasons, violations
+
+
+def _evaluate_policy_gates(
+    *,
+    rcs_value: Optional[int],
+    min_rcs: int,
+    require_digest: Optional[str],
+    subject_digests: List[str],
+    disallow_degraded: bool,
+    degraded: Optional[bool],
+    degraded_reasons: Optional[List[str]],
+) -> Tuple[List[str], List[str]]:
+    """Evaluates --min-rcs/--require-digest/--disallow-degraded against
+    already-extracted+validated RCS fields (see _validate_rcs_block).
+    Returns (violations, warnings) to fold into the overall result."""
+    violations: List[str] = []
+    warnings: List[str] = []
+
+    if rcs_value is None:
+        violations.append(
+            "predicate.release_confidence_score.value is missing; cannot evaluate --min-rcs gate"
+        )
+    elif rcs_value < min_rcs:
+        violations.append(f"RCS score {rcs_value} is below required threshold {min_rcs}")
+
+    if require_digest:
+        wanted = _normalize_digest(require_digest)
+        if wanted not in subject_digests:
+            violations.append(
+                f"required subject digest {wanted!r} not found among attested digests {subject_digests}"
+            )
+
+    if disallow_degraded and degraded is True:
+        # Fail-closed by default: --disallow-degraded blocks unless
+        # degraded_reasons proves every cause is a known, unavoidable
+        # one (see _ALLOWED_DEGRADED_REASONS). A missing/malformed
+        # degraded_reasons (older attestations predating this field,
+        # or the type-violation case above) can't prove that, so it
+        # blocks too -- silently trusting an absent explanation would
+        # be exactly the kind of loophole this gate exists to prevent.
+        non_exempt_reasons = (
+            [r for r in degraded_reasons if r not in _ALLOWED_DEGRADED_REASONS]
+            if degraded_reasons
+            else None
+        )
+        if not degraded_reasons or non_exempt_reasons:
+            violations.append(
+                "release_confidence_score.degraded is true and --disallow-degraded was set "
+                f"(degraded_reasons={degraded_reasons!r})"
+            )
+        else:
+            warnings.append(
+                "release_confidence_score.degraded is true, but --disallow-degraded allows it: "
+                f"every cause ({degraded_reasons!r}) is a known, unavoidable one "
+                "(a GitHub Free-plan branch-rulesets limitation and/or a docs/config-only diff "
+                "with no coverable lines), not a real governance or quality gap"
+            )
+
+    return violations, warnings
+
+
+def verify_dsse_attestation(
+    envelope: Dict[str, Any],
+    *,
+    min_rcs: int = 0,
+    require_digest: Optional[str] = None,
+    disallow_degraded: bool = False,
+    dry_run: bool = False,
+    cert_identity: Optional[str] = None,
+    cert_oidc_issuer: Optional[str] = None,
+    expected_issuer: Optional[str] = None,
+    expected_repository: Optional[str] = None,
+    expected_workflow: Optional[str] = None,
+    expected_ref: Optional[str] = None,
+) -> VerificationResult:
+    """Validates a DSSE envelope's structure, decodes its in-toto Statement
+    payload, best-effort verifies the Sigstore signing identity, and enforces
+    the admission policy gates. Never raises for malformed/hostile input --
+    problems are reported as `violations` on the returned result.
+
+    Orchestrates (see each helper's own docstring for its contract):
+      _decode_envelope_statement -- structure + payload decode
+      _validate_against_schema   -- optional/diagnostic JSON Schema check
+      _validate_rcs_block        -- RCS field type/range validation
+      _evaluate_policy_gates     -- --min-rcs/--require-digest/--disallow-degraded
+      _verify_sigstore_identity  -- best-effort Sigstore identity check
+    """
+    if not isinstance(envelope, dict):
+        return VerificationResult(
+            passed=False,
+            violations=["DSSE envelope is not a JSON object"],
+            identity_status="skipped",
+            identity_detail="envelope malformed; identity verification not attempted",
+        )
+
+    statement, violations, warnings = _decode_envelope_statement(envelope)
 
     rcs_value: Optional[int] = None
     degraded: Optional[bool] = None
@@ -759,71 +895,23 @@ def verify_dsse_attestation(
         elif schema_validation_status == "skipped":
             warnings.extend(f"schema validation skipped: {m}" for m in schema_messages)
 
-        rcs_block = predicate.get("release_confidence_score")
-        rcs_block = rcs_block if isinstance(rcs_block, dict) else {}
-        rcs_value = rcs_block.get("value")
-        
-        # Check non-standard numeric scores for rcs_value
-        if not isinstance(rcs_value, (int, float)) or isinstance(rcs_value, bool) or math.isnan(rcs_value) or math.isinf(rcs_value):
-            violations.append(f"invalid release_confidence_score.value: {rcs_value!r}")
-            rcs_value = None
-        
-        degraded = rcs_block.get("degraded")
-        if degraded is not None and not isinstance(degraded, bool):
-            violations.append(f"invalid release_confidence_score.degraded type, expected boolean: {degraded!r}")
-            degraded = False
-
-        degraded_reasons = rcs_block.get("degraded_reasons")
-        if degraded_reasons is not None and not (
-            isinstance(degraded_reasons, list) and all(isinstance(r, str) for r in degraded_reasons)
-        ):
-            violations.append(
-                f"invalid release_confidence_score.degraded_reasons, expected a list of strings: {degraded_reasons!r}"
-            )
-            degraded_reasons = None
+        rcs_value, degraded, degraded_reasons, rcs_violations = _validate_rcs_block(predicate)
+        violations.extend(rcs_violations)
 
         metrics = _extract_metrics(predicate)
         static_analysis_tools = _extract_static_analysis_tools(predicate)
 
-        if rcs_value is None:
-            violations.append(
-                "predicate.release_confidence_score.value is missing; cannot evaluate --min-rcs gate"
-            )
-        elif rcs_value < min_rcs:
-            violations.append(f"RCS score {rcs_value} is below required threshold {min_rcs}")
-
-        if require_digest:
-            wanted = _normalize_digest(require_digest)
-            if wanted not in subject_digests:
-                violations.append(
-                    f"required subject digest {wanted!r} not found among attested digests {subject_digests}"
-                )
-
-        if disallow_degraded and degraded is True:
-            # Fail-closed by default: --disallow-degraded blocks unless
-            # degraded_reasons proves every cause is a known, unavoidable
-            # one (see _ALLOWED_DEGRADED_REASONS). A missing/malformed
-            # degraded_reasons (older attestations predating this field,
-            # or the type-violation case above) can't prove that, so it
-            # blocks too -- silently trusting an absent explanation would
-            # be exactly the kind of loophole this gate exists to prevent.
-            non_exempt_reasons = (
-                [r for r in degraded_reasons if r not in _ALLOWED_DEGRADED_REASONS]
-                if degraded_reasons
-                else None
-            )
-            if not degraded_reasons or non_exempt_reasons:
-                violations.append(
-                    "release_confidence_score.degraded is true and --disallow-degraded was set "
-                    f"(degraded_reasons={degraded_reasons!r})"
-                )
-            else:
-                warnings.append(
-                    "release_confidence_score.degraded is true, but --disallow-degraded allows it: "
-                    f"every cause ({degraded_reasons!r}) is a known, unavoidable one "
-                    "(a GitHub Free-plan branch-rulesets limitation and/or a docs/config-only diff "
-                    "with no coverable lines), not a real governance or quality gap"
-                )
+        gate_violations, gate_warnings = _evaluate_policy_gates(
+            rcs_value=rcs_value,
+            min_rcs=min_rcs,
+            require_digest=require_digest,
+            subject_digests=subject_digests,
+            disallow_degraded=disallow_degraded,
+            degraded=degraded,
+            degraded_reasons=degraded_reasons,
+        )
+        violations.extend(gate_violations)
+        warnings.extend(gate_warnings)
 
     identity_status, identity_detail = _verify_sigstore_identity(
         envelope,
@@ -916,14 +1004,20 @@ def load_envelope(path: str) -> Any:
     MAX_ENVELOPE_SIZE *before* reading a single byte of it -- a size check
     done after loading the file into memory defeats the entire point of
     the guard (a hostile or corrupt multi-GB "envelope" must never be able
-    to exhaust memory just by being pointed at)."""
-    size = os.path.getsize(path)  # raises FileNotFoundError/OSError, same as open() would
+    to exhaust memory just by being pointed at). The path itself is
+    resolved via safe_resolve_path() first (rejects null bytes/malformed
+    paths, normalizes `../`/symlinks) so every downstream sink -- the
+    size check and the read -- operates on the same validated, canonical
+    Path; raises UnsafePathError (a ValueError) if that fails, which
+    main() catches and reports the same way as any other file error."""
+    resolved = safe_resolve_path(path)
+    size = os.path.getsize(resolved)  # raises FileNotFoundError/OSError, same as open() would
     if size > MAX_ENVELOPE_SIZE:
         raise EnvelopeTooLargeError(
             f"attestation file exceeds maximum allowed size "
             f"({MAX_ENVELOPE_SIZE // (1024 * 1024)}MB): {size} bytes"
         )
-    with open(path, "r", encoding="utf-8") as f:
+    with open(resolved, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -937,6 +1031,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return EXIT_FILE_ERROR
     except EnvelopeTooLargeError as e:
         print(f"ERROR: Attestation file exceeds maximum allowed size (10MB): {e}", file=sys.stderr)
+        return EXIT_FILE_ERROR
+    except UnsafePathError as e:
+        print(f"ERROR: unsafe envelope file path: {e}", file=sys.stderr)
         return EXIT_FILE_ERROR
     except (OSError, json.JSONDecodeError) as e:
         print(f"ERROR: failed to read/parse envelope file {args.envelope}: {e}", file=sys.stderr)

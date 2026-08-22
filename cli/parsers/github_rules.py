@@ -284,7 +284,7 @@ def _github_api_get(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) -> An
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "plinth-assay",
+        "User-Agent": "tenax-assay",
     }
 
     url: Optional[str] = f"{GITHUB_API_BASE}{path}"

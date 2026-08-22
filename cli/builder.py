@@ -1,6 +1,6 @@
 """
 Assembles the unsigned in-toto Statement (predicateType =
-https://plinth.dev/attestation/v1) from parsed inputs.
+https://tenax.io/attestations/assay/v1) from parsed inputs.
 
 Hardened against:
   - TypeError on boolean evaluation of NoneType line rates
@@ -21,7 +21,7 @@ from .parsers.sarif import SarifSummaryReport
 from .patch_coverage import PatchCoverageResult
 from .scorer import RCSResult
 
-DEFAULT_PREDICATE_TYPE = "https://plinth.dev/attestation/v1"
+DEFAULT_PREDICATE_TYPE = "https://tenax.io/attestations/assay/v1"
 
 
 def _now_iso() -> str:
@@ -69,6 +69,8 @@ def build_statement(
     rcs: RCSResult,
     sbom: Optional[Dict[str, Any]] = None,
     sarif_report: Optional[SarifSummaryReport] = None,
+    ast_skipped_test_functions: int = 0,
+    ast_languages: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> Dict[str, Any]:
     """Returns a dict matching the lifecycle/v0.1 predicate schema, wrapped
     in a standard in-toto Statement envelope."""
@@ -206,7 +208,9 @@ def build_statement(
                 "empty_test_bodies": empty_test_bodies,
                 "assertion_only_true": assertion_only_true,
                 "skipped_or_disabled_ratio": skipped_ratio,
+                "ast_skipped_test_functions": ast_skipped_test_functions,
             },
+            "languages": ast_languages or {},
         },
         "static_analysis": static_analysis,
         "release_confidence_score": {

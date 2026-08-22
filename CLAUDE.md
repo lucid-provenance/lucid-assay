@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Plinth Assay: a single-binary CI tool (`cli/main.py`, packaged as `plinth`/`plinth-assay`) that turns test/coverage/governance signals from a CI run into a deterministic Release Confidence Score (RCS), assembles that into a signed in-toto attestation (DSSE + Sigstore keyless signing), and provides a standalone admission gate (`cli/verify.py`) that CI can enforce against the signed attestation before allowing a merge/deploy.
+Tenax Assay: a single-binary CI tool (`cli/main.py`, packaged as `tenax`/`tenax-assay`, with `plinth`/`plinth-assay` kept as backwards-compatible aliases from its pre-rebrand name) that turns test/coverage/governance signals from a CI run into a deterministic Release Confidence Score (RCS), assembles that into a signed in-toto attestation (DSSE + Sigstore keyless signing), and provides a standalone admission gate (`cli/verify.py`) that CI can enforce against the signed attestation before allowing a merge/deploy.
 
 ## Git workflow
 
@@ -38,7 +38,7 @@ python3 -m cli.main --junit-xml ... --coverage-report ... --image-ref ... \
   --skip-perf-budget-check --out /tmp/attestation.unsigned.json
 
 # Verify a signed DSSE envelope against admission policy gates
-python3 -m cli.verify build/plinth-assay.dsse.json --min-rcs 65 --disallow-degraded
+python3 -m cli.verify build/tenax-assay.dsse.json --min-rcs 65 --disallow-degraded
 ```
 
 There is no configured linter/type-checker in `pyproject.toml` — don't invent one.
@@ -65,7 +65,7 @@ There is no configured linter/type-checker in `pyproject.toml` — don't invent 
 
 Also: on a `pull_request` event, `github.ref_name` resolves to the synthetic `"<number>/merge"` ref, not a real branch — `assay.yml` resolves `--branch` from `github.event.pull_request.base.ref || github.ref_name` instead. If branch governance starts erroring on a nonsense branch name, check that this resolution didn't regress.
 
-**AST assertion-integrity checker** (`cli/parsers/ast_inspector.py`): per `.continue/rules/plinth-assay.md`, preserve *scoped* AST visitor isolation when touching this — never use `ast.walk()` inside a test function's scope, since that would credit assertions inside dead branches, nested defs/lambdas, or swallowed-exception `try` blocks as if they actually execute. It also recognizes and rejects tautological assertions (`assert True`, `self.assertEqual(x, x)`, etc.) and mock-typo bypasses (`mock.assert_called()`).
+**AST assertion-integrity checker** (`cli/parsers/ast_inspector.py`): per `.continue/rules/tenax-assay.md`, preserve *scoped* AST visitor isolation when touching this — never use `ast.walk()` inside a test function's scope, since that would credit assertions inside dead branches, nested defs/lambdas, or swallowed-exception `try` blocks as if they actually execute. It also recognizes and rejects tautological assertions (`assert True`, `self.assertEqual(x, x)`, etc.) and mock-typo bypasses (`mock.assert_called()`).
 
 **Hardening pattern**: nearly every module in `cli/` opens with a docstring block titled "Hardened against:" enumerating the specific failure modes it defends against (injection, auth failures, malformed input, adversarial pagination, etc.). When editing one of these modules, check its docstring first and preserve every listed guarantee — the adversarial/boundary test files (`tests/test_security_boundaries.py`, `tests/test_verify_boundaries.py`, `tests/test_adversarial_ast.py`) exist specifically to hold the line on these.
 

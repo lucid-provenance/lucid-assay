@@ -173,11 +173,24 @@ def _score_overall_coverage(overall_line_rate: float, overall_min: float) -> Sco
     return ScoreComponent(w, raw, raw * w, reason)
 
 
-def _score_assertion_integrity(total_assertions: int, total_test_functions: int) -> ScoreComponent:
+def _score_assertion_integrity(
+    total_assertions: int, total_test_functions: int, ast_skipped_test_functions: int = 0
+) -> ScoreComponent:
     w = WEIGHTS["assertion_integrity"]
 
     if total_test_functions <= 0 or total_assertions < 0:
-        return ScoreComponent(w, 0.0, 0.0, "no test functions to compute assertion density from")
+        if total_test_functions <= 0 and ast_skipped_test_functions > 0:
+            # Distinct from "genuinely no tests": the suite has
+            # ast_skipped_test_functions test(s), all of them
+            # skipped/disabled -- an auditor reading the signed reason
+            # string should see that, not a claim that no tests exist.
+            reason = (
+                f"no non-skipped test functions to compute assertion density from "
+                f"({ast_skipped_test_functions} skipped/disabled)"
+            )
+        else:
+            reason = "no test functions to compute assertion density from"
+        return ScoreComponent(w, 0.0, 0.0, reason)
 
     density = total_assertions / total_test_functions
     raw = _clamp((density / ASSERTION_DENSITY_TARGET) * 100.0)
@@ -287,6 +300,7 @@ def score_pipeline(
     overall_coverage_min: float = OVERALL_COVERAGE_MIN_DEFAULT,
     branch_governance: Optional[BranchGovernanceReport] = None,
     sarif_report: Optional[SarifSummaryReport] = None,
+    ast_skipped_test_functions: int = 0,
 ) -> RCSResult:
     degraded = False
     degraded_reasons: List[str] = []
@@ -316,7 +330,9 @@ def score_pipeline(
             degraded_reasons.append(DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE)
 
     overall_component = _score_overall_coverage(overall_line_rate, overall_coverage_min)
-    assertion_component = _score_assertion_integrity(total_assertions, total_test_functions)
+    assertion_component = _score_assertion_integrity(
+        total_assertions, total_test_functions, ast_skipped_test_functions
+    )
     governance_component = _score_governance(
         pr_present, approvers_count, required_approvals, review_state, branch_governance
     )

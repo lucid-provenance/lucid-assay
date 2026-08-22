@@ -146,7 +146,7 @@ def sign_statement(
     # `sigstore attest` *does* produce a DSSE envelope, but this sigstore
     # version's CLI restricts --predicate-type to the SLSA provenance enum
     # and derives the subject from a hash of the predicate file itself --
-    # neither fits a custom predicateType (plinth.dev/attestation/v1) over
+    # neither fits a custom predicateType (tenax.io/attestations/assay/v1) over
     # an already-fully-assembled Statement whose subject is a container
     # image digest, not a local file's hash. `Signer.sign_dsse()` is the
     # public library entry point both CLI subcommands themselves delegate

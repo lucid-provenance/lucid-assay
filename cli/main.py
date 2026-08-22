@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-plinth-assay: single-binary CI attestation & governance engine.
+tenax-assay: single-binary CI attestation & governance engine.
 
 Hardened against:
   - Unsafe output filename collision during DSSE envelope output
@@ -19,7 +19,7 @@ from typing import Dict, Iterator, List, Optional
 
 from .builder import build_statement
 from .hashing import sha256_file, worm_uri
-from .parsers.ast_inspector import inspect_test_suite
+from .parsers.ast import inspect_test_suite
 from .parsers.coverage import parse_cobertura, parse_lcov
 from .parsers.github_rules import bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
@@ -83,7 +83,7 @@ def _emit_stage_profile(
     single blocking-overhead figure the 50ms budget check already covers;
     see cli/oidc_signer.py::sign_statement's `timing` param."""
     label_w = 28
-    print("=== Plinth Assay Stage Profiling ===", file=sys.stderr)
+    print("=== Tenax Assay Stage Profiling ===", file=sys.stderr)
     for key, label in _STAGE_LABELS:
         print(f"- {label + ':':<{label_w}}{_fmt_ms(stage_ns.get(key, 0)):>12}", file=sys.stderr)
     if sign_total_ns is not None:
@@ -128,8 +128,8 @@ def upload_to_worm_async(local_path: str, sha256_hex: str, bucket: str = "eviden
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="plinth-assay",
-        description="plinth-assay: single-binary CI attestation & governance engine.",
+        prog="tenax-assay",
+        description="tenax-assay: single-binary CI attestation & governance engine.",
     )
     p.add_argument("--junit-xml", required=True)
     p.add_argument("--coverage-format", choices=["cobertura", "lcov"], default="cobertura")
@@ -177,7 +177,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     raw_argv = argv if argv is not None else sys.argv[1:]
 
-    # `plinth`/`plinth-assay verify ...` dispatches to the standalone
+    # `tenax`/`tenax-assay verify ...` dispatches to the standalone
     # admission gatekeeper instead of the attestation-building pipeline below.
     if raw_argv and raw_argv[0] == "verify":
         from .verify import main as verify_main
@@ -246,6 +246,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         total_test_functions = ast_metrics.total_test_functions
         empty_bodies = ast_metrics.empty_test_bodies
         tautological = ast_metrics.tautological_assertions
+        ast_skipped = ast_metrics.skipped_test_functions
+        ast_languages = {lang: m.as_dict() for lang, m in ast_metrics.languages.items()}
 
     # 6. Deterministic scoring
     pr_approvers = [a.strip() for a in args.pr_approvers.split(",") if a.strip()]
@@ -264,6 +266,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             overall_coverage_min=args.overall_coverage_min,
             branch_governance=branch_governance,
             sarif_report=sarif_report,
+            ast_skipped_test_functions=ast_skipped,
         )
 
     # 7. Build unsigned in-toto Statement
@@ -299,6 +302,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             assertion_only_true=tautological,
             rcs=rcs,
             sarif_report=sarif_report,
+            ast_skipped_test_functions=ast_skipped,
+            ast_languages=ast_languages,
         )
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0

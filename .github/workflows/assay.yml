@@ -1,4 +1,4 @@
-name: Plinth Assay
+name: Tenax Assay
 
 # Deliberately `pull_request`, NOT `pull_request_target`: this workflow
 # checks out and executes code from the PR head ref, so it must run in the
@@ -104,7 +104,7 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           permission-administration: read
 
-      - name: Mint Signed Plinth Attestation
+      - name: Mint Signed Tenax Attestation
         env:
           GOVPLANE_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           EVENT_NAME: ${{ github.event_name }}
@@ -150,10 +150,10 @@ jobs:
             --github-token "$GOVPLANE_GITHUB_TOKEN" \
             --min-rcs 65 \
             --sign \
-            --out build/plinth-assay.dsse.json \
+            --out build/tenax-assay.dsse.json \
             "${EXTRA_ARGS[@]}"
 
-      - name: Verify Plinth Attestation Gate
+      - name: Verify Tenax Attestation Gate
         env:
           EXPECTED_REPOSITORY: ${{ github.repository }}
           EXPECTED_REF: ${{ github.ref }}
@@ -169,10 +169,10 @@ jobs:
             VERIFY_ARGS+=(--disallow-degraded)
           fi
 
-          python -m cli.verify build/plinth-assay.dsse.json "${VERIFY_ARGS[@]}"
+          python -m cli.verify build/tenax-assay.dsse.json "${VERIFY_ARGS[@]}"
       - name: Upload In-Toto Attestation Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: plinth-assay-attestation
-          path: build/plinth-assay.dsse.json
+          name: tenax-assay-attestation
+          path: build/tenax-assay.dsse.json
           if-no-files-found: error

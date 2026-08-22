@@ -8,7 +8,7 @@ name: Tenax Assay
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'feat/**' ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -20,7 +20,8 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # Required for Sigstore keyless OIDC minting
+  id-token: write        # Required for Sigstore keyless OIDC minting
+  security-events: write # Required for github/codeql-action/analyze to upload SARIF to code scanning
   # No `pull-requests` or `administration` scope here: patch coverage is
   # computed from local git diff, not the GitHub API, and `administration`
   # (needed to query /repos/{owner}/{repo}/rules/branches/{branch}) isn't a
@@ -37,6 +38,16 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0 # Full history needed to calculate patch coverage diff
+
+      # No explicit build step needed between init and analyze: Python is
+      # extracted statically by the CodeQL CLI rather than traced through a
+      # compile/autobuild step (unlike compiled languages), so running the
+      # test suite in between (below) is just this workflow's own test
+      # step, not something CodeQL depends on.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@42947a340483f03ba47bb1a039b2c519aab3df85 # v3.37.8
+        with:
+          languages: python
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -82,6 +93,65 @@ jobs:
             --cov=cli \
             --cov-report=xml:build/coverage.xml \
             tests/
+
+      # `output` is a directory, not a file: the CodeQL CLI names the SARIF
+      # file after the analyzed language itself, so a single `languages:
+      # python` init (above) produces build/codeql/python.sarif here --
+      # the exact path cli.main's --sarif expects below. `upload` defaults
+      # to "always" (uploads to GitHub code scanning too, hence
+      # security-events: write above); left at its default since surfacing
+      # findings in the Security tab is independent of also feeding them
+      # into the attestation.
+      - name: CodeQL Analysis
+        uses: github/codeql-action/analyze@42947a340483f03ba47bb1a039b2c519aab3df85 # v3.37.8
+        with:
+          output: build/codeql
+          category: python
+
+      # SONAR_TOKEN, like APP_PRIVATE_KEY above, is unavailable in the
+      # restricted `pull_request` context a fork PR runs under -- guarded
+      # the same way, so an external contributor's PR degrades (no
+      # SonarQube enrichment) instead of failing outright.
+      # Project metadata (organization, projectKey, sources, coverage/xunit
+      # paths) lives in sonar-project.properties at the repo root -- the
+      # action reads it automatically, so it's the single source of truth
+      # rather than duplicating those same values here via `args:` (two
+      # copies of "where are the sources" is exactly how that file's
+      # sonar.sources briefly pointed at a nonexistent src/ directory
+      # instead of cli/).
+      - name: SonarQube Cloud Scan
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      # SonarQube Cloud's scanner analyzes server-side and doesn't emit a
+      # local SARIF file the way CodeQL does -- there is no scanner
+      # property that makes it write one out (`sonar.sarif.reportPaths` is
+      # an *input* for feeding an existing SARIF into Sonar, not an
+      # output toggle). Its quality-gate/complexity/debt metrics are
+      # pulled back out via the Measures API instead, matching
+      # cli.parsers.sarif.parse_sonar_metrics_file's expected
+      # {"component": {"measures": [...]}} shape, and merged into a
+      # scanned tool's extensions via --sonar-metrics below.
+      # continue-on-error: enrichment data only -- cli.main already
+      # degrades to a warning (not a failure) when --sonar-metrics can't
+      # be read, so a transient API hiccup here must never fail the job.
+      - name: Fetch SonarQube Cloud Measures
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          # HTTP Basic auth (token as username, empty password) rather than
+          # a Bearer header: it's the auth method SonarCloud/SonarQube user
+          # tokens have supported across every scanner/API version, where
+          # Bearer support is newer and version-dependent.
+          curl -sSf \
+            -u "${SONAR_TOKEN}:" \
+            "https://sonarcloud.io/api/measures/component?component=tenax-io_tenax-assay&metricKeys=alert_status,sqale_index,cognitive_complexity" \
+            -o build/sonar-measures.json
 
       # Mints a short-lived GitHub App installation token so branch-governance
       # inspection (cli.parsers.github_rules) can query the rules-for-branch
@@ -135,6 +205,22 @@ jobs:
               exit 1
             fi
             EXTRA_ARGS=(--base-sha "$BASE_SHA" --pr-number "$PR_NUMBER")
+          fi
+
+          # CodeQL always runs (no secret dependency), but the SARIF path
+          # is still guarded on existence rather than assumed -- if the
+          # CodeQL CLI's output-naming convention ever changes, this run
+          # should degrade (cli.main treats a missing --sarif file as a
+          # warning, not a hard failure) rather than break the mint step.
+          # SonarQube's measures export is guarded the same way since its
+          # own step above is fork-PR-skipped and continue-on-error.
+          if [ -f build/codeql/python.sarif ]; then
+            EXTRA_ARGS+=(--sarif build/codeql/python.sarif)
+          else
+            echo "WARNING: build/codeql/python.sarif not found; skipping CodeQL SARIF ingestion" >&2
+          fi
+          if [ -f build/sonar-measures.json ]; then
+            EXTRA_ARGS+=(--sonar-metrics build/sonar-measures.json)
           fi
 
           echo "Running with EXTRA_ARGS: ${EXTRA_ARGS[*]}"

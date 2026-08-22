@@ -304,7 +304,16 @@ def score_pipeline(
             f"{patch_component.reason}; fell back to overall_coverage*{PATCH_COVERAGE_FALLBACK_MULTIPLIER} proxy",
         )
         degraded = True
-        degraded_reasons.append(DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE)
+        # Namespaced with the specific reason_code when known (e.g.
+        # REASON_CODE_NO_COVERABLE_LINES for a docs/config-only diff --
+        # see cli.patch_coverage), mirroring how branch_governance's
+        # reason_code is namespaced below; falls back to the generic
+        # reason for a genuinely unverifiable patch coverage (missing
+        # base SHA, failed git diff).
+        if patch_coverage.reason_code:
+            degraded_reasons.append(f"patch_coverage:{patch_coverage.reason_code}")
+        else:
+            degraded_reasons.append(DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE)
 
     overall_component = _score_overall_coverage(overall_line_rate, overall_coverage_min)
     assertion_component = _score_assertion_integrity(total_assertions, total_test_functions)

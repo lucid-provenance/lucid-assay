@@ -68,19 +68,28 @@ EXIT_PASS = 0
 EXIT_POLICY_VIOLATION = 2
 EXIT_FILE_ERROR = 1
 
-# The one degraded_reasons entry --disallow-degraded treats as non-blocking:
-# a known, unavoidable GitHub platform/plan-tier limitation on branch
-# rulesets (private repo, Free plan -- see
-# cli.parsers.github_rules.REASON_CODE_PLATFORM_UNSUPPORTED_TIER), not a
-# real governance gap. Deliberately duplicated here as a literal rather
-# than imported from cli.scorer/cli.parsers.github_rules: this module
+# degraded_reasons entries --disallow-degraded treats as non-blocking:
+# known, unavoidable states that aren't a real governance/quality gap --
+#   - a GitHub platform/plan-tier limitation on branch rulesets (private
+#     repo, Free plan -- see
+#     cli.parsers.github_rules.REASON_CODE_PLATFORM_UNSUPPORTED_TIER)
+#   - a docs/config-only diff with zero coverable changed lines -- there's
+#     no code in the diff for patch coverage to be missing over (see
+#     cli.patch_coverage.REASON_CODE_NO_COVERABLE_LINES)
+# Deliberately duplicated here as literals rather than imported from
+# cli.scorer/cli.parsers.github_rules/cli.patch_coverage: this module
 # verifies only the decoded JSON predicate, with no dependency on the
-# pipeline's Python types, and this string is a stable, versioned part of
-# the attestation's own schema (predicate.release_confidence_score.
-# degraded_reasons), not an implementation detail of those modules. If
-# either module's construction of this string changes, this constant must
-# be updated to match.
-_ALLOWED_DEGRADED_REASON_PLATFORM_UNSUPPORTED_TIER = "branch_governance:platform_unsupported_tier"
+# pipeline's Python types, and these strings are a stable, versioned part
+# of the attestation's own schema (predicate.release_confidence_score.
+# degraded_reasons), not an implementation detail of those modules. If any
+# of those modules' construction of these strings changes, this set must
+# be updated to match. A degraded run is only exempted from
+# --disallow-degraded when *every* entry in degraded_reasons is a member
+# of this set -- any other cause present still blocks.
+_ALLOWED_DEGRADED_REASONS = frozenset({
+    "branch_governance:platform_unsupported_tier",
+    "patch_coverage:no_coverable_lines",
+})
 
 
 @dataclass
@@ -620,14 +629,14 @@ def verify_dsse_attestation(
 
         if disallow_degraded and degraded is True:
             # Fail-closed by default: --disallow-degraded blocks unless
-            # degraded_reasons proves the *only* cause is the one known,
-            # unavoidable platform limitation. A missing/malformed
+            # degraded_reasons proves every cause is a known, unavoidable
+            # one (see _ALLOWED_DEGRADED_REASONS). A missing/malformed
             # degraded_reasons (older attestations predating this field,
             # or the type-violation case above) can't prove that, so it
             # blocks too -- silently trusting an absent explanation would
             # be exactly the kind of loophole this gate exists to prevent.
             non_exempt_reasons = (
-                [r for r in degraded_reasons if r != _ALLOWED_DEGRADED_REASON_PLATFORM_UNSUPPORTED_TIER]
+                [r for r in degraded_reasons if r not in _ALLOWED_DEGRADED_REASONS]
                 if degraded_reasons
                 else None
             )
@@ -639,8 +648,9 @@ def verify_dsse_attestation(
             else:
                 warnings.append(
                     "release_confidence_score.degraded is true, but --disallow-degraded allows it: "
-                    f"the only cause is {_ALLOWED_DEGRADED_REASON_PLATFORM_UNSUPPORTED_TIER!r} "
-                    "(a GitHub Free-plan branch-rulesets limitation, not a real governance gap)"
+                    f"every cause ({degraded_reasons!r}) is a known, unavoidable one "
+                    "(a GitHub Free-plan branch-rulesets limitation and/or a docs/config-only diff "
+                    "with no coverable lines), not a real governance or quality gap"
                 )
 
     identity_status, identity_detail = _verify_sigstore_identity(

@@ -157,6 +157,38 @@ class VerifyDsseAttestationTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertTrue(any("disallow-degraded" in v for v in result.violations), result.violations)
 
+    def test_disallow_degraded_allows_sole_docs_only_patch_coverage_cause(self):
+        # A docs/config-only diff has no code for patch coverage to be
+        # missing over -- the same kind of unavoidable, benign state as
+        # the platform-tier branch-governance case.
+        envelope = _envelope(_statement(
+            degraded=True, degraded_reasons=["patch_coverage:no_coverable_lines"]
+        ))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+
+        self.assertTrue(result.passed, result.violations)
+        self.assertFalse(any("disallow-degraded" in v for v in result.violations))
+
+    def test_disallow_degraded_allows_both_exempted_causes_together(self):
+        # The exact real-world scenario this test guards: a docs-only PR
+        # against a private GitHub Free-plan repo triggers *both* exempted
+        # causes at once (no coverable lines AND branch governance can't
+        # be verified on this plan tier) -- neither is a real gap, so
+        # neither should block, together or separately.
+        envelope = _envelope(_statement(
+            degraded=True,
+            degraded_reasons=[
+                "patch_coverage:no_coverable_lines",
+                "branch_governance:platform_unsupported_tier",
+            ],
+        ))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+
+        self.assertTrue(result.passed, result.violations)
+        self.assertFalse(any("disallow-degraded" in v for v in result.violations))
+
     def test_disallow_degraded_blocks_generic_branch_governance_unverified(self):
         # A generic "couldn't verify branch governance at all" (missing
         # token, network failure, an under-scoped-but-not-platform-limited

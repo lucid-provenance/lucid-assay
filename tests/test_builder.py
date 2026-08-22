@@ -8,7 +8,7 @@ from cli.builder import DEFAULT_PREDICATE_TYPE, build_statement
 from cli.parsers.coverage import CoverageReport
 from cli.parsers.github_rules import BranchGovernanceReport
 from cli.parsers.junit import TestTotals
-from cli.patch_coverage import PatchCoverageResult
+from cli.patch_coverage import PatchCoverageResult, REASON_CODE_NO_COVERABLE_LINES
 from cli.scorer import score_pipeline
 
 
@@ -227,6 +227,26 @@ class BuilderStatementTests(unittest.TestCase):
             )
         )
         self.assertFalse(statement["predicate"]["coverage"]["thresholds"]["patch_met"])
+
+    def test_patch_coverage_reason_and_reason_code_are_embedded(self):
+        statement = build_statement(
+            **_base_kwargs(
+                patch_coverage=PatchCoverageResult(
+                    available=False, line_rate=None, lines_changed=0, lines_covered=0,
+                    reason="diff contained no coverable changed lines (docs/config-only change)",
+                    reason_code=REASON_CODE_NO_COVERABLE_LINES,
+                ),
+            )
+        )
+        patch_block = statement["predicate"]["coverage"]["patch"]
+        self.assertIn("docs/config-only change", patch_block["reason"])
+        self.assertEqual(patch_block["reason_code"], "no_coverable_lines")
+
+    def test_patch_coverage_reason_code_defaults_to_none(self):
+        statement = build_statement(**_base_kwargs())
+        patch_block = statement["predicate"]["coverage"]["patch"]
+        self.assertIn("reason_code", patch_block)
+        self.assertIsNone(patch_block["reason_code"])
 
     def test_overall_met_reflects_threshold_comparison(self):
         statement = build_statement(

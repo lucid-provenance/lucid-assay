@@ -79,27 +79,57 @@ class GitHubAPIError(RuntimeError):
 
 
 # The rules-for-branch and rulesets endpoints require 'Administration: Read'
-# repository permission. That permission is never available to the default
-# GITHUB_TOKEN via a workflow's `permissions:` block -- it isn't one of the
-# scopes GITHUB_TOKEN supports, full stop -- so a 401/403 here is, in
-# practice, almost always that, not a one-off transient auth glitch. Spelled
-# out explicitly (with the concrete remediation) so it's diagnoseable
-# straight from CI logs instead of a bare "HTTP 403".
+# repository permission -- never available to the default GITHUB_TOKEN via a
+# workflow's `permissions:` block, since it isn't one of the scopes
+# GITHUB_TOKEN supports -- so a missing/under-scoped token is *one* common
+# cause of a 401/403 here. It is NOT the only one: GitHub returns the same
+# HTTP 403 when the endpoint itself isn't available to the repo at all --
+# e.g. a private repo on a personal (non-Pro) account or a non-Team/
+# Enterprise org, where the body reads "Upgrade to GitHub Pro or make this
+# repository public to enable this feature." -- a plan/feature gate that no
+# amount of token permission can fix. `_github_api_get` captures GitHub's own
+# error message (see `_extract_http_error_detail`) precisely so this
+# function can lead with the real cause instead of guessing at one.
 _ADMINISTRATION_READ_REMEDIATION = (
-    "the token needs 'Administration: Read' repository permission; the default "
-    "GITHUB_TOKEN can never be granted this via a workflow's `permissions:` block "
-    "(it is not one of the scopes GITHUB_TOKEN supports) -- mint a GitHub App "
-    "installation token instead (e.g. via actions/create-github-app-token, with "
-    "the App granted 'Administration: Read') and pass it as --github-token / "
-    "GITHUB_TOKEN"
+    "if the message above doesn't already explain it: the token may need "
+    "'Administration: Read' repository permission; the default GITHUB_TOKEN can "
+    "never be granted this via a workflow's `permissions:` block (it is not one "
+    "of the scopes GITHUB_TOKEN supports) -- mint a GitHub App installation "
+    "token instead (e.g. via actions/create-github-app-token, with the App "
+    "granted 'Administration: Read') and pass it as --github-token / GITHUB_TOKEN"
 )
 
 
 def _actionable_auth_failure_reason(e: GitHubAPIError, context: str) -> str:
-    """Builds a fail-closed diagnostic for a 401/403 GitHub API response
-    that tells the operator exactly what's wrong and how to fix it, rather
-    than surfacing a bare status code."""
+    """Builds a diagnostic for a 401/403 GitHub API response, leading with
+    GitHub's own error message (already embedded in `e` -- see
+    `_extract_http_error_detail`) since it's frequently the actual cause
+    (e.g. a plan/feature gate, not a missing token permission), with the
+    'Administration: Read' hint kept as a secondary fallback rather than an
+    assumed diagnosis."""
     return f"GitHub API authentication/authorization failed {context} (HTTP {e.status_code}): {e}. {_ADMINISTRATION_READ_REMEDIATION}."
+
+
+def _extract_http_error_detail(e: "urllib.error.HTTPError") -> str:
+    """Best-effort extraction of GitHub's own error message from an
+    HTTPError body (e.g. `{"message": "Upgrade to GitHub Pro or make this
+    repository public to enable this feature.", ...}`), which is far more
+    useful than the generic HTTP reason phrase (`e.reason`, e.g. just
+    "Forbidden") -- GitHub returns 401/403 on this endpoint for several
+    unrelated causes (missing/invalid token, a token missing
+    'Administration: Read', or a plan/feature gate no token permission can
+    fix), and only the body's own message tells them apart. Falls back to
+    `e.reason` if the body isn't readable or isn't the expected JSON shape;
+    never raises."""
+    try:
+        raw = e.read()
+        body = json.loads(raw.decode("utf-8"))
+        msg = body.get("message") if isinstance(body, dict) else None
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()
+    except (OSError, ValueError, UnicodeDecodeError, AttributeError):
+        pass
+    return e.reason
 
 
 @dataclass
@@ -229,7 +259,8 @@ def _github_api_get(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) -> An
                 return None
             if e.code == 404:
                 break  # ran out of pages mid-pagination; return what we have so far
-            raise GitHubAPIError(f"GET {path} -> HTTP {e.code}: {e.reason}", status_code=e.code) from e
+            detail = _extract_http_error_detail(e)
+            raise GitHubAPIError(f"GET {path} -> HTTP {e.code}: {detail}", status_code=e.code) from e
         except urllib.error.URLError as e:
             raise GitHubAPIError(f"GET {path} failed: {e.reason}") from e
         except (json.JSONDecodeError, ValueError, OSError) as e:

@@ -107,7 +107,7 @@ strings, so identical inputs always produce an identical score):
 | Patch coverage | 20% | Line-rate over just the lines touched by `git diff base...head`, intersected with the coverage report's hit map. Unavailable (no base SHA, or a docs/config-only diff with zero coverable changed lines) **falls back to overall coverage × 0.70**, and flags the whole result `degraded: true` — a proxy signal can never outscore the real measurement it's standing in for. |
 | Overall coverage | 15% | Straight line-rate vs. configurable threshold (default 0.60). |
 | Assertion integrity | 10% | `assertions / test_functions` normalized against a target density (1.5), capped at 100; zero test functions floors to 0. Fed by the AST inspector (below), which filters out tautological/empty assertions before counting. |
-| Governance | 15% | No PR/MR context scores a **neutral 50**, not full credit, and flags `degraded`. `changes_requested` and unresolved zeroes the component outright; a required-approvals count of 0 caps at 60 (flagged as a weak control). Independently, a **live GitHub branch-governance check** docks −35pts if it finds the branch would let the same change land unreviewed regardless of this PR's own state (see below) — **and docks the same −35pts if that check couldn't run at all** (missing/invalid `GITHUB_TOKEN`, API failure), so omitting the token is never a cheaper way to dodge the penalty than a confirmed bypass. |
+| Governance | 15% | No PR/MR context scores a **neutral 50**, not full credit, and flags `degraded`. `changes_requested` and unresolved zeroes the component outright; a required-approvals count of 0 caps at 60 (flagged as a weak control). Independently, a **live GitHub branch-governance check** docks −35pts if it finds the branch would let the same change land unreviewed regardless of this PR's own state (see below) — **and docks the same −35pts if that check couldn't run at all** (missing/invalid `GITHUB_TOKEN`, API failure, or GitHub's own plan/visibility feature gate on rulesets), so omitting the token is never a cheaper way to dodge the penalty than a confirmed bypass. |
 | Static analysis (SARIF) | 5% | No `--sarif` configured → full 100 (a control that was never invoked isn't penalized). Configured but unreadable/corrupt → −25pts, fails closed. Otherwise: **new-in-patch errors** cost 25pts each, **new-in-patch warnings** 5pts each, **pre-existing/legacy errors** cost only 2pts each capped at −15 total — gates hard on regressions *introduced by this diff* without making a legacy-heavy repo unshippable on day one. |
 
 Every component's `reason` string is embedded verbatim in the predicate's
@@ -116,8 +116,14 @@ signed JSON never has to reverse-engineer why a run scored what it did. A
 separate top-level `degraded: true` flag (distinct from the score itself)
 is set whenever any component fell back to a proxy or a check couldn't be
 verified — a 95/100 that's quietly degraded stays visibly distinguishable
-from a clean 95. NaN/Inf arithmetic anywhere in the pipeline clamps to the
-score floor rather than propagating.
+from a clean 95. Alongside it, `degraded_reasons` lists *which* independent
+trigger(s) fired (`patch_coverage_unavailable`, `no_pr_context`,
+`sarif_unavailable`, `branch_governance_unverified` / a namespaced
+`branch_governance:<reason_code>` when the governance check identifies a
+specific known cause, or `branch_governance_bypass_permitted`) — a run can
+be degraded for more than one reason at once, and each shows up as its own
+entry, not a single opaque flag. NaN/Inf arithmetic anywhere in the
+pipeline clamps to the score floor rather than propagating.
 
 Run the edge-case suite:
 
@@ -182,9 +188,17 @@ approval state claims. Notable hardening:
   only trusted as benign once branch existence is independently confirmed
   via a second API call; otherwise it fails closed.
 - A 401/403 anywhere — including the secondary per-ruleset detail fetch —
-  invalidates the *whole* report, with a diagnostic explaining that the
-  default `GITHUB_TOKEN` can never carry the required `Administration: Read`
-  permission and pointing at `actions/create-github-app-token` as the fix.
+  invalidates the *whole* report. GitHub's own error-body message is
+  extracted and led with in the diagnostic, since a 403 here is genuinely
+  ambiguous: it's most often an under-scoped `GITHUB_TOKEN` missing
+  `Administration: Read` (pointing at `actions/create-github-app-token` as
+  the fix), but GitHub returns the *identical* status code when rulesets
+  simply aren't a supported feature for the repo at all — a private repo
+  on GitHub Free. That specific case is tagged with a machine-readable
+  `reason_code` (`platform_unsupported_tier`) rather than left
+  indistinguishable from a token problem, so downstream policy (see
+  `--disallow-degraded` below) can tell an unavoidable platform limitation
+  apart from a real governance gap.
 - Bypass-actor `bypass_mode` is allowlisted, not blocklisted: only
   `"pull_request"` mode counts as a partial (PR-review-only) bypass;
   `"always"`, a missing mode, or any unrecognized value fails closed to
@@ -255,7 +269,20 @@ Policy gates:
 - `--min-rcs N` — fail if `release_confidence_score.value < N`.
 - `--require-digest sha256:<hex>` — fail unless that digest is among the
   Statement's attested subjects.
-- `--disallow-degraded` — fail if `release_confidence_score.degraded` is true.
+- `--disallow-degraded` — fails a degraded run, but isn't a flat
+  `degraded == true` check: it inspects `degraded_reasons` and only lets a
+  degraded run through when that list is non-empty **and every entry** is
+  the one known, unavoidable platform limitation
+  (`branch_governance:platform_unsupported_tier` — a private repo on
+  GitHub Free, where branch rulesets simply aren't supported at any token
+  scope). Any other cause present — a real governance gap, missing PR
+  context, a broken SARIF/patch-coverage input, or `degraded_reasons`
+  missing/malformed entirely (e.g. an older attestation predating this
+  field) — still blocks. This deliberately can't be satisfied by
+  visibility alone (`private == true`): private repos on GitHub
+  Pro/Team/Enterprise *do* support rulesets, so a repo-visibility check
+  would wrongly waive strict enforcement for a paid private repo with a
+  real, fixable governance problem too.
 
 Identity verification (best-effort, four possible outcomes):
 - **`verified`** — cryptographic signature *and* asserted identity checks
@@ -317,7 +344,7 @@ installed — outside CI there's no ambient identity to fetch, by design.
 
 ## Test suite
 
-~220 test cases across 9 modules, including dedicated adversarial suites:
+~210 test cases across 9 modules, including dedicated adversarial suites:
 `test_adversarial_ast.py` (assertion-integrity bypass attempts),
 `test_security_boundaries.py` and `test_verify_boundaries.py`
 (malformed/hostile-input hardening), and `test_github_rules.py` (auth

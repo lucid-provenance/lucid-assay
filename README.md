@@ -14,7 +14,14 @@ schema/
 cli/
   parsers/junit.py          # streaming JUnit XML -> TestTotals (flaky-retry aware)
   parsers/coverage.py       # Cobertura XML + LCOV -> CoverageReport (per-line hit maps)
-  parsers/ast_inspector.py  # scoped AST walk of test files -> assertion integrity metrics
+  parsers/ast_inspector.py  # backward-compat shim -> re-exports parsers/ast/
+  parsers/ast/              # multi-language assertion integrity engine (registry/dispatcher)
+    __init__.py                # inspect_test_suite(): discovery + per-language aggregation
+    common.py                  # shared dataclasses (TestFunctionMetrics, TestSuiteMetrics, ...)
+    python_visitor.py          # reference standard: stdlib `ast`, test_*.py / *_test.py
+    tsjs_visitor.py             # Tree-sitter TS/JS: Jest/Vitest/Mocha, *.test.*/*.spec.*/__tests__/
+    go_visitor.py                # Tree-sitter Go: testing.T + testify, *_test.go
+    java_visitor.py               # Tree-sitter Java: JUnit 4/5, AssertJ, Hamcrest, *Test(s).java
   parsers/sarif.py          # SARIF 2.1.0 ingestion -> differential (patch vs. legacy) findings
   parsers/github_rules.py   # GitHub branch protection/ruleset inspection via REST API
   patch_coverage.py         # git diff base...head, intersected with coverage hit maps
@@ -28,14 +35,20 @@ tests/
   test_scorer.py               # adversarial edge-case tests for the RCS algorithm
   test_patch_coverage.py        # git-diff/coverage intersection + reason_code tests (real git repo)
   test_builder.py               # in-toto Statement assembly tests
-  test_ast_inspector.py          # real/tautological/empty assertion detection tests
-  test_adversarial_ast.py         # adversarial bypass suite for the AST inspector
+  test_ast_inspector.py          # real/tautological/empty assertion detection tests (Python)
+  test_adversarial_ast.py         # adversarial bypass suite for the Python AST visitor
+  test_ast_assertions.py           # multi-language engine: fixtures, per-language heuristics,
+                                    # registry dispatch, and DSSE predicate telemetry tests
   test_sarif.py                    # SARIF parsing, path-matching, and fail-closed aggregation tests
   test_github_rules.py              # branch governance API client tests (auth, pagination, bypass modes)
   test_verify.py                     # DSSE/Sigstore verification + policy-gate tests
   test_verify_boundaries.py           # verify.py hardening/edge-case suite
   test_security_boundaries.py          # cross-cutting adversarial-input suite
   fixtures/                             # sample cobertura.xml and a rendered statement
+  fixtures/ast_assertions/                # per-language source-text fixtures for the AST engine
+                                           # (python/, typescript/, javascript/, go/, java/) --
+                                           # excluded from pytest's own collection, see
+                                           # [tool.pytest.ini_options] in pyproject.toml
 ```
 
 ## Why this decomposition
@@ -151,7 +164,7 @@ strings, so identical inputs always produce an identical score):
 | Test health | 35% | `pass_rate = passed / (passed+failed+errored)`. Zero executed tests **floors to 0** with an explicit reason distinguishing "all skipped" from "broken/bypassed gate" (never a neutral default — a broken test gate is a strong negative signal). Flaky retries (same `classname`+`name` seen more than once, final attempt passed) penalize 4pts/case, capped at −30, without being able to zero the run outright. |
 | Patch coverage | 20% | Line-rate over just the lines touched by `git diff base...head`, intersected with the coverage report's hit map. Unavailable (no base SHA, or a docs/config-only diff with zero coverable changed lines) **falls back to overall coverage × 0.70**, and flags the whole result `degraded: true` — a proxy signal can never outscore the real measurement it's standing in for. A docs/config-only diff is tagged with its own `reason_code` (`no_coverable_lines`), since there's no code in it for coverage to be missing over — see `--disallow-degraded` below. |
 | Overall coverage | 15% | Straight line-rate vs. configurable threshold (default 0.60). |
-| Assertion integrity | 10% | `assertions / test_functions` normalized against a target density (1.5), capped at 100; zero test functions floors to 0. Fed by the AST inspector (below), which filters out tautological/empty assertions before counting. |
+| Assertion integrity | 10% | `assertions / test_functions` normalized against a target density (1.5), capped at 100; zero test functions floors to 0. Fed by the multi-language AST engine (below), which filters out tautological/empty assertions — and excludes skipped/disabled tests entirely, from every supported language — before counting. |
 | Governance | 15% | No PR/MR context scores a **neutral 50**, not full credit, and flags `degraded`. `changes_requested` and unresolved zeroes the component outright; a required-approvals count of 0 caps at 60 (flagged as a weak control). Independently, a **live GitHub branch-governance check** docks −35pts if it finds the branch would let the same change land unreviewed regardless of this PR's own state (see below) — **and docks the same −35pts if that check couldn't run at all** (missing/invalid `GITHUB_TOKEN`, API failure, or GitHub's own plan/visibility feature gate on rulesets), so omitting the token is never a cheaper way to dodge the penalty than a confirmed bypass. |
 | Static analysis (SARIF) | 5% | No `--sarif` configured → full 100 (a control that was never invoked isn't penalized). Configured but unreadable/corrupt → −25pts, fails closed. Otherwise: **new-in-patch errors** cost 25pts each, **new-in-patch warnings** 5pts each, **pre-existing/legacy errors** cost only 2pts each capped at −15 total — gates hard on regressions *introduced by this diff* without making a legacy-heavy repo unshippable on day one. |
 
@@ -202,20 +215,79 @@ on path components — an ambiguous tie is treated as no match rather than
 guessed at. Hardened against git CLI option injection (`--end-of-options`
 before the revision range) and quoted/escaped filenames in diff headers.
 
-**`parsers/ast_inspector.py`** (the largest parser, ~570 lines) walks every
-`test_*`/`*_test` function — including `unittest.TestCase` methods — and
-distinguishes real assertions from bogus ones via compile-time constant
-folding: `assert True`, `assert 1 == 1`, `assert x == x` (self-comparison),
-`assertTrue(True)`, `assertEqual(x, x)`, and bare truthy literals/collections
-are all caught as tautological. It also recognizes non-`assert` real-check
-idioms (`unittest.mock`'s allowlisted snake_case API, non-empty
-`pytest.raises`/`warns` blocks, PyHamcrest's `assert_that`, Chai/Jasmine-style
-`expect(x).to_equal(...)`) and flags empty bodies (`pass`/`...`/docstring-only)
-separately. Traversal is scope-aware: it never descends into a nested
-`def`/`lambda`/`class` inside a test body, and prunes statically-dead `if
-False:` branches and `try` bodies whose `except (AssertionError, ...): pass`
-would silently swallow a failed check — none of that unreachable code is
-credited or blamed.
+**`parsers/ast/`** is a language-agnostic registry/dispatcher for assertion
+integrity: `inspect_test_suite()` discovers test files across four
+languages by naming convention (mutually exclusive, so file ownership is
+unambiguous — see the package docstring), hands each to its visitor, and
+aggregates the results into one `TestSuiteMetrics`, both overall and
+per-language (`TestSuiteMetrics.languages`, embedded in the DSSE predicate
+as `assertion_density.languages`). `parsers/ast_inspector.py` remains as a
+thin backward-compatible shim re-exporting the same names.
+
+- **`python_visitor.py`** (the reference standard, stdlib `ast`) walks every
+  `test_*`/`*_test` function — including `unittest.TestCase` methods — and
+  distinguishes real assertions from bogus ones via compile-time constant
+  folding: `assert True`, `assert 1 == 1`, `assert x == x` (self-comparison),
+  `assertTrue(True)`, `assertEqual(x, x)`, and bare truthy literals/collections
+  are all caught as tautological. It also recognizes non-`assert` real-check
+  idioms (`unittest.mock`'s allowlisted snake_case API, non-empty
+  `pytest.raises`/`warns` blocks, PyHamcrest's `assert_that`, Chai/Jasmine-style
+  `expect(x).to_equal(...)`) and flags empty bodies (`pass`/`...`/docstring-only)
+  and `@skip`/`@skipif`/`@unittest.skip*`-decorated tests separately. Traversal
+  is scope-aware: it never descends into a nested `def`/`lambda`/`class` inside
+  a test body, and prunes statically-dead `if False:` branches and `try` bodies
+  whose `except (AssertionError, ...): pass` would silently swallow a failed
+  check — none of that unreachable code is credited or blamed.
+- **`tsjs_visitor.py`** (Tree-sitter `tree-sitter-typescript`/
+  `tree-sitter-javascript`) covers `.ts`/`.tsx`/`.js`/`.jsx`/`.mjs`/`.cjs`
+  files matching Jest/Vitest/Mocha's own discovery conventions
+  (`*.test.*`, `*.spec.*`, anything under `__tests__/`). Recognizes
+  `expect(x).toBe/toEqual/toStrictEqual(y)` chains — including
+  `.not`/`.resolves`/`.rejects` passthrough, where `.not` disables the
+  tautology check outright rather than inverting it — plus bare
+  Node `assert(x)` and chai's `assert.equal`/`.isTrue`/`.isFalse`/etc.
+  `it.skip`/`test.skip`/`xit`/`xtest`/`it.todo` are tracked as skipped, not
+  zero-assertion. Descends into inline arrow/function-expression callbacks
+  (`.then(...)`, `.forEach(...)`) since those run synchronously as part of
+  the test, but not into a named, unin­voked `function` declaration.
+- **`go_visitor.py`** (Tree-sitter `tree-sitter-go`) covers `*_test.go`,
+  matching `func TestXxx(t *testing.T)` declarations. Recognizes
+  `t.Error/Errorf/Fatal/Fatalf/Fail/FailNow` and testify's
+  `assert.*`/`require.*` (tautology-checked for `True`/`False`/`Equal`/`Same`
+  with the leading `t` argument offset accounted for). A test is tracked as
+  skipped only when `t.Skip`/`Skipf`/`SkipNow` is its very first statement —
+  a *conditional* skip further down the body does not suppress the rest of
+  the test's real assertions from counting. Descends into `func_literal`
+  bodies (table-driven `t.Run(...)` subtests), unlike the Python visitor's
+  nested-`def` pruning, since Go closures can't be declared without being
+  used.
+- **`java_visitor.py`** (Tree-sitter `tree-sitter-java`) covers
+  `*Test.java`/`*Tests.java`/`*TestCase.java`, matching `@Test`-annotated
+  methods (JUnit 4 and 5, matched by annotation name alone — no import
+  resolution). Recognizes JUnit static/qualified `assertEquals`/`assertTrue`/
+  `assertNotNull`/etc., AssertJ's `assertThat(x).isEqualTo/isTrue/isFalse(...)`
+  fluent chains (evaluated at the chain's outermost call so
+  `assertThat(x)` isn't double-counted as its own assertion), and
+  Hamcrest's non-chained `assertThat(x, matcher)`. `@Disabled`/`@Ignore`
+  (bare or fully-qualified) mark a method skipped.
+
+Every visitor tracks skipped/disabled tests in their own bucket
+(`TestSuiteMetrics.skipped_test_functions`, embedded as
+`assertion_density.heuristics.ast_skipped_test_functions`) rather than
+folding them into "zero-assertion" — a test a human explicitly disabled is
+a different signal than one that ran and asserted nothing.
+
+**Scoring note:** skip detection is new for Python too (the single-language
+engine this replaced had none). A repo whose Python suite uses
+`@pytest.mark.skip`/`@unittest.skip*` will now compute a different
+`assertion_integrity` component than before this change — skipped tests no
+longer drag the density average down (or, previously, silently inflate it
+if a disabled test's dead body still contained real-looking assertions).
+This is intentional and disclosed here, not a regression: a test that
+never ran shouldn't count either way. If every test function in scope is
+skipped, `total_test_functions` is `0` and the component's `reason`
+distinguishes that ("no non-skipped test functions ... (N skipped/disabled)")
+from the genuinely-no-tests-exist case.
 
 **`parsers/sarif.py`** ingests one or more `--sarif` 2.1.0 reports (semgrep,
 trivy, CodeQL, ...), normalizing `level` (defaults to `warning` per spec)
@@ -393,12 +465,21 @@ installed — outside CI there's no ambient identity to fetch, by design.
 
 ## Test suite
 
-~250 test cases across 11 modules, including dedicated adversarial suites:
-`test_adversarial_ast.py` (assertion-integrity bypass attempts),
-`test_security_boundaries.py` and `test_verify_boundaries.py`
-(malformed/hostile-input hardening), and `test_github_rules.py` (auth
-failure modes, pagination limits, bypass-mode edge cases against a mocked
-GitHub API).
+~290 test cases across 13 modules, including dedicated adversarial suites:
+`test_adversarial_ast.py` (Python assertion-integrity bypass attempts),
+`test_ast_assertions.py` (the multi-language engine: on-disk fixtures for
+every supported language, per-language gaming heuristics, registry
+dispatch, and DSSE predicate telemetry), `test_security_boundaries.py` and
+`test_verify_boundaries.py` (malformed/hostile-input hardening), and
+`test_github_rules.py` (auth failure modes, pagination limits, bypass-mode
+edge cases against a mocked GitHub API).
+
+Run the full suite in parallel:
+
+```bash
+python3 -m pip install pytest-xdist
+python3 -m pytest -n auto -v tests/
+```
 
 ## Not yet built (flagged, not hidden)
 

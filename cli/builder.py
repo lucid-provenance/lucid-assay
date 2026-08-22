@@ -69,6 +69,8 @@ def build_statement(
     rcs: RCSResult,
     sbom: Optional[Dict[str, Any]] = None,
     sarif_report: Optional[SarifSummaryReport] = None,
+    ast_skipped_test_functions: int = 0,
+    ast_languages: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> Dict[str, Any]:
     """Returns a dict matching the lifecycle/v0.1 predicate schema, wrapped
     in a standard in-toto Statement envelope."""
@@ -206,7 +208,9 @@ def build_statement(
                 "empty_test_bodies": empty_test_bodies,
                 "assertion_only_true": assertion_only_true,
                 "skipped_or_disabled_ratio": skipped_ratio,
+                "ast_skipped_test_functions": ast_skipped_test_functions,
             },
+            "languages": ast_languages or {},
         },
         "static_analysis": static_analysis,
         "release_confidence_score": {

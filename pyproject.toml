@@ -12,6 +12,11 @@ dependencies = [
     "pydantic>=2.0.0",
     "cryptography>=41.0.0",
     "sigstore>=3.0.0,<5.0.0",
+    "tree-sitter>=0.22,<1.0",
+    "tree-sitter-typescript>=0.21,<1.0",
+    "tree-sitter-javascript>=0.21,<1.0",
+    "tree-sitter-go>=0.21,<1.0",
+    "tree-sitter-java>=0.21,<1.0",
 ]
 
 [project.optional-dependencies]
@@ -27,3 +32,14 @@ plinth-assay = "cli.main:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["cli*", "schema*"]
+
+[tool.pytest.ini_options]
+# tests/fixtures/ast_assertions/ holds source-text fixtures for the
+# multi-language AST assertion engine (tests/test_ast_assertions.py parses
+# them directly via inspect_test_suite). The Python ones are named
+# test_*.py to satisfy PythonAssertionVisitor's own discovery convention,
+# which makes pytest's default collector try to import and *execute* them
+# as real tests too -- they're not; they reference undefined helpers on
+# purpose to exercise zero-assertion/tautology detection. Excluded from
+# collection by directory basename.
+norecursedirs = ["ast_assertions", ".git", ".venv", "node_modules", "build", "dist"]

@@ -190,7 +190,24 @@
           "properties": {
             "empty_test_bodies": { "type": "integer", "minimum": 0, "description": "Test functions with zero assertions and zero meaningful statements." },
             "assertion_only_true": { "type": "integer", "minimum": 0, "description": "Suspicious tautological assertions, e.g. assert True / expect(true).toBe(true)." },
-            "skipped_or_disabled_ratio": { "type": "number", "minimum": 0, "maximum": 1 }
+            "skipped_or_disabled_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+            "ast_skipped_test_functions": { "type": "integer", "minimum": 0, "description": "Test functions the AST engine identified as skipped/disabled (e.g. @Disabled, it.skip, t.Skip-wholesale, @unittest.skip*) across every scanned language; excluded from total_test_functions/total_assertions." }
+          }
+        },
+        "languages": {
+          "type": "object",
+          "description": "Per-language breakdown of the AST assertion engine's scan, keyed by language id (python, typescript, javascript, go, java). Absent/empty on older attestations predating multi-language support.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "files_scanned": { "type": "integer", "minimum": 0 },
+              "total_test_functions": { "type": "integer", "minimum": 0 },
+              "total_assertions": { "type": "integer", "minimum": 0 },
+              "tautological_assertions": { "type": "integer", "minimum": 0 },
+              "empty_test_bodies": { "type": "integer", "minimum": 0 },
+              "skipped_test_functions": { "type": "integer", "minimum": 0 }
+            }
           }
         }
       }

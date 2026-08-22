@@ -19,7 +19,7 @@ from typing import Dict, Iterator, List, Optional
 
 from .builder import build_statement
 from .hashing import sha256_file, worm_uri
-from .parsers.ast_inspector import inspect_test_suite
+from .parsers.ast import inspect_test_suite
 from .parsers.coverage import parse_cobertura, parse_lcov
 from .parsers.github_rules import bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
@@ -246,6 +246,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         total_test_functions = ast_metrics.total_test_functions
         empty_bodies = ast_metrics.empty_test_bodies
         tautological = ast_metrics.tautological_assertions
+        ast_skipped = ast_metrics.skipped_test_functions
+        ast_languages = {lang: m.as_dict() for lang, m in ast_metrics.languages.items()}
 
     # 6. Deterministic scoring
     pr_approvers = [a.strip() for a in args.pr_approvers.split(",") if a.strip()]
@@ -264,6 +266,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             overall_coverage_min=args.overall_coverage_min,
             branch_governance=branch_governance,
             sarif_report=sarif_report,
+            ast_skipped_test_functions=ast_skipped,
         )
 
     # 7. Build unsigned in-toto Statement
@@ -299,6 +302,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             assertion_only_true=tautological,
             rcs=rcs,
             sarif_report=sarif_report,
+            ast_skipped_test_functions=ast_skipped,
+            ast_languages=ast_languages,
         )
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0

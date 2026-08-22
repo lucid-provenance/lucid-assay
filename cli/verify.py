@@ -55,6 +55,15 @@ GITHUB_ACTIONS_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 _GITHUB_WORKFLOW_REF_OID = "1.3.6.1.4.1.57264.1.6"
 _OIDC_SOURCE_REPOSITORY_REF_OID = "1.3.6.1.4.1.57264.1.14"
 
+# Same v1/v2 split as above, for the other claims _describe_actual_cert_claims
+# reports on failure: OIDC issuer, workflow repository, and workflow name.
+# (Workflow name has no v2 successor extension -- it's carried by .4 alone.)
+_OIDC_ISSUER_V1_OID = "1.3.6.1.4.1.57264.1.1"
+_OIDC_ISSUER_V2_OID = "1.3.6.1.4.1.57264.1.8"
+_GITHUB_WORKFLOW_NAME_OID = "1.3.6.1.4.1.57264.1.4"
+_GITHUB_WORKFLOW_REPOSITORY_OID = "1.3.6.1.4.1.57264.1.5"
+_OIDC_SOURCE_REPOSITORY_URI_OID = "1.3.6.1.4.1.57264.1.12"
+
 EXIT_PASS = 0
 EXIT_POLICY_VIOLATION = 2
 EXIT_FILE_ERROR = 1
@@ -205,15 +214,16 @@ def _der_decode_short_utf8_string(raw: bytes) -> Optional[str]:
         return None
 
 
-def _extract_cert_ref(cert: Any) -> Optional[str]:
-    """Extracts the GitHub Actions ref from a Fulcio certificate, checking
-    both the legacy v1 extension (raw UTF-8 bytes) and the current v2
-    extension (DER-encoded UTF8String) -- whichever version minted the
-    cert. Returns None if neither extension is present."""
+def _extract_cert_ext_v1_or_v2(cert: Any, v1_oid: str, v2_oid: str) -> Optional[str]:
+    """Extracts a Fulcio GitHub Actions OIDC claim from `cert`, checking the
+    legacy v1 extension (raw UTF-8 bytes) first and falling back to the
+    current v2 extension (DER-encoded UTF8String) -- whichever version
+    minted the cert. Returns None if neither extension is present or
+    parseable."""
     from cryptography.x509 import ExtensionNotFound, ObjectIdentifier
 
     try:
-        raw = cert.extensions.get_extension_for_oid(ObjectIdentifier(_GITHUB_WORKFLOW_REF_OID)).value.value
+        raw = cert.extensions.get_extension_for_oid(ObjectIdentifier(v1_oid)).value.value
         return raw.decode("utf-8")
     except ExtensionNotFound:
         pass
@@ -221,10 +231,66 @@ def _extract_cert_ref(cert: Any) -> Optional[str]:
         return None
 
     try:
-        raw = cert.extensions.get_extension_for_oid(ObjectIdentifier(_OIDC_SOURCE_REPOSITORY_REF_OID)).value.value
+        raw = cert.extensions.get_extension_for_oid(ObjectIdentifier(v2_oid)).value.value
     except ExtensionNotFound:
         return None
     return _der_decode_short_utf8_string(raw)
+
+
+def _extract_cert_ref(cert: Any) -> Optional[str]:
+    """Extracts the GitHub Actions ref from a Fulcio certificate, checking
+    both the legacy v1 extension (raw UTF-8 bytes) and the current v2
+    extension (DER-encoded UTF8String) -- whichever version minted the
+    cert. Returns None if neither extension is present."""
+    return _extract_cert_ext_v1_or_v2(cert, _GITHUB_WORKFLOW_REF_OID, _OIDC_SOURCE_REPOSITORY_REF_OID)
+
+
+def _describe_actual_cert_claims(cert: Any) -> str:
+    """Best-effort, human-readable summary of a Fulcio certificate's SAN and
+    GitHub Actions OIDC claims (issuer, repository, workflow name, ref), for
+    logging alongside a failed identity policy's expected claims so a
+    mismatch is immediately diagnoseable in CI logs. Never raises -- a claim
+    that's absent, unparseable, or hits an unexpected cert shape is reported
+    as None rather than aborting the whole summary."""
+    from cryptography import x509
+    from cryptography.x509 import ExtensionNotFound
+    from cryptography.x509.oid import ExtensionOID
+
+    san: Optional[str] = None
+    try:
+        san_ext = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value
+        uris = san_ext.get_values_for_type(x509.UniformResourceIdentifier)
+        san = uris[0] if uris else None
+    except ExtensionNotFound:
+        pass
+    except Exception:  # noqa: BLE001 - diagnostics must never themselves crash the gate
+        san = "<unparseable>"
+
+    try:
+        issuer = _extract_cert_ext_v1_or_v2(cert, _OIDC_ISSUER_V1_OID, _OIDC_ISSUER_V2_OID)
+    except Exception:  # noqa: BLE001
+        issuer = "<unparseable>"
+
+    try:
+        repository = _extract_cert_ext_v1_or_v2(
+            cert, _GITHUB_WORKFLOW_REPOSITORY_OID, _OIDC_SOURCE_REPOSITORY_URI_OID
+        )
+    except Exception:  # noqa: BLE001
+        repository = "<unparseable>"
+
+    try:
+        # Workflow name has no v2 successor extension, so re-use the v1/v2
+        # helper with the same OID twice -- it'll simply take the v1 branch.
+        workflow = _extract_cert_ext_v1_or_v2(cert, _GITHUB_WORKFLOW_NAME_OID, _GITHUB_WORKFLOW_NAME_OID)
+    except Exception:  # noqa: BLE001
+        workflow = "<unparseable>"
+
+    try:
+        ref = _extract_cert_ref(cert)
+    except Exception:  # noqa: BLE001
+        ref = "<unparseable>"
+
+    return f"SAN={san!r} issuer={issuer!r} repository={repository!r} workflow={workflow!r} ref={ref!r}"
 
 
 class _RefPatternPolicy:
@@ -401,6 +467,20 @@ def _verify_sigstore_identity(
             return "verified", f"Sigstore signature verification succeeded, but {policy_detail}"
         return "verified", f"Sigstore identity verification succeeded ({policy_detail})"
     except SigstoreVerificationError as e:
+        # `bundle` is guaranteed bound here: Bundle.from_json() above must
+        # have already succeeded for verifier.verify_dsse() to have reached
+        # a policy check that could raise this.
+        try:
+            actual_claims = _describe_actual_cert_claims(bundle.signing_certificate)
+        except Exception:  # noqa: BLE001 - diagnostics must never mask the real failure
+            actual_claims = "<unavailable: could not introspect signing certificate>"
+        print(
+            "Sigstore identity verification failed -- expected vs actual certificate claims:\n"
+            f"  expected: {policy_detail}\n"
+            f"  actual:   {actual_claims}\n"
+            f"  error:    {e}",
+            file=sys.stderr,
+        )
         return "failed", f"Sigstore identity verification failed: {e}"
     except (NetworkError, TUFError, MetadataError) as e:
         return "unavailable", f"Sigstore verification unavailable (offline or trust-root fetch failed): {e}"

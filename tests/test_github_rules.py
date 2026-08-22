@@ -212,6 +212,39 @@ class InspectBranchGovernanceTests(unittest.TestCase):
         self.assertEqual(report.warnings, [])
 
     @patch("cli.parsers.github_rules._github_api_get")
+    def test_403_on_rules_endpoint_gives_actionable_administration_read_diagnostic(self, mock_get):
+        # The default GITHUB_TOKEN can never be granted 'Administration:
+        # Read' via a workflow's `permissions:` block -- a 403 straight from
+        # the primary rules-for-branch call is the single most common way
+        # an under-scoped token shows up, so it must fail closed with a
+        # concrete, actionable diagnostic (not just a bare "HTTP 403").
+        mock_get.side_effect = _api_get_router({
+            "/repos/acme/widgets/rules/branches/main": GitHubAPIError(
+                "GET ... -> HTTP 403: Forbidden", status_code=403
+            ),
+        })
+
+        report = inspect_branch_governance("acme/widgets", "main", token="under-scoped-token")
+
+        self.assertFalse(report.available)
+        self.assertIn("authentication/authorization failed", report.reason)
+        self.assertIn("Administration: Read", report.reason)
+        self.assertIn("querying rules for branch", report.reason)
+
+    @patch("cli.parsers.github_rules._github_api_get")
+    def test_401_on_rules_endpoint_gives_actionable_administration_read_diagnostic(self, mock_get):
+        mock_get.side_effect = _api_get_router({
+            "/repos/acme/widgets/rules/branches/main": GitHubAPIError(
+                "GET ... -> HTTP 401: Unauthorized", status_code=401
+            ),
+        })
+
+        report = inspect_branch_governance("acme/widgets", "main", token="bad-token")
+
+        self.assertFalse(report.available)
+        self.assertIn("Administration: Read", report.reason)
+
+    @patch("cli.parsers.github_rules._github_api_get")
     def test_ruleset_detail_error_degrades_bypass_visibility_but_keeps_rules_result(self, mock_get):
         mock_get.side_effect = _api_get_router({
             "/repos/acme/widgets/rules/branches/main": [_pull_request_rule(2)],
@@ -282,6 +315,7 @@ class InspectBranchGovernanceTests(unittest.TestCase):
 
         self.assertFalse(report.available)
         self.assertIn("authentication/authorization failed", report.reason)
+        self.assertIn("Administration: Read", report.reason)
 
     @patch("cli.parsers.github_rules._github_api_get")
     def test_403_enumerating_ruleset_detail_invalidates_whole_report(self, mock_get):
@@ -297,6 +331,7 @@ class InspectBranchGovernanceTests(unittest.TestCase):
 
         self.assertFalse(report.available)
         self.assertIn("authentication/authorization failed", report.reason)
+        self.assertIn("Administration: Read", report.reason)
 
     @patch("cli.parsers.github_rules._github_api_get")
     def test_unrecognized_bypass_mode_fails_closed(self, mock_get):

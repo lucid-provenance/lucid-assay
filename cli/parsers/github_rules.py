@@ -21,7 +21,12 @@ Hardened against:
   - Auth failures (401/403) anywhere in the flow -- including secondary
     ruleset/bypass-actor enrichment -- invalidate the whole report
     (available=False), since a bad/under-scoped token can't be trusted
-    to have reported the rest of the data faithfully either
+    to have reported the rest of the data faithfully either. The default
+    GITHUB_TOKEN can never be granted the 'Administration: Read'
+    permission these endpoints require (it isn't an available workflow
+    `permissions:` scope at all), so a 401/403 here almost always means
+    that; the failure reason spells this out explicitly rather than
+    surfacing a bare status code
   - Unbounded/adversarial pagination (bounded to MAX_PAGES, following
     only same-origin HTTPS `Link: rel="next"` targets)
   - Transport/timeout/malformed-JSON failures on either endpoint (degrades
@@ -71,6 +76,30 @@ class GitHubAPIError(RuntimeError):
     def __init__(self, message: str, status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+# The rules-for-branch and rulesets endpoints require 'Administration: Read'
+# repository permission. That permission is never available to the default
+# GITHUB_TOKEN via a workflow's `permissions:` block -- it isn't one of the
+# scopes GITHUB_TOKEN supports, full stop -- so a 401/403 here is, in
+# practice, almost always that, not a one-off transient auth glitch. Spelled
+# out explicitly (with the concrete remediation) so it's diagnoseable
+# straight from CI logs instead of a bare "HTTP 403".
+_ADMINISTRATION_READ_REMEDIATION = (
+    "the token needs 'Administration: Read' repository permission; the default "
+    "GITHUB_TOKEN can never be granted this via a workflow's `permissions:` block "
+    "(it is not one of the scopes GITHUB_TOKEN supports) -- mint a GitHub App "
+    "installation token instead (e.g. via actions/create-github-app-token, with "
+    "the App granted 'Administration: Read') and pass it as --github-token / "
+    "GITHUB_TOKEN"
+)
+
+
+def _actionable_auth_failure_reason(e: GitHubAPIError, context: str) -> str:
+    """Builds a fail-closed diagnostic for a 401/403 GitHub API response
+    that tells the operator exactly what's wrong and how to fix it, rather
+    than surfacing a bare status code."""
+    return f"GitHub API authentication/authorization failed {context} (HTTP {e.status_code}): {e}. {_ADMINISTRATION_READ_REMEDIATION}."
 
 
 @dataclass
@@ -300,6 +329,8 @@ def inspect_branch_governance(
             f"/repos/{repository}/rules/branches/{_quote_ref(branch)}", resolved_token, timeout
         )
     except GitHubAPIError as e:
+        if e.status_code in (401, 403):
+            return _unavailable(branch, _actionable_auth_failure_reason(e, "querying rules for branch"))
         return _unavailable(branch, f"GitHub rules API request failed: {e}")
 
     if raw_rules is None:
@@ -333,11 +364,7 @@ def inspect_branch_governance(
             # A bad/under-scoped token taints the whole report, not just
             # this one lookup -- the rules-for-branch call above may well
             # have "succeeded" only via its own 404-is-benign short-circuit.
-            return _unavailable(
-                branch,
-                f"GitHub API authentication/authorization failed while enumerating rulesets "
-                f"(HTTP {e.status_code}); token may be invalid or insufficiently scoped: {e}",
-            )
+            return _unavailable(branch, _actionable_auth_failure_reason(e, "enumerating rulesets"))
         # Any other (non-auth) failure enumerating rulesets doesn't invalidate
         # the rules data already in hand -- degrade to "no bypass-actor
         # visibility" rather than discarding an otherwise-successful lookup.

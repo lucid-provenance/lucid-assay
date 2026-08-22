@@ -16,8 +16,10 @@ from cli.verify import (
     main,
     verify_dsse_attestation,
     _build_identity_policy,
+    _describe_actual_cert_claims,
     _envelope_to_bundle_json,
     _extract_cert_ref,
+    _verify_sigstore_identity,
 )
 
 SUBJECT_DIGEST = "a" * 64
@@ -558,6 +560,111 @@ class EnvelopeToBundleJsonTests(unittest.TestCase):
         self.assertEqual(
             reconstructed["mediaType"], "application/vnd.dev.sigstore.bundle.v0.3+json"
         )
+
+
+class DescribeActualCertClaimsTests(unittest.TestCase):
+    """Coverage for the human-readable actual-claims summary printed to
+    stderr when identity verification fails (see
+    VerifySigstoreIdentityDiagnosticsTests below)."""
+
+    def test_reports_all_present_claims(self):
+        cert = _make_fulcio_style_cert(
+            san_uri="https://github.com/acme/widgets/.github/workflows/assay.yml@refs/heads/main",
+            issuer=GITHUB_ACTIONS_OIDC_ISSUER,
+            repository="acme/widgets",
+            workflow_name="Plinth Assay",
+            ref="refs/heads/main",
+        )
+
+        summary = _describe_actual_cert_claims(cert)
+
+        self.assertIn("acme/widgets", summary)
+        self.assertIn(GITHUB_ACTIONS_OIDC_ISSUER, summary)
+        self.assertIn("Plinth Assay", summary)
+        self.assertIn("refs/heads/main", summary)
+        self.assertIn(
+            "https://github.com/acme/widgets/.github/workflows/assay.yml@refs/heads/main", summary
+        )
+
+    def test_v2_only_repository_and_ref_still_reported(self):
+        cert = _make_fulcio_style_cert(
+            repository=None,
+            source_repository_uri="https://github.com/acme/widgets",
+            ref="refs/tags/v1.2.3",
+            ref_is_v2=True,
+        )
+
+        summary = _describe_actual_cert_claims(cert)
+
+        self.assertIn("https://github.com/acme/widgets", summary)
+        self.assertIn("refs/tags/v1.2.3", summary)
+
+    def test_missing_claims_reported_as_none_not_raised(self):
+        cert = _make_fulcio_style_cert()  # no SAN, no GitHub OIDC extensions at all
+
+        summary = _describe_actual_cert_claims(cert)  # must not raise
+
+        self.assertIn("SAN=None", summary)
+        self.assertIn("issuer=None", summary)
+        self.assertIn("repository=None", summary)
+        self.assertIn("workflow=None", summary)
+        self.assertIn("ref=None", summary)
+
+
+class VerifySigstoreIdentityDiagnosticsTests(unittest.TestCase):
+    """Regression coverage: on a genuine Sigstore identity-policy mismatch,
+    cli.verify must log the expected vs. actual certificate claims to
+    stderr, so the mismatch is immediately diagnoseable straight from CI
+    logs rather than just a bare exception message."""
+
+    def test_failed_verification_logs_expected_vs_actual_claims_to_stderr(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        from sigstore.errors import VerificationError
+
+        actual_cert = _make_fulcio_style_cert(
+            san_uri="https://github.com/acme/widgets/.github/workflows/assay.yml@refs/heads/main",
+            issuer=GITHUB_ACTIONS_OIDC_ISSUER,
+            repository="acme/widgets",
+            workflow_name="Plinth Assay",
+            ref="refs/heads/main",
+        )
+        fake_bundle = mock.Mock()
+        fake_bundle.signing_certificate = actual_cert
+
+        envelope = _envelope(
+            _statement(),
+            signatures=[{"sig": "c2ln", "certificate": _fake_cert_pem()}],
+        )
+
+        with mock.patch("sigstore.models.Bundle.from_json", return_value=fake_bundle), mock.patch(
+            "sigstore.verify.Verifier.production"
+        ) as mock_production:
+            mock_verifier = mock.Mock()
+            mock_verifier.verify_dsse.side_effect = VerificationError(
+                "certificate repository mismatch"
+            )
+            mock_production.return_value = mock_verifier
+
+            captured_stderr = io.StringIO()
+            with contextlib.redirect_stderr(captured_stderr):
+                status, detail = _verify_sigstore_identity(
+                    envelope,
+                    dry_run=False,
+                    cert_identity=None,
+                    cert_oidc_issuer=None,
+                    expected_repository="attacker/evil-fork",
+                )
+
+        self.assertEqual(status, "failed")
+        stderr_output = captured_stderr.getvalue()
+        self.assertIn("expected:", stderr_output)
+        self.assertIn("attacker/evil-fork", stderr_output)
+        self.assertIn("actual:", stderr_output)
+        self.assertIn("acme/widgets", stderr_output)
+        self.assertIn("certificate repository mismatch", stderr_output)
 
 
 if __name__ == "__main__":

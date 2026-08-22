@@ -87,17 +87,25 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # On a pull_request event, github.ref_name is the synthetic
+          # "<number>/merge" ref (e.g. "5/merge"), not a real branch --
+          # querying branch governance for that name 404s/403s every time.
+          # --branch feeds cli.parsers.github_rules.inspect_branch_governance
+          # and is recorded as the attestation's target branch, so what's
+          # wanted here is the PR's actual base branch (the one protection
+          # rules apply to); github.ref_name is only correct on a direct push.
+          BRANCH_NAME: ${{ github.event.pull_request.base.ref || github.ref_name }}
         run: |
-          EXTRA_ARGS=""
+          EXTRA_ARGS=()
           if [ "$EVENT_NAME" = "pull_request" ]; then
             if [ -z "$BASE_SHA" ]; then
               echo "ERROR: github.event.pull_request.base.sha was empty on a pull_request event; refusing to guess a base commit" >&2
               exit 1
             fi
-            EXTRA_ARGS="--base-sha $BASE_SHA --pr-number $PR_NUMBER"
+            EXTRA_ARGS=(--base-sha "$BASE_SHA" --pr-number "$PR_NUMBER")
           fi
 
-          echo "Running with EXTRA_ARGS: $EXTRA_ARGS"
+          echo "Running with EXTRA_ARGS: ${EXTRA_ARGS[*]}"
 
           python -m cli.main \
             --junit-xml build/junit.xml \
@@ -106,23 +114,30 @@ jobs:
             --image-digest "sha256:$(git rev-parse HEAD | sha256sum | awk '{print $1}')" \
             --head-sha "${HEAD_SHA}" \
             --repository "${{ github.repository }}" \
-            --branch "${{ github.ref_name }}" \
+            --branch "${BRANCH_NAME}" \
             --github-token "$GOVPLANE_GITHUB_TOKEN" \
             --min-rcs 65 \
             --sign \
             --out build/plinth-assay.dsse.json \
-            $EXTRA_ARGS
+            "${EXTRA_ARGS[@]}"
 
       - name: Verify Plinth Attestation Gate
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REF: ${{ github.ref }}
         run: |
-          VERIFY_ARGS="--min-rcs 65"
-          VERIFY_ARGS="$VERIFY_ARGS --expected-repository \"${{ github.repository }}\""
-          VERIFY_ARGS="$VERIFY_ARGS --expected-ref \"${{ github.ref }}\""
+          # Built as a bash array, not a string handed to word-splitting:
+          # the previous string-concatenation form embedded literal `"`
+          # characters into each flag's value (they were inside an
+          # already-double-quoted string, so `\"` had no quoting effect),
+          # which made --expected-repository/--expected-ref never match the
+          # real certificate claims and failed the gate on every run.
+          VERIFY_ARGS=(--min-rcs 65 --expected-repository "$EXPECTED_REPOSITORY" --expected-ref "$EXPECTED_REF")
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            VERIFY_ARGS="$VERIFY_ARGS --disallow-degraded"
+            VERIFY_ARGS+=(--disallow-degraded)
           fi
 
-          python -m cli.verify build/plinth-assay.dsse.json $VERIFY_ARGS
+          python -m cli.verify build/plinth-assay.dsse.json "${VERIFY_ARGS[@]}"
       - name: Upload In-Toto Attestation Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

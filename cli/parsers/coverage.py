@@ -17,6 +17,8 @@ from typing import Dict, Optional, Tuple
 
 from ..common import safe_resolve_path
 
+from ..common import safe_resolve_path
+
 
 def _normalize_path(path_str: str) -> str:
     """Normalize file paths so git diff keys and coverage report keys match."""

@@ -30,7 +30,9 @@ cli/
   hashing.py                 # SHA-256 content hashing + WORM key derivation
   scorer.py                  # pure, deterministic Release Confidence Score (RCS)
   builder.py                 # assembles the unsigned in-toto Statement
+  slsa_provenance.py          # assembles a *separate*, real SLSA v1.0 provenance Statement (--emit-slsa-provenance)
   oidc_signer.py              # ambient OIDC -> Fulcio cert -> DSSE sign -> Rekor log
+  sign.py                      # `tenax-assay sign <file>`: standalone signing subcommand for an isolated attest job
   verify.py                   # admission gatekeeper: DSSE decode + Sigstore identity + policy gates
   main.py                     # CLI entrypoint wiring it all together (`tenax-assay verify` dispatches to verify.py)
 tests/
@@ -48,6 +50,9 @@ tests/
   test_verify_hardening.py             # envelope size guard, diagnostic schema validation, OIDC fetch retry
   test_security_boundaries.py          # cross-cutting adversarial-input suite
   test_common_path_safety.py            # safe_resolve_path() + its wiring into every open()/getsize() call site
+  test_slsa_provenance.py               # SLSA v1.0 provenance builder: ground-truth/fail-closed tests, and proof
+                                         # a genuine statement satisfies cli/verify.py's SLSA Level 1/2 checklist
+  test_sign.py                          # `tenax-assay sign` CLI + cli.oidc_signer.sign_file_to_envelope tests
   fixtures/                             # sample cobertura.xml and a rendered statement
   fixtures/ast_assertions/                # per-language source-text fixtures for the AST engine
                                            # (python/, typescript/, javascript/, go/, java/) --
@@ -618,7 +623,9 @@ gates above — it evaluates the SLSA-specific fields (`predicateType`,
 applies to any SLSA v1.0 provenance statement handed to this same
 admission gate, not just tenax-assay's own attestations (whose
 predicate isn't SLSA-provenance-shaped, so most items there legitimately
-show `[✗]` today). Neither level's outcome ever affects `passed`/the
+show `[✗]` today — that's by design, see "SLSA v1.0 provenance
+attestation" below for the statement that's actually meant to satisfy
+this checklist). Neither level's outcome ever affects `passed`/the
 exit code:
 
 ```text
@@ -656,6 +663,121 @@ Status: PASSED (SLSA Build Level 2)
   `buildDefinition.resolvedDependencies` has at least one entry with a
   non-empty `uri`.
 
+## SLSA v1.0 provenance attestation (`--emit-slsa-provenance`)
+
+`--emit-slsa-provenance` (`cli/slsa_provenance.py`) makes `cli.main` write a
+**second, separate** in-toto Statement alongside tenax-assay's own RCS
+predicate — same subject artifact, but `predicateType`
+`https://slsa.dev/provenance/v1`, real SLSA-shaped `buildDefinition`/
+`runDetails`, and its own output file (`--slsa-provenance-out`, default
+derived from `--out`, e.g. `attestation.slsa-provenance.unsigned.json`). If
+`--sign`/`--dry-run-sign` was also passed, this second statement is signed
+into its own DSSE envelope the same way the primary one is. The two
+predicates are kept apart rather than merged — see `parsers/lockfiles.py`'s
+note above and the SLSA checklist section for why tenax-assay's own
+predicate is deliberately not SLSA-shaped; this is the statement built
+specifically to *be* SLSA-shaped instead.
+
+**Ground-truth only, fail-closed** (same contract as the rest of `cli/`):
+every `buildDefinition`/`runDetails` field is populated strictly from data
+that genuinely describes the run — ambient `GITHUB_REPOSITORY`/`_SHA`/
+`_RUN_ID`/`_RUN_ATTEMPT`/`_WORKFLOW_REF`/`RUNNER_ENVIRONMENT` env vars
+Actions itself sets, plus tenax-assay's own already-parsed lockfile
+dependency list (`resolved_dependencies`, reshaped into SLSA's `{uri,
+digest}` form). Nothing is inferred or defaulted to a plausible-looking
+value:
+- Off-CI (no ambient GitHub Actions env), `buildDefinition.externalParameters`
+  and `.resolvedDependencies` are empty and `runDetails.builder`/
+  `metadata.invocationId` are absent — a legitimately less-complete
+  statement, not a fabricated one.
+- `runDetails.builder.id` (`https://github.com/actions/runner`, matching
+  `cli/verify.py`'s `TRUSTED_HOSTED_BUILDER_IDS` allowlist) is only ever set
+  when `RUNNER_ENVIRONMENT=github-hosted` — a self-hosted runner gets no
+  builder id at all rather than a false "hosted" claim.
+- `buildDefinition.buildType` is always
+  `https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1`,
+  the real published buildType for a GitHub Actions workflow build (from
+  the [slsa-github-generator](https://github.com/slsa-framework/github-actions-buildtypes)
+  project, not invented here).
+
+Because it's populated this way, this statement legitimately satisfies
+`cli/verify.py`'s SLSA Build Level 1/2 checklist when run on a
+GitHub-hosted Actions runner with a real signature — `tests/
+test_slsa_provenance.py::GenuineGitHubActionsRunTests::
+test_satisfies_verify_py_slsa_build_level_1_and_2_checklists` asserts this
+directly against `_evaluate_slsa_l1`/`_evaluate_slsa_l2`. Note that
+`cli.verify`'s own `--min-rcs`/`--disallow-degraded`/`--require-digest`
+gates (and its unconditional `predicateType`/`release_confidence_score`
+checks) are specific to tenax-assay's RCS predicate and will always report
+`passed: false` against this statement — that's expected and unrelated to
+the SLSA checklist's outcome; `.github/workflows/assay.yml`'s "SLSA v1.0
+Provenance Checklist" step runs `cli.verify` against it with
+`continue-on-error: true` for exactly this reason, purely to print the
+checklist to the log. See `tests/fixtures/slsa_provenance_statement.output.json`
+for a minimal fully-populated example.
+
+## Isolating signing from the build (`tenax-assay sign`)
+
+A signed, checklist-passing statement is not by itself a defensible SLSA
+Build Level 2 claim. Level 2's actual requirement is that provenance is
+generated by the *build platform*, isolated from the tenant's own build
+steps — so a compromised build (a malicious dependency, a tampered test
+fixture) can't also forge its own provenance. Signing the statement in the
+same job, under the same script, as the code that runs a PR's tests and
+dependencies doesn't provide that: nothing stops that code from reaching
+the signing credential, in principle, since both share one trust boundary.
+
+`tenax-assay sign <statement.json> [--out PATH] [--dry-run-sign]`
+(`cli/sign.py`) exists to make real isolation possible: it signs an
+already-built unsigned statement *file*, nothing else — no scoring,
+coverage, SARIF, or branch-governance re-execution, so a job invoking only
+this subcommand never needs read access to any of that. It's the same
+`cli.oidc_signer.sign_file_to_envelope()` either path uses; `cli.main`'s
+own `--sign`/`--dry-run-sign` flags still build-then-sign in one process
+for local/single-command use exactly as before — `tenax-assay sign` is
+additive, not a replacement.
+
+`.github/workflows/assay.yml` uses this to split into three jobs:
+
+```text
+build (contents: read, security-events: write)
+  checkout -> tests -> coverage -> CodeQL -> RCS score
+  -> unsigned statement.json (no id-token permission at all)
+  -> upload-artifact "unsigned-statements"
+         |
+         v  (artifacts only -- no shared runner/credentials)
+attest (id-token: write -- the ONLY job with it)
+  download-artifact -> `tenax-assay sign` -> upload-artifact "signed-statements"
+         |
+         v
+verify (contents: read)
+  download-artifact -> admission gate (--min-rcs/--disallow-degraded)
+  -> SLSA checklist -> final attestation artifact
+```
+
+`build`'s test/dependency execution can never reach the Sigstore signing
+credential — `id-token: write` is granted to `attest` alone. `attest` is a
+`uses:` call to [`tenax-io/tenax-attest`](https://github.com/tenax-io/tenax-attest),
+a separate, branch-protected repository hosting the signing job as a
+`workflow_call` reusable workflow, checked out at a commit SHA (`signer-ref`)
+pinned independently of whatever ref triggered the calling run (the same
+pattern [`slsa-framework/slsa-github-generator`](https://github.com/slsa-framework/slsa-github-generator)
+uses). That's the gap that matters: even a PR that fully rewrites
+`tenax-assay`'s own workflow file in the same PR can't also rewrite what
+the signer trusts, since that code isn't part of the PR's diff at all. The
+source for that repo's content lives in `contrib/tenax-attest-repo/` in
+this repo (not part of `tenax-assay`'s own CI — a header comment there
+says so) along with setup instructions; `assay.yml`'s `attest` job comment
+cross-references it.
+
+What this still doesn't claim: reproducible builds, ephemeral/hardened
+isolation of individual build *steps* within the `build` job itself, or
+third-party/official certification — that's further SLSA Build Level 3
+territory and independent-assessment territory respectively, both out of
+scope here. The concrete, verifiable claim this architecture supports is
+narrower and accurate: the code that builds and tests a PR cannot mint the
+identity that signs what gets said about it.
+
 ## Try it
 
 ```bash
@@ -674,19 +796,34 @@ python3 -m cli.main \
   --sarif path/to/semgrep.sarif.json --sarif path/to/sonarqube.sarif.json \
   --sonar-metrics path/to/sonar-measures.json \
   --skip-perf-budget-check --debug \
+  --emit-slsa-provenance --slsa-provenance-out /tmp/attestation.slsa-provenance.unsigned.json \
   --out /tmp/attestation.unsigned.json
 # `tenax-assay run --sarif ... --sonar-metrics ...` is an equivalent, explicit
-# spelling of the same pipeline invocation above.
+# spelling of the same pipeline invocation above. Omit --emit-slsa-provenance/
+# --slsa-provenance-out to skip the second, SLSA-shaped statement entirely.
 
 # Admission gate against the unsigned statement's DSSE-shaped output
 # (only meaningful once --sign/--dry-run-sign has produced a real envelope):
 python3 -m cli.main verify /tmp/attestation.dsse.json --min-rcs 60 --dry-run
+
+# Print the SLSA Build Level 1/2 checklist for the second statement
+# (its own --min-rcs/--disallow-degraded outcome is expected to fail --
+# see "SLSA v1.0 provenance attestation" above -- this is only useful for
+# the checklist stderr generates, not this command's own exit code):
+python3 -m cli.main verify /tmp/attestation.slsa-provenance.dsse.json --dry-run
+
+# Standalone signing of an already-built unsigned statement file (no
+# scoring/coverage/SARIF re-execution) -- what an isolated `attest` CI job
+# invokes instead of --sign; see "Isolating signing from the build" above:
+python3 -m cli.main sign /tmp/attestation.unsigned.json --dry-run-sign
 ```
 
 `tests/fixtures/` currently ships `cobertura.xml` and a rendered
-`sample_statement.output.json`; supply your own `junit.xml` (the schema is
-standard JUnit XML — pytest's `--junitxml=`, jest-junit, etc. all work) to
-exercise the full pipeline end to end.
+`sample_statement.output.json` (tenax-assay's own RCS predicate) plus
+`slsa_provenance_statement.output.json` (a minimal, fully-populated
+`--emit-slsa-provenance` statement); supply your own `junit.xml` (the
+schema is standard JUnit XML — pytest's `--junitxml=`, jest-junit, etc.
+all work) to exercise the full pipeline end to end.
 
 (Omit `--sign` unless running inside an actual GitHub Actions/GitLab CI
 job with `id-token: write` permissions and the `sigstore` package
@@ -702,9 +839,13 @@ every supported language, per-language gaming heuristics, registry
 dispatch, and DSSE predicate telemetry), `test_security_boundaries.py`,
 `test_verify_boundaries.py`, and `test_sarif_adversarial.py` (malformed/
 hostile-input hardening), `test_verify_hardening.py` (envelope size guard,
-diagnostic schema validation, OIDC fetch retry bounding), and
+diagnostic schema validation, OIDC fetch retry bounding),
 `test_github_rules.py` (auth failure modes, pagination limits, bypass-mode
-edge cases against a mocked GitHub API).
+edge cases against a mocked GitHub API), `test_slsa_provenance.py`
+(ground-truth/fail-closed tests for `--emit-slsa-provenance`, plus proof
+that a genuine statement satisfies `cli/verify.py`'s SLSA Level 1/2
+checklist), and `test_sign.py` (`tenax-assay sign`'s CLI surface and
+`cli.oidc_signer.sign_file_to_envelope`'s size-guard/fail-closed paths).
 
 Run the full suite in parallel:
 

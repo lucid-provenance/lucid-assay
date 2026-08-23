@@ -1,10 +1,11 @@
 """
 Direct unit tests for cli/main.py's pipeline-step helper functions
-(_merge_sonar_metrics, _ingest_sarif, _maybe_sign, _emit_run_warnings),
-extracted from main() during the SonarCloud complexity sweep. These are
-tested directly here rather than by driving main() end to end, since a
-full run requires mocking GitHub's branch-governance API and a real git
-repo for patch coverage -- these helpers don't need either.
+(_merge_sonar_metrics, _ingest_sarif, _maybe_sign, _emit_run_warnings,
+_maybe_emit_slsa_provenance), extracted from main() during the SonarCloud
+complexity sweep. These are tested directly here rather than by driving
+main() end to end, since a full run requires mocking GitHub's
+branch-governance API and a real git repo for patch coverage -- these
+helpers don't need either.
 """
 from __future__ import annotations
 
@@ -16,7 +17,15 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 
-from cli.main import _detect_lockfile_dependencies, _emit_run_warnings, _ingest_sarif, _maybe_sign, _merge_sonar_metrics
+from cli.main import (
+    _detect_lockfile_dependencies,
+    _emit_run_warnings,
+    _ingest_sarif,
+    _maybe_emit_slsa_provenance,
+    _maybe_sign,
+    _merge_sonar_metrics,
+    derive_slsa_provenance_path,
+)
 from cli.parsers.github_rules import BranchGovernanceReport
 from cli.parsers.sarif import SarifSummaryReport, SarifToolSummary
 from cli.scorer import RCSResult
@@ -293,6 +302,97 @@ class EmitRunWarningsTests(unittest.TestCase):
         with redirect_stderr(buf2):
             _emit_run_warnings(_rcs(), _governance(), "main", 75.0, skip_perf_budget_check=True)
         self.assertNotIn("exceeded the 50ms budget", buf2.getvalue())
+
+
+class DeriveSlsaProvenancePathTests(unittest.TestCase):
+    def test_explicit_path_wins_over_any_derivation(self):
+        self.assertEqual(
+            derive_slsa_provenance_path("attestation.unsigned.json", "custom.json"),
+            "custom.json",
+        )
+
+    def test_derives_alongside_dot_unsigned_dot_json_out(self):
+        self.assertEqual(
+            derive_slsa_provenance_path("attestation.unsigned.json", None),
+            "attestation.slsa-provenance.unsigned.json",
+        )
+
+    def test_derives_alongside_plain_dot_json_out(self):
+        self.assertEqual(
+            derive_slsa_provenance_path("attestation.json", None),
+            "attestation.slsa-provenance.json",
+        )
+
+    def test_derives_alongside_extensionless_out(self):
+        self.assertEqual(
+            derive_slsa_provenance_path("build/attestation", None),
+            "build/attestation.slsa-provenance.json",
+        )
+
+
+class MaybeEmitSlsaProvenanceTests(unittest.TestCase):
+    def _tmp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        return d
+
+    def _args(self, out_path, **overrides):
+        base = dict(
+            emit_slsa_provenance=False,
+            slsa_provenance_out=None,
+            image_ref="registry.example.com/org/svc",
+            out=out_path,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_flag_not_set_is_a_noop(self):
+        out_path = os.path.join(self._tmp(), "attestation.unsigned.json")
+        result = _maybe_emit_slsa_provenance(
+            self._args(out_path),
+            image_digest="a" * 64,
+            pipeline_started_at="2026-08-23T12:00:00Z",
+            resolved_dependencies=[],
+        )
+        self.assertIsNone(result)
+        self.assertFalse(os.path.exists(derive_slsa_provenance_path(out_path, None)))
+
+    def test_flag_set_writes_a_slsa_shaped_statement_at_the_derived_path(self):
+        out_path = os.path.join(self._tmp(), "attestation.unsigned.json")
+        result = _maybe_emit_slsa_provenance(
+            self._args(out_path, emit_slsa_provenance=True),
+            image_digest="a" * 64,
+            pipeline_started_at="2026-08-23T12:00:00Z",
+            resolved_dependencies=[{"uri": "pkg:pypi/requests@2.31.0", "digest": {"sha256": "c" * 64}}],
+        )
+        # _maybe_emit_slsa_provenance resolves the path via
+        # common.safe_resolve_path() (same as every other operator-supplied
+        # output path in cli/main.py), which returns an absolute, symlink-
+        # normalized Path -- compare the resolved forms, not raw strings.
+        self.assertEqual(str(result), os.path.realpath(derive_slsa_provenance_path(out_path, None)))
+        self.assertTrue(os.path.exists(result))
+
+        with open(result, "r", encoding="utf-8") as f:
+            statement = json.load(f)
+        self.assertEqual(statement["predicateType"], "https://slsa.dev/provenance/v1")
+        self.assertEqual(statement["subject"][0]["digest"]["sha256"], "a" * 64)
+        self.assertIn(
+            {"uri": "pkg:pypi/requests@2.31.0", "digest": {"sha256": "c" * 64}},
+            statement["predicate"]["buildDefinition"]["resolvedDependencies"],
+        )
+
+    def test_explicit_slsa_provenance_out_is_honored(self):
+        tmp = self._tmp()
+        out_path = os.path.join(tmp, "attestation.unsigned.json")
+        explicit_path = os.path.join(tmp, "custom-slsa.json")
+        result = _maybe_emit_slsa_provenance(
+            self._args(out_path, emit_slsa_provenance=True, slsa_provenance_out=explicit_path),
+            image_digest="a" * 64,
+            pipeline_started_at="2026-08-23T12:00:00Z",
+            resolved_dependencies=None,
+        )
+        self.assertEqual(str(result), os.path.realpath(explicit_path))
+        self.assertTrue(os.path.exists(explicit_path))
 
 
 if __name__ == "__main__":

@@ -575,6 +575,22 @@ class CliSurfaceTests(unittest.TestCase):
         args = parse_args(self._base_argv())
         self.assertIsNone(args.sonar_metrics)
 
+    def test_emit_slsa_provenance_defaults_off_and_out_path_defaults_to_none(self):
+        from cli.main import parse_args
+
+        args = parse_args(self._base_argv())
+        self.assertFalse(args.emit_slsa_provenance)
+        self.assertIsNone(args.slsa_provenance_out)
+
+    def test_emit_slsa_provenance_and_its_out_path_are_parsed(self):
+        from cli.main import parse_args
+
+        args = parse_args(
+            self._base_argv(["--emit-slsa-provenance", "--slsa-provenance-out", "slsa.unsigned.json"])
+        )
+        self.assertTrue(args.emit_slsa_provenance)
+        self.assertEqual(args.slsa_provenance_out, "slsa.unsigned.json")
+
     def test_run_subcommand_is_stripped_before_arg_parsing(self):
         from cli.main import main
 

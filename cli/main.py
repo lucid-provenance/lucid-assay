@@ -15,6 +15,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .builder import build_statement
@@ -34,6 +35,7 @@ from .parsers.sarif import (
 )
 from .patch_coverage import compute_patch_coverage, compute_patch_modified_lines
 from .scorer import RCSResult, score_pipeline
+from .slsa_provenance import build_slsa_provenance_statement
 
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="worm-upload")
 
@@ -126,6 +128,52 @@ def derive_signed_path(out_path: str) -> str:
     return f"{out_path}.dsse.json"
 
 
+def derive_slsa_provenance_path(out_path: str, explicit: Optional[str]) -> str:
+    """Output path for --emit-slsa-provenance's second statement: honors
+    --slsa-provenance-out verbatim when given, otherwise derives one from
+    --out the same way derive_signed_path() derives the signed-envelope
+    path, so the two outputs sit side by side (e.g.
+    attestation.unsigned.json -> attestation.slsa-provenance.unsigned.json)
+    without a caller having to spell out a second full path by hand."""
+    if explicit:
+        return explicit
+    if out_path.endswith(".unsigned.json"):
+        base_out = out_path[: -len(".unsigned.json")]
+        return f"{base_out}.slsa-provenance.unsigned.json"
+    if out_path.endswith(".json"):
+        base_out = out_path[: -len(".json")]
+        return f"{base_out}.slsa-provenance.json"
+    return f"{out_path}.slsa-provenance.json"
+
+
+def _maybe_emit_slsa_provenance(
+    args: argparse.Namespace,
+    *,
+    image_digest: str,
+    pipeline_started_at: str,
+    resolved_dependencies: Optional[List[Dict[str, Any]]],
+) -> Optional[str]:
+    """Step 7b: builds and writes the --emit-slsa-provenance second
+    statement (see cli/slsa_provenance.py), returning the path it was
+    written to, or None when the flag wasn't passed. Extracted (same
+    rationale as _detect_lockfile_dependencies/_maybe_sign above) so it's
+    unit-testable directly with a tmp dir and a plain argparse.Namespace,
+    rather than only reachable by driving main() end to end."""
+    if not args.emit_slsa_provenance:
+        return None
+
+    slsa_statement = build_slsa_provenance_statement(
+        subject_name=args.image_ref,
+        subject_sha256=image_digest,
+        started_at=pipeline_started_at,
+        resolved_dependencies=resolved_dependencies,
+    )
+    slsa_provenance_out_path = safe_resolve_path(derive_slsa_provenance_path(args.out, args.slsa_provenance_out))
+    with open(slsa_provenance_out_path, "w", encoding="utf-8") as f:
+        json.dump(slsa_statement, f, indent=2)
+    return slsa_provenance_out_path
+
+
 def upload_to_worm_async(local_path: str, sha256_hex: str, bucket: str = "evidence"):
     """Fire-and-forget evidence storage dispatch."""
     def _upload():
@@ -206,23 +254,24 @@ def _detect_lockfile_dependencies(args: argparse.Namespace, stage_ns: Dict[str, 
 def _maybe_sign(args: argparse.Namespace, out_path) -> Tuple[Optional[int], Dict[str, int]]:
     """Step 9: keyless Sigstore signing, gated on --sign/--dry-run-sign.
     Returns (sign_total_ns, sign_sub_ns) for --debug's stage-profile
-    report; sign_total_ns is None when neither flag was passed."""
+    report; sign_total_ns is None when neither flag was passed.
+
+    Thin wrapper around cli.oidc_signer.sign_file_to_envelope (the same
+    file-in/file-out entry point `tenax-assay sign` -- cli/sign.py -- uses
+    for an isolated signing job that only has an unsigned statement file,
+    not this pipeline's in-process state); this call site just also times
+    it for --debug's stage-profile report."""
     if not (args.sign or args.dry_run_sign):
         return None, {}
 
-    from .oidc_signer import sign_statement
-
-    with open(out_path, "rb") as f:
-        envelope_bytes = f.read()
+    from .oidc_signer import sign_file_to_envelope
 
     sign_sub_ns: Dict[str, int] = {}
     t0 = time.perf_counter_ns()
-    envelope = sign_statement(envelope_bytes, dry_run=args.dry_run_sign, timing=sign_sub_ns)
+    signed_path = sign_file_to_envelope(
+        str(out_path), derive_signed_path(str(out_path)), dry_run=args.dry_run_sign, timing=sign_sub_ns
+    )
     sign_total_ns = time.perf_counter_ns() - t0
-
-    signed_path = safe_resolve_path(derive_signed_path(str(out_path)))
-    with open(signed_path, "w", encoding="utf-8") as f:
-        f.write(envelope.to_json())
     print(f"signed envelope written to {signed_path}", file=sys.stderr)
 
     return sign_total_ns, sign_sub_ns
@@ -307,6 +356,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--out", default="attestation.unsigned.json")
     p.add_argument("--sign", action="store_true", help="perform keyless Sigstore signing")
     p.add_argument("--dry-run-sign", action="store_true", help="simulate DSSE envelope creation without OIDC")
+    p.add_argument(
+        "--emit-slsa-provenance",
+        action="store_true",
+        dest="emit_slsa_provenance",
+        help="additionally emit a second, separate in-toto Statement shaped as real SLSA v1.0 provenance "
+        "(predicateType https://slsa.dev/provenance/v1) alongside tenax-assay's own RCS predicate -- see "
+        "cli/slsa_provenance.py. Populated only from real ambient GitHub Actions context (GITHUB_REPOSITORY/"
+        "SHA/RUN_ID/WORKFLOW_REF, RUNNER_ENVIRONMENT); fields with no real value off-CI are simply omitted, "
+        "never fabricated, so an off-CI run legitimately produces a less-complete statement.",
+    )
+    p.add_argument(
+        "--slsa-provenance-out",
+        default=None,
+        dest="slsa_provenance_out",
+        help="output path for the --emit-slsa-provenance statement (default: derived from --out, e.g. "
+        "attestation.slsa-provenance.unsigned.json)",
+    )
     p.add_argument("--skip-perf-budget-check", action="store_true")
     p.add_argument(
         "--debug",
@@ -328,6 +394,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         return verify_main(raw_argv[1:])
 
+    # `tenax-assay sign ...` dispatches to the standalone signing subcommand
+    # (cli/sign.py) -- signs an already-built unsigned statement *file*
+    # directly, without re-running the pipeline above. See cli/sign.py's
+    # module docstring for why this exists separately from --sign/
+    # --dry-run-sign below (which still build-then-sign in one process).
+    if raw_argv and raw_argv[0] == "sign":
+        from .sign import main as sign_main
+
+        return sign_main(raw_argv[1:])
+
     # `tenax-assay run ...` is an explicit alias for the attestation
     # pipeline below -- it's also what runs with no subcommand at all, so
     # `run` is stripped rather than required, keeping `tenax-assay --sarif
@@ -338,6 +414,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(raw_argv)
     t_start = time.perf_counter()
     t_start_ns = time.perf_counter_ns()
+    pipeline_started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     stage_ns: Dict[str, int] = {}
 
     # 1. Parse test report
@@ -447,6 +524,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(statement, f, indent=2)
 
+    # 7b. --emit-slsa-provenance: a second, separate in-toto Statement
+    # shaped as real SLSA v1.0 provenance (see cli/slsa_provenance.py).
+    # Independent of the RCS predicate above -- same subject digest, but
+    # its own file and (if --sign/--dry-run-sign) its own DSSE envelope.
+    slsa_provenance_out_path = _maybe_emit_slsa_provenance(
+        args,
+        image_digest=image_digest,
+        pipeline_started_at=pipeline_started_at,
+        resolved_dependencies=resolved_dependencies,
+    )
+
     # 8. Async WORM uploads (fire-and-forget: the timed cost here is only
     # the dispatch/submission overhead, not the background upload itself)
     with _stage(stage_ns, "worm_upload"):
@@ -455,6 +543,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 9. Keyless signing
     sign_total_ns, sign_sub_ns = _maybe_sign(args, out_path)
+    if slsa_provenance_out_path is not None:
+        _maybe_sign(args, slsa_provenance_out_path)
 
     if args.debug:
         wall_elapsed_ns = time.perf_counter_ns() - t_start_ns

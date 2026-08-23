@@ -8,6 +8,9 @@ Hardened against:
   - SSRF / Hostile redirect attacks on the OIDC token endpoint
   - Malformed URL query string assembly
   - Forked PR / Non-OIDC pipeline crashes via explicit dry-run support
+  - A hostile/corrupt oversized input file exhausting memory before signing
+    is even attempted (sign_file_to_envelope's size guard, same rationale
+    and threshold as cli.verify.load_envelope's)
 """
 from __future__ import annotations
 
@@ -18,7 +21,10 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from .common import safe_resolve_path
 
 
 class AmbientIdentityError(RuntimeError):
@@ -36,6 +42,22 @@ _OIDC_FETCH_MAX_ATTEMPTS = 3
 _OIDC_FETCH_TIMEOUT_SECONDS = 10
 _OIDC_FETCH_BACKOFF_BASE_SECONDS = 1.0
 _OIDC_FETCH_BACKOFF_CAP_SECONDS = 5.0
+
+# An unsigned in-toto Statement is a small JSON document by construction --
+# same rationale and threshold as cli.verify.MAX_ENVELOPE_SIZE. sign_file_
+# to_envelope() takes an operator-supplied input path directly (unlike
+# sign_statement()'s in-memory bytes, used only by cli.main's own pipeline
+# right after it built the statement in-process), so it gets the same
+# stat()-before-read guard every other such boundary in cli/ already has.
+MAX_INPUT_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+
+class InputFileTooLargeError(Exception):
+    """Raised by sign_file_to_envelope() when the input file exceeds
+    MAX_INPUT_FILE_SIZE. Deliberately not an OSError subclass, matching
+    cli.verify.EnvelopeTooLargeError's reasoning: an oversized file is a
+    distinct, policy-driven rejection, not an I/O failure a broad `except
+    OSError` should swallow."""
 
 
 @dataclass
@@ -251,3 +273,45 @@ def sign_statement(
         rekor_log_id=log_id,
         sigstore_bundle=bundle_data,
     )
+
+
+def sign_file_to_envelope(
+    input_path: str,
+    output_path: str,
+    *,
+    dry_run: bool = False,
+    timing: Optional[Dict[str, int]] = None,
+) -> Path:
+    """Reads an already-built unsigned in-toto Statement from `input_path`,
+    signs it via sign_statement(), and writes the resulting DSSE envelope
+    to `output_path`. Returns the resolved output Path.
+
+    This is the file-in/file-out counterpart to sign_statement() (which
+    takes/returns in-memory bytes for cli.main's own single-process
+    pipeline, right after it builds a statement) -- it exists for callers
+    that sign a statement they didn't just build themselves, e.g. a
+    separate CI job (cli.sign's `tenax-assay sign` subcommand) that only
+    received the unsigned file as an artifact from an upstream build job
+    and has no access to -- or trust in -- however that job produced it
+    beyond the file's own bytes. Both paths are resolved via
+    common.safe_resolve_path() first, the same convention every other
+    operator-supplied path in cli/ follows.
+    """
+    resolved_input = safe_resolve_path(input_path)
+    size = os.path.getsize(resolved_input)  # raises FileNotFoundError/OSError, same as open() would
+    if size > MAX_INPUT_FILE_SIZE:
+        raise InputFileTooLargeError(
+            f"input statement file exceeds maximum allowed size "
+            f"({MAX_INPUT_FILE_SIZE // (1024 * 1024)}MB): {size} bytes"
+        )
+
+    with open(resolved_input, "rb") as f:
+        statement_json_bytes = f.read()
+
+    envelope = sign_statement(statement_json_bytes, dry_run=dry_run, timing=timing)
+
+    resolved_output = safe_resolve_path(output_path)
+    with open(resolved_output, "w", encoding="utf-8") as f:
+        f.write(envelope.to_json())
+
+    return resolved_output

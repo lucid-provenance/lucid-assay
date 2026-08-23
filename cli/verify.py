@@ -57,6 +57,26 @@ EXPECTED_PAYLOAD_TYPE = "application/vnd.in-toto+json"
 EXPECTED_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 EXPECTED_PREDICATE_TYPE = "https://tenax.io/attestations/assay/v1"
 
+# The generic SLSA v1.0 provenance predicateType (distinct from
+# EXPECTED_PREDICATE_TYPE above, which is tenax-assay's own RCS predicate).
+# The SLSA Build Level 1/2 checklist below (_evaluate_slsa_l1/_l2) is a
+# separate, purely informational assessment against the SLSA v1.0
+# provenance schema (https://slsa.dev/spec/v1.0/provenance) -- it never
+# gates `passed`/exit code, the same way static_analysis_tools doesn't --
+# so it applies whether the decoded statement is tenax-assay's own
+# predicate (which, not being SLSA provenance shaped, will legitimately
+# fail most of this checklist today) or a real SLSA provenance statement
+# handed to this same admission gate.
+SLSA_PROVENANCE_PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
+
+# Builder IDs trusted as SLSA Build Level 2 "hosted"/tamper-resistant
+# build platforms. Deliberately a narrow, explicit allowlist rather than
+# a prefix/pattern match: a hosted-builder claim is exactly the kind of
+# claim that must fail closed on anything not explicitly recognized.
+TRUSTED_HOSTED_BUILDER_IDS = frozenset({
+    "https://github.com/actions/runner",
+})
+
 # GitHub Actions' well-known OIDC token issuer. GitHub-Actions-specific
 # identity claims (repository/workflow/ref) are only meaningful -- and only
 # safe to trust -- when they came from this issuer, so any of those claims
@@ -158,6 +178,8 @@ class VerificationResult:
     identity_detail: str = ""
     static_analysis_tools: List[Dict[str, Any]] = field(default_factory=list)
     schema_validation_status: str = "skipped"
+    slsa_level1: Optional[Dict[str, Any]] = None
+    slsa_level2: Optional[Dict[str, Any]] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -174,6 +196,8 @@ class VerificationResult:
             "identity_detail": self.identity_detail,
             "static_analysis_tools": self.static_analysis_tools,
             "schema_validation_status": self.schema_validation_status,
+            "slsa_level1": self.slsa_level1,
+            "slsa_level2": self.slsa_level2,
         }
 
 
@@ -234,6 +258,265 @@ def _extract_static_analysis_tools(predicate: Dict[str, Any]) -> List[Dict[str, 
         return []
 
     return [t for t in tools if isinstance(t, dict)]
+
+
+def _slsa_item(label: str, passed: bool, detail: str = "") -> Dict[str, Any]:
+    """One SLSA checklist row: {label, passed, detail}. `detail` is a
+    human-readable explanation of *why* a failed item failed; left "" for
+    a passing item -- callers never need to distinguish "passed" from
+    "passed with a caveat", only pass/fail plus a reason when it's not."""
+    return {"label": label, "passed": passed, "detail": detail}
+
+
+def _slsa_check_statement_envelope(statement: Dict[str, Any]) -> Dict[str, Any]:
+    statement_type = statement.get("_type")
+    passed = statement_type == EXPECTED_STATEMENT_TYPE
+    detail = "" if passed else f"unexpected _type: {statement_type!r} (expected {EXPECTED_STATEMENT_TYPE!r})"
+    return _slsa_item("in-toto v1 Statement Envelope", passed, detail)
+
+
+def _slsa_check_predicate_type(statement: Dict[str, Any]) -> Dict[str, Any]:
+    predicate_type = statement.get("predicateType")
+    passed = predicate_type == SLSA_PROVENANCE_PREDICATE_TYPE
+    detail = (
+        "" if passed
+        else f"unexpected predicateType: {predicate_type!r} (expected {SLSA_PROVENANCE_PREDICATE_TYPE!r})"
+    )
+    return _slsa_item("SLSA v1.0 Provenance Predicate", passed, detail)
+
+
+def _slsa_has_build_type(predicate: Dict[str, Any]) -> bool:
+    build_definition = predicate.get("buildDefinition")
+    build_definition = build_definition if isinstance(build_definition, dict) else {}
+    build_type = build_definition.get("buildType")
+    return isinstance(build_type, str) and bool(build_type.strip())
+
+
+def _slsa_has_invocation_metadata(predicate: Dict[str, Any]) -> bool:
+    """True if runDetails.metadata carries either an invocationId, or both
+    a startedOn and finishedOn timestamp -- either is sufficient evidence
+    the build's invocation was actually recorded, per SLSA's own
+    BuildMetadata definition (all three fields are individually optional
+    there)."""
+    run_details = predicate.get("runDetails")
+    run_details = run_details if isinstance(run_details, dict) else {}
+    metadata = run_details.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+
+    if metadata.get("invocationId"):
+        return True
+    return bool(metadata.get("startedOn")) and bool(metadata.get("finishedOn"))
+
+
+def _slsa_check_build_definition(predicate: Dict[str, Any]) -> Dict[str, Any]:
+    """Combines two SLSA L1 requirements (a populated buildDefinition.
+    buildType, and runDetails.metadata invocation evidence) into one
+    checklist row -- both describe "the provenance actually records what
+    build produced this", so a reader doesn't need two near-identical
+    lines to see that's missing."""
+    has_build_type = _slsa_has_build_type(predicate)
+    has_metadata = _slsa_has_invocation_metadata(predicate)
+    label = "Build Definition & Invocation Metadata"
+    if has_build_type and has_metadata:
+        return _slsa_item(label, True)
+
+    missing = []
+    if not has_build_type:
+        missing.append("buildDefinition.buildType")
+    if not has_metadata:
+        missing.append("runDetails.metadata.invocationId (or startedOn/finishedOn)")
+    return _slsa_item(label, False, f"missing {', '.join(missing)}")
+
+
+def _slsa_check_subject_digest(statement: Dict[str, Any]) -> Dict[str, Any]:
+    digests = _extract_subject_digests(statement)
+    passed = bool(digests)
+    detail = "" if passed else "no subject digests present under statement.subject[].digest"
+    return _slsa_item("Subject Artifact Digest Verification", passed, detail)
+
+
+def _evaluate_slsa_l1(statement: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluates the SLSA v1.0 Build Level 1 checklist -- in-toto Statement
+    envelope, SLSA provenance predicateType, buildDefinition/runDetails
+    invocation metadata, and a subject artifact digest -- against a
+    decoded in-toto Statement dict. Purely informational: never raises,
+    and its result never feeds into `passed`/exit code (see
+    verify_dsse_attestation's docstring). Returns
+    {level, name, items, passed} where `items` is a list of
+    {label, passed, detail} rows (see _slsa_item) and `passed` is True iff
+    every item passed."""
+    predicate = statement.get("predicate")
+    predicate = predicate if isinstance(predicate, dict) else {}
+    items = [
+        _slsa_check_statement_envelope(statement),
+        _slsa_check_predicate_type(statement),
+        _slsa_check_build_definition(predicate),
+        _slsa_check_subject_digest(statement),
+    ]
+    return {"level": 1, "name": "SLSA Build Level 1", "items": items, "passed": all(i["passed"] for i in items)}
+
+
+def _slsa_check_hosted_builder(predicate: Dict[str, Any]) -> Dict[str, Any]:
+    run_details = predicate.get("runDetails")
+    run_details = run_details if isinstance(run_details, dict) else {}
+    builder = run_details.get("builder")
+    builder = builder if isinstance(builder, dict) else {}
+    builder_id = builder.get("id")
+
+    if not isinstance(builder_id, str) or not builder_id.strip():
+        return _slsa_item("Hosted Builder Identity", False, "missing runDetails.builder.id")
+
+    label = f"Hosted Builder Identity ({builder_id})"
+    if builder_id not in TRUSTED_HOSTED_BUILDER_IDS:
+        return _slsa_item(
+            label, False,
+            f"builder id is not in the trusted hosted-builder allowlist {sorted(TRUSTED_HOSTED_BUILDER_IDS)}",
+        )
+    return _slsa_item(label, True)
+
+
+def _slsa_check_signature(identity_status: str, identity_detail: str) -> Dict[str, Any]:
+    """Reuses the identity_status/identity_detail verify_dsse_attestation()
+    already computed via _verify_sigstore_identity() -- this checklist
+    item never re-verifies the signature itself, only reports on that
+    result. Only the "verified" outcome counts: "skipped"/"unavailable"
+    (network/offline conditions) and "failed" all fail this item, since a
+    Level 2 tamper-resistance claim requires an actual verified
+    signature, not merely the absence of an explicit rejection."""
+    passed = identity_status == "verified"
+    label = "Cryptographic Envelope Signature (Sigstore Keyless OIDC)"
+    detail = "" if passed else f"Sigstore identity_status={identity_status!r}: {identity_detail}"
+    return _slsa_item(label, passed, detail)
+
+
+def _slsa_check_source_binding(predicate: Dict[str, Any], expected_repository: Optional[str]) -> Dict[str, Any]:
+    """externalParameters lives under buildDefinition in the SLSA v1.0
+    provenance schema (buildDefinition.{buildType, externalParameters,
+    internalParameters, resolvedDependencies}), so this reads
+    buildDefinition.externalParameters.workflow.repository, not a
+    top-level predicate.externalParameters."""
+    build_definition = predicate.get("buildDefinition")
+    build_definition = build_definition if isinstance(build_definition, dict) else {}
+    external_params = build_definition.get("externalParameters")
+    external_params = external_params if isinstance(external_params, dict) else {}
+    workflow = external_params.get("workflow")
+    workflow = workflow if isinstance(workflow, dict) else {}
+    repository = workflow.get("repository")
+    label = "Authenticated Source Repository Binding"
+
+    if not isinstance(repository, str) or not repository.strip():
+        return _slsa_item(label, False, "missing buildDefinition.externalParameters.workflow.repository")
+
+    if expected_repository and expected_repository not in repository:
+        return _slsa_item(
+            label, False,
+            f"buildDefinition.externalParameters.workflow.repository {repository!r} does not match "
+            f"expected repository {expected_repository!r}",
+        )
+    return _slsa_item(label, True)
+
+
+def _slsa_check_resolved_dependencies(predicate: Dict[str, Any]) -> Dict[str, Any]:
+    build_definition = predicate.get("buildDefinition")
+    build_definition = build_definition if isinstance(build_definition, dict) else {}
+    resolved = build_definition.get("resolvedDependencies")
+    label = "Materialized Resolved Dependencies"
+
+    if not isinstance(resolved, list) or not resolved:
+        return _slsa_item(label, False, "buildDefinition.resolvedDependencies is missing or empty")
+
+    valid_count = sum(
+        1 for d in resolved if isinstance(d, dict) and isinstance(d.get("uri"), str) and d.get("uri").strip()
+    )
+    if valid_count == 0:
+        return _slsa_item(label, False, "no entries with a valid non-empty 'uri' found")
+
+    return _slsa_item(f"{label} ({valid_count} packages recorded)", True)
+
+
+def _evaluate_slsa_l2(
+    statement: Dict[str, Any],
+    *,
+    identity_status: str,
+    identity_detail: str,
+    expected_repository: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Evaluates the SLSA v1.0 Build Level 2 checklist -- a trusted hosted
+    builder identity, a verified Sigstore keyless signature, authenticated
+    source-repository binding, and materialized resolvedDependencies --
+    against a decoded in-toto Statement dict. Purely informational, same
+    contract as _evaluate_slsa_l1 (never raises, never gates `passed`).
+    Each item is evaluated independently here; see _format_slsa_report for
+    where "Level 2 builds on Level 1" (SLSA's leveling is cumulative) is
+    actually enforced in the combined Status line."""
+    predicate = statement.get("predicate")
+    predicate = predicate if isinstance(predicate, dict) else {}
+    items = [
+        _slsa_check_hosted_builder(predicate),
+        _slsa_check_signature(identity_status, identity_detail),
+        _slsa_check_source_binding(predicate, expected_repository),
+        _slsa_check_resolved_dependencies(predicate),
+    ]
+    return {"level": 2, "name": "SLSA Build Level 2", "items": items, "passed": all(i["passed"] for i in items)}
+
+
+def _evaluate_slsa_checklists(
+    statement: Optional[Dict[str, Any]],
+    *,
+    identity_status: str,
+    identity_detail: str,
+    expected_repository: Optional[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Computes both SLSA checklists for verify_dsse_attestation(): a
+    thin wrapper whose only real job is applying the `statement or {}`
+    fallback (a decode failure leaves `statement` as None) exactly once,
+    so the two _evaluate_slsa_l1/_l2 call sites in
+    verify_dsse_attestation() don't each carry that branch's own
+    complexity cost."""
+    stmt = statement or {}
+    l1 = _evaluate_slsa_l1(stmt)
+    l2 = _evaluate_slsa_l2(
+        stmt, identity_status=identity_status, identity_detail=identity_detail, expected_repository=expected_repository
+    )
+    return l1, l2
+
+
+def _format_slsa_level_block(assessment: Dict[str, Any], overall_passed: bool) -> List[str]:
+    """Renders one level's checklist -- header, one [✓]/[✗] row per item
+    (with a trailing failure description on any [✗] row), and a Status
+    line. `overall_passed` is taken from the caller rather than
+    `assessment["passed"]` directly so _format_slsa_report can fold in
+    Level 2's Level-1-cumulative requirement without this function needing
+    to know about that rule."""
+    lines = [f"=== {assessment['name']} Assessment ==="]
+    for item in assessment["items"]:
+        mark = "✓" if item["passed"] else "✗"
+        line = f"[{mark}] {item['label']}"
+        if not item["passed"] and item["detail"]:
+            line += f" -- {item['detail']}"
+        lines.append(line)
+    status = "PASSED" if overall_passed else "FAILED"
+    lines.append(f"Status: {status} (SLSA Build Level {assessment['level']})")
+    return lines
+
+
+def _format_slsa_report(l1: Dict[str, Any], l2: Dict[str, Any]) -> List[str]:
+    """Renders the combined SLSA Build Level 1 + Level 2 checklist as
+    plain-text lines, for --verify's human-readable output (see the
+    module README section "Verification (admission gate)" for a full
+    example). SLSA's own leveling is cumulative -- Level 2 formally builds
+    on Level 1 -- so Level 2's Status line only reads PASSED when every
+    Level 1 item *and* every Level 2 item passed, even though each block
+    still lists and marks its own items independently so a reader can see
+    exactly which level-specific requirement is missing."""
+    l1_passed = bool(l1["passed"])
+    l2_passed = l1_passed and bool(l2["passed"])
+
+    lines = _format_slsa_level_block(l1, l1_passed)
+    lines.append("")
+    lines.extend(_format_slsa_level_block(l2, l2_passed))
+    lines.append("=====================================")
+    return lines
 
 
 def _load_schema() -> Optional[Dict[str, Any]]:
@@ -324,106 +607,17 @@ def _static_analysis_tools_by_name(tools: List[Dict[str, Any]]) -> Dict[str, Dic
     return out
 
 
-# Level 2 checks with no real underlying signal in this pipeline (see
-# _compute_slsa_assessment) -- keyed by check name, valued by the reason
-# it can't be evaluated. Per the "Fail-Closed Verification" invariant in
-# CLAUDE.md ("Supply Chain Integrity & Attestation Invariants"), a check
-# that can't be verified must resolve to `False`/non-compliant, never a
-# `null`/unknown state that could be mistaken for "not yet checked" rather
-# than "checked and can't be trusted" -- this dict exists purely to carry
-# *why* alongside that `False`, not to soften it.
-_SLSA_LEVEL_2_UNEVALUATED_CHECKS = {
-    "resolved_dependencies": "not evaluated: tenax-assay does not track a build dependency graph",
-}
-
-
-def _compute_slsa_assessment(result: VerificationResult, args: argparse.Namespace) -> Dict[str, Any]:
-    """Best-effort SLSA Level 1/2 self-assessment derived strictly from
-    signals this pipeline actually verifies -- never a hardcoded/fabricated
-    `true`. Each check maps to a concrete, already-computed fact on `result`
-    (or a CLI flag the caller asserted). Fail-closed by construction (see
-    CLAUDE.md "Supply Chain Integrity & Attestation Invariants"): a check
-    with no real underlying signal (currently: resolved_dependencies --
-    this pipeline doesn't build or track a dependency graph) is `False`,
-    not `None`/skipped -- unverified must never be indistinguishable from
-    "verified and non-compliant" by simply being excluded from the
-    roll-up. `unevaluated_checks` carries the reason alongside that `False`
-    so an auditor can still tell "checked, failed" apart from "can't check
-    this at all yet" without the boolean itself pretending otherwise.
-
-    Level 1 (provenance exists and is authentic to the artifact):
-      - statement_envelope: the DSSE payload decoded into a well-formed
-        in-toto Statement at all
-      - provenance_predicate: the decoded Statement's _type/predicateType
-        match what this tool actually produces (EXPECTED_STATEMENT_TYPE /
-        EXPECTED_PREDICATE_TYPE)
-      - build_definition: the predicate carries real build/test signal
-        (result.metrics is non-empty -- test totals, coverage, or
-        assertion density were actually extracted)
-      - subject_digest_match: at least one subject digest was present to
-        bind the provenance to an artifact
-
-    Level 2 (provenance is authenticated by a hosted build platform):
-      - hosted_builder / source_binding / cryptographic_signature: all
-        require result.identity_status == "verified" -- i.e. Sigstore
-        cryptographically verified the DSSE signature *and* the asserted
-        identity policy, never merely that a signature block was present
-      - hosted_builder additionally requires the caller asserted a CI-only
-        identity claim (--expected-issuer/--expected-repository/
-        --expected-workflow/--expected-ref/--cert-oidc-issuer): a bare
-        --cert-identity alone (e.g. a human's email) doesn't establish the
-        signer was a hosted CI runner
-      - source_binding additionally requires --expected-repository was
-        asserted and matched, binding the provenance to a specific source
-        repo rather than just *some* verified identity
-      - resolved_dependencies: always False -- see
-        _SLSA_LEVEL_2_UNEVALUATED_CHECKS above
-    """
-    statement = result.statement or {}
-    statement_type_ok = statement.get("_type") == EXPECTED_STATEMENT_TYPE
-    predicate_type_ok = statement.get("predicateType") == EXPECTED_PREDICATE_TYPE
-
-    level_1_checks: Dict[str, bool] = {
-        "statement_envelope": result.statement is not None,
-        "provenance_predicate": statement_type_ok and predicate_type_ok,
-        "build_definition": bool(result.metrics),
-        "subject_digest_match": bool(result.subject_digests),
-    }
-    level_1_compliant = all(level_1_checks.values())
-
-    identity_verified = result.identity_status == "verified"
-    ci_identity_asserted = bool(
-        args.expected_issuer
-        or args.expected_repository
-        or args.expected_workflow
-        or args.expected_ref
-        or args.cert_oidc_issuer
-    )
-    level_2_checks: Dict[str, bool] = {
-        "hosted_builder": identity_verified and ci_identity_asserted,
-        "cryptographic_signature": identity_verified,
-        "source_binding": identity_verified and bool(args.expected_repository),
-        "resolved_dependencies": False,
-    }
-    level_2_compliant = all(level_2_checks.values())
-
-    return {
-        "level_1": {"compliant": level_1_compliant, "checks": level_1_checks},
-        "level_2": {
-            "compliant": level_2_compliant,
-            "checks": level_2_checks,
-            "unevaluated_checks": dict(_SLSA_LEVEL_2_UNEVALUATED_CHECKS),
-        },
-    }
-
-
-def _build_verify_json_payload(result: VerificationResult, args: argparse.Namespace) -> Dict[str, Any]:
+def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
     """Assembles the --format json payload: the complete verification
     result (envelope shape, RCS score, static analysis, violations/
-    warnings/identity) plus a best-effort SLSA Level 1/2 self-assessment
-    (see _compute_slsa_assessment). Never raises -- every field it reads
-    off `result`/`args` is already defensively populated by
-    verify_dsse_attestation()/parse_args()."""
+    warnings/identity) plus the same SLSA Build Level 1/2 checklist the
+    text formatter renders via _format_slsa_report (result.slsa_level1/
+    slsa_level2, computed once by _evaluate_slsa_checklists() inside
+    verify_dsse_attestation() -- json and text output must never disagree
+    about SLSA compliance, so this reads the identical already-computed
+    result rather than recomputing its own assessment). Never raises --
+    every field it reads off `result` is already defensively populated by
+    verify_dsse_attestation()."""
     statement = result.statement or {}
     subjects = statement.get("subject")
     return {
@@ -434,7 +628,7 @@ def _build_verify_json_payload(result: VerificationResult, args: argparse.Namesp
             "predicate_type": statement.get("predicateType"),
             "subject": subjects if isinstance(subjects, list) else [],
         },
-        "slsa": _compute_slsa_assessment(result, args),
+        "slsa": {"level_1": result.slsa_level1, "level_2": result.slsa_level2},
         "release_confidence_score": {
             "score": result.rcs_value,
             "degraded": result.degraded,
@@ -1047,6 +1241,7 @@ def verify_dsse_attestation(
       _validate_rcs_block        -- RCS field type/range validation
       _evaluate_policy_gates     -- --min-rcs/--require-digest/--disallow-degraded
       _verify_sigstore_identity  -- best-effort Sigstore identity check
+      _evaluate_slsa_l1/_l2      -- informational SLSA Build Level 1/2 checklist
     """
     if not isinstance(envelope, dict):
         return VerificationResult(
@@ -1139,6 +1334,18 @@ def verify_dsse_attestation(
     else:
         warnings.append(identity_detail)
 
+    # Purely informational SLSA v1.0 Build Level 1/2 compliance checklist,
+    # never folded into violations/warnings/passed above -- same
+    # non-gating contract as static_analysis_tools. See
+    # _evaluate_slsa_checklists' own docstring for why this is its own
+    # helper rather than inlined here.
+    slsa_level1, slsa_level2 = _evaluate_slsa_checklists(
+        statement,
+        identity_status=identity_status,
+        identity_detail=identity_detail,
+        expected_repository=expected_repository,
+    )
+
     return VerificationResult(
         passed=len(violations) == 0,
         violations=violations,
@@ -1154,6 +1361,8 @@ def verify_dsse_attestation(
         identity_detail=identity_detail,
         static_analysis_tools=static_analysis_tools,
         schema_validation_status=schema_validation_status,
+        slsa_level1=slsa_level1,
+        slsa_level2=slsa_level2,
     )
 
 
@@ -1276,6 +1485,20 @@ def _load_envelope_for_cli(path: str) -> Tuple[Optional[Any], Optional[int]]:
     return envelope, None
 
 
+def _print_slsa_section(result: VerificationResult) -> None:
+    """Prints the SLSA Build Level 1/2 checklist block (see
+    _format_slsa_report) to stderr, preceded by a blank separator line --
+    a no-op when either level's assessment is absent (e.g. a
+    VerificationResult built directly by a test without going through
+    verify_dsse_attestation()). Split out of _print_verify_result_human so
+    that function's own complexity doesn't grow with this block's."""
+    if result.slsa_level1 is None or result.slsa_level2 is None:
+        return
+    print("", file=sys.stderr)
+    for line in _format_slsa_report(result.slsa_level1, result.slsa_level2):
+        print(line, file=sys.stderr)
+
+
 def _print_verify_result_human(result: VerificationResult) -> None:
     """Human-readable (non --json) stderr rendering of a completed
     VerificationResult -- main()'s else branch of --json."""
@@ -1291,6 +1514,7 @@ def _print_verify_result_human(result: VerificationResult) -> None:
         print("  static analysis:", file=sys.stderr)
         for line in _format_static_analysis_table(result.static_analysis_tools):
             print(line, file=sys.stderr)
+    _print_slsa_section(result)
     for v in result.violations:
         print(f"  VIOLATION: {v}", file=sys.stderr)
     for w in result.warnings:
@@ -1328,7 +1552,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         output_format = "json"
 
     if output_format == "json":
-        print(json.dumps(_build_verify_json_payload(result, args), indent=2))
+        print(json.dumps(_build_verify_json_payload(result), indent=2))
     else:
         _print_verify_result_human(result)
 

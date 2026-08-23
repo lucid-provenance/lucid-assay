@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from typing import Any, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -13,15 +14,19 @@ from cli.verify import (
     EXIT_PASS,
     EXIT_POLICY_VIOLATION,
     GITHUB_ACTIONS_OIDC_ISSUER,
+    SLSA_PROVENANCE_PREDICATE_TYPE,
+    TRUSTED_HOSTED_BUILDER_IDS,
     main,
     parse_args,
     verify_dsse_attestation,
     _build_identity_policy,
     _build_verify_json_payload,
-    _compute_slsa_assessment,
     _describe_actual_cert_claims,
     _envelope_to_bundle_json,
+    _evaluate_slsa_l1,
+    _evaluate_slsa_l2,
     _extract_cert_ref,
+    _format_slsa_report,
     _static_analysis_tools_by_name,
     _verify_sigstore_identity,
 )
@@ -452,76 +457,11 @@ class VerifyCliMainTests(unittest.TestCase):
 
 
 class VerifyJsonPayloadTests(unittest.TestCase):
-    def _args(self, **overrides):
-        ns = parse_args(["unused-envelope-path.json", "--dry-run"])
-        for k, v in overrides.items():
-            setattr(ns, k, v)
-        return ns
-
-    def test_slsa_level_1_compliant_for_well_formed_predicate(self):
-        envelope = _envelope(_statement(rcs_value=85))
-        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
-
-        slsa = _compute_slsa_assessment(result, self._args())
-
-        self.assertTrue(slsa["level_1"]["compliant"])
-        self.assertEqual(
-            slsa["level_1"]["checks"],
-            {
-                "statement_envelope": True,
-                "provenance_predicate": True,
-                "build_definition": True,
-                "subject_digest_match": True,
-            },
-        )
-
-    def test_slsa_level_2_fails_closed_on_unevaluated_resolved_dependencies(self):
-        envelope = _envelope(_statement(rcs_value=85))
-        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
-
-        slsa = _compute_slsa_assessment(result, self._args())
-
-        # dry-run: no Sigstore identity verification was attempted, so
-        # hosted_builder/cryptographic_signature/source_binding are all
-        # honestly False -- and resolved_dependencies, which this pipeline
-        # has no signal for at all, fails closed to False rather than a
-        # null/unknown state (CLAUDE.md "Fail-Closed Verification"), so
-        # overall level_2 compliance is False, never fabricated as True.
-        self.assertFalse(slsa["level_2"]["checks"]["resolved_dependencies"])
-        self.assertFalse(slsa["level_2"]["compliant"])
-        self.assertIn("resolved_dependencies", slsa["level_2"]["unevaluated_checks"])
-        self.assertFalse(slsa["level_2"]["checks"]["hosted_builder"])
-        self.assertFalse(slsa["level_2"]["checks"]["cryptographic_signature"])
-
-    def test_slsa_level_2_stays_non_compliant_even_when_identity_verified(self):
-        """Even a fully-verified Sigstore identity can't make level_2
-        compliant True -- resolved_dependencies has no real signal in this
-        pipeline and fails closed, so it must always drag compliant to
-        False rather than being silently excluded from the roll-up."""
-        envelope = _envelope(_statement(rcs_value=85))
-        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
-        result.identity_status = "verified"  # simulate a fully verified signature
-
-        slsa = _compute_slsa_assessment(
-            result, self._args(expected_repository="acme/widgets", expected_issuer="https://example.test")
-        )
-
-        self.assertTrue(slsa["level_2"]["checks"]["hosted_builder"])
-        self.assertTrue(slsa["level_2"]["checks"]["cryptographic_signature"])
-        self.assertTrue(slsa["level_2"]["checks"]["source_binding"])
-        self.assertFalse(slsa["level_2"]["checks"]["resolved_dependencies"])
-        self.assertFalse(slsa["level_2"]["compliant"])
-
-    def test_slsa_level_1_fails_on_malformed_predicate_type(self):
-        statement = _statement(rcs_value=85)
-        statement["predicateType"] = "not-a-real-predicate-type"
-        envelope = _envelope(statement)
-        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
-
-        slsa = _compute_slsa_assessment(result, self._args())
-
-        self.assertFalse(slsa["level_1"]["checks"]["provenance_predicate"])
-        self.assertFalse(slsa["level_1"]["compliant"])
+    # Dedicated SLSA-assessment coverage (well-formed predicate, malformed
+    # predicateType, fails-closed identity/dependency states, etc.) lives in
+    # EvaluateSlsaL1Tests/EvaluateSlsaL2Tests/FormatSlsaReportTests below --
+    # this class only needs to confirm _build_verify_json_payload plumbs
+    # that already-computed result through faithfully.
 
     def test_static_analysis_tools_by_name_merges_summary_and_quality_gate(self):
         tools = [
@@ -543,7 +483,7 @@ class VerifyJsonPayloadTests(unittest.TestCase):
         envelope = _envelope(_statement(rcs_value=85))
         result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
 
-        payload = _build_verify_json_payload(result, self._args())
+        payload = _build_verify_json_payload(result)
 
         for key in (
             "version",
@@ -563,10 +503,29 @@ class VerifyJsonPayloadTests(unittest.TestCase):
         envelope = _envelope(_statement(omit_degraded_field=True))
         result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
 
-        payload = _build_verify_json_payload(result, self._args())
+        payload = _build_verify_json_payload(result)
 
         self.assertIs(payload["release_confidence_score"]["degraded"], False)
         self.assertIs(payload["release_confidence_score"]["degraded_field_present"], False)
+
+    def test_json_payload_slsa_matches_text_output_checklist(self):
+        """Regression guard for the exact bug this merge fixes: --format
+        json's "slsa" block and the text formatter's SLSA checklist
+        (_format_slsa_report) must be the same underlying assessment
+        (result.slsa_level1/slsa_level2), never two independently computed
+        (and potentially disagreeing) SLSA verdicts for the same run."""
+        envelope = _envelope(_statement(rcs_value=85))
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+        payload = _build_verify_json_payload(result)
+
+        self.assertIs(payload["slsa"]["level_1"], result.slsa_level1)
+        self.assertIs(payload["slsa"]["level_2"], result.slsa_level2)
+        self.assertEqual(payload["slsa"]["level_1"]["passed"], result.slsa_level1["passed"])
+        self.assertEqual(
+            [line for line in _format_slsa_report(result.slsa_level1, result.slsa_level2)],
+            _format_slsa_report(payload["slsa"]["level_1"], payload["slsa"]["level_2"]),
+        )
 
 
 def _der_utf8_string(value: str) -> bytes:
@@ -1033,6 +992,390 @@ class VerifySigstoreIdentityDiagnosticsTests(unittest.TestCase):
         self.assertIn("actual:", stderr_output)
         self.assertIn("acme/widgets", stderr_output)
         self.assertIn("certificate repository mismatch", stderr_output)
+
+
+def _slsa_provenance_statement(
+    *,
+    statement_type="https://in-toto.io/Statement/v1",
+    predicate_type=SLSA_PROVENANCE_PREDICATE_TYPE,
+    subject_digests=None,
+    build_type="https://actions.github.io/buildtypes/workflow/v1",
+    invocation_id="run-12345",
+    started_on="2026-08-23T00:00:00Z",
+    finished_on="2026-08-23T00:05:00Z",
+    builder_id="https://github.com/actions/runner",
+    repository="https://github.com/acme/widgets",
+    resolved_dependencies=None,
+):
+    """Builds a fully SLSA v1.0 Build Level 1+2-shaped in-toto Statement
+    (buildDefinition/runDetails/externalParameters), with every field
+    individually overridable so tests can knock out exactly one checklist
+    item at a time. Passing None for a field omits it (or, for
+    subject_digests/resolved_dependencies, an explicit [] empties it)."""
+    predicate: Dict[str, Any] = {}
+
+    build_definition: Dict[str, Any] = {}
+    if build_type is not None:
+        build_definition["buildType"] = build_type
+    if repository is not None:
+        build_definition["externalParameters"] = {"workflow": {"repository": repository}}
+    if resolved_dependencies is not None:
+        build_definition["resolvedDependencies"] = resolved_dependencies
+    predicate["buildDefinition"] = build_definition
+
+    run_details: Dict[str, Any] = {}
+    if builder_id is not None:
+        run_details["builder"] = {"id": builder_id}
+    metadata = {}
+    if invocation_id is not None:
+        metadata["invocationId"] = invocation_id
+    if started_on is not None:
+        metadata["startedOn"] = started_on
+    if finished_on is not None:
+        metadata["finishedOn"] = finished_on
+    run_details["metadata"] = metadata
+    predicate["runDetails"] = run_details
+
+    subject = (
+        [{"name": "pkg:generic/widget", "digest": {"sha256": SUBJECT_DIGEST}}]
+        if subject_digests is None
+        else subject_digests
+    )
+
+    return {
+        "_type": statement_type,
+        "subject": subject,
+        "predicateType": predicate_type,
+        "predicate": predicate,
+    }
+
+
+DEFAULT_RESOLVED_DEPENDENCIES = [
+    {"uri": f"pkg:pypi/pkg{i}@1.0.0", "digest": {"sha256": "b" * 64}} for i in range(142)
+]
+
+
+class EvaluateSlsaL1Tests(unittest.TestCase):
+    def test_fully_compliant_statement_passes_all_items(self):
+        statement = _slsa_provenance_statement(resolved_dependencies=DEFAULT_RESOLVED_DEPENDENCIES)
+
+        assessment = _evaluate_slsa_l1(statement)
+
+        self.assertEqual(assessment["level"], 1)
+        self.assertTrue(assessment["passed"])
+        self.assertTrue(all(item["passed"] for item in assessment["items"]))
+        self.assertEqual(len(assessment["items"]), 4)
+
+    def test_wrong_statement_type_fails_that_item_only(self):
+        statement = _slsa_provenance_statement(statement_type="https://example.com/not-in-toto")
+
+        assessment = _evaluate_slsa_l1(statement)
+
+        self.assertFalse(assessment["passed"])
+        by_label = {i["label"]: i for i in assessment["items"]}
+        self.assertFalse(by_label["in-toto v1 Statement Envelope"]["passed"])
+        self.assertIn("https://example.com/not-in-toto", by_label["in-toto v1 Statement Envelope"]["detail"])
+        # Every other item is still independently evaluated and passes.
+        self.assertTrue(by_label["SLSA v1.0 Provenance Predicate"]["passed"])
+        self.assertTrue(by_label["Subject Artifact Digest Verification"]["passed"])
+
+    def test_wrong_predicate_type_fails(self):
+        statement = _slsa_provenance_statement(predicate_type="https://tenax.io/attestations/assay/v1")
+
+        assessment = _evaluate_slsa_l1(statement)
+
+        self.assertFalse(assessment["passed"])
+        by_label = {i["label"]: i for i in assessment["items"]}
+        self.assertFalse(by_label["SLSA v1.0 Provenance Predicate"]["passed"])
+
+    def test_missing_build_type_fails_combined_item(self):
+        statement = _slsa_provenance_statement(build_type=None)
+
+        assessment = _evaluate_slsa_l1(statement)
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        item = by_label["Build Definition & Invocation Metadata"]
+        self.assertFalse(item["passed"])
+        self.assertIn("buildDefinition.buildType", item["detail"])
+
+    def test_missing_invocation_metadata_fails_combined_item(self):
+        statement = _slsa_provenance_statement(invocation_id=None, started_on=None, finished_on=None)
+
+        assessment = _evaluate_slsa_l1(statement)
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        item = by_label["Build Definition & Invocation Metadata"]
+        self.assertFalse(item["passed"])
+        self.assertIn("invocationId", item["detail"])
+
+    def test_started_and_finished_on_satisfy_metadata_without_invocation_id(self):
+        statement = _slsa_provenance_statement(invocation_id=None, started_on="a", finished_on="b")
+
+        assessment = _evaluate_slsa_l1(statement)
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        self.assertTrue(by_label["Build Definition & Invocation Metadata"]["passed"])
+
+    def test_only_started_on_without_finished_on_is_insufficient(self):
+        statement = _slsa_provenance_statement(invocation_id=None, started_on="a", finished_on=None)
+
+        assessment = _evaluate_slsa_l1(statement)
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        self.assertFalse(by_label["Build Definition & Invocation Metadata"]["passed"])
+
+    def test_missing_subject_digest_fails(self):
+        statement = _slsa_provenance_statement(subject_digests=[])
+
+        assessment = _evaluate_slsa_l1(statement)
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        self.assertFalse(by_label["Subject Artifact Digest Verification"]["passed"])
+
+    def test_non_dict_predicate_fails_closed_without_raising(self):
+        statement = {"_type": "https://in-toto.io/Statement/v1", "predicateType": "x", "predicate": "not-a-dict"}
+
+        assessment = _evaluate_slsa_l1(statement)
+
+        self.assertFalse(assessment["passed"])
+
+    def test_empty_statement_fails_every_item_without_raising(self):
+        assessment = _evaluate_slsa_l1({})
+
+        self.assertFalse(assessment["passed"])
+        self.assertTrue(all(not i["passed"] for i in assessment["items"]))
+
+
+class EvaluateSlsaL2Tests(unittest.TestCase):
+    def _l2(self, statement, *, identity_status="verified", identity_detail="ok", expected_repository=None):
+        return _evaluate_slsa_l2(
+            statement,
+            identity_status=identity_status,
+            identity_detail=identity_detail,
+            expected_repository=expected_repository,
+        )
+
+    def test_fully_compliant_statement_passes_all_items(self):
+        statement = _slsa_provenance_statement(resolved_dependencies=DEFAULT_RESOLVED_DEPENDENCIES)
+
+        assessment = self._l2(statement, expected_repository="acme/widgets")
+
+        self.assertEqual(assessment["level"], 2)
+        self.assertTrue(assessment["passed"])
+        self.assertEqual(len(assessment["items"]), 4)
+        by_label = {i["label"]: i for i in assessment["items"]}
+        self.assertIn("Hosted Builder Identity (https://github.com/actions/runner)", by_label)
+        self.assertIn("Materialized Resolved Dependencies (142 packages recorded)", by_label)
+
+    def test_untrusted_builder_id_fails(self):
+        statement = _slsa_provenance_statement(builder_id="https://evil.example.com/self-hosted")
+
+        assessment = self._l2(statement)
+
+        item = next(i for i in assessment["items"] if i["label"].startswith("Hosted Builder Identity"))
+        self.assertFalse(item["passed"])
+        self.assertIn("not in the trusted hosted-builder allowlist", item["detail"])
+
+    def test_missing_builder_id_fails(self):
+        statement = _slsa_provenance_statement(builder_id=None)
+
+        assessment = self._l2(statement)
+
+        item = next(i for i in assessment["items"] if i["label"] == "Hosted Builder Identity")
+        self.assertFalse(item["passed"])
+
+    def test_trusted_builder_id_is_the_documented_constant(self):
+        # Sanity check that the allowlist actually contains the builder id
+        # used throughout this test file's fixtures/examples.
+        self.assertIn("https://github.com/actions/runner", TRUSTED_HOSTED_BUILDER_IDS)
+
+    def test_unverified_signature_fails_that_item(self):
+        statement = _slsa_provenance_statement()
+
+        assessment = self._l2(statement, identity_status="unavailable", identity_detail="offline")
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        item = by_label["Cryptographic Envelope Signature (Sigstore Keyless OIDC)"]
+        self.assertFalse(item["passed"])
+        self.assertIn("unavailable", item["detail"])
+        self.assertIn("offline", item["detail"])
+
+    def test_verified_signature_passes(self):
+        statement = _slsa_provenance_statement()
+
+        assessment = self._l2(statement, identity_status="verified", identity_detail="ok")
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        self.assertTrue(by_label["Cryptographic Envelope Signature (Sigstore Keyless OIDC)"]["passed"])
+
+    def test_missing_source_repository_fails(self):
+        statement = _slsa_provenance_statement(repository=None)
+
+        assessment = self._l2(statement)
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        self.assertFalse(by_label["Authenticated Source Repository Binding"]["passed"])
+
+    def test_source_repository_mismatch_fails_when_expected_repository_given(self):
+        statement = _slsa_provenance_statement(repository="https://github.com/acme/widgets")
+
+        assessment = self._l2(statement, expected_repository="someone-else/other-repo")
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        item = by_label["Authenticated Source Repository Binding"]
+        self.assertFalse(item["passed"])
+        self.assertIn("someone-else/other-repo", item["detail"])
+
+    def test_source_repository_present_passes_without_expected_repository(self):
+        statement = _slsa_provenance_statement(repository="https://github.com/acme/widgets")
+
+        assessment = self._l2(statement, expected_repository=None)
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        self.assertTrue(by_label["Authenticated Source Repository Binding"]["passed"])
+
+    def test_missing_resolved_dependencies_fails(self):
+        statement = _slsa_provenance_statement(resolved_dependencies=None)
+        # buildDefinition.resolvedDependencies was never set at all in this case.
+
+        assessment = self._l2(statement)
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        self.assertFalse(by_label["Materialized Resolved Dependencies"]["passed"])
+
+    def test_empty_resolved_dependencies_list_fails(self):
+        statement = _slsa_provenance_statement(resolved_dependencies=[])
+
+        assessment = self._l2(statement)
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        self.assertFalse(by_label["Materialized Resolved Dependencies"]["passed"])
+
+    def test_resolved_dependencies_with_missing_uris_are_not_counted(self):
+        statement = _slsa_provenance_statement(
+            resolved_dependencies=[{"uri": "pkg:pypi/good@1.0"}, {"digest": {"sha256": "a" * 64}}, {"uri": ""}]
+        )
+
+        assessment = self._l2(statement)
+
+        by_label = {i["label"]: i for i in assessment["items"]}
+        # Only the one entry with a non-empty 'uri' should be counted.
+        self.assertIn("Materialized Resolved Dependencies (1 packages recorded)", by_label)
+        self.assertTrue(by_label["Materialized Resolved Dependencies (1 packages recorded)"]["passed"])
+
+    def test_non_dict_predicate_fails_closed_without_raising(self):
+        statement = {"predicate": ["not", "a", "dict"]}
+
+        assessment = self._l2(statement)
+
+        self.assertFalse(assessment["passed"])
+
+
+class FormatSlsaReportTests(unittest.TestCase):
+    def test_both_levels_passed_renders_passed_status_for_both(self):
+        statement = _slsa_provenance_statement(resolved_dependencies=DEFAULT_RESOLVED_DEPENDENCIES)
+        l1 = _evaluate_slsa_l1(statement)
+        l2 = _evaluate_slsa_l2(
+            statement, identity_status="verified", identity_detail="ok", expected_repository="acme/widgets"
+        )
+
+        lines = _format_slsa_report(l1, l2)
+        text = "\n".join(lines)
+
+        self.assertIn("=== SLSA Build Level 1 Assessment ===", text)
+        self.assertIn("=== SLSA Build Level 2 Assessment ===", text)
+        self.assertIn("Status: PASSED (SLSA Build Level 1)", text)
+        self.assertIn("Status: PASSED (SLSA Build Level 2)", text)
+        self.assertIn("[✓] in-toto v1 Statement Envelope", text)
+        self.assertIn("[✓] Materialized Resolved Dependencies (142 packages recorded)", text)
+        self.assertTrue(text.rstrip("\n").endswith("====================================="))
+
+    def test_failing_item_renders_cross_mark_and_detail(self):
+        statement = _slsa_provenance_statement(statement_type="https://example.com/wrong")
+        l1 = _evaluate_slsa_l1(statement)
+        l2 = _evaluate_slsa_l2(statement, identity_status="skipped", identity_detail="--dry-run")
+
+        lines = _format_slsa_report(l1, l2)
+        text = "\n".join(lines)
+
+        self.assertIn("[✗] in-toto v1 Statement Envelope -- unexpected _type:", text)
+        self.assertIn("Status: FAILED (SLSA Build Level 1)", text)
+
+    def test_level2_status_fails_when_level1_fails_even_if_all_level2_items_pass(self):
+        # SLSA leveling is cumulative: Level 2 can't PASS on its own merits
+        # if the statement doesn't even satisfy Level 1.
+        statement = _slsa_provenance_statement(
+            predicate_type="https://tenax.io/attestations/assay/v1",  # breaks L1's predicateType check
+            resolved_dependencies=DEFAULT_RESOLVED_DEPENDENCIES,
+        )
+        l1 = _evaluate_slsa_l1(statement)
+        l2 = _evaluate_slsa_l2(
+            statement, identity_status="verified", identity_detail="ok", expected_repository="acme/widgets"
+        )
+        self.assertFalse(l1["passed"])
+        self.assertTrue(l2["passed"])  # every L2-specific item, evaluated independently, does pass
+
+        lines = _format_slsa_report(l1, l2)
+        text = "\n".join(lines)
+
+        self.assertIn("Status: FAILED (SLSA Build Level 1)", text)
+        self.assertIn("Status: FAILED (SLSA Build Level 2)", text)
+        # But the individual Level 2 items are still shown as passing --
+        # only the combined Status line reflects the Level 1 gating.
+        self.assertIn("[✓] Hosted Builder Identity", text)
+
+    def test_partially_passing_level_shows_mixed_marks(self):
+        statement = _slsa_provenance_statement(builder_id=None, resolved_dependencies=DEFAULT_RESOLVED_DEPENDENCIES)
+        l1 = _evaluate_slsa_l1(statement)
+        l2 = _evaluate_slsa_l2(
+            statement, identity_status="verified", identity_detail="ok", expected_repository="acme/widgets"
+        )
+
+        lines = _format_slsa_report(l1, l2)
+        text = "\n".join(lines)
+
+        self.assertIn("[✗] Hosted Builder Identity -- missing runDetails.builder.id", text)
+        self.assertIn("[✓] Cryptographic Envelope Signature (Sigstore Keyless OIDC)", text)
+        self.assertIn("Status: FAILED (SLSA Build Level 2)", text)
+
+
+class VerifyDsseAttestationSlsaIntegrationTests(unittest.TestCase):
+    """SLSA checklist wiring through verify_dsse_attestation(): purely
+    informational, must never affect `passed`/violations regardless of
+    whether the statement happens to be tenax-assay's own RCS predicate
+    (which is not SLSA-provenance-shaped) or a real SLSA provenance one."""
+
+    def test_tenax_predicate_gets_slsa_assessment_without_affecting_rcs_gate(self):
+        envelope = _envelope(_statement(rcs_value=85, degraded=False))
+
+        result = verify_dsse_attestation(envelope, min_rcs=70, dry_run=True)
+
+        self.assertTrue(result.passed)
+        self.assertIsNotNone(result.slsa_level1)
+        self.assertIsNotNone(result.slsa_level2)
+        # tenax-assay's own predicate isn't SLSA-provenance-shaped, so most
+        # items legitimately fail -- but that must never leak into violations.
+        self.assertFalse(result.slsa_level1["passed"])
+        self.assertEqual(result.violations, [])
+
+    def test_slsa_fields_present_in_as_dict(self):
+        envelope = _envelope(_statement())
+
+        result = verify_dsse_attestation(envelope, dry_run=True)
+        d = result.as_dict()
+
+        self.assertIn("slsa_level1", d)
+        self.assertIn("slsa_level2", d)
+        self.assertEqual(d["slsa_level1"]["level"], 1)
+        self.assertEqual(d["slsa_level2"]["level"], 2)
+
+    def test_malformed_envelope_still_yields_no_slsa_assessment(self):
+        # verify_dsse_attestation()'s top-level malformed-envelope guard
+        # returns before any SLSA evaluation is even attempted.
+        result = verify_dsse_attestation("not a dict")
+
+        self.assertIsNone(result.slsa_level1)
+        self.assertIsNone(result.slsa_level2)
 
 
 if __name__ == "__main__":

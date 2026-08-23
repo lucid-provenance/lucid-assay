@@ -492,25 +492,26 @@ same data reshaped into `static_analysis.tools` (see below).
     },
     "slsa": {
       "level_1": {
-        "compliant": true,
-        "checks": {
-          "statement_envelope": true,
-          "provenance_predicate": true,
-          "build_definition": true,
-          "subject_digest_match": true
-        }
+        "level": 1,
+        "name": "SLSA Build Level 1",
+        "passed": true,
+        "items": [
+          {"label": "in-toto v1 Statement Envelope", "passed": true, "detail": ""},
+          {"label": "SLSA v1.0 Provenance Predicate", "passed": true, "detail": ""},
+          {"label": "Build Definition & Invocation Metadata", "passed": true, "detail": ""},
+          {"label": "Subject Artifact Digest Verification", "passed": true, "detail": ""}
+        ]
       },
       "level_2": {
-        "compliant": false,
-        "checks": {
-          "hosted_builder": true,
-          "cryptographic_signature": true,
-          "source_binding": true,
-          "resolved_dependencies": false
-        },
-        "unevaluated_checks": {
-          "resolved_dependencies": "not evaluated: tenax-assay does not track a build dependency graph"
-        }
+        "level": 2,
+        "name": "SLSA Build Level 2",
+        "passed": false,
+        "items": [
+          {"label": "Hosted Builder Identity", "passed": false, "detail": "missing runDetails.builder.id"},
+          {"label": "Cryptographic Envelope Signature (Sigstore Keyless OIDC)", "passed": true, "detail": ""},
+          {"label": "Authenticated Source Repository Binding", "passed": true, "detail": ""},
+          {"label": "Materialized Resolved Dependencies", "passed": false, "detail": "buildDefinition.resolvedDependencies is missing or empty"}
+        ]
       }
     },
     "release_confidence_score": {"score": 89, "degraded": false, "degraded_field_present": true, "degraded_reasons": []},
@@ -520,27 +521,13 @@ same data reshaped into `static_analysis.tools` (see below).
     "warnings": []
   }
   ```
-  The `slsa` block is a **best-effort self-assessment derived only from
-  signals this tool actually verifies** — it is not an official SLSA
-  conformance claim. `level_1` checks map 1:1 onto the DSSE/Statement
-  decode and predicate-shape checks already performed. `level_2`'s
-  `hosted_builder`/`cryptographic_signature`/`source_binding` all require
-  `identity_status == "verified"` (real Sigstore cryptographic + identity
-  verification, not merely a signature being present); `hosted_builder`
-  additionally requires a CI-only identity claim was asserted
-  (`--expected-issuer`/`--expected-repository`/`--expected-workflow`/
-  `--expected-ref`/`--cert-oidc-issuer`), and `source_binding` additionally
-  requires `--expected-repository` was asserted and matched.
-  `resolved_dependencies` has no underlying signal — this pipeline doesn't
-  build or track a dependency graph — so per this repo's fail-closed
-  convention (see "Supply Chain Integrity & Attestation Invariants" in
-  `CLAUDE.md`) it's always `false` rather than a `null`/unknown state that
-  could be mistaken for "not yet checked"; `unevaluated_checks` carries the
-  reason alongside that `false` so an auditor can tell "checked and failed"
-  apart from "can't check this at all yet." Because that check can never
-  currently be verified, `level_2.compliant` is always `false` too — Level
-  2 compliance can never be claimed `true` while a required check is
-  unevaluated.
+  `slsa.level_1`/`slsa.level_2` are exactly `slsa_level1`/`slsa_level2` —
+  the same SLSA v1.0 Build Level 1/2 checklist the text formatter renders
+  to stderr via `_format_slsa_report` (see "SLSA v1.0 Build Level 1/2
+  checklist" below for what each item means and how Level 2 builds on
+  Level 1), reshaped as JSON here rather than recomputed, so `--format
+  json` and the default text output can never disagree about SLSA
+  compliance for the same run.
 
   `--json` (no `-f`) is kept as a **deprecated alias** for `--format json`
   — it emits the same payload and prints a one-line deprecation notice to
@@ -598,6 +585,56 @@ Identity verification (best-effort, four possible outcomes):
   it's immediately diagnoseable from CI logs.
 
 Exit codes: `0` = pass, `1` = file/parse error, `2` = policy violation.
+
+**SLSA v1.0 Build Level 1/2 checklist** (informational, non-gating):
+every `verify` run additionally evaluates the decoded statement against
+the [SLSA v1.0 provenance](https://slsa.dev/spec/v1.0/provenance) Build
+Level 1 and Level 2 requirements and prints a scannable checklist to
+stderr (`--format json` carries the same data under `slsa.level_1`/
+`slsa.level_2`; the deprecated `--json` alias does too).
+This check is independent of tenax-assay's own RCS predicate/policy
+gates above — it evaluates the SLSA-specific fields (`predicateType`,
+`buildDefinition`, `runDetails`, `externalParameters`) directly, so it
+applies to any SLSA v1.0 provenance statement handed to this same
+admission gate, not just tenax-assay's own attestations (whose
+predicate isn't SLSA-provenance-shaped, so most items there legitimately
+show `[✗]` today). Neither level's outcome ever affects `passed`/the
+exit code:
+
+```text
+=== SLSA Build Level 1 Assessment ===
+[✓] in-toto v1 Statement Envelope
+[✓] SLSA v1.0 Provenance Predicate
+[✓] Build Definition & Invocation Metadata
+[✓] Subject Artifact Digest Verification
+Status: PASSED (SLSA Build Level 1)
+
+=== SLSA Build Level 2 Assessment ===
+[✓] Hosted Builder Identity (https://github.com/actions/runner)
+[✓] Cryptographic Envelope Signature (Sigstore Keyless OIDC)
+[✓] Authenticated Source Repository Binding
+[✓] Materialized Resolved Dependencies (142 packages recorded)
+Status: PASSED (SLSA Build Level 2)
+=====================================
+```
+
+- **Level 1** — `_type` is `https://in-toto.io/Statement/v1`; `predicateType`
+  is `https://slsa.dev/provenance/v1`; `buildDefinition.buildType` is
+  present *and* `runDetails.metadata` carries either an `invocationId` or
+  both `startedOn`/`finishedOn` (combined into one checklist row); and at
+  least one subject digest is attested.
+- **Level 2** builds on Level 1 (SLSA's own leveling is cumulative — the
+  combined `Status` line for Level 2 only reads `PASSED` when every Level
+  1 item *and* every Level 2 item passed, even though each block still
+  marks its own items independently): `runDetails.builder.id` is a
+  trusted hosted builder (currently just
+  `https://github.com/actions/runner` — a deliberately narrow, explicit
+  allowlist); the envelope's Sigstore identity check (the same
+  `identity_status` computed above) came back `verified`;
+  `buildDefinition.externalParameters.workflow.repository` is present
+  (and matches `--expected-repository` when that flag is set); and
+  `buildDefinition.resolvedDependencies` has at least one entry with a
+  non-empty `uri`.
 
 ## Try it
 

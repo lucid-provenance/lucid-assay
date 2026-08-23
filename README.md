@@ -520,6 +520,55 @@ Identity verification (best-effort, four possible outcomes):
 
 Exit codes: `0` = pass, `1` = file/parse error, `2` = policy violation.
 
+**SLSA v1.0 Build Level 1/2 checklist** (informational, non-gating):
+every `verify` run additionally evaluates the decoded statement against
+the [SLSA v1.0 provenance](https://slsa.dev/spec/v1.0/provenance) Build
+Level 1 and Level 2 requirements and prints a scannable checklist to
+stderr (`--json` carries the same data as `slsa_level1`/`slsa_level2`).
+This check is independent of tenax-assay's own RCS predicate/policy
+gates above — it evaluates the SLSA-specific fields (`predicateType`,
+`buildDefinition`, `runDetails`, `externalParameters`) directly, so it
+applies to any SLSA v1.0 provenance statement handed to this same
+admission gate, not just tenax-assay's own attestations (whose
+predicate isn't SLSA-provenance-shaped, so most items there legitimately
+show `[✗]` today). Neither level's outcome ever affects `passed`/the
+exit code:
+
+```text
+=== SLSA Build Level 1 Assessment ===
+[✓] in-toto v1 Statement Envelope
+[✓] SLSA v1.0 Provenance Predicate
+[✓] Build Definition & Invocation Metadata
+[✓] Subject Artifact Digest Verification
+Status: PASSED (SLSA Build Level 1)
+
+=== SLSA Build Level 2 Assessment ===
+[✓] Hosted Builder Identity (https://github.com/actions/runner)
+[✓] Cryptographic Envelope Signature (Sigstore Keyless OIDC)
+[✓] Authenticated Source Repository Binding
+[✓] Materialized Resolved Dependencies (142 packages recorded)
+Status: PASSED (SLSA Build Level 2)
+=====================================
+```
+
+- **Level 1** — `_type` is `https://in-toto.io/Statement/v1`; `predicateType`
+  is `https://slsa.dev/provenance/v1`; `buildDefinition.buildType` is
+  present *and* `runDetails.metadata` carries either an `invocationId` or
+  both `startedOn`/`finishedOn` (combined into one checklist row); and at
+  least one subject digest is attested.
+- **Level 2** builds on Level 1 (SLSA's own leveling is cumulative — the
+  combined `Status` line for Level 2 only reads `PASSED` when every Level
+  1 item *and* every Level 2 item passed, even though each block still
+  marks its own items independently): `runDetails.builder.id` is a
+  trusted hosted builder (currently just
+  `https://github.com/actions/runner` — a deliberately narrow, explicit
+  allowlist); the envelope's Sigstore identity check (the same
+  `identity_status` computed above) came back `verified`;
+  `buildDefinition.externalParameters.workflow.repository` is present
+  (and matches `--expected-repository` when that flag is set); and
+  `buildDefinition.resolvedDependencies` has at least one entry with a
+  non-empty `uri`.
+
 ## Try it
 
 ```bash

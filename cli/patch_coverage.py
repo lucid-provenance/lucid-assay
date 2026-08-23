@@ -5,6 +5,11 @@ new code path behind a high legacy baseline.
 
 Hardened against:
   - Git CLI option injection (explicit '--' separator)
+  - Non-ref-shaped base_sha/head_sha values (validated against a strict
+    allowlist regex before ever reaching subprocess.run(), on top of --
+    not instead of -- --end-of-options; shell=False is used throughout,
+    by construction, since every subprocess.run() call here takes a list
+    of argv tokens, never a shell string)
   - Quoted/escaped filenames in diff headers (-c core.quotepath=false)
   - Path normalization discrepancies between git and coverage parsers
   - Binary / deleted file diffs (/dev/null filtering)
@@ -37,6 +42,30 @@ def _normalize_path(path_str: str) -> str:
 
 _HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _DIFF_PLUS = re.compile(r"^\+\+\+ b/(.*)$")
+
+# Allowlist for a value destined for a git CLI argument (base_sha/head_sha):
+# hex commit SHAs, branch/tag names, and refs/... paths all fit this shape.
+# Defense in depth alongside --end-of-options below (which already prevents
+# a ref value from being parsed as a git flag) and shell=False (implicit --
+# subprocess.run() is always called with a list of argv tokens here, never
+# a shell string, so shell metacharacters can't reach a shell to begin
+# with): this closes off any future refactor that might reintroduce
+# string-based command construction, and gives a bad value one clear,
+# typed rejection point instead of relying solely on git's own parsing.
+_SAFE_GIT_REF_PATTERN = re.compile(r"^[a-zA-Z0-9_./-]+$")
+
+
+class UnsafeGitRefError(ValueError):
+    """Raised by _validate_git_ref() when a base_sha/head_sha value
+    contains characters outside _SAFE_GIT_REF_PATTERN."""
+
+
+def _validate_git_ref(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value or not _SAFE_GIT_REF_PATTERN.match(value):
+        raise UnsafeGitRefError(
+            f"{label} is not a safe git ref (must match {_SAFE_GIT_REF_PATTERN.pattern!r}): {value!r}"
+        )
+    return value
 
 
 # Machine-readable PatchCoverageResult.reason_code value for a diff that
@@ -72,6 +101,9 @@ class PatchCoverageResult:
 
 def _changed_lines_by_file(base_sha: str, head_sha: str, cwd: str) -> Dict[str, List[int]]:
     """Returns {file_path: [added_line_numbers]} for the diff base_sha...head_sha."""
+    _validate_git_ref(base_sha, "base_sha")
+    _validate_git_ref(head_sha, "head_sha")
+
     # -c core.quotepath=false prevents git from double-quoting unicode/spaced paths
     # '--end-of-options' ensures the revision range can't be parsed as arbitrary git
     # flags (e.g. a SHA-like string starting with '-'). Note this must precede the
@@ -146,7 +178,7 @@ def compute_patch_modified_lines(
         return {}
     try:
         changed = _changed_lines_by_file(base_sha, head_sha, repo_dir)
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, UnsafeGitRefError):
         return {}
     return {path: set(lines) for path, lines in changed.items()}
 
@@ -224,6 +256,14 @@ def compute_patch_coverage(
             lines_changed=0,
             lines_covered=0,
             reason=f"git diff failed: {e.stderr.strip()[:200]}",
+        )
+    except UnsafeGitRefError as e:
+        return PatchCoverageResult(
+            available=False,
+            line_rate=None,
+            lines_changed=0,
+            lines_covered=0,
+            reason=f"git diff refused: {e}",
         )
 
     total_changed = 0

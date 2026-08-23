@@ -58,6 +58,38 @@ def _java_language():
     return tsjava.language()
 
 
+def _fold_number_literal(node: Node, src: bytes) -> Tuple[bool, Any]:
+    text = node_text(node, src).rstrip("lLfFdD").replace("_", "")
+    try:
+        return True, (int(text, 0) if "integer" in node.type else float(text))
+    except ValueError:
+        return False, None
+
+
+def _fold_string_literal(node: Node, src: bytes) -> Tuple[bool, Any]:
+    frags = [c for c in node.children if c.type == "string_fragment"]
+    if frags:
+        return True, "".join(node_text(f, src) for f in frags)
+    return True, node_text(node, src).strip('"')
+
+
+def _fold_unary_expression(node: Node, src: bytes) -> Tuple[bool, Any]:
+    op = node_text(node.children[0], src) if node.children else ""
+    operand = node.child_by_field_name("operand")
+    ok, val = _fold_java_literal(operand, src)
+    if ok and op == "!":
+        return True, not val
+    return False, None
+
+
+def _fold_parenthesized(node: Node, src: bytes) -> Tuple[bool, Any]:
+    inner = node.child_by_field_name("expression")
+    if inner is None:
+        named = [c for c in node.children if c.is_named]
+        inner = named[0] if named else None
+    return _fold_java_literal(inner, src)
+
+
 def _fold_java_literal(node: Optional[Node], src: bytes) -> Tuple[bool, Any]:
     if node is None:
         return False, None
@@ -68,29 +100,13 @@ def _fold_java_literal(node: Optional[Node], src: bytes) -> Tuple[bool, Any]:
     if node.type == "null_literal":
         return True, None
     if node.type.endswith("_integer_literal") or node.type.endswith("_floating_point_literal"):
-        text = node_text(node, src).rstrip("lLfFdD").replace("_", "")
-        try:
-            return True, (int(text, 0) if "integer" in node.type else float(text))
-        except ValueError:
-            return False, None
+        return _fold_number_literal(node, src)
     if node.type == "string_literal":
-        frags = [c for c in node.children if c.type == "string_fragment"]
-        if frags:
-            return True, "".join(node_text(f, src) for f in frags)
-        return True, node_text(node, src).strip('"')
+        return _fold_string_literal(node, src)
     if node.type == "unary_expression":
-        op = node_text(node.children[0], src) if node.children else ""
-        operand = node.child_by_field_name("operand")
-        ok, val = _fold_java_literal(operand, src)
-        if ok and op == "!":
-            return True, not val
-        return False, None
+        return _fold_unary_expression(node, src)
     if node.type == "parenthesized_expression":
-        inner = node.child_by_field_name("expression")
-        if inner is None:
-            named = [c for c in node.children if c.is_named]
-            inner = named[0] if named else None
-        return _fold_java_literal(inner, src)
+        return _fold_parenthesized(node, src)
     return False, None
 
 
@@ -127,6 +143,57 @@ def _trace_assertthat_arg(node: Optional[Node], src: bytes) -> Optional[Node]:
     return None
 
 
+def _classify_junit_style_assertion(name: str, obj: Optional[Node], args: List[Node], src: bytes) -> Optional[bool]:
+    """Returns is_tautological for a bare/statically-qualified
+    `assert*(...)` call (JUnit's `Assert`/`Assertions` or Hamcrest's
+    non-chained `assertThat(x, matcher)`), or None if `name`/`obj` don't
+    match that shape at all -- the caller then tries the AssertJ fluent
+    chain instead, rather than treating "not a JUnit-qualified assert
+    name" as "not an assertion"."""
+    if not (name.startswith("assert") and name != "assert"):
+        return None
+    is_bare_or_qualified = obj is None or (obj.type == "identifier" and node_text(obj, src) in _JUNIT_QUALIFIERS)
+    if not is_bare_or_qualified:
+        return None
+
+    taut = False
+    if name == "assertTrue" and args:
+        ok, val = _fold_java_literal(args[0], src)
+        taut = ok and bool(val)
+    elif name == "assertFalse" and args:
+        ok, val = _fold_java_literal(args[0], src)
+        taut = ok and not val
+    elif name in ("assertEquals", "assertSame") and len(args) >= 2:
+        taut = literal_or_structural_equal(args[0], args[1], src, _fold_java_literal)
+    return taut
+
+
+def _classify_assertj_chain(
+    name: str, obj: Optional[Node], args: List[Node], src: bytes
+) -> Optional[Tuple[bool, Optional[Node]]]:
+    """Returns (is_tautological, subtree_to_skip) for an AssertJ fluent
+    terminal call (`assertThat(x).isEqualTo(y)`, `.isTrue()`, ...), or
+    None if `obj` doesn't trace back to an `assertThat(...)` receiver."""
+    if obj is None:
+        return None
+    base_arg = _trace_assertthat_arg(obj, src)
+    if base_arg is None:
+        return None
+
+    taut = False
+    if name in _ASSERTJ_TRUE_TERMINALS:
+        ok, val = _fold_java_literal(base_arg, src)
+        taut = ok and bool(val)
+    elif name in _ASSERTJ_FALSE_TERMINALS:
+        ok, val = _fold_java_literal(base_arg, src)
+        taut = ok and not val
+    elif name in _ASSERTJ_EQUALITY_TERMINALS and args:
+        taut = literal_or_structural_equal(base_arg, args[0], src, _fold_java_literal)
+    # else: any other AssertJ/fluent terminal (isNotNull, hasSize,
+    # contains, ...) still counts as a real assertion call (taut=False).
+    return taut, obj
+
+
 def _classify_method_invocation(node: Node, src: bytes) -> Optional[Tuple[bool, Optional[Node]]]:
     """Returns (is_tautological, subtree_to_skip) for a `method_invocation`
     that qualifies as an assertion call, else None. `subtree_to_skip` is
@@ -140,41 +207,11 @@ def _classify_method_invocation(node: Node, src: bytes) -> Optional[Tuple[bool, 
     obj = node.child_by_field_name("object")
     args = call_args(node.child_by_field_name("arguments"))
 
-    if name.startswith("assert") and name != "assert":
-        is_bare_or_qualified = obj is None or (
-            obj.type == "identifier" and node_text(obj, src) in _JUNIT_QUALIFIERS
-        )
-        if is_bare_or_qualified:
-            taut = False
-            if name == "assertTrue" and args:
-                ok, val = _fold_java_literal(args[0], src)
-                taut = ok and bool(val)
-            elif name == "assertFalse" and args:
-                ok, val = _fold_java_literal(args[0], src)
-                taut = ok and not val
-            elif name in ("assertEquals", "assertSame") and len(args) >= 2:
-                taut = literal_or_structural_equal(args[0], args[1], src, _fold_java_literal)
-            return taut, None
+    junit_taut = _classify_junit_style_assertion(name, obj, args, src)
+    if junit_taut is not None:
+        return junit_taut, None
 
-    if obj is not None:
-        base_arg = _trace_assertthat_arg(obj, src)
-        if base_arg is not None:
-            taut = False
-            if name in _ASSERTJ_TRUE_TERMINALS:
-                ok, val = _fold_java_literal(base_arg, src)
-                taut = ok and bool(val)
-            elif name in _ASSERTJ_FALSE_TERMINALS:
-                ok, val = _fold_java_literal(base_arg, src)
-                taut = ok and not val
-            elif name in _ASSERTJ_EQUALITY_TERMINALS and args:
-                taut = literal_or_structural_equal(base_arg, args[0], src, _fold_java_literal)
-            else:
-                # any other AssertJ/fluent terminal (isNotNull, hasSize,
-                # contains, ...) still counts as a real assertion call.
-                pass
-            return taut, obj
-
-    return None
+    return _classify_assertj_chain(name, obj, args, src)
 
 
 class _BodyWalker:

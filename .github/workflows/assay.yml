@@ -63,31 +63,43 @@ jobs:
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
-          cache-dependency-glob: "pyproject.toml"
+          cache-dependency-glob: "uv.lock"
 
       # sigstore-python fetches TUF (The Update Framework) trust-root
       # metadata from the public good instance on first use each run;
       # caching it here avoids that network round-trip on every job.
-      # A cache miss (first run, or a pyproject.toml change invalidating
-      # the key) just means sigstore re-fetches -- `actions/cache` never
+      # A cache miss (first run, or a lockfile change invalidating the
+      # key) just means sigstore re-fetches -- `actions/cache` never
       # fails the job on a miss, only on an actual restore/save error, so
       # nothing else here needs to defend against a miss explicitly.
       - name: Cache Sigstore TUF Metadata
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/sigstore-python
-          key: sigstore-tuf-${{ runner.os }}-${{ hashFiles('**/pyproject.toml') }}
+          key: sigstore-tuf-${{ runner.os }}-${{ hashFiles('**/uv.lock') }}
           restore-keys: |
             sigstore-tuf-${{ runner.os }}-
 
+      # --frozen: install exactly what uv.lock pins (versions *and*
+      # hashes), refusing to re-resolve even if pyproject.toml has
+      # drifted from it -- deterministic, reproducible builds, and no
+      # arbitrary "resolve whatever's newest and compatible today" step
+      # that could pull in a since-compromised transitive dependency
+      # between runs. `--extra dev` brings in pytest/pytest-cov/
+      # pytest-xdist/jsonschema alongside the core runtime deps, all from
+      # the one lockfile -- nothing installed ad hoc outside it.
       - name: Install Dependencies
         run: |
-          uv pip install --system -e ".[dev]" sigstore pytest pytest-cov pytest-xdist
+          uv sync --frozen --extra dev
 
+      # `uv run --no-sync`: execute inside the environment `uv sync` just
+      # populated without uv re-checking/re-syncing it first (already
+      # synced explicitly above, so that would just be redundant work) --
+      # not a second, different environment.
       - name: Execute Tests with Telemetry
         run: |
           mkdir -p build
-          pytest \
+          uv run --no-sync pytest \
             -n auto \
             --junitxml=build/junit.xml \
             --cov=cli \
@@ -225,7 +237,7 @@ jobs:
 
           echo "Running with EXTRA_ARGS: ${EXTRA_ARGS[*]}"
 
-          python -m cli.main \
+          uv run --no-sync python -m cli.main \
             --junit-xml build/junit.xml \
             --coverage-report build/coverage.xml \
             --image-ref "ghcr.io/${{ github.repository }}:${HEAD_SHA}" \
@@ -255,7 +267,7 @@ jobs:
             VERIFY_ARGS+=(--disallow-degraded)
           fi
 
-          python -m cli.verify build/tenax-assay.dsse.json "${VERIFY_ARGS[@]}"
+          uv run --no-sync python -m cli.verify build/tenax-assay.dsse.json "${VERIFY_ARGS[@]}"
       - name: Upload In-Toto Attestation Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

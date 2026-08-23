@@ -109,36 +109,57 @@ def _language_for(ext: str):
     return tsjs.language
 
 
+def _fold_parenthesized(node: Node, src: bytes) -> Tuple[bool, Any]:
+    inner = [c for c in node.children if c.is_named]
+    return _fold_js_literal(inner[0], src) if inner else (False, None)
+
+
+def _fold_number_literal(node: Node, src: bytes) -> Tuple[bool, Any]:
+    text = node_text(node, src)
+    try:
+        return True, (int(text, 0) if not any(c in text for c in ".eE") else float(text))
+    except ValueError:
+        return False, None
+
+
+def _fold_string_literal(node: Node, src: bytes) -> Tuple[bool, Any]:
+    frags = [c for c in node.children if c.type == "string_fragment"]
+    return True, "".join(node_text(f, src) for f in frags)
+
+
+def _fold_unary_expression(node: Node, src: bytes) -> Tuple[bool, Any]:
+    op = node_text(node.children[0], src) if node.children else ""
+    operand = node.child_by_field_name("argument")
+    ok, val = _fold_js_literal(operand, src)
+    if not ok:
+        return False, None
+    if op == "!":
+        return True, not val
+    return False, None
+
+
+# Dispatch table for _fold_js_literal: node.type -> (node, src) -> (ok, value).
+# Keeps the dispatcher itself a flat lookup instead of a long if/elif chain.
+_LITERAL_FOLDERS = {
+    "parenthesized_expression": _fold_parenthesized,
+    "number": _fold_number_literal,
+    "string": _fold_string_literal,
+    "unary_expression": _fold_unary_expression,
+}
+
+
 def _fold_js_literal(node: Optional[Node], src: bytes) -> Tuple[bool, Any]:
     if node is None:
         return False, None
-    if node.type == "parenthesized_expression":
-        inner = [c for c in node.children if c.is_named]
-        return _fold_js_literal(inner[0], src) if inner else (False, None)
     if node.type == "true":
         return True, True
     if node.type == "false":
         return True, False
     if node.type in ("null", "undefined"):
         return True, None
-    if node.type == "number":
-        text = node_text(node, src)
-        try:
-            return True, (int(text, 0) if not any(c in text for c in ".eE") else float(text))
-        except ValueError:
-            return False, None
-    if node.type == "string":
-        frags = [c for c in node.children if c.type == "string_fragment"]
-        return True, "".join(node_text(f, src) for f in frags)
-    if node.type == "unary_expression":
-        op = node_text(node.children[0], src) if node.children else ""
-        operand = node.child_by_field_name("argument")
-        ok, val = _fold_js_literal(operand, src)
-        if not ok:
-            return False, None
-        if op == "!":
-            return True, not val
-        return False, None
+    folder = _LITERAL_FOLDERS.get(node.type)
+    if folder is not None:
+        return folder(node, src)
     return False, None
 
 
@@ -237,20 +258,24 @@ class _TestBodyWalker:
             if self._handle_call(node, src):
                 return  # matched call: its own subtree is opaque past this point
         if node.type == "if_statement":
-            # `if (false) { expect(...).toBe(...); }` is statically
-            # dead/live -- prune to the branch that actually runs,
-            # mirroring python_visitor.py's visit_If.
-            ok, value = _fold_js_literal(node.child_by_field_name("condition"), src)
-            if ok:
-                branch = node.child_by_field_name("consequence" if value else "alternative")
-                if branch is not None and branch.type == "else_clause":
-                    named = [c for c in branch.children if c.is_named]
-                    branch = named[0] if named else None
-                if branch is not None:
-                    self.walk(branch, src)
-                return
+            self._walk_if_statement(node, src)
+            return
         for child in node.children:
             self.walk(child, src)
+
+    def _walk_if_statement(self, node: Node, src: bytes) -> None:
+        # `if (false) { expect(...).toBe(...); }` is statically dead/live --
+        # prune to the branch that actually runs, mirroring
+        # python_visitor.py's visit_If.
+        ok, value = _fold_js_literal(node.child_by_field_name("condition"), src)
+        if not ok:
+            return
+        branch = node.child_by_field_name("consequence" if value else "alternative")
+        if branch is not None and branch.type == "else_clause":
+            named = [c for c in branch.children if c.is_named]
+            branch = named[0] if named else None
+        if branch is not None:
+            self.walk(branch, src)
 
     def _handle_call(self, node: Node, src: bytes) -> bool:
         func = node.child_by_field_name("function")
@@ -258,16 +283,7 @@ class _TestBodyWalker:
             return False
 
         if func.type == "identifier":
-            ident = node_text(func, src)
-            if ident == "assert":
-                args = call_args(node.child_by_field_name("arguments"))
-                taut = False
-                if args:
-                    ok, val = _fold_js_literal(args[0], src)
-                    taut = ok and bool(val)
-                self._record(taut)
-                return True
-            return False
+            return self._handle_bare_assert_call(node, func, src)
 
         if func.type == "member_expression":
             obj = func.child_by_field_name("object")
@@ -276,31 +292,54 @@ class _TestBodyWalker:
 
             trace = _trace_expect_chain(obj, src)
             if trace is not None:
-                expect_arg, negated = trace
-                if member in _EXPECT_CHAIN_PASSTHROUGH:
-                    return False  # part of the chain, not its terminal matcher
-                args = call_args(node.child_by_field_name("arguments"))
-                taut = False
-                if not negated and member in _EXPECT_EQUALITY_MATCHERS and expect_arg is not None and args:
-                    taut = literal_or_structural_equal(expect_arg, args[0], src, _fold_js_literal)
-                self._record(taut)
-                return True
+                return self._handle_expect_chain_call(node, member, trace, src)
 
             if obj is not None and obj.type == "identifier" and node_text(obj, src) in ("assert", "chai"):
-                args = call_args(node.child_by_field_name("arguments"))
-                taut = False
-                if member in _CHAI_ASSERT_EQUALITY_METHODS and len(args) >= 2:
-                    taut = literal_or_structural_equal(args[0], args[1], src, _fold_js_literal)
-                elif member in _CHAI_ASSERT_TRUE_METHODS and args:
-                    ok, val = _fold_js_literal(args[0], src)
-                    taut = ok and bool(val)
-                elif member in _CHAI_ASSERT_FALSE_METHODS and args:
-                    ok, val = _fold_js_literal(args[0], src)
-                    taut = ok and not val
-                self._record(taut)
-                return True
+                return self._handle_chai_assert_call(node, member, src)
 
         return False
+
+    def _handle_bare_assert_call(self, node: Node, func: Node, src: bytes) -> bool:
+        """Node `assert(...)` (bare Node assert, not chai's `assert.*`)."""
+        ident = node_text(func, src)
+        if ident != "assert":
+            return False
+        args = call_args(node.child_by_field_name("arguments"))
+        taut = False
+        if args:
+            ok, val = _fold_js_literal(args[0], src)
+            taut = ok and bool(val)
+        self._record(taut)
+        return True
+
+    def _handle_expect_chain_call(
+        self, node: Node, member: str, trace: Tuple[Optional[Node], bool], src: bytes
+    ) -> bool:
+        """`expect(x)[.not/.resolves/.rejects].<matcher>(...)` terminal call."""
+        expect_arg, negated = trace
+        if member in _EXPECT_CHAIN_PASSTHROUGH:
+            return False  # part of the chain, not its terminal matcher
+        args = call_args(node.child_by_field_name("arguments"))
+        taut = False
+        if not negated and member in _EXPECT_EQUALITY_MATCHERS and expect_arg is not None and args:
+            taut = literal_or_structural_equal(expect_arg, args[0], src, _fold_js_literal)
+        self._record(taut)
+        return True
+
+    def _handle_chai_assert_call(self, node: Node, member: str, src: bytes) -> bool:
+        """`assert.equal(...)`/`chai.isTrue(...)`/etc."""
+        args = call_args(node.child_by_field_name("arguments"))
+        taut = False
+        if member in _CHAI_ASSERT_EQUALITY_METHODS and len(args) >= 2:
+            taut = literal_or_structural_equal(args[0], args[1], src, _fold_js_literal)
+        elif member in _CHAI_ASSERT_TRUE_METHODS and args:
+            ok, val = _fold_js_literal(args[0], src)
+            taut = ok and bool(val)
+        elif member in _CHAI_ASSERT_FALSE_METHODS and args:
+            ok, val = _fold_js_literal(args[0], src)
+            taut = ok and not val
+        self._record(taut)
+        return True
 
     def _record(self, tautological: bool) -> None:
         if tautological:

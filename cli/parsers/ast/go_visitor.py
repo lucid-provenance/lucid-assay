@@ -47,6 +47,33 @@ def _go_language():
     return tsgo.language()
 
 
+def _fold_number_literal(node: Node, src: bytes) -> Tuple[bool, Any]:
+    text = node_text(node, src)
+    try:
+        return True, (int(text, 0) if node.type == "int_literal" else float(text))
+    except ValueError:
+        return False, None
+
+
+def _fold_interpreted_string(node: Node, src: bytes) -> Tuple[bool, Any]:
+    frags = [c for c in node.children if c.type == "interpreted_string_literal_content"]
+    return True, "".join(node_text(f, src) for f in frags)
+
+
+def _fold_unary_expression(node: Node, src: bytes) -> Tuple[bool, Any]:
+    op = node_text(node.children[0], src) if node.children else ""
+    operand = node.child_by_field_name("operand")
+    ok, val = _fold_go_literal(operand, src)
+    if ok and op == "!":
+        return True, not val
+    return False, None
+
+
+def _fold_parenthesized(node: Node, src: bytes) -> Tuple[bool, Any]:
+    inner = [c for c in node.children if c.is_named]
+    return _fold_go_literal(inner[0], src) if inner else (False, None)
+
+
 def _fold_go_literal(node: Optional[Node], src: bytes) -> Tuple[bool, Any]:
     if node is None:
         return False, None
@@ -57,26 +84,15 @@ def _fold_go_literal(node: Optional[Node], src: bytes) -> Tuple[bool, Any]:
     if node.type == "nil":
         return True, None
     if node.type in ("int_literal", "float_literal"):
-        text = node_text(node, src)
-        try:
-            return True, (int(text, 0) if node.type == "int_literal" else float(text))
-        except ValueError:
-            return False, None
+        return _fold_number_literal(node, src)
     if node.type == "interpreted_string_literal":
-        frags = [c for c in node.children if c.type == "interpreted_string_literal_content"]
-        return True, "".join(node_text(f, src) for f in frags)
+        return _fold_interpreted_string(node, src)
     if node.type == "raw_string_literal":
         return True, node_text(node, src).strip("`")
     if node.type == "unary_expression":
-        op = node_text(node.children[0], src) if node.children else ""
-        operand = node.child_by_field_name("operand")
-        ok, val = _fold_go_literal(operand, src)
-        if ok and op == "!":
-            return True, not val
-        return False, None
+        return _fold_unary_expression(node, src)
     if node.type == "parenthesized_expression":
-        inner = [c for c in node.children if c.is_named]
-        return _fold_go_literal(inner[0], src) if inner else (False, None)
+        return _fold_parenthesized(node, src)
     return False, None
 
 
@@ -107,6 +123,23 @@ def _is_test_function(node: Node, src: bytes) -> Optional[str]:
     return None
 
 
+def _classify_testify_call(node: Node, method: str, src: bytes) -> bool:
+    """Returns is_tautological for a recognized `assert.*`/`require.*`
+    testify call. Argument indices are offset by 1: testify's API takes
+    the leading `t *testing.T` as args[0]."""
+    args = call_args(node.child_by_field_name("arguments"))
+    taut = False
+    if method == "True" and len(args) >= 2:
+        ok, val = _fold_go_literal(args[1], src)
+        taut = ok and bool(val)
+    elif method == "False" and len(args) >= 2:
+        ok, val = _fold_go_literal(args[1], src)
+        taut = ok and not val
+    elif method in ("Equal", "Same") and len(args) >= 3:
+        taut = literal_or_structural_equal(args[1], args[2], src, _fold_go_literal)
+    return taut
+
+
 def _classify_call(node: Node, src: bytes) -> Optional[Tuple[bool, bool]]:
     """Returns (is_assertion, is_tautological) for a call_expression, or
     None if it isn't a recognized assertion/failure call."""
@@ -121,17 +154,7 @@ def _classify_call(node: Node, src: bytes) -> Optional[Tuple[bool, bool]]:
     method = node_text(field, src)
 
     if base_name in _TESTIFY_PACKAGES:
-        args = call_args(node.child_by_field_name("arguments"))
-        taut = False
-        if method == "True" and len(args) >= 2:
-            ok, val = _fold_go_literal(args[1], src)
-            taut = ok and bool(val)
-        elif method == "False" and len(args) >= 2:
-            ok, val = _fold_go_literal(args[1], src)
-            taut = ok and not val
-        elif method in ("Equal", "Same") and len(args) >= 3:
-            taut = literal_or_structural_equal(args[1], args[2], src, _fold_go_literal)
-        return True, taut
+        return True, _classify_testify_call(node, method, src)
 
     if method in _FAILURE_METHODS:
         return True, False

@@ -576,34 +576,43 @@ def _validate_against_schema(predicate: Dict[str, Any]) -> Tuple[str, List[str]]
     ]
 
 
+def _static_analysis_tool_entry(t: Dict[str, Any]) -> Dict[str, Any]:
+    """Builds one tool's {errors, warnings, quality_gate} entry for
+    _static_analysis_tools_by_name -- split out purely to keep that
+    function's cognitive complexity down (SonarCloud flagged it at 18 of
+    an allowed 15); behavior is unchanged. A field that isn't the expected
+    type is simply omitted from the entry rather than defaulting to a
+    fabricated value."""
+    entry: Dict[str, Any] = {}
+    summary = t.get("summary") if isinstance(t.get("summary"), dict) else {}
+    errors = summary.get("errors")
+    warnings = summary.get("warnings")
+    if isinstance(errors, int) and not isinstance(errors, bool):
+        entry["errors"] = errors
+    if isinstance(warnings, int) and not isinstance(warnings, bool):
+        entry["warnings"] = warnings
+    extensions = t.get("extensions") if isinstance(t.get("extensions"), dict) else {}
+    sonarqube = extensions.get("sonarqube") if isinstance(extensions.get("sonarqube"), dict) else {}
+    quality_gate = sonarqube.get("quality_gate")
+    if isinstance(quality_gate, str):
+        entry["quality_gate"] = quality_gate
+    return entry
+
+
 def _static_analysis_tools_by_name(tools: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """Reshapes the internal per-tool SARIF list (see
     _extract_static_analysis_tools) into a {tool_name: {...}} mapping for
     --format json, merging each tool's error/warning summary and SonarQube
-    quality-gate extension (when present) into one flat object per tool.
-    Purely a display transform over already-validated data -- a tool with
-    no usable name is skipped rather than raising, and a field that isn't
-    the expected type is simply omitted from that tool's entry rather than
-    defaulting to a fabricated value."""
+    quality-gate extension (when present) into one flat object per tool
+    (see _static_analysis_tool_entry). Purely a display transform over
+    already-validated data -- a tool with no usable name is skipped rather
+    than raising."""
     out: Dict[str, Dict[str, Any]] = {}
     for t in tools:
         name = t.get("name")
         if not isinstance(name, str) or not name:
             continue
-        entry: Dict[str, Any] = {}
-        summary = t.get("summary") if isinstance(t.get("summary"), dict) else {}
-        errors = summary.get("errors")
-        warnings = summary.get("warnings")
-        if isinstance(errors, int) and not isinstance(errors, bool):
-            entry["errors"] = errors
-        if isinstance(warnings, int) and not isinstance(warnings, bool):
-            entry["warnings"] = warnings
-        extensions = t.get("extensions") if isinstance(t.get("extensions"), dict) else {}
-        sonarqube = extensions.get("sonarqube") if isinstance(extensions.get("sonarqube"), dict) else {}
-        quality_gate = sonarqube.get("quality_gate")
-        if isinstance(quality_gate, str):
-            entry["quality_gate"] = quality_gate
-        out[name] = entry
+        out[name] = _static_analysis_tool_entry(t)
     return out
 
 

@@ -2,7 +2,15 @@
 // test_ast_assertions.py. Mirrors the categories exercised for every
 // other language's fixture: standard/valid, gamed/tautological,
 // zero-assertion, and skipped.
-package com.example.fixtures;
+//
+// This file is never compiled or classpath-resolved -- cli/parsers/ast/
+// java_visitor.py parses it with Tree-sitter's grammar only, which has no
+// notion of packages/directories at all, so the fixture intentionally
+// lives at a fixed path (tests/fixtures/ast_assertions/java/
+// FixtureSuiteTest.java, referenced by hardcoded name in
+// tests/test_ast_assertions.py) rather than under a matching
+// com/example/fixtures/ directory tree.
+package com.example.fixtures; // NOSONAR: static parser fixture, not compiled -- see note above
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Disabled;

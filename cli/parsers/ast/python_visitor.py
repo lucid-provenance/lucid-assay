@@ -281,26 +281,32 @@ def _is_mock_style_name(name: str) -> bool:
     return "_" in name
 
 
+def _is_tautological_bool_assert(call: ast.Call, method: str) -> bool:
+    """`self.assertTrue(True)` / `self.assertFalse(False)` / any hardcoded
+    truthy/falsy literal that makes the call trivially pass, plus a
+    tautological comparison expression (`1 == 1`, ...) passed to either."""
+    if method not in _TAUTOLOGICAL_BOOL_METHODS or not call.args:
+        return False
+    arg = call.args[0]
+    ok, value = _fold_constant(arg)
+    if ok:
+        if method == "assertTrue" and value:
+            return True
+        if method == "assertFalse" and not value:
+            return True
+    return isinstance(arg, ast.Compare) and _is_tautological_test_expr(arg)
+
+
+def _is_tautological_eq_assert(call: ast.Call, method: str) -> bool:
+    """`self.assertEqual(x, x)` (self-reference)."""
+    return method in _TAUTOLOGICAL_EQ_METHODS and len(call.args) >= 2 and _same_expr(call.args[0], call.args[1])
+
+
 def _is_tautological_assert_call(call: ast.Call, method: str) -> bool:
     """`self.assertTrue(True)`, `self.assertFalse(False)`,
     `self.assertTrue(123)` (any hardcoded truthy/falsy literal that makes
     the call trivially pass), and `self.assertEqual(x, x)`."""
-    if method in _TAUTOLOGICAL_BOOL_METHODS and call.args:
-        arg = call.args[0]
-        ok, value = _fold_constant(arg)
-        if ok:
-            if method == "assertTrue" and value:
-                return True
-            if method == "assertFalse" and not value:
-                return True
-        if isinstance(arg, ast.Compare) and _is_tautological_test_expr(arg):
-            return True
-
-    if method in _TAUTOLOGICAL_EQ_METHODS and len(call.args) >= 2:
-        if _same_expr(call.args[0], call.args[1]):
-            return True
-
-    return False
+    return _is_tautological_bool_assert(call, method) or _is_tautological_eq_assert(call, method)
 
 
 def _is_pytest_raises_or_warns(call: ast.Call) -> bool:

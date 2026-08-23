@@ -204,27 +204,44 @@ class _BodyWalker:
         self.assertion_count = 0
         self.tautological_count = 0
 
+    def _handle_call_expression(self, node: Node, src: bytes) -> bool:
+        """Classifies a `call_expression` as a testify/native Go assertion
+        call. Returns True when classified -- its subtree is never walked
+        further, since these calls' arguments don't themselves contain
+        assertions -- False means it isn't a recognized assertion call and
+        the caller should fall through to the generic child walk."""
+        classified = _classify_call(node, src)
+        if classified is None:
+            return False
+        is_assertion, is_taut = classified
+        if is_taut:
+            self.tautological_count += 1
+        else:
+            self.assertion_count += 1
+        return True
+
+    def _handle_if_statement(self, node: Node, src: bytes) -> bool:
+        """`if false { t.Error(...) }` (or `if true { ... } else { ... }`)
+        is statically dead/live -- prune to the branch that actually runs
+        rather than crediting an unreachable one, mirroring
+        python_visitor.py's visit_If. Returns True when the condition
+        folded to a known value (its live branch, if any, has already been
+        walked) -- False means the condition isn't statically known and
+        the caller should fall through to the generic child walk, which
+        walks both branches."""
+        ok, value = _fold_go_literal(node.child_by_field_name("condition"), src)
+        if not ok:
+            return False
+        branch = node.child_by_field_name("consequence" if value else "alternative")
+        if branch is not None:
+            self.walk(branch, src)
+        return True
+
     def walk(self, node: Node, src: bytes) -> None:
-        if node.type == "call_expression":
-            classified = _classify_call(node, src)
-            if classified is not None:
-                is_assertion, is_taut = classified
-                if is_taut:
-                    self.tautological_count += 1
-                else:
-                    self.assertion_count += 1
-                return
-        if node.type == "if_statement":
-            # `if false { t.Error(...) }` (or `if true { ... } else { ... }`)
-            # is statically dead/live -- prune to the branch that actually
-            # runs rather than crediting an unreachable one, mirroring
-            # python_visitor.py's visit_If.
-            ok, value = _fold_go_literal(node.child_by_field_name("condition"), src)
-            if ok:
-                branch = node.child_by_field_name("consequence" if value else "alternative")
-                if branch is not None:
-                    self.walk(branch, src)
-                return
+        if node.type == "call_expression" and self._handle_call_expression(node, src):
+            return
+        if node.type == "if_statement" and self._handle_if_statement(node, src):
+            return
         for child in node.children:
             self.walk(child, src)
 

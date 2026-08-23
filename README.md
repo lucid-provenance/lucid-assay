@@ -67,7 +67,9 @@ Every module is a pure function or a thin, swappable I/O boundary:
 - `common.py::safe_resolve_path()` is the one path-safety choke point every
   module reads an operator-supplied file through (`--junit-xml`,
   `--coverage-report`, `--sarif`, `--sonar-metrics`, `--out`, the `verify`
-  envelope argument): resolves to an absolute, symlink-normalized `Path`
+  envelope argument, plus `hashing.py`'s evidence-artifact hashing and
+  `patch_coverage.py`'s `--repo-dir` as `subprocess.run()`'s `cwd`):
+  resolves to an absolute, symlink-normalized `Path`
   and rejects null bytes/malformed input before it ever reaches
   `open()`/`os.path.getsize()`/`ET.parse()`. It does not enforce a single
   root/allowlist directory — these are CLI arguments an operator supplies
@@ -233,9 +235,12 @@ allowlist regex (`^[a-zA-Z0-9_./-]+$`) before ever reaching
 `subprocess.run()` — defense in depth on top of, not instead of,
 `--end-of-options`; every `subprocess.run()` call here takes a list of
 argv tokens, never a shell string, so `shell=True`/shell metacharacter
-injection isn't reachable to begin with. A ref that fails validation
-degrades exactly like a failed `git diff` would (`available=False`, or an
-empty mapping from `compute_patch_modified_lines`), never a raw crash.
+injection isn't reachable to begin with. `--repo-dir` (`subprocess.run()`'s
+`cwd`) gets the same treatment via `common.safe_resolve_path()` — it's as
+real a subprocess argument as the argv list, not just an incidental
+working-directory string. A ref or path that fails validation degrades
+exactly like a failed `git diff` would (`available=False`, or an empty
+mapping from `compute_patch_modified_lines`), never a raw crash.
 
 **`parsers/ast/`** is a language-agnostic registry/dispatcher for assertion
 integrity: `inspect_test_suite()` discovers test files across four
@@ -374,9 +379,12 @@ approval state claims. Notable hardening:
   response header.
 
 **`hashing.py`** computes SHA-256 in 1MB chunks (bounded memory for large
-reports). The digest is both the in-toto `report_sha256` and the WORM
-content-addressed key (`s3://evidence/sha256/<hex>` — same content, same
-key, free dedup and idempotent uploads across re-attested runs).
+reports), resolving every path it hashes through `common.safe_resolve_path()`
+first, the same choke point every other operator-supplied file path in the
+pipeline goes through. The digest is both the in-toto `report_sha256` and
+the WORM content-addressed key (`s3://evidence/sha256/<hex>` — same
+content, same key, free dedup and idempotent uploads across re-attested
+runs).
 
 ## Signing flow (keyless / Sigstore)
 

@@ -180,6 +180,35 @@ def _extract_callback(args: List[Node]) -> Optional[Node]:
     return None
 
 
+def _classify_identifier_test_call(func: Node, src: bytes) -> Optional[Tuple[str, bool]]:
+    """`_classify_test_call`'s bare-identifier case: `it(...)`/`test(...)`
+    or one of their skip aliases (`xit(...)`, `xtest(...)`, ...)."""
+    ident = node_text(func, src)
+    if ident in _TEST_CALL_IDENTS:
+        return ident, False
+    if ident in _SKIP_ALIAS_IDENTS:
+        return ident, True
+    return None
+
+
+def _classify_member_test_call(func: Node, src: bytes) -> Optional[Tuple[str, bool]]:
+    """`_classify_test_call`'s member-expression case:
+    `it.skip(...)`/`test.only(...)`/etc."""
+    obj = func.child_by_field_name("object")
+    prop = func.child_by_field_name("property")
+    if obj is None or prop is None or obj.type != "identifier":
+        return None
+    base = node_text(obj, src)
+    if base not in _TEST_CALL_IDENTS:
+        return None
+    member = node_text(prop, src)
+    if member in _SKIP_MEMBERS:
+        return base, True
+    if member in _RUNNABLE_MEMBERS:
+        return base, False
+    return None
+
+
 def _classify_test_call(node: Node, src: bytes) -> Optional[Tuple[str, bool]]:
     """Returns (matched_ident_label, is_skipped) if `node` is an
     it(...)/test(...) call site (any of the skip/only/todo/xit/xtest
@@ -188,27 +217,22 @@ def _classify_test_call(node: Node, src: bytes) -> Optional[Tuple[str, bool]]:
     if func is None:
         return None
     if func.type == "identifier":
-        ident = node_text(func, src)
-        if ident in _TEST_CALL_IDENTS:
-            return ident, False
-        if ident in _SKIP_ALIAS_IDENTS:
-            return ident, True
-        return None
+        return _classify_identifier_test_call(func, src)
     if func.type == "member_expression":
-        obj = func.child_by_field_name("object")
-        prop = func.child_by_field_name("property")
-        if obj is None or prop is None or obj.type != "identifier":
-            return None
-        base = node_text(obj, src)
-        if base not in _TEST_CALL_IDENTS:
-            return None
-        member = node_text(prop, src)
-        if member in _SKIP_MEMBERS:
-            return base, True
-        if member in _RUNNABLE_MEMBERS:
-            return base, False
-        return None
+        return _classify_member_test_call(func, src)
     return None
+
+
+def _expect_chain_hop(cur: Node, src: bytes) -> Optional[Tuple[Optional[Node], bool]]:
+    """One step of _trace_expect_chain: given a `member_expression` link in
+    the chain, returns (next_node_to_examine, hop_is_negation) when it's a
+    recognized passthrough (.not/.resolves/.rejects), else None to signal
+    the chain doesn't continue toward a bare expect(...) call from here."""
+    prop = cur.child_by_field_name("property")
+    member = node_text(prop, src)
+    if member not in _EXPECT_CHAIN_PASSTHROUGH:
+        return None
+    return cur.child_by_field_name("object"), member == "not"
 
 
 def _trace_expect_chain(node: Optional[Node], src: bytes) -> Optional[Tuple[Optional[Node], bool]]:
@@ -224,16 +248,13 @@ def _trace_expect_chain(node: Optional[Node], src: bytes) -> Optional[Tuple[Opti
                 args = call_args(cur.child_by_field_name("arguments"))
                 return (args[0] if args else None), negated
             return None
-        if cur.type == "member_expression":
-            prop = cur.child_by_field_name("property")
-            member = node_text(prop, src)
-            if member in _EXPECT_CHAIN_PASSTHROUGH:
-                if member == "not":
-                    negated = True
-                cur = cur.child_by_field_name("object")
-                continue
+        if cur.type != "member_expression":
             return None
-        return None
+        hop = _expect_chain_hop(cur, src)
+        if hop is None:
+            return None
+        cur, hop_negated = hop
+        negated = negated or hop_negated
     return None
 
 

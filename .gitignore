@@ -27,12 +27,14 @@ venv/
 ENV/
 
 # Testing & Coverage
+# NOTE: CI-generated coverage.xml/junit.xml already live under build/
+# (ignored above) -- do NOT add bare `coverage.xml`/`junit.xml` patterns
+# here, they also match (and silently exclude from version control)
+# legitimate checked-in fixtures like tests/fixtures/junit.xml.
 .pytest_cache/
 .coverage
 .coverage.*
 htmlcov/
-coverage.xml
-junit.xml
 
 # Node / Web UI
 node_modules/

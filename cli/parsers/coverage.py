@@ -13,7 +13,7 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from ..common import safe_resolve_path
 
@@ -39,24 +39,53 @@ class CoverageReport:
     files: Dict[str, FileCoverage] = field(default_factory=dict)
 
 
+def _parse_clamped_rate(raw: Optional[str]) -> float:
+    """Parses a Cobertura rate attribute (e.g. line-rate="0.87"), clamping
+    to [0.0, 1.0] and defaulting to 0.0 when missing or unparseable."""
+    try:
+        return max(0.0, min(1.0, float(raw or 0.0)))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _parse_optional_clamped_rate(raw: Optional[str]) -> Optional[float]:
+    """Same as _parse_clamped_rate, but returns None (rather than 0.0)
+    when the attribute is absent or unparseable -- used for branch-rate,
+    which Cobertura doesn't always emit."""
+    if raw is None:
+        return None
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_cobertura_class_lines(cls: ET.Element, fc: FileCoverage) -> None:
+    """Merges one <class>'s <line> hit counts into `fc.line_hits`, in
+    place -- max-of-hits across duplicate <class> entries for the same
+    filename (Cobertura can emit more than one <class> per file)."""
+    lines_el = cls.find("lines")
+    if lines_el is None:
+        return
+    for line in lines_el.findall("line"):
+        raw_num = line.get("number")
+        if not raw_num:
+            continue
+        try:
+            num = int(raw_num)
+            hits = max(0, int(line.get("hits", "0") or 0))
+        except (ValueError, TypeError):
+            continue
+        fc.line_hits[num] = max(fc.line_hits.get(num, 0), hits)
+
+
 def parse_cobertura(path: str) -> CoverageReport:
     """Cobertura XML stream/tree parser with strict attribute validation."""
     tree = ET.parse(safe_resolve_path(path))
     root = tree.getroot()
 
-    try:
-        raw_line_rate = float(root.get("line-rate", "0") or 0.0)
-        overall_line_rate = max(0.0, min(1.0, raw_line_rate))
-    except (ValueError, TypeError):
-        overall_line_rate = 0.0
-
-    overall_branch_rate = None
-    branch_attr = root.get("branch-rate")
-    if branch_attr is not None:
-        try:
-            overall_branch_rate = max(0.0, min(1.0, float(branch_attr)))
-        except (ValueError, TypeError):
-            overall_branch_rate = None
+    overall_line_rate = _parse_clamped_rate(root.get("line-rate"))
+    overall_branch_rate = _parse_optional_clamped_rate(root.get("branch-rate"))
 
     files: Dict[str, FileCoverage] = {}
     for cls in root.iter("class"):
@@ -66,28 +95,25 @@ def parse_cobertura(path: str) -> CoverageReport:
 
         filename = _normalize_path(raw_filename)
         fc = files.setdefault(filename, FileCoverage())
-
-        lines_el = cls.find("lines")
-        if lines_el is None:
-            continue
-
-        for line in lines_el.findall("line"):
-            raw_num = line.get("number")
-            if not raw_num:
-                continue
-            try:
-                num = int(raw_num)
-                hits = max(0, int(line.get("hits", "0") or 0))
-            except (ValueError, TypeError):
-                continue
-
-            fc.line_hits[num] = max(fc.line_hits.get(num, 0), hits)
+        _parse_cobertura_class_lines(cls, fc)
 
     return CoverageReport(overall_line_rate, overall_branch_rate, files)
 
 
 _LCOV_SF = re.compile(r"^SF:(.+)$")
 _LCOV_DA = re.compile(r"^DA:(\d+),(-?\d+)")
+
+
+def _parse_da_record(m_da: "re.Match[str]") -> Optional[Tuple[int, int]]:
+    """Parses one `DA:<line>,<hits>` LCOV record into (line_number,
+    hit_count), clamping a non-standard negative hit count to 0. Returns
+    None if either field isn't parseable."""
+    try:
+        num = int(m_da.group(1))
+        hits = max(int(m_da.group(2)), 0)
+    except (ValueError, TypeError):
+        return None
+    return num, hits
 
 
 def parse_lcov(path: str) -> CoverageReport:
@@ -111,16 +137,13 @@ def parse_lcov(path: str) -> CoverageReport:
 
             m_da = _LCOV_DA.match(line)
             if m_da and current is not None:
-                try:
-                    num = int(m_da.group(1))
-                    hits = max(int(m_da.group(2)), 0)
-                except (ValueError, TypeError):
-                    continue
-
-                files[current].line_hits[num] = hits
-                total_lines += 1
-                if hits > 0:
-                    covered_lines += 1
+                record = _parse_da_record(m_da)
+                if record is not None:
+                    num, hits = record
+                    files[current].line_hits[num] = hits
+                    total_lines += 1
+                    if hits > 0:
+                        covered_lines += 1
                 continue
 
             if line == "end_of_record":

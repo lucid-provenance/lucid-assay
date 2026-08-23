@@ -35,6 +35,50 @@ class _CaseAttempt:
     outcome: str  # "passed" | "failed" | "errored" | "skipped"
 
 
+def _testcase_outcome(elem: ET.Element) -> str:
+    """Classifies one <testcase> element's outcome by the presence of a
+    <failure>/<error>/<skipped> child, in that priority order."""
+    if elem.find("failure") is not None:
+        return "failed"
+    if elem.find("error") is not None:
+        return "errored"
+    if elem.find("skipped") is not None:
+        return "skipped"
+    return "passed"
+
+
+def _record_testcase(elem: ET.Element, attempts: Dict[Tuple[str, str], list], totals: TestTotals) -> None:
+    """Records one <testcase> element's timing and outcome into `attempts`
+    (keyed by (classname, name), for flaky-retry detection across repeated
+    attempts) and `totals.duration_ms`, in place."""
+    classname = elem.get("classname", "")
+    name = elem.get("name", "")
+    time_s = float(elem.get("time", "0") or 0.0)
+    totals.duration_ms += int(round(time_s * 1000))
+
+    key = (classname, name)
+    attempts.setdefault(key, []).append(_testcase_outcome(elem))
+
+
+def _finalize_case_totals(outcomes: list, totals: TestTotals) -> None:
+    """Rolls up one (classname, name) key's recorded attempts into
+    `totals`, in place: a case's *final* attempt determines its
+    pass/fail/error/skip bucket, and more than one recorded attempt ending
+    in a pass counts as a flaky retry."""
+    totals.tests += 1
+    final = outcomes[-1]
+    if final == "passed":
+        totals.passed += 1
+        if len(outcomes) > 1:
+            totals.flaky_retries += 1
+    elif final == "failed":
+        totals.failed += 1
+    elif final == "errored":
+        totals.errored += 1
+    else:
+        totals.skipped += 1
+
+
 def parse_junit_xml(path: str) -> TestTotals:
     """Stream-parse a junit.xml (or junit-xml aggregate with multiple
     <testsuite> elements) into aggregate totals.
@@ -54,37 +98,10 @@ def parse_junit_xml(path: str) -> TestTotals:
     for _, elem in context:
         if elem.tag != "testcase":
             continue
-
-        classname = elem.get("classname", "")
-        name = elem.get("name", "")
-        time_s = float(elem.get("time", "0") or 0.0)
-        totals.duration_ms += int(round(time_s * 1000))
-
-        outcome = "passed"
-        if elem.find("failure") is not None:
-            outcome = "failed"
-        elif elem.find("error") is not None:
-            outcome = "errored"
-        elif elem.find("skipped") is not None:
-            outcome = "skipped"
-
-        key = (classname, name)
-        attempts.setdefault(key, []).append(outcome)
-
+        _record_testcase(elem, attempts, totals)
         elem.clear()  # release memory; safe because we've already read it
 
-    for key, outcomes in attempts.items():
-        totals.tests += 1
-        final = outcomes[-1]
-        if final == "passed":
-            totals.passed += 1
-            if len(outcomes) > 1:
-                totals.flaky_retries += 1
-        elif final == "failed":
-            totals.failed += 1
-        elif final == "errored":
-            totals.errored += 1
-        else:
-            totals.skipped += 1
+    for outcomes in attempts.values():
+        _finalize_case_totals(outcomes, totals)
 
     return totals

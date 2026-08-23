@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="pkg.core" tests="4" failures="1" errors="0" skipped="1" time="1.234">
+    <testcase classname="pkg.core.TestFoo" name="test_add" time="0.01"/>
+    <testcase classname="pkg.core.TestFoo" name="test_sub" time="0.02"/>
+    <testcase classname="pkg.core.TestFoo" name="test_flaky" time="0.05">
+      <failure message="assert 1 == 2">AssertionError</failure>
+    </testcase>
+    <testcase classname="pkg.core.TestFoo" name="test_flaky" time="0.03"/>
+    <testcase classname="pkg.core.TestBar" name="test_skip" time="0.0">
+      <skipped/>
+    </testcase>
+  </testsuite>
+</testsuites>

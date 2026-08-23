@@ -141,7 +141,16 @@ class VerificationResult:
     warnings: List[str] = field(default_factory=list)
     statement: Optional[Dict[str, Any]] = None
     rcs_value: Optional[int] = None
-    degraded: Optional[bool] = None
+    # Always a concrete bool, never None -- see _validate_rcs_block's
+    # docstring. Defaults to False (this field's own JSON-Schema-declared
+    # default) when the predicate omits it entirely; that's a legitimate,
+    # documented display interpretation, not a fabricated compliance claim.
+    # degraded_field_present is the separate, honest "was this actually
+    # asserted" signal -- --disallow-degraded (see _evaluate_policy_gates)
+    # fails closed on degraded_field_present is False rather than silently
+    # trusting the display default (CLAUDE.md "Fail-Closed Verification").
+    degraded: bool = False
+    degraded_field_present: bool = False
     degraded_reasons: Optional[List[str]] = None
     subject_digests: List[str] = field(default_factory=list)
     metrics: Dict[str, Any] = field(default_factory=dict)
@@ -157,6 +166,7 @@ class VerificationResult:
             "warnings": self.warnings,
             "rcs_value": self.rcs_value,
             "degraded": self.degraded,
+            "degraded_field_present": self.degraded_field_present,
             "degraded_reasons": self.degraded_reasons,
             "subject_digests": self.subject_digests,
             "metrics": self.metrics,
@@ -281,6 +291,166 @@ def _validate_against_schema(predicate: Dict[str, Any]) -> Tuple[str, List[str]]
     return "failed", [
         f"{'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors
     ]
+
+
+def _static_analysis_tools_by_name(tools: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Reshapes the internal per-tool SARIF list (see
+    _extract_static_analysis_tools) into a {tool_name: {...}} mapping for
+    --format json, merging each tool's error/warning summary and SonarQube
+    quality-gate extension (when present) into one flat object per tool.
+    Purely a display transform over already-validated data -- a tool with
+    no usable name is skipped rather than raising, and a field that isn't
+    the expected type is simply omitted from that tool's entry rather than
+    defaulting to a fabricated value."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for t in tools:
+        name = t.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        entry: Dict[str, Any] = {}
+        summary = t.get("summary") if isinstance(t.get("summary"), dict) else {}
+        errors = summary.get("errors")
+        warnings = summary.get("warnings")
+        if isinstance(errors, int) and not isinstance(errors, bool):
+            entry["errors"] = errors
+        if isinstance(warnings, int) and not isinstance(warnings, bool):
+            entry["warnings"] = warnings
+        extensions = t.get("extensions") if isinstance(t.get("extensions"), dict) else {}
+        sonarqube = extensions.get("sonarqube") if isinstance(extensions.get("sonarqube"), dict) else {}
+        quality_gate = sonarqube.get("quality_gate")
+        if isinstance(quality_gate, str):
+            entry["quality_gate"] = quality_gate
+        out[name] = entry
+    return out
+
+
+# Level 2 checks with no real underlying signal in this pipeline (see
+# _compute_slsa_assessment) -- keyed by check name, valued by the reason
+# it can't be evaluated. Per the "Fail-Closed Verification" invariant in
+# CLAUDE.md ("Supply Chain Integrity & Attestation Invariants"), a check
+# that can't be verified must resolve to `False`/non-compliant, never a
+# `null`/unknown state that could be mistaken for "not yet checked" rather
+# than "checked and can't be trusted" -- this dict exists purely to carry
+# *why* alongside that `False`, not to soften it.
+_SLSA_LEVEL_2_UNEVALUATED_CHECKS = {
+    "resolved_dependencies": "not evaluated: tenax-assay does not track a build dependency graph",
+}
+
+
+def _compute_slsa_assessment(result: VerificationResult, args: argparse.Namespace) -> Dict[str, Any]:
+    """Best-effort SLSA Level 1/2 self-assessment derived strictly from
+    signals this pipeline actually verifies -- never a hardcoded/fabricated
+    `true`. Each check maps to a concrete, already-computed fact on `result`
+    (or a CLI flag the caller asserted). Fail-closed by construction (see
+    CLAUDE.md "Supply Chain Integrity & Attestation Invariants"): a check
+    with no real underlying signal (currently: resolved_dependencies --
+    this pipeline doesn't build or track a dependency graph) is `False`,
+    not `None`/skipped -- unverified must never be indistinguishable from
+    "verified and non-compliant" by simply being excluded from the
+    roll-up. `unevaluated_checks` carries the reason alongside that `False`
+    so an auditor can still tell "checked, failed" apart from "can't check
+    this at all yet" without the boolean itself pretending otherwise.
+
+    Level 1 (provenance exists and is authentic to the artifact):
+      - statement_envelope: the DSSE payload decoded into a well-formed
+        in-toto Statement at all
+      - provenance_predicate: the decoded Statement's _type/predicateType
+        match what this tool actually produces (EXPECTED_STATEMENT_TYPE /
+        EXPECTED_PREDICATE_TYPE)
+      - build_definition: the predicate carries real build/test signal
+        (result.metrics is non-empty -- test totals, coverage, or
+        assertion density were actually extracted)
+      - subject_digest_match: at least one subject digest was present to
+        bind the provenance to an artifact
+
+    Level 2 (provenance is authenticated by a hosted build platform):
+      - hosted_builder / source_binding / cryptographic_signature: all
+        require result.identity_status == "verified" -- i.e. Sigstore
+        cryptographically verified the DSSE signature *and* the asserted
+        identity policy, never merely that a signature block was present
+      - hosted_builder additionally requires the caller asserted a CI-only
+        identity claim (--expected-issuer/--expected-repository/
+        --expected-workflow/--expected-ref/--cert-oidc-issuer): a bare
+        --cert-identity alone (e.g. a human's email) doesn't establish the
+        signer was a hosted CI runner
+      - source_binding additionally requires --expected-repository was
+        asserted and matched, binding the provenance to a specific source
+        repo rather than just *some* verified identity
+      - resolved_dependencies: always False -- see
+        _SLSA_LEVEL_2_UNEVALUATED_CHECKS above
+    """
+    statement = result.statement or {}
+    statement_type_ok = statement.get("_type") == EXPECTED_STATEMENT_TYPE
+    predicate_type_ok = statement.get("predicateType") == EXPECTED_PREDICATE_TYPE
+
+    level_1_checks: Dict[str, bool] = {
+        "statement_envelope": result.statement is not None,
+        "provenance_predicate": statement_type_ok and predicate_type_ok,
+        "build_definition": bool(result.metrics),
+        "subject_digest_match": bool(result.subject_digests),
+    }
+    level_1_compliant = all(level_1_checks.values())
+
+    identity_verified = result.identity_status == "verified"
+    ci_identity_asserted = bool(
+        args.expected_issuer
+        or args.expected_repository
+        or args.expected_workflow
+        or args.expected_ref
+        or args.cert_oidc_issuer
+    )
+    level_2_checks: Dict[str, bool] = {
+        "hosted_builder": identity_verified and ci_identity_asserted,
+        "cryptographic_signature": identity_verified,
+        "source_binding": identity_verified and bool(args.expected_repository),
+        "resolved_dependencies": False,
+    }
+    level_2_compliant = all(level_2_checks.values())
+
+    return {
+        "level_1": {"compliant": level_1_compliant, "checks": level_1_checks},
+        "level_2": {
+            "compliant": level_2_compliant,
+            "checks": level_2_checks,
+            "unevaluated_checks": dict(_SLSA_LEVEL_2_UNEVALUATED_CHECKS),
+        },
+    }
+
+
+def _build_verify_json_payload(result: VerificationResult, args: argparse.Namespace) -> Dict[str, Any]:
+    """Assembles the --format json payload: the complete verification
+    result (envelope shape, RCS score, static analysis, violations/
+    warnings/identity) plus a best-effort SLSA Level 1/2 self-assessment
+    (see _compute_slsa_assessment). Never raises -- every field it reads
+    off `result`/`args` is already defensively populated by
+    verify_dsse_attestation()/parse_args()."""
+    statement = result.statement or {}
+    subjects = statement.get("subject")
+    return {
+        "version": "1.0.0",
+        "verified": result.passed,
+        "envelope": {
+            "statement_type": statement.get("_type"),
+            "predicate_type": statement.get("predicateType"),
+            "subject": subjects if isinstance(subjects, list) else [],
+        },
+        "slsa": _compute_slsa_assessment(result, args),
+        "release_confidence_score": {
+            "score": result.rcs_value,
+            "degraded": result.degraded,
+            "degraded_field_present": result.degraded_field_present,
+            "degraded_reasons": result.degraded_reasons or [],
+        },
+        "static_analysis": {
+            "tools": _static_analysis_tools_by_name(result.static_analysis_tools),
+        },
+        "identity": {
+            "status": result.identity_status,
+            "detail": result.identity_detail,
+        },
+        "violations": result.violations,
+        "warnings": result.warnings,
+    }
 
 
 def _format_static_analysis_table(tools: List[Dict[str, Any]]) -> List[str]:
@@ -720,12 +890,30 @@ def _decode_envelope_statement(envelope: Dict[str, Any]) -> Tuple[Optional[Dict[
 
 def _validate_rcs_block(
     predicate: Dict[str, Any],
-) -> Tuple[Optional[int], Optional[bool], Optional[List[str]], List[str]]:
+) -> Tuple[Optional[int], bool, bool, Optional[List[str]], List[str]]:
     """Extracts and type/range-validates release_confidence_score.{value,
     degraded,degraded_reasons} from the predicate. An invalid value resets
-    to a safe default (None/False/None respectively) alongside a violation
-    entry, never raised. Returns (rcs_value, degraded, degraded_reasons,
-    violations)."""
+    to a safe default alongside a violation entry, never raised.
+
+    Returns (rcs_value, degraded, degraded_field_present, degraded_reasons,
+    violations).
+
+    `degraded` is always a concrete bool, never None: when the predicate
+    omits the field entirely (it's optional per schema/tenax-attestation-
+    v1.schema.json, which documents "default": false), `degraded` resolves
+    to that schema-declared default -- a legitimate, versioned display
+    interpretation, not a fabricated compliance claim. `degraded_field_present`
+    is the separate, honest signal of whether the predicate actually
+    asserted a value (True) versus the field being absent or malformed
+    (False) -- callers evaluating --disallow-degraded (see
+    _evaluate_policy_gates) MUST fail closed on `degraded_field_present is
+    False` rather than trusting the display default, since an absent field
+    on anything but a genuine tenax-assay-signed predicate is an unknown
+    state, not a confirmed non-degraded one (CLAUDE.md "Fail-Closed
+    Verification"). A malformed (non-bool) value both reports
+    degraded_field_present=False *and* raises its own `violations` entry,
+    which already fails the whole gate regardless of --disallow-degraded.
+    """
     violations: List[str] = []
 
     rcs_block = predicate.get("release_confidence_score")
@@ -737,10 +925,16 @@ def _validate_rcs_block(
         violations.append(f"invalid release_confidence_score.value: {rcs_value!r}")
         rcs_value = None
 
-    degraded = rcs_block.get("degraded")
-    if degraded is not None and not isinstance(degraded, bool):
-        violations.append(f"invalid release_confidence_score.degraded type, expected boolean: {degraded!r}")
+    degraded_field_present = "degraded" in rcs_block
+    degraded_raw = rcs_block.get("degraded")
+    if degraded_field_present and not isinstance(degraded_raw, bool):
+        violations.append(f"invalid release_confidence_score.degraded type, expected boolean: {degraded_raw!r}")
         degraded = False
+        degraded_field_present = False
+    elif degraded_field_present:
+        degraded = degraded_raw
+    else:
+        degraded = False  # schema-documented display default; not itself a compliance claim
 
     degraded_reasons = rcs_block.get("degraded_reasons")
     if degraded_reasons is not None and not (
@@ -751,7 +945,7 @@ def _validate_rcs_block(
         )
         degraded_reasons = None
 
-    return rcs_value, degraded, degraded_reasons, violations
+    return rcs_value, degraded, degraded_field_present, degraded_reasons, violations
 
 
 def _evaluate_policy_gates(
@@ -761,7 +955,8 @@ def _evaluate_policy_gates(
     require_digest: Optional[str],
     subject_digests: List[str],
     disallow_degraded: bool,
-    degraded: Optional[bool],
+    degraded: bool,
+    degraded_field_present: bool,
     degraded_reasons: Optional[List[str]],
 ) -> Tuple[List[str], List[str]]:
     """Evaluates --min-rcs/--require-digest/--disallow-degraded against
@@ -784,7 +979,21 @@ def _evaluate_policy_gates(
                 f"required subject digest {wanted!r} not found among attested digests {subject_digests}"
             )
 
-    if disallow_degraded and degraded is True:
+    if disallow_degraded and not degraded_field_present:
+        # Fail-closed on an unknown state (CLAUDE.md "Fail-Closed
+        # Verification"): the field is either absent (no genuine
+        # tenax-assay-signed predicate omits it -- scorer.py always sets
+        # it explicitly) or malformed (already its own violation above).
+        # Either way, --disallow-degraded exists specifically to block
+        # degraded runs, so it must never silently trust an unconfirmed
+        # "not degraded" -- that would be exactly the same null-treated-
+        # as-pass loophole the degraded_reasons check below exists to
+        # close for the *true* case.
+        violations.append(
+            "release_confidence_score.degraded is missing or malformed and --disallow-degraded was "
+            "set; cannot confirm this run is not degraded, failing closed"
+        )
+    elif disallow_degraded and degraded is True:
         # Fail-closed by default: --disallow-degraded blocks unless
         # degraded_reasons proves every cause is a known, unavoidable
         # one (see _ALLOWED_DEGRADED_REASONS). A missing/malformed
@@ -850,7 +1059,8 @@ def verify_dsse_attestation(
     statement, violations, warnings = _decode_envelope_statement(envelope)
 
     rcs_value: Optional[int] = None
-    degraded: Optional[bool] = None
+    degraded: bool = False
+    degraded_field_present: bool = False
     degraded_reasons: Optional[List[str]] = None
     subject_digests: List[str] = []
     metrics: Dict[str, Any] = {}
@@ -895,7 +1105,7 @@ def verify_dsse_attestation(
         elif schema_validation_status == "skipped":
             warnings.extend(f"schema validation skipped: {m}" for m in schema_messages)
 
-        rcs_value, degraded, degraded_reasons, rcs_violations = _validate_rcs_block(predicate)
+        rcs_value, degraded, degraded_field_present, degraded_reasons, rcs_violations = _validate_rcs_block(predicate)
         violations.extend(rcs_violations)
 
         metrics = _extract_metrics(predicate)
@@ -908,6 +1118,7 @@ def verify_dsse_attestation(
             subject_digests=subject_digests,
             disallow_degraded=disallow_degraded,
             degraded=degraded,
+            degraded_field_present=degraded_field_present,
             degraded_reasons=degraded_reasons,
         )
         violations.extend(gate_violations)
@@ -935,6 +1146,7 @@ def verify_dsse_attestation(
         statement=statement,
         rcs_value=rcs_value,
         degraded=degraded,
+        degraded_field_present=degraded_field_present,
         degraded_reasons=degraded_reasons,
         subject_digests=subject_digests,
         metrics=metrics,
@@ -994,7 +1206,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="require the certificate's GitHub Actions ref to match this glob pattern, e.g. 'refs/heads/main'",
     )
     p.add_argument(
-        "--json", action="store_true", dest="json_output", help="emit the machine-readable result as JSON on stdout"
+        "--format",
+        "-f",
+        choices=["text", "json"],
+        default="text",
+        help=(
+            "output format: 'text' (default) prints a human-readable summary to stderr; "
+            "'json' suppresses all human-oriented output and emits ONLY the structured "
+            "verification result (envelope, SLSA level 1/2 assessment, RCS score, static "
+            "analysis) as JSON on stdout"
+        ),
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="deprecated: equivalent to --format json (kept for backwards compatibility)",
     )
     return p.parse_args(argv)
 
@@ -1092,8 +1319,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         expected_ref=args.expected_ref,
     )
 
-    if args.json_output:
-        print(json.dumps(result.as_dict(), indent=2))
+    output_format = args.format
+    if args.json_output and output_format == "text":
+        # --json predates --format and is kept only as an alias; the
+        # deprecation notice goes to stderr, never stdout, so it can never
+        # corrupt a --json consumer's "ONLY valid JSON on stdout" parsing.
+        print("warning: --json is deprecated; use --format json instead", file=sys.stderr)
+        output_format = "json"
+
+    if output_format == "json":
+        print(json.dumps(_build_verify_json_payload(result, args), indent=2))
     else:
         _print_verify_result_human(result)
 

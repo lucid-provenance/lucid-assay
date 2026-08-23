@@ -14,11 +14,15 @@ from cli.verify import (
     EXIT_POLICY_VIOLATION,
     GITHUB_ACTIONS_OIDC_ISSUER,
     main,
+    parse_args,
     verify_dsse_attestation,
     _build_identity_policy,
+    _build_verify_json_payload,
+    _compute_slsa_assessment,
     _describe_actual_cert_claims,
     _envelope_to_bundle_json,
     _extract_cert_ref,
+    _static_analysis_tools_by_name,
     _verify_sigstore_identity,
 )
 
@@ -28,14 +32,22 @@ SUBJECT_DIGEST = "a" * 64
 _DEGRADED_REASONS_OMITTED = object()  # sentinel: distinct from None/[] -- key left out of the predicate entirely
 
 
-def _statement(*, rcs_value=85, degraded=False, degraded_reasons=_DEGRADED_REASONS_OMITTED, subject_sha256=SUBJECT_DIGEST):
+def _statement(
+    *,
+    rcs_value=85,
+    degraded=False,
+    degraded_reasons=_DEGRADED_REASONS_OMITTED,
+    omit_degraded_field=False,
+    subject_sha256=SUBJECT_DIGEST,
+):
     rcs_block = {
         "value": rcs_value,
         "algorithm_version": "rcs-v0.1",
         "components": {},
-        "degraded": degraded,
         "computed_at": "2026-08-20T02:18:40Z",
     }
+    if not omit_degraded_field:
+        rcs_block["degraded"] = degraded
     if degraded_reasons is not _DEGRADED_REASONS_OMITTED:
         rcs_block["degraded_reasons"] = degraded_reasons
     return {
@@ -236,6 +248,57 @@ class VerifyDsseAttestationTests(unittest.TestCase):
 
         self.assertTrue(result.passed, result.violations)
 
+    def test_disallow_degraded_blocks_when_degraded_field_itself_is_missing(self):
+        # Fail closed on an unknown state, not just a known-True one: a
+        # predicate that omits release_confidence_score.degraded entirely
+        # (schema declares it optional with a display default of False)
+        # must not be silently trusted as "confirmed not degraded" when
+        # --disallow-degraded is set -- the whole point of the flag is to
+        # never let an unconfirmed state slip through as if it were a pass.
+        envelope = _envelope(_statement(omit_degraded_field=True))
+        decoded_payload = json.loads(base64.b64decode(envelope["payload"]))
+        self.assertNotIn("degraded", decoded_payload["predicate"]["release_confidence_score"])
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("disallow-degraded" in v for v in result.violations), result.violations)
+        self.assertFalse(result.degraded_field_present)
+        self.assertFalse(result.degraded)  # display default, not itself a compliance claim
+
+    def test_missing_degraded_field_is_permissive_when_flag_not_set(self):
+        # Without --disallow-degraded, the missing field is display-only
+        # and defaults to False (this field's own schema-declared default)
+        # -- it must not itself become a blocking violation.
+        envelope = _envelope(_statement(omit_degraded_field=True))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=False, dry_run=True)
+
+        self.assertTrue(result.passed, result.violations)
+        self.assertFalse(result.degraded_field_present)
+        self.assertFalse(result.degraded)
+
+    def test_degraded_field_present_true_when_explicitly_asserted(self):
+        envelope = _envelope(_statement(degraded=False))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+        self.assertTrue(result.degraded_field_present)
+        self.assertFalse(result.degraded)
+
+    def test_malformed_degraded_type_is_treated_as_not_present(self):
+        # A non-bool degraded value is both its own violation (existing
+        # behavior) and, per the fail-closed fix, degraded_field_present
+        # goes False too -- a malformed assertion is exactly as untrusted
+        # as a missing one, not silently coerced into "confirmed False".
+        envelope = _envelope(_statement(degraded="not-a-bool"))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+
+        self.assertFalse(result.passed)
+        self.assertFalse(result.degraded_field_present)
+        self.assertTrue(any("invalid release_confidence_score.degraded type" in v for v in result.violations), result.violations)
+
     def test_invalid_degraded_reasons_type_is_a_violation_and_still_blocks(self):
         envelope = _envelope(_statement(degraded=True, degraded_reasons="not-a-list"))
 
@@ -321,6 +384,189 @@ class VerifyCliMainTests(unittest.TestCase):
         rc = main([path, "--dry-run"])
 
         self.assertEqual(rc, EXIT_FILE_ERROR)
+
+    def test_format_json_emits_only_valid_json_on_stdout_and_preserves_exit_code(self):
+        import contextlib
+        import io
+
+        path = self._write_envelope(_envelope(_statement(rcs_value=90)))
+        captured_stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(captured_stdout):
+            rc = main([path, "--min-rcs", "80", "--dry-run", "--format", "json"])
+
+        self.assertEqual(rc, EXIT_PASS)
+        payload = json.loads(captured_stdout.getvalue())  # raises if stdout wasn't pure JSON
+        self.assertEqual(payload["version"], "1.0.0")
+        self.assertTrue(payload["verified"])
+        self.assertEqual(payload["release_confidence_score"]["score"], 90)
+        self.assertIn("slsa", payload)
+        self.assertIn("level_1", payload["slsa"])
+        self.assertIn("level_2", payload["slsa"])
+        self.assertEqual(
+            payload["envelope"]["predicate_type"], "https://tenax.io/attestations/assay/v1"
+        )
+
+    def test_format_json_reflects_nonzero_exit_on_policy_violation(self):
+        import contextlib
+        import io
+
+        path = self._write_envelope(_envelope(_statement(rcs_value=50)))
+        captured_stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(captured_stdout):
+            rc = main([path, "--min-rcs", "80", "--dry-run", "--format", "json"])
+
+        self.assertEqual(rc, EXIT_POLICY_VIOLATION)
+        payload = json.loads(captured_stdout.getvalue())
+        self.assertFalse(payload["verified"])
+
+    def test_format_defaults_to_text_on_stderr_not_stdout(self):
+        import contextlib
+        import io
+
+        path = self._write_envelope(_envelope(_statement(rcs_value=90)))
+        captured_stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(captured_stdout):
+            rc = main([path, "--min-rcs", "80", "--dry-run"])
+
+        self.assertEqual(rc, EXIT_PASS)
+        self.assertEqual(captured_stdout.getvalue(), "")
+
+    def test_deprecated_json_flag_still_emits_json_and_warns_on_stderr(self):
+        import contextlib
+        import io
+
+        path = self._write_envelope(_envelope(_statement(rcs_value=90)))
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+
+        with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(captured_stderr):
+            rc = main([path, "--min-rcs", "80", "--dry-run", "--json"])
+
+        self.assertEqual(rc, EXIT_PASS)
+        payload = json.loads(captured_stdout.getvalue())
+        self.assertTrue(payload["verified"])
+        self.assertIn("deprecated", captured_stderr.getvalue())
+
+
+class VerifyJsonPayloadTests(unittest.TestCase):
+    def _args(self, **overrides):
+        ns = parse_args(["unused-envelope-path.json", "--dry-run"])
+        for k, v in overrides.items():
+            setattr(ns, k, v)
+        return ns
+
+    def test_slsa_level_1_compliant_for_well_formed_predicate(self):
+        envelope = _envelope(_statement(rcs_value=85))
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+        slsa = _compute_slsa_assessment(result, self._args())
+
+        self.assertTrue(slsa["level_1"]["compliant"])
+        self.assertEqual(
+            slsa["level_1"]["checks"],
+            {
+                "statement_envelope": True,
+                "provenance_predicate": True,
+                "build_definition": True,
+                "subject_digest_match": True,
+            },
+        )
+
+    def test_slsa_level_2_fails_closed_on_unevaluated_resolved_dependencies(self):
+        envelope = _envelope(_statement(rcs_value=85))
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+        slsa = _compute_slsa_assessment(result, self._args())
+
+        # dry-run: no Sigstore identity verification was attempted, so
+        # hosted_builder/cryptographic_signature/source_binding are all
+        # honestly False -- and resolved_dependencies, which this pipeline
+        # has no signal for at all, fails closed to False rather than a
+        # null/unknown state (CLAUDE.md "Fail-Closed Verification"), so
+        # overall level_2 compliance is False, never fabricated as True.
+        self.assertFalse(slsa["level_2"]["checks"]["resolved_dependencies"])
+        self.assertFalse(slsa["level_2"]["compliant"])
+        self.assertIn("resolved_dependencies", slsa["level_2"]["unevaluated_checks"])
+        self.assertFalse(slsa["level_2"]["checks"]["hosted_builder"])
+        self.assertFalse(slsa["level_2"]["checks"]["cryptographic_signature"])
+
+    def test_slsa_level_2_stays_non_compliant_even_when_identity_verified(self):
+        """Even a fully-verified Sigstore identity can't make level_2
+        compliant True -- resolved_dependencies has no real signal in this
+        pipeline and fails closed, so it must always drag compliant to
+        False rather than being silently excluded from the roll-up."""
+        envelope = _envelope(_statement(rcs_value=85))
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        result.identity_status = "verified"  # simulate a fully verified signature
+
+        slsa = _compute_slsa_assessment(
+            result, self._args(expected_repository="acme/widgets", expected_issuer="https://example.test")
+        )
+
+        self.assertTrue(slsa["level_2"]["checks"]["hosted_builder"])
+        self.assertTrue(slsa["level_2"]["checks"]["cryptographic_signature"])
+        self.assertTrue(slsa["level_2"]["checks"]["source_binding"])
+        self.assertFalse(slsa["level_2"]["checks"]["resolved_dependencies"])
+        self.assertFalse(slsa["level_2"]["compliant"])
+
+    def test_slsa_level_1_fails_on_malformed_predicate_type(self):
+        statement = _statement(rcs_value=85)
+        statement["predicateType"] = "not-a-real-predicate-type"
+        envelope = _envelope(statement)
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+        slsa = _compute_slsa_assessment(result, self._args())
+
+        self.assertFalse(slsa["level_1"]["checks"]["provenance_predicate"])
+        self.assertFalse(slsa["level_1"]["compliant"])
+
+    def test_static_analysis_tools_by_name_merges_summary_and_quality_gate(self):
+        tools = [
+            {"name": "codeql", "summary": {"errors": 0, "warnings": 2}},
+            {
+                "name": "sonarcloud",
+                "extensions": {"sonarqube": {"quality_gate": "PASSED"}},
+            },
+            {"name": "", "summary": {"errors": 1}},  # no usable name -- skipped
+        ]
+
+        out = _static_analysis_tools_by_name(tools)
+
+        self.assertEqual(out["codeql"], {"errors": 0, "warnings": 2})
+        self.assertEqual(out["sonarcloud"], {"quality_gate": "PASSED"})
+        self.assertNotIn("", out)
+
+    def test_build_verify_json_payload_includes_all_top_level_sections(self):
+        envelope = _envelope(_statement(rcs_value=85))
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+        payload = _build_verify_json_payload(result, self._args())
+
+        for key in (
+            "version",
+            "verified",
+            "envelope",
+            "slsa",
+            "release_confidence_score",
+            "static_analysis",
+            "identity",
+            "violations",
+            "warnings",
+        ):
+            self.assertIn(key, payload)
+        json.dumps(payload)  # must be JSON-serializable end to end
+
+    def test_json_payload_degraded_never_null(self):
+        envelope = _envelope(_statement(omit_degraded_field=True))
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+        payload = _build_verify_json_payload(result, self._args())
+
+        self.assertIs(payload["release_confidence_score"]["degraded"], False)
+        self.assertIs(payload["release_confidence_score"]["degraded_field_present"], False)
 
 
 def _der_utf8_string(value: str) -> bytes:

@@ -468,11 +468,83 @@ unavailable, or validation itself raising unexpectedly all degrade to
 treated as a failure.
 
 When the predicate carries a `static_analysis.tools[]` block, the
-human-readable (non-`--json`) output prints a clean summary table —
-per-tool error/warning counts and SonarQube quality-gate status when
+human-readable (`--format text`, the default) output prints a clean summary
+table — per-tool error/warning counts and SonarQube quality-gate status when
 present — purely for display; it's never a gating input, so a malformed or
-missing table never affects `passed`. `--json` output carries the same
-data as `static_analysis_tools`.
+missing table never affects `passed`. `--format json` output carries the
+same data reshaped into `static_analysis.tools` (see below).
+
+**`--format {text,json}` / `-f`** (default: `text`) controls output shape:
+- `text` (default) prints the human-readable summary above to **stderr**
+  (banner, RCS/degraded line, static-analysis table, violations/warnings).
+- `json` suppresses all of that and emits **only** a single
+  `json.dumps(..., indent=2)` document on **stdout** — safe to pipe into
+  `jq` or another consumer without any banner/table text mixed in. Exit
+  codes (`0`/`1`/`2`, below) are unaffected by `--format`. Shape:
+  ```json
+  {
+    "version": "1.0.0",
+    "verified": true,
+    "envelope": {
+      "statement_type": "https://in-toto.io/Statement/v1",
+      "predicate_type": "https://tenax.io/attestations/assay/v1",
+      "subject": [{"name": "registry.example.com/org/svc", "digest": {"sha256": "..."}}]
+    },
+    "slsa": {
+      "level_1": {
+        "compliant": true,
+        "checks": {
+          "statement_envelope": true,
+          "provenance_predicate": true,
+          "build_definition": true,
+          "subject_digest_match": true
+        }
+      },
+      "level_2": {
+        "compliant": false,
+        "checks": {
+          "hosted_builder": true,
+          "cryptographic_signature": true,
+          "source_binding": true,
+          "resolved_dependencies": false
+        },
+        "unevaluated_checks": {
+          "resolved_dependencies": "not evaluated: tenax-assay does not track a build dependency graph"
+        }
+      }
+    },
+    "release_confidence_score": {"score": 89, "degraded": false, "degraded_field_present": true, "degraded_reasons": []},
+    "static_analysis": {"tools": {"codeql": {"errors": 0, "warnings": 0}, "sonarcloud": {"quality_gate": "PASSED"}}},
+    "identity": {"status": "verified", "detail": "..."},
+    "violations": [],
+    "warnings": []
+  }
+  ```
+  The `slsa` block is a **best-effort self-assessment derived only from
+  signals this tool actually verifies** — it is not an official SLSA
+  conformance claim. `level_1` checks map 1:1 onto the DSSE/Statement
+  decode and predicate-shape checks already performed. `level_2`'s
+  `hosted_builder`/`cryptographic_signature`/`source_binding` all require
+  `identity_status == "verified"` (real Sigstore cryptographic + identity
+  verification, not merely a signature being present); `hosted_builder`
+  additionally requires a CI-only identity claim was asserted
+  (`--expected-issuer`/`--expected-repository`/`--expected-workflow`/
+  `--expected-ref`/`--cert-oidc-issuer`), and `source_binding` additionally
+  requires `--expected-repository` was asserted and matched.
+  `resolved_dependencies` has no underlying signal — this pipeline doesn't
+  build or track a dependency graph — so per this repo's fail-closed
+  convention (see "Supply Chain Integrity & Attestation Invariants" in
+  `CLAUDE.md`) it's always `false` rather than a `null`/unknown state that
+  could be mistaken for "not yet checked"; `unevaluated_checks` carries the
+  reason alongside that `false` so an auditor can tell "checked and failed"
+  apart from "can't check this at all yet." Because that check can never
+  currently be verified, `level_2.compliant` is always `false` too — Level
+  2 compliance can never be claimed `true` while a required check is
+  unevaluated.
+
+  `--json` (no `-f`) is kept as a **deprecated alias** for `--format json`
+  — it emits the same payload and prints a one-line deprecation notice to
+  stderr (never stdout, so it can't corrupt a `--json` consumer's parsing).
 
 Policy gates:
 - `--min-rcs N` — fail if `release_confidence_score.value < N`.
@@ -488,7 +560,14 @@ Policy gates:
   diff with no code for patch coverage to be missing over). Any other
   cause present — a real governance gap, missing PR context, a broken
   SARIF input, or `degraded_reasons` missing/malformed entirely (e.g. an
-  older attestation predating this field) — still blocks. This
+  older attestation predating this field) — still blocks. `degraded`
+  itself is schema-optional (defaults to `false` for *display* when a
+  predicate omits it — that default is documented in
+  `schema/tenax-attestation-v1.schema.json`, not a guess) — but
+  `--disallow-degraded` never trusts that display default as a compliance
+  signal: `degraded` missing or malformed entirely is its own fail-closed
+  violation under this flag (`degraded_field_present == False`), same
+  severity as a confirmed `degraded == true` with no exempted reason. This
   deliberately can't be approximated by simpler proxies like repo
   visibility (`private == true`): private repos on GitHub Pro/Team/
   Enterprise *do* support rulesets, so a repo-visibility check would

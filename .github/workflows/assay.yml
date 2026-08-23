@@ -33,29 +33,17 @@ permissions:
   contents: read
   security-events: write # Required for github/codeql-action/analyze to upload SARIF to code scanning
 
-# SIGNER_WORKFLOW_REF is the *single* source of truth for which
-# tenax-io/tenax-attest/.github/workflows/sign.yml release the `attest` job
-# below trusts -- it must be kept identical to the tag pinned on that job's
-# `uses:` line (GitHub Actions reusable-workflow calls don't accept
+# SIGNER_WORKFLOW_SHA is the *single* source of truth for the pinned commit
+# tenax-io/tenax-attest/.github/workflows/sign.yml is trusted at -- it must
+# be kept byte-for-byte identical to the SHA pinned on the `attest` job's
+# `uses:` line below (GitHub Actions reusable-workflow calls don't accept
 # expressions in `uses:`, so that line can't just reference this var
 # directly; bump both together, in the same commit, whenever `attest`'s pin
-# moves). The `verify` job's admission gate reads it back out to build
-# --cert-identity, so the gate can never drift from what `attest` actually
-# invoked.
-#
-# This is a tracked SemVer major-version tag (`v1`), not a commit SHA: it
-# moves automatically as tenax-attest cuts new v1.x.y releases, trading the
-# cryptographic guarantee a SHA pin gives (the identity check below can
-# only ever match one specific commit) for not having to land a commit
-# here every time tenax-attest releases. What still makes that safe is
-# entirely external to this file: a repository ruleset on tenax-io/
-# tenax-attest restricting who can move the `v1` tag (see that repo's
-# sign.yml header comment, "Releases" section) -- if that ruleset is ever
-# missing or bypassed, --cert-identity below would silently accept
-# whatever `v1` was repointed to, since Fulcio certificates carry the ref
-# name that was checked out, not the resolved commit.
+# moves). The `verify` job's admission gate reads it back out via
+# `${{ env.SIGNER_WORKFLOW_SHA }}` to build --cert-identity, so the gate can
+# never drift from what `attest` actually invoked.
 env:
-  SIGNER_WORKFLOW_REF: v1 # tracks tenax-io/tenax-attest's `v1` release tag -- keep in sync with attest job's `uses:` pin
+  SIGNER_WORKFLOW_SHA: 8730ecaf79e4d55cb18be9a89ecd5cea645bba75 # v2 (2026-08-23: remove signer-ref input) -- keep in sync with attest job's `uses:` pin
 
 jobs:
   # Runs the PR's own code: tests, coverage, CodeQL, SonarQube, RCS scoring.
@@ -292,36 +280,27 @@ jobs:
   # `build` uploaded, and nothing it computes itself. The signing job's
   # code lives entirely in tenax-io/tenax-attest (a separate, branch-
   # protected repo -- see contrib/tenax-attest-repo/ in this repo for its
-  # content/rationale), checked out there at whatever commit its `v1`
-  # release tag currently resolves to (`uses:` below) -- so a PR that
-  # fully rewrites this workflow file, or tenax-assay's own pipeline code,
-  # in the same PR cannot also change what the signer trusts, since that
-  # code isn't part of this PR's diff at all.
+  # content/rationale), checked out there at a commit SHA (`uses:` below)
+  # pinned independently of whatever ref triggered this run -- so a PR
+  # that fully rewrites this workflow file, or tenax-assay's own pipeline
+  # code, in the same PR cannot also change what the signer trusts, since
+  # that code isn't part of this PR's diff at all.
   #
-  # `uses: ...@v1` tracks tenax-attest's `v1` release tag rather than a
-  # pinned commit SHA -- a new tenax-attest v1.x.y release is picked up
-  # here with no commit needed in this repo. That convenience comes
-  # entirely from trusting a repository ruleset on tenax-io/tenax-attest
-  # that restricts who can move `v1` (see that repo's sign.yml header
-  # comment); there is no SHA pin left in this file to fall back on if
-  # that ruleset is ever missing or bypassed.
-  #
-  # This job has no way to choose which tenax-assay ref sign.yml checks
+  # This job has no way to choose which tenax-assay commit sign.yml checks
   # out for cli/sign.py/cli/oidc_signer.py: that pin lives hardcoded inside
-  # tenax-attest's own sign.yml (env.TRUSTED_SIGNER_REF), not as a
+  # tenax-attest's own sign.yml (env.TRUSTED_SIGNER_SHA), not as a
   # `workflow_call` input here -- a caller-supplied `signer-ref` input was
   # deliberately removed so the privileged signing job can never be pointed
-  # at caller-chosen code. Bumping which tenax-assay release the signer
+  # at caller-chosen code. Bumping which tenax-assay commit the signer
   # trusts is exclusively a tenax-attest-repo change, same discipline as
-  # bumping the `uses:` tag below whenever tenax-attest cuts a new v1
-  # release -- and env.SIGNER_WORKFLOW_REF above must move with it, in the
-  # same commit.
+  # bumping the `uses:` SHA below whenever tenax-attest's own sign.yml
+  # changes.
   attest:
     needs: build
     permissions:
       id-token: write # Required for Sigstore keyless OIDC minting
       contents: read
-    uses: tenax-io/tenax-attest/.github/workflows/sign.yml@v1
+    uses: tenax-io/tenax-attest/.github/workflows/sign.yml@8730ecaf79e4d55cb18be9a89ecd5cea645bba75 # v2 (2026-08-23: remove signer-ref input)
     with:
       artifact-name: unsigned-statements
       statement-files: |
@@ -381,28 +360,16 @@ jobs:
         env:
           EXPECTED_REPOSITORY: ${{ github.repository }}
           EXPECTED_REF: ${{ github.ref }}
-          # Pins the admission gate to the quarantined signer identity: not
-          # just "some workflow in tenax-io/tenax-attest", but that repo's
-          # sign.yml specifically, at the same release `attest` invoked
-          # (env.SIGNER_WORKFLOW_REF, declared once at the top of this
-          # file). --expected-repository/--expected-ref alone only
-          # constrain claims about *this* repo's own ref -- they say
-          # nothing about which workflow minted the OIDC token, so without
-          # --cert-identity any other job in tenax-assay that ever
-          # acquired id-token: write could sign an envelope this gate
-          # would still accept.
-          #
-          # This now matches by *ref name* (refs/tags/v1), not by commit:
-          # Fulcio embeds the literal ref the reusable workflow was
-          # checked out at into the certificate, so this string is
-          # identical for every commit `v1` has ever pointed to. The
-          # cryptographic guarantee that used to come from matching an
-          # exact commit SHA here now depends entirely on the tag-
-          # protection ruleset on tenax-io/tenax-attest restricting who
-          # can move `v1` (see that repo's sign.yml header comment) -- if
-          # that ruleset is ever missing or bypassed, this check cannot
-          # detect it.
-          CERT_IDENTITY: https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml@refs/tags/${{ env.SIGNER_WORKFLOW_REF }}
+          # Pins the admission gate to the exact quarantined signer identity:
+          # not just "some workflow in tenax-io/tenax-attest", but that repo's
+          # sign.yml specifically, at the same commit SHA `attest` invoked
+          # (env.SIGNER_WORKFLOW_SHA, declared once at the top of this file).
+          # --expected-repository/--expected-ref alone only constrain claims
+          # about *this* repo's own ref -- they say nothing about which
+          # workflow minted the OIDC token, so without --cert-identity any
+          # other job in tenax-assay that ever acquired id-token: write could
+          # sign an envelope this gate would still accept.
+          CERT_IDENTITY: https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml@${{ env.SIGNER_WORKFLOW_SHA }}
           CERT_OIDC_ISSUER: https://token.actions.githubusercontent.com
           # Binds admission to the *caller* side of the identity too: not
           # just "signed by the quarantined tenax-attest signer" (that's

@@ -1,70 +1,36 @@
 name: Sign In-Toto Statement (Sigstore Keyless)
 
 # Reusable workflow: the trusted signing boundary for tenax-assay-produced
-# attestations.
-#
-# Public entrypoint: `uses: tenax-io/tenax-attest/.github/workflows/
-# sign.yml@v1` -- callers track the `v1` SemVer-major release tag rather
-# than a commit SHA, so a new v1.x.y release of this workflow is picked up
-# by every caller without a corresponding commit in their own repo. See
-# "Releases" below for what that requires of *this* repo to stay safe.
-# Called from a *calling* repo's own job (see tenax-io/tenax-assay's
-# .github/workflows/assay.yml `attest` job) -- never invoked directly.
+# attestations. Called via `uses: tenax-io/tenax-attest/.github/workflows/
+# sign.yml@<pinned-sha>` from a *calling* repo's own job (see
+# tenax-io/tenax-assay's .github/workflows/assay.yml `attest` job) -- never
+# invoked directly.
 #
 # Why this lives in its own repo rather than as a job inside the calling
-# repo's own workflow file: env.TRUSTED_SIGNER_REF below is a ref of
+# repo's own workflow file: env.TRUSTED_SIGNER_SHA below is a commit SHA of
 # tenax-io/tenax-assay hardcoded in *this* file -- it is deliberately NOT a
 # `workflow_call` input the caller can set. What actually executes is this
 # file, checked out from THIS repo at whatever ref the caller's `uses:`
-# line resolves (currently the `v1` tag; see that line's own comment), so
-# a PR to tenax-assay that rewrites its own workflow file, or the pipeline
-# code TRUSTED_SIGNER_REF points at, cannot also rewrite what this job
-# trusts -- neither is part of that PR's diff at all, and neither can
-# steer this job to check out a different tenax-assay ref than the one
-# tracked here.
+# line pins (see that line's own `# vX` comment for which one), so a PR to
+# tenax-assay that rewrites its own workflow file, or the pipeline code
+# TRUSTED_SIGNER_SHA points at, cannot also rewrite what this job trusts --
+# neither is part of that PR's diff at all, and neither can steer this job
+# to check out a different tenax-assay ref than the one pinned here.
+# Bumping TRUSTED_SIGNER_SHA (which tenax-assay commit's cli/sign.py +
+# cli/oidc_signer.py this job trusts enough to check out and run) is a
+# separate, deliberate, reviewable commit to *this* repo -- never something
+# a caller-side compromise (a malicious `workflow_call` input, a rewritten
+# assay.yml) can do by itself.
 #
 # A caller-controlled `signer-ref` input previously existed here and was
 # removed deliberately: the privileged job below (id-token: write) must
 # never execute code checked out from a ref an untrusted caller supplies
-# dynamically. TRUSTED_SIGNER_REF is the opposite of that -- a ref this
-# repo alone controls -- but it is now a tracked tag (`refs/tags/v1`)
-# rather than an immutable commit SHA, which trades a cryptographic
-# guarantee for release-process convenience. See "Releases" below for the
-# tag-protection rules that are the *entire* remaining backstop against
-# that ref moving to unreviewed code; there is no downstream check that
-# would catch it if that ruleset were ever missing or bypassed.
+# dynamically, no matter how independently that ref was described as
+# "pinned" -- the caller, not this repo, would still control the value.
 #
 # id-token: write is granted to exactly one job, in exactly one workflow,
 # in this one repo. No other job anywhere in the calling repo's own
 # workflow has it (see assay.yml's top-level `permissions:` comment).
-#
-# ## Releases
-#
-# This repo's own `sign.yml` (the file callers `uses:`) and the
-# tenax-assay commit it trusts (TRUSTED_SIGNER_REF, below) are versioned
-# and released independently, each as real, tagged GitHub Releases:
-#
-#   - This repo: tag `vX.Y.Z` on the commit being released, plus a moving
-#     `vX` major-version alias (`v1`, `v2`, ...) repointed to the latest
-#     `vX.*.*` on every release -- the same convention
-#     `actions/*`/`github/codeql-action`/etc. use. Callers normally track
-#     the moving `vX` alias (`uses: ...@v1`); pin to an exact `vX.Y.Z` tag
-#     instead if you want a specific release to never move under you.
-#   - tenax-assay: TRUSTED_SIGNER_REF here tracks that repo's own `vX`
-#     release tag the same way, rather than a commit SHA -- bump the
-#     *value* it points to only by cutting a new tenax-assay release, never
-#     by hand-editing a SHA in this file.
-#
-# Both `v1` tags (this repo's and tenax-assay's) MUST be protected by a
-# repository ruleset restricting who can create/update/delete refs
-# matching `v*` (Settings -> Rules -> Rulesets -> New tag ruleset), scoped
-# to release-manager accounts only, with deletion and non-fast-forward
-# updates blocked. Because CERT_IDENTITY in tenax-assay's verify gate
-# matches this workflow's SAN by ref name (`.../sign.yml@refs/tags/v1`,
-# not by commit), that ruleset -- not the identity check -- is what
-# actually prevents `v1` from being silently repointed at unreviewed code
-# post-release. Treat changes to it with the same scrutiny as a
-# branch-protection change on `main`.
 
 on:
   workflow_call:
@@ -89,14 +55,14 @@ on:
 
 permissions: {}
 
-# The one and only ref of tenax-io/tenax-assay this job will ever check out
-# cli/sign.py + cli/oidc_signer.py from. Hardcoded here rather than
+# The one and only commit of tenax-io/tenax-assay this job will ever check
+# out cli/sign.py + cli/oidc_signer.py from. Hardcoded here rather than
 # accepted as a workflow_call input -- see the file header for why. Bump
-# this only by cutting a new tenax-assay `v1.x.y` release and repointing
-# tenax-assay's own `v1` tag at it (that repo's release process), never by
-# hand-editing this value to a branch or an arbitrary ref.
+# this in its own deliberate, reviewed commit to *this* repo whenever
+# tenax-assay's signing surface should move; never point it at a branch,
+# and never accept it as a value from the calling workflow.
 env:
-  TRUSTED_SIGNER_REF: refs/tags/v1
+  TRUSTED_SIGNER_SHA: e1d66a2bb4aeba71abc4a251ce8d59373a7d7d79 # tenax-assay main: feat(provenance)+feat(sign) (#26)
 
 jobs:
   sign:
@@ -108,7 +74,7 @@ jobs:
     steps:
       # Explicit repository:/ref: -- this is NOT a self-checkout of
       # tenax-attest. It checks out tenax-io/tenax-assay at the hardcoded
-      # env.TRUSTED_SIGNER_REF above (never anything caller-supplied), into
+      # env.TRUSTED_SIGNER_SHA above (never anything caller-supplied), into
       # a subdirectory, purely to get the small, stable cli/sign.py +
       # cli/oidc_signer.py signing surface (see those files' own
       # docstrings) -- nothing from the calling build job's own checkout
@@ -117,7 +83,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: tenax-io/tenax-assay
-          ref: ${{ env.TRUSTED_SIGNER_REF }}
+          ref: ${{ env.TRUSTED_SIGNER_SHA }}
           path: _signer
 
       - name: Set up Python
@@ -139,7 +105,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/sigstore-python
-          key: sigstore-tuf-${{ runner.os }}
+          key: sigstore-tuf-${{ runner.os }}-${{ env.TRUSTED_SIGNER_SHA }}
           restore-keys: |
             sigstore-tuf-${{ runner.os }}-
 

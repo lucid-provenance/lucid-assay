@@ -811,6 +811,48 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
         with self.assertRaises(VerificationError):
             policy.verify(cert)
 
+    def test_cert_identity_matches_tag_based_san(self):
+        """--cert-identity must match a SAN minted for a tag-tracked reusable
+        workflow call (`uses: .../sign.yml@v1`) the same way it matches a
+        SHA-pinned one -- sp.Identity does a plain string-set comparison
+        (see test_cert_identity_rejects_prefix_match's docstring), so a SAN
+        ending in `@refs/tags/v1` requires no special-casing versus one
+        ending in a commit SHA."""
+        expected = "https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml@refs/tags/v1"
+        cert = self._cert(san_uri=expected, issuer=GITHUB_ACTIONS_OIDC_ISSUER)
+        policy, unsafe, _ = _build_identity_policy(
+            cert_identity=expected,
+            cert_oidc_issuer=GITHUB_ACTIONS_OIDC_ISSUER,
+            expected_issuer=None, expected_repository=None, expected_workflow=None, expected_ref=None,
+        )
+        self.assertFalse(unsafe)
+        policy.verify(cert)  # must not raise
+
+    def test_cert_identity_tag_based_san_is_commit_agnostic(self):
+        """Documents the trade-off a tag-tracked --cert-identity accepts,
+        deliberately, rather than as a bug: because Fulcio embeds the ref
+        string a reusable workflow was invoked with (not the commit it
+        resolved to) into the certificate, a SAN ending in `@refs/tags/v1`
+        matches identically regardless of *which* commit `v1` pointed to
+        when that particular signature was minted. Unlike a SHA-pinned
+        identity (see test_cert_identity_rejects_prefix_match), this policy
+        alone cannot distinguish a signature minted before vs. after `v1`
+        was repointed -- that guarantee now lives entirely in the tag-
+        protection ruleset on tenax-io/tenax-attest restricting who can
+        move `v1` (see assay.yml's CERT_IDENTITY comment)."""
+        expected = "https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml@refs/tags/v1"
+        policy, _, _ = _build_identity_policy(
+            cert_identity=expected,
+            cert_oidc_issuer=GITHUB_ACTIONS_OIDC_ISSUER,
+            expected_issuer=None, expected_repository=None, expected_workflow=None, expected_ref=None,
+        )
+        # Two certs, standing in for signatures minted while `v1` pointed at
+        # two different (hypothetical) tenax-attest commits -- same ref,
+        # same SAN, both pass identically.
+        for _ in range(2):
+            cert = self._cert(san_uri=expected, issuer=GITHUB_ACTIONS_OIDC_ISSUER)
+            policy.verify(cert)  # must not raise, for either
+
     def test_cert_oidc_issuer_alone_matches(self):
         cert = self._cert(issuer=GITHUB_ACTIONS_OIDC_ISSUER)
         policy, unsafe, _ = _build_identity_policy(

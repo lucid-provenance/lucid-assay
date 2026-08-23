@@ -43,7 +43,7 @@ permissions:
 # `${{ env.SIGNER_WORKFLOW_SHA }}` to build --cert-identity, so the gate can
 # never drift from what `attest` actually invoked.
 env:
-  SIGNER_WORKFLOW_SHA: 11086bc4004f0e0e061a3c3e30223535f696e1f0 # v1 (2026-08-23: add sign.yml) -- keep in sync with attest job's `uses:` pin
+  SIGNER_WORKFLOW_SHA: 8730ecaf79e4d55cb18be9a89ecd5cea645bba75 # v2 (2026-08-23: remove signer-ref input) -- keep in sync with attest job's `uses:` pin
 
 jobs:
   # Runs the PR's own code: tests, coverage, CodeQL, SonarQube, RCS scoring.
@@ -300,7 +300,7 @@ jobs:
     permissions:
       id-token: write # Required for Sigstore keyless OIDC minting
       contents: read
-    uses: tenax-io/tenax-attest/.github/workflows/sign.yml@11086bc4004f0e0e061a3c3e30223535f696e1f0 # v1 (2026-08-23: add sign.yml)
+    uses: tenax-io/tenax-attest/.github/workflows/sign.yml@8730ecaf79e4d55cb18be9a89ecd5cea645bba75 # v2 (2026-08-23: remove signer-ref input)
     with:
       artifact-name: unsigned-statements
       statement-files: |

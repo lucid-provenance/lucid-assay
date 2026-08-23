@@ -102,6 +102,16 @@ class OffCiFailsClosedTests(_EnvIsolatedTestCase):
         )
         self.assertEqual(statement["predicate"]["buildDefinition"]["externalParameters"], {})
 
+    def test_workflow_ref_with_empty_ref_after_at_sign_is_omitted_not_guessed(self):
+        self._set_hosted_github_actions_env()
+        os.environ["GITHUB_WORKFLOW_REF"] = "org/svc/.github/workflows/assay.yml@"  # empty ref
+        statement = build_slsa_provenance_statement(
+            subject_name="registry.example.com/org/svc",
+            subject_sha256="a" * 64,
+            started_at="2026-08-23T12:00:00Z",
+        )
+        self.assertEqual(statement["predicate"]["buildDefinition"]["externalParameters"], {})
+
 
 class GenuineGitHubActionsRunTests(_EnvIsolatedTestCase):
     def test_matches_fixture_statement(self):

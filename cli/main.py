@@ -146,6 +146,34 @@ def derive_slsa_provenance_path(out_path: str, explicit: Optional[str]) -> str:
     return f"{out_path}.slsa-provenance.json"
 
 
+def _maybe_emit_slsa_provenance(
+    args: argparse.Namespace,
+    *,
+    image_digest: str,
+    pipeline_started_at: str,
+    resolved_dependencies: Optional[List[Dict[str, Any]]],
+) -> Optional[str]:
+    """Step 7b: builds and writes the --emit-slsa-provenance second
+    statement (see cli/slsa_provenance.py), returning the path it was
+    written to, or None when the flag wasn't passed. Extracted (same
+    rationale as _detect_lockfile_dependencies/_maybe_sign above) so it's
+    unit-testable directly with a tmp dir and a plain argparse.Namespace,
+    rather than only reachable by driving main() end to end."""
+    if not args.emit_slsa_provenance:
+        return None
+
+    slsa_statement = build_slsa_provenance_statement(
+        subject_name=args.image_ref,
+        subject_sha256=image_digest,
+        started_at=pipeline_started_at,
+        resolved_dependencies=resolved_dependencies,
+    )
+    slsa_provenance_out_path = safe_resolve_path(derive_slsa_provenance_path(args.out, args.slsa_provenance_out))
+    with open(slsa_provenance_out_path, "w", encoding="utf-8") as f:
+        json.dump(slsa_statement, f, indent=2)
+    return slsa_provenance_out_path
+
+
 def upload_to_worm_async(local_path: str, sha256_hex: str, bucket: str = "evidence"):
     """Fire-and-forget evidence storage dispatch."""
     def _upload():
@@ -489,19 +517,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     # shaped as real SLSA v1.0 provenance (see cli/slsa_provenance.py).
     # Independent of the RCS predicate above -- same subject digest, but
     # its own file and (if --sign/--dry-run-sign) its own DSSE envelope.
-    slsa_provenance_out_path = None
-    if args.emit_slsa_provenance:
-        slsa_statement = build_slsa_provenance_statement(
-            subject_name=args.image_ref,
-            subject_sha256=image_digest,
-            started_at=pipeline_started_at,
-            resolved_dependencies=resolved_dependencies,
-        )
-        slsa_provenance_out_path = safe_resolve_path(
-            derive_slsa_provenance_path(args.out, args.slsa_provenance_out)
-        )
-        with open(slsa_provenance_out_path, "w", encoding="utf-8") as f:
-            json.dump(slsa_statement, f, indent=2)
+    slsa_provenance_out_path = _maybe_emit_slsa_provenance(
+        args,
+        image_digest=image_digest,
+        pipeline_started_at=pipeline_started_at,
+        resolved_dependencies=resolved_dependencies,
+    )
 
     # 8. Async WORM uploads (fire-and-forget: the timed cost here is only
     # the dispatch/submission overhead, not the background upload itself)

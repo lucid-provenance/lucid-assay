@@ -15,7 +15,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .builder import build_statement
 from .common import safe_resolve_path
@@ -190,6 +190,17 @@ def _ingest_sarif(args: argparse.Namespace, stage_ns: Dict[str, int]) -> Optiona
         _merge_sonar_metrics(args.sonar_metrics, sarif_report)
 
     return sarif_report
+
+
+def _detect_lockfile_dependencies(args: argparse.Namespace, stage_ns: Dict[str, int]) -> List[Dict[str, Any]]:
+    """Step 6b: auto-detects and parses lockfiles under args.repo_dir
+    (uv.lock/package-lock.json/go.sum/Gradle/Maven -- see
+    cli.parsers.lockfiles) into the predicate's resolved_dependencies.
+    Scoring-independent -- feeds build_statement() only. Extracted (same
+    rationale as _ingest_sarif above) so it's unit-testable directly
+    rather than only reachable by driving main() end to end."""
+    with _stage(stage_ns, "lockfile_dependencies"):
+        return detect_and_parse_dependencies(args.repo_dir)
 
 
 def _maybe_sign(args: argparse.Namespace, out_path) -> Tuple[Optional[int], Dict[str, int]]:
@@ -389,12 +400,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             ast_skipped_test_functions=ast_skipped,
         )
 
-    # 6b. Lockfile dependency detection (repo_dir lockfiles -> the
-    # predicate's resolved_dependencies -- scoring-independent, feeds
-    # build_statement only; never raises, degrades to [] on any missing/
-    # unreadable/unrecognized lockfile).
-    with _stage(stage_ns, "lockfile_dependencies"):
-        resolved_dependencies = detect_and_parse_dependencies(args.repo_dir)
+    # 6b. Lockfile dependency detection (see _detect_lockfile_dependencies)
+    resolved_dependencies = _detect_lockfile_dependencies(args, stage_ns)
 
     # 7. Build unsigned in-toto Statement
     with _stage(stage_ns, "predicate_assembly"):

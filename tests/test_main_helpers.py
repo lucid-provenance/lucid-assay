@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 
-from cli.main import _emit_run_warnings, _ingest_sarif, _maybe_sign, _merge_sonar_metrics
+from cli.main import _detect_lockfile_dependencies, _emit_run_warnings, _ingest_sarif, _maybe_sign, _merge_sonar_metrics
 from cli.parsers.github_rules import BranchGovernanceReport
 from cli.parsers.sarif import SarifSummaryReport, SarifToolSummary
 from cli.scorer import RCSResult
@@ -164,6 +164,48 @@ class IngestSarifTests(unittest.TestCase):
         self.assertTrue(result.available)
         tool = next(t for t in result.tools if t.name == "sonarqube")
         self.assertEqual(tool.extensions["sonarqube"]["quality_gate"], "FAILED")
+
+
+class DetectLockfileDependenciesTests(unittest.TestCase):
+    def _tmp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        return d
+
+    def _args(self, repo_dir):
+        return argparse.Namespace(repo_dir=repo_dir)
+
+    def test_no_lockfiles_returns_empty_list(self):
+        stage_ns = {}
+        result = _detect_lockfile_dependencies(self._args(self._tmp()), stage_ns)
+        self.assertEqual(result, [])
+        self.assertIn("lockfile_dependencies", stage_ns)
+
+    def test_uv_lock_is_detected_and_parsed(self):
+        repo_dir = self._tmp()
+        toml = """
+[[package]]
+name = "pytest"
+version = "8.3.2"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://example/pytest-8.3.2-py3-none-any.whl", hash = "sha256:deadbeef" },
+]
+"""
+        _write(repo_dir, "uv.lock", toml)
+
+        stage_ns = {}
+        result = _detect_lockfile_dependencies(self._args(repo_dir), stage_ns)
+
+        self.assertEqual(result, [{"uri": "pkg:pypi/pytest@8.3.2", "digest": {"sha256": "deadbeef"}}])
+        self.assertIn("lockfile_dependencies", stage_ns)
+        self.assertGreaterEqual(stage_ns["lockfile_dependencies"], 0)
+
+    def test_nonexistent_repo_dir_returns_empty_list_not_raise(self):
+        result = _detect_lockfile_dependencies(
+            self._args(os.path.join(self._tmp(), "does-not-exist")), {}
+        )
+        self.assertEqual(result, [])
 
 
 class MaybeSignTests(unittest.TestCase):

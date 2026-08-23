@@ -274,11 +274,11 @@ jobs:
   # code, in the same PR cannot also change what the signer trusts, since
   # that code isn't part of this PR's diff at all.
   #
-  # `signer-ref` below is temporarily pinned to a commit on the
-  # feat/slsa-v1-provenance-attestation branch (the one that introduced
-  # cli/sign.py) rather than `main`, since that PR hasn't merged yet --
-  # bump it to the merge commit on `main` once it has, same discipline as
-  # bumping the `uses:` SHA whenever tenax-attest's own sign.yml changes.
+  # `signer-ref` pins to a commit on `main` -- bump it (deliberate,
+  # reviewed commit, never a moving branch) whenever cli/sign.py or
+  # cli/oidc_signer.py change in a way the signer should pick up, same
+  # discipline as bumping the `uses:` SHA whenever tenax-attest's own
+  # sign.yml changes.
   attest:
     needs: build
     permissions:
@@ -290,7 +290,7 @@ jobs:
       statement-files: |
         tenax-assay.unsigned.json
         tenax-assay.slsa-provenance.unsigned.json
-      signer-ref: 583bedebf5685c157ac7aa57a0fe4812d42025a2 # feat/slsa-v1-provenance-attestation: feat(sign) -- bump to main's merge commit once that PR lands
+      signer-ref: e1d66a2bb4aeba71abc4a251ce8d59373a7d7d79 # main: feat(provenance)+feat(sign) (#26)
 
   # Downloads the signed envelopes `attest` produced and evaluates
   # tenax-assay's own admission policy gates against them, plus the

@@ -759,9 +759,10 @@ verify (contents: read)
 credential — `id-token: write` is granted to `attest` alone. `attest` is a
 `uses:` call to [`tenax-io/tenax-attest`](https://github.com/tenax-io/tenax-attest),
 a separate, branch-protected repository hosting the signing job as a
-`workflow_call` reusable workflow, checked out at a commit SHA (`signer-ref`)
-pinned independently of whatever ref triggered the calling run (the same
-pattern [`slsa-framework/slsa-github-generator`](https://github.com/slsa-framework/slsa-github-generator)
+`workflow_call` reusable workflow, checked out at a commit SHA hardcoded
+inside that repo's own `sign.yml` (`env.TRUSTED_SIGNER_SHA`) — deliberately
+*not* a value `tenax-assay`'s `attest` job (or any other caller) can supply
+(the same pattern [`slsa-framework/slsa-github-generator`](https://github.com/slsa-framework/slsa-github-generator)
 uses). That's the gap that matters: even a PR that fully rewrites
 `tenax-assay`'s own workflow file in the same PR can't also rewrite what
 the signer trusts, since that code isn't part of the PR's diff at all. The

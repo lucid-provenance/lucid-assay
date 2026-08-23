@@ -767,6 +767,72 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
         self.assertFalse(unsafe)
         policy.verify(cert)
 
+    def test_mismatched_cert_identity_fails(self):
+        """A cert signed by a different workflow entirely (different repo,
+        different workflow file) must be rejected outright -- this is the
+        exact bypass --cert-identity exists to close: some other workflow
+        that ever acquired id-token: write must not be able to impersonate
+        the quarantined signer."""
+        cert = self._cert(
+            san_uri="https://github.com/tenax-io/tenax-assay/.github/workflows/assay.yml@refs/heads/main",
+            issuer=GITHUB_ACTIONS_OIDC_ISSUER,
+        )
+        policy, unsafe, _ = _build_identity_policy(
+            cert_identity="https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml@11086bc4004f0e0e061a3c3e30223535f696e1f0",
+            cert_oidc_issuer=GITHUB_ACTIONS_OIDC_ISSUER,
+            expected_issuer=None, expected_repository=None, expected_workflow=None, expected_ref=None,
+        )
+        self.assertFalse(unsafe)
+        from sigstore.errors import VerificationError
+
+        with self.assertRaises(VerificationError):
+            policy.verify(cert)
+
+    def test_cert_identity_rejects_prefix_match(self):
+        """A SAN that merely starts with (or extends) the expected identity
+        string must not verify -- sp.Identity matches via Python `in` against
+        a *set* of exact SAN strings (see sigstore.verify.policy.Identity),
+        never a prefix/substring test, so an attacker-controlled workflow
+        path that happens to share a prefix (e.g. a same-named workflow file
+        one path segment deeper, or an extra trailing ref segment) must still
+        be rejected."""
+        expected = "https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml@11086bc4004f0e0e061a3c3e30223535f696e1f0"
+        cert = self._cert(
+            san_uri=expected + "-evil",  # expected is a strict prefix of the actual SAN
+            issuer=GITHUB_ACTIONS_OIDC_ISSUER,
+        )
+        policy, _, _ = _build_identity_policy(
+            cert_identity=expected,
+            cert_oidc_issuer=GITHUB_ACTIONS_OIDC_ISSUER,
+            expected_issuer=None, expected_repository=None, expected_workflow=None, expected_ref=None,
+        )
+        from sigstore.errors import VerificationError
+
+        with self.assertRaises(VerificationError):
+            policy.verify(cert)
+
+    def test_cert_oidc_issuer_alone_matches(self):
+        cert = self._cert(issuer=GITHUB_ACTIONS_OIDC_ISSUER)
+        policy, unsafe, _ = _build_identity_policy(
+            cert_identity=None,
+            cert_oidc_issuer=GITHUB_ACTIONS_OIDC_ISSUER,
+            expected_issuer=None, expected_repository=None, expected_workflow=None, expected_ref=None,
+        )
+        self.assertFalse(unsafe)
+        policy.verify(cert)  # must not raise
+
+    def test_cert_oidc_issuer_alone_mismatch_fails(self):
+        cert = self._cert(issuer="https://gitlab.com")
+        policy, _, _ = _build_identity_policy(
+            cert_identity=None,
+            cert_oidc_issuer=GITHUB_ACTIONS_OIDC_ISSUER,
+            expected_issuer=None, expected_repository=None, expected_workflow=None, expected_ref=None,
+        )
+        from sigstore.errors import VerificationError
+
+        with self.assertRaises(VerificationError):
+            policy.verify(cert)
+
 
 def _b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")

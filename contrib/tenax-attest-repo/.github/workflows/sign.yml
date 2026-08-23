@@ -7,16 +7,26 @@ name: Sign In-Toto Statement (Sigstore Keyless)
 # invoked directly.
 #
 # Why this lives in its own repo rather than as a job inside the calling
-# repo's own workflow file: `signer-ref` below is a commit SHA the CALLER
-# passes in, but what actually executes is *this file*, checked out from
-# THIS repo at whatever ref the caller's `uses:` line pins (see that
-# line's own `# vX` comment for which one) -- a PR to tenax-assay that
-# rewrites its own workflow file, or the pipeline code `signer-ref` points
-# at, cannot also rewrite what this file does, because this file isn't
-# part of that PR's diff at all. Bumping `signer-ref` (which tenax-assay
-# commit's cli/sign.py + cli/oidc_signer.py this job trusts enough to
-# check out and run) is a separate, deliberate, reviewable act -- not
-# something a build-job compromise can do by itself.
+# repo's own workflow file: env.TRUSTED_SIGNER_SHA below is a commit SHA of
+# tenax-io/tenax-assay hardcoded in *this* file -- it is deliberately NOT a
+# `workflow_call` input the caller can set. What actually executes is this
+# file, checked out from THIS repo at whatever ref the caller's `uses:`
+# line pins (see that line's own `# vX` comment for which one), so a PR to
+# tenax-assay that rewrites its own workflow file, or the pipeline code
+# TRUSTED_SIGNER_SHA points at, cannot also rewrite what this job trusts --
+# neither is part of that PR's diff at all, and neither can steer this job
+# to check out a different tenax-assay ref than the one pinned here.
+# Bumping TRUSTED_SIGNER_SHA (which tenax-assay commit's cli/sign.py +
+# cli/oidc_signer.py this job trusts enough to check out and run) is a
+# separate, deliberate, reviewable commit to *this* repo -- never something
+# a caller-side compromise (a malicious `workflow_call` input, a rewritten
+# assay.yml) can do by itself.
+#
+# A caller-controlled `signer-ref` input previously existed here and was
+# removed deliberately: the privileged job below (id-token: write) must
+# never execute code checked out from a ref an untrusted caller supplies
+# dynamically, no matter how independently that ref was described as
+# "pinned" -- the caller, not this repo, would still control the value.
 #
 # id-token: write is granted to exactly one job, in exactly one workflow,
 # in this one repo. No other job anywhere in the calling repo's own
@@ -33,10 +43,6 @@ on:
         description: "Newline-separated list of *.unsigned.json filenames (within artifact-name) to sign"
         required: true
         type: string
-      signer-ref:
-        description: "Commit SHA of tenax-io/tenax-assay to check out for cli/sign.py + cli/oidc_signer.py -- pinned independently of whatever ref triggered the caller, never the caller's own ref"
-        required: true
-        type: string
       dry-run-sign:
         description: "Simulate DSSE envelope creation without a real OIDC/Sigstore round-trip"
         required: false
@@ -49,6 +55,15 @@ on:
 
 permissions: {}
 
+# The one and only commit of tenax-io/tenax-assay this job will ever check
+# out cli/sign.py + cli/oidc_signer.py from. Hardcoded here rather than
+# accepted as a workflow_call input -- see the file header for why. Bump
+# this in its own deliberate, reviewed commit to *this* repo whenever
+# tenax-assay's signing surface should move; never point it at a branch,
+# and never accept it as a value from the calling workflow.
+env:
+  TRUSTED_SIGNER_SHA: e1d66a2bb4aeba71abc4a251ce8d59373a7d7d79 # tenax-assay main: feat(provenance)+feat(sign) (#26)
+
 jobs:
   sign:
     runs-on: ubuntu-latest
@@ -58,9 +73,9 @@ jobs:
 
     steps:
       # Explicit repository:/ref: -- this is NOT a self-checkout of
-      # tenax-attest. It checks out tenax-io/tenax-assay at the caller-
-      # supplied, independently-pinned inputs.signer-ref, into a
-      # subdirectory, purely to get the small, stable cli/sign.py +
+      # tenax-attest. It checks out tenax-io/tenax-assay at the hardcoded
+      # env.TRUSTED_SIGNER_SHA above (never anything caller-supplied), into
+      # a subdirectory, purely to get the small, stable cli/sign.py +
       # cli/oidc_signer.py signing surface (see those files' own
       # docstrings) -- nothing from the calling build job's own checkout
       # is trusted or reused here.
@@ -68,7 +83,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: tenax-io/tenax-assay
-          ref: ${{ inputs.signer-ref }}
+          ref: ${{ env.TRUSTED_SIGNER_SHA }}
           path: _signer
 
       - name: Set up Python
@@ -90,7 +105,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/sigstore-python
-          key: sigstore-tuf-${{ runner.os }}-${{ inputs.signer-ref }}
+          key: sigstore-tuf-${{ runner.os }}-${{ env.TRUSTED_SIGNER_SHA }}
           restore-keys: |
             sigstore-tuf-${{ runner.os }}-
 
@@ -105,6 +120,17 @@ jobs:
       # is silently ignored, not swept up. Each `tenax-assay sign` call
       # (cli/sign.py, checked out above) reads only that one file's bytes;
       # it never touches anything else this job downloaded.
+      #
+      # inputs.statement-files is caller-supplied, so every line read out of
+      # it is treated as hostile input, not a trusted filename, before it
+      # touches the filesystem or the Python CLI:
+      #   - rejected outright if it contains `/`, `\`, or `..` -- a bare
+      #     filename can never walk outside ./unsigned/ (the only directory
+      #     this step ever reads from) via a path-traversal or separator
+      #     sequence.
+      #   - `basename -- "$f" ...` (the `--`) stops a hyphen-prefixed
+      #     filename (e.g. "--help.unsigned.json") from being parsed as a
+      #     flag by basename itself.
       - name: Sign Statements
         env:
           STATEMENT_FILES: ${{ inputs.statement-files }}
@@ -117,7 +143,15 @@ jobs:
           fi
           while IFS= read -r f; do
             [ -z "$f" ] && continue
-            base="$(basename "$f" .unsigned.json)"
+
+            case "$f" in
+              */*|*\\*|*..*)
+                echo "ERROR: rejecting unsafe statement filename: $f" >&2
+                exit 1
+                ;;
+            esac
+
+            base="$(basename -- "$f" .unsigned.json)"
             (cd _signer && uv run --no-sync python -m cli.main sign \
               "../unsigned/$f" --out "../signed/${base}.dsse.json" "${DRY_RUN_ARGS[@]}")
           done <<< "$STATEMENT_FILES"

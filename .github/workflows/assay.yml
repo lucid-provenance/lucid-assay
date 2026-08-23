@@ -33,6 +33,18 @@ permissions:
   contents: read
   security-events: write # Required for github/codeql-action/analyze to upload SARIF to code scanning
 
+# SIGNER_WORKFLOW_SHA is the *single* source of truth for the pinned commit
+# tenax-io/tenax-attest/.github/workflows/sign.yml is trusted at -- it must
+# be kept byte-for-byte identical to the SHA pinned on the `attest` job's
+# `uses:` line below (GitHub Actions reusable-workflow calls don't accept
+# expressions in `uses:`, so that line can't just reference this var
+# directly; bump both together, in the same commit, whenever `attest`'s pin
+# moves). The `verify` job's admission gate reads it back out via
+# `${{ env.SIGNER_WORKFLOW_SHA }}` to build --cert-identity, so the gate can
+# never drift from what `attest` actually invoked.
+env:
+  SIGNER_WORKFLOW_SHA: 11086bc4004f0e0e061a3c3e30223535f696e1f0 # v1 (2026-08-23: add sign.yml) -- keep in sync with attest job's `uses:` pin
+
 jobs:
   # Runs the PR's own code: tests, coverage, CodeQL, SonarQube, RCS scoring.
   # Produces two *unsigned* statement files and nothing else that crosses
@@ -268,17 +280,21 @@ jobs:
   # `build` uploaded, and nothing it computes itself. The signing job's
   # code lives entirely in tenax-io/tenax-attest (a separate, branch-
   # protected repo -- see contrib/tenax-attest-repo/ in this repo for its
-  # content/rationale), checked out there at a commit SHA (`signer-ref`)
+  # content/rationale), checked out there at a commit SHA (`uses:` below)
   # pinned independently of whatever ref triggered this run -- so a PR
   # that fully rewrites this workflow file, or tenax-assay's own pipeline
   # code, in the same PR cannot also change what the signer trusts, since
   # that code isn't part of this PR's diff at all.
   #
-  # `signer-ref` pins to a commit on `main` -- bump it (deliberate,
-  # reviewed commit, never a moving branch) whenever cli/sign.py or
-  # cli/oidc_signer.py change in a way the signer should pick up, same
-  # discipline as bumping the `uses:` SHA whenever tenax-attest's own
-  # sign.yml changes.
+  # This job has no way to choose which tenax-assay commit sign.yml checks
+  # out for cli/sign.py/cli/oidc_signer.py: that pin lives hardcoded inside
+  # tenax-attest's own sign.yml (env.TRUSTED_SIGNER_SHA), not as a
+  # `workflow_call` input here -- a caller-supplied `signer-ref` input was
+  # deliberately removed so the privileged signing job can never be pointed
+  # at caller-chosen code. Bumping which tenax-assay commit the signer
+  # trusts is exclusively a tenax-attest-repo change, same discipline as
+  # bumping the `uses:` SHA below whenever tenax-attest's own sign.yml
+  # changes.
   attest:
     needs: build
     permissions:
@@ -290,7 +306,6 @@ jobs:
       statement-files: |
         tenax-assay.unsigned.json
         tenax-assay.slsa-provenance.unsigned.json
-      signer-ref: e1d66a2bb4aeba71abc4a251ce8d59373a7d7d79 # main: feat(provenance)+feat(sign) (#26)
 
   # Downloads the signed envelopes `attest` produced and evaluates
   # tenax-assay's own admission policy gates against them, plus the
@@ -345,6 +360,29 @@ jobs:
         env:
           EXPECTED_REPOSITORY: ${{ github.repository }}
           EXPECTED_REF: ${{ github.ref }}
+          # Pins the admission gate to the exact quarantined signer identity:
+          # not just "some workflow in tenax-io/tenax-attest", but that repo's
+          # sign.yml specifically, at the same commit SHA `attest` invoked
+          # (env.SIGNER_WORKFLOW_SHA, declared once at the top of this file).
+          # --expected-repository/--expected-ref alone only constrain claims
+          # about *this* repo's own ref -- they say nothing about which
+          # workflow minted the OIDC token, so without --cert-identity any
+          # other job in tenax-assay that ever acquired id-token: write could
+          # sign an envelope this gate would still accept.
+          CERT_IDENTITY: https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml@${{ env.SIGNER_WORKFLOW_SHA }}
+          CERT_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          # Binds admission to the *caller* side of the identity too: not
+          # just "signed by the quarantined tenax-attest signer" (that's
+          # what --cert-identity above already pins), but "signed on behalf
+          # of a run this workflow itself triggered" -- github.workflow is
+          # this workflow's own `name:` ("Tenax Assay"), which GitHub's OIDC
+          # token carries as the `workflow` claim for every job in this run,
+          # including the reusable `attest` job. Without this, any other
+          # workflow in tenax-io/tenax-assay (present or future) that ever
+          # called the same tenax-attest signer would still pass this gate,
+          # since --expected-repository alone doesn't distinguish which
+          # workflow file within the repo triggered the signing.
+          EXPECTED_WORKFLOW: ${{ github.workflow }}
         run: |
           # Built as a bash array, not a string handed to word-splitting:
           # the previous string-concatenation form embedded literal `"`
@@ -352,7 +390,14 @@ jobs:
           # already-double-quoted string, so `\"` had no quoting effect),
           # which made --expected-repository/--expected-ref never match the
           # real certificate claims and failed the gate on every run.
-          VERIFY_ARGS=(--min-rcs 65 --expected-repository "$EXPECTED_REPOSITORY" --expected-ref "$EXPECTED_REF")
+          VERIFY_ARGS=(
+            --min-rcs 65
+            --expected-repository "$EXPECTED_REPOSITORY"
+            --expected-ref "$EXPECTED_REF"
+            --expected-workflow "$EXPECTED_WORKFLOW"
+            --cert-identity "$CERT_IDENTITY"
+            --cert-oidc-issuer "$CERT_OIDC_ISSUER"
+          )
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             VERIFY_ARGS+=(--disallow-degraded)
           fi

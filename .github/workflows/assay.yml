@@ -367,15 +367,23 @@ jobs:
         # unconditional "unexpected predicateType" check are specific to the
         # RCS predicate and don't apply here (see README.md's "SLSA v1.0
         # provenance attestation" section) -- this step only exists to print
-        # the SLSA Build Level 1/2 checklist to the log, so continue-on-error
-        # keeps that unrelated exit code from failing the job.
+        # the SLSA Build Level 1/2 checklist to the log, and its own exit
+        # code is expected to be nonzero (irrelevant RCS-gate violations
+        # against a non-RCS predicate). The trailing `|| true` swallows
+        # that within the step itself, so the step reports a clean success
+        # with no red ✗/"Process completed with exit code N" styling in
+        # the log -- continue-on-error alone keeps the *job* from failing
+        # on this, but GitHub still renders the step itself as failed,
+        # which reads as a false alarm on every single run. continue-on-
+        # error is left in place too as a belt-and-suspenders backstop in
+        # case a future edit here drops the `|| true`.
         continue-on-error: true
         env:
           EXPECTED_REPOSITORY: ${{ github.repository }}
           EXPECTED_REF: ${{ github.ref }}
         run: |
           uv run --no-sync python -m cli.verify build/tenax-assay.slsa-provenance.dsse.json \
-            --expected-repository "$EXPECTED_REPOSITORY" --expected-ref "$EXPECTED_REF"
+            --expected-repository "$EXPECTED_REPOSITORY" --expected-ref "$EXPECTED_REF" || true
 
       - name: Upload In-Toto Attestation Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

@@ -40,11 +40,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from ..common import UnsafePathError, safe_resolve_path
 
@@ -366,9 +367,12 @@ def _extract_sonarqube_extension(run: Dict[str, Any]) -> Optional[Dict[str, Any]
         for in_key in in_keys:
             if in_key in bag and bag[in_key] is not None:
                 try:
-                    val = int(float(bag[in_key]))
+                    fval = float(bag[in_key])
+                    if not math.isfinite(fval):
+                        continue
+                    val = int(fval)
                     result[out_key] = max(0, val)  # Clamp to non-negative
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     pass
                 break
 

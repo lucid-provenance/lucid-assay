@@ -756,20 +756,18 @@ verify (contents: read)
 ```
 
 `build`'s test/dependency execution can never reach the Sigstore signing
-credential — `id-token: write` is granted to `attest` alone. That's a real,
-concrete boundary, but honestly scoped: `attest` today still checks out
-`tenax-assay` at *this same run's own ref* to get `cli/sign.py` — a
-placeholder pending [`tenax-io/tenax-attest`](https://github.com/tenax-io/tenax-attest),
-a separate repository hosting `attest`'s job as a `workflow_call` reusable
-workflow, checked out at a commit SHA pinned independently of whatever ref
-triggered the calling run (the same pattern
-[`slsa-framework/slsa-github-generator`](https://github.com/slsa-framework/slsa-github-generator)
-uses). That closes the remaining gap: even a PR that fully rewrites
+credential — `id-token: write` is granted to `attest` alone. `attest` is a
+`uses:` call to [`tenax-io/tenax-attest`](https://github.com/tenax-io/tenax-attest),
+a separate, branch-protected repository hosting the signing job as a
+`workflow_call` reusable workflow, checked out at a commit SHA (`signer-ref`)
+pinned independently of whatever ref triggered the calling run (the same
+pattern [`slsa-framework/slsa-github-generator`](https://github.com/slsa-framework/slsa-github-generator)
+uses). That's the gap that matters: even a PR that fully rewrites
 `tenax-assay`'s own workflow file in the same PR can't also rewrite what
 the signer trusts, since that code isn't part of the PR's diff at all. The
-exact file for that repo lives in `contrib/tenax-attest-repo/` in this
-repo (not part of `tenax-assay`'s own CI — a header comment there says so)
-along with setup instructions; `assay.yml`'s `attest` job comment
+source for that repo's content lives in `contrib/tenax-attest-repo/` in
+this repo (not part of `tenax-assay`'s own CI — a header comment there
+says so) along with setup instructions; `assay.yml`'s `attest` job comment
 cross-references it.
 
 What this still doesn't claim: reproducible builds, ephemeral/hardened

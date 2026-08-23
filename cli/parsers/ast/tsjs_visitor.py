@@ -235,6 +235,20 @@ def _expect_chain_hop(cur: Node, src: bytes) -> Optional[Tuple[Optional[Node], b
     return cur.child_by_field_name("object"), member == "not"
 
 
+def _match_expect_call(cur: Node, src: bytes) -> Tuple[bool, Optional[Node]]:
+    """Returns (is_expect_call, arg_or_None) for a `call_expression` node.
+    is_expect_call is True only when the call's function is the bare
+    identifier `expect`; arg is its first argument, or None if it was
+    called with none -- which is a distinct case from "not an expect(...)
+    call at all" (is_expect_call False), so both are returned rather than
+    folding them into one Optional value."""
+    func = cur.child_by_field_name("function")
+    if func is None or func.type != "identifier" or node_text(func, src) != "expect":
+        return False, None
+    args = call_args(cur.child_by_field_name("arguments"))
+    return True, (args[0] if args else None)
+
+
 def _trace_expect_chain(node: Optional[Node], src: bytes) -> Optional[Tuple[Optional[Node], bool]]:
     """Peels `.not`/`.resolves`/`.rejects` off a member-expression chain to
     find whether it originates at a bare `expect(...)` call. Returns
@@ -243,11 +257,8 @@ def _trace_expect_chain(node: Optional[Node], src: bytes) -> Optional[Tuple[Opti
     cur = node
     while cur is not None:
         if cur.type == "call_expression":
-            func = cur.child_by_field_name("function")
-            if func is not None and func.type == "identifier" and node_text(func, src) == "expect":
-                args = call_args(cur.child_by_field_name("arguments"))
-                return (args[0] if args else None), negated
-            return None
+            is_expect, arg = _match_expect_call(cur, src)
+            return (arg, negated) if is_expect else None
         if cur.type != "member_expression":
             return None
         hop = _expect_chain_hop(cur, src)

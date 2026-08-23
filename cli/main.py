@@ -24,6 +24,7 @@ from .parsers.ast import inspect_test_suite
 from .parsers.coverage import parse_cobertura, parse_lcov
 from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
+from .parsers.lockfiles import detect_and_parse_dependencies
 from .parsers.sarif import (
     SarifSummaryReport,
     aggregate_sarif_reports,
@@ -50,6 +51,7 @@ _STAGE_LABELS = [
     ("ast_inspection", "AST Assertion Walking"),
     ("github_rules_api", "GitHub Ruleset API"),
     ("rcs_scoring", "RCS Scoring Engine"),
+    ("lockfile_dependencies", "Lockfile Dependency Detection"),
     ("predicate_assembly", "Predicate Serialization"),
     ("worm_upload", "WORM Upload Dispatch"),
 ]
@@ -387,6 +389,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             ast_skipped_test_functions=ast_skipped,
         )
 
+    # 6b. Lockfile dependency detection (repo_dir lockfiles -> the
+    # predicate's resolved_dependencies -- scoring-independent, feeds
+    # build_statement only; never raises, degrades to [] on any missing/
+    # unreadable/unrecognized lockfile).
+    with _stage(stage_ns, "lockfile_dependencies"):
+        resolved_dependencies = detect_and_parse_dependencies(args.repo_dir)
+
     # 7. Build unsigned in-toto Statement
     with _stage(stage_ns, "predicate_assembly"):
         statement = build_statement(
@@ -422,6 +431,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             sarif_report=sarif_report,
             ast_skipped_test_functions=ast_skipped,
             ast_languages=ast_languages,
+            resolved_dependencies=resolved_dependencies,
         )
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0

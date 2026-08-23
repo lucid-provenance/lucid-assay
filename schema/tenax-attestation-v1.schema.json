@@ -359,6 +359,23 @@
       }
     },
 
+    "resolved_dependencies": {
+      "type": "array",
+      "description": "Pinned/resolved dependencies detected from lockfiles under the repo (cli/parsers/lockfiles.py: uv.lock, package-lock.json, go.sum, Gradle/Maven locks), deduplicated by uri. Empty when no recognized lockfile was found under the repo, or on attestations predating this field. Distinct from -- and not a substitute for -- SLSA v1.0 provenance's buildDefinition.resolvedDependencies, which lives on a differently-shaped predicate entirely.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["uri", "digest"],
+        "properties": {
+          "uri": { "type": "string", "minLength": 1, "description": "A pkg: PURL identifying the resolved dependency, e.g. pkg:pypi/requests@2.31.0." },
+          "digest": {
+            "type": "object",
+            "description": "algorithm -> hex digest map, e.g. {\"sha256\": \"...\"}. Empty when the lockfile format carries no cryptographic digest (Gradle/Maven) or it couldn't be decoded."
+          }
+        }
+      }
+    },
+
     "release_confidence_score": {
       "type": "object",
       "additionalProperties": false,

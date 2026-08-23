@@ -71,6 +71,7 @@ def build_statement(
     sarif_report: Optional[SarifSummaryReport] = None,
     ast_skipped_test_functions: int = 0,
     ast_languages: Optional[Dict[str, Dict[str, int]]] = None,
+    resolved_dependencies: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Returns a dict matching the lifecycle/v0.1 predicate schema, wrapped
     in a standard in-toto Statement envelope."""
@@ -227,6 +228,19 @@ def build_statement(
             "languages": ast_languages or {},
         },
         "static_analysis": static_analysis,
+        # Pinned/resolved dependencies detected from lockfiles under the
+        # repo (cli/parsers/lockfiles.py: uv.lock, package-lock.json,
+        # go.sum, Gradle/Maven locks), deduplicated by uri. This is
+        # tenax-assay's own top-level predicate field, distinct from --
+        # and never a substitute for -- SLSA v1.0 provenance's
+        # buildDefinition.resolvedDependencies, which cli/verify.py's
+        # SLSA Level 2 checklist reads from a differently-shaped
+        # predicate entirely (see cli/verify.py's SLSA checklist
+        # docstrings); populating this field does not change that
+        # checklist's outcome. `[]` when detect_and_parse_dependencies()
+        # found no recognized lockfile, or on attestations predating
+        # this field.
+        "resolved_dependencies": resolved_dependencies or [],
         "release_confidence_score": {
             "value": rcs.value,
             "algorithm_version": rcs.algorithm_version,

@@ -1,10 +1,17 @@
+import json
 import os
 import sys
 import unittest
 
+from jsonschema import Draft202012Validator
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cli.builder import DEFAULT_PREDICATE_TYPE, build_statement
+
+_SCHEMA_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema", "tenax-attestation-v1.schema.json"
+)
 from cli.parsers.coverage import CoverageReport
 from cli.parsers.github_rules import BranchGovernanceReport
 from cli.parsers.junit import TestTotals
@@ -277,6 +284,39 @@ class BuilderStatementTests(unittest.TestCase):
         sbom = {"bomFormat": "CycloneDX", "components": []}
         statement = build_statement(**_base_kwargs(sbom=sbom))
         self.assertEqual(statement["predicate"]["artifact"]["sbom"], sbom)
+
+    def test_resolved_dependencies_defaults_to_empty_list(self):
+        statement = build_statement(**_base_kwargs())
+        self.assertEqual(statement["predicate"]["resolved_dependencies"], [])
+
+    def test_resolved_dependencies_none_also_defaults_to_empty_list(self):
+        # detect_and_parse_dependencies() never returns None (it fails
+        # closed to [] itself), but build_statement's own default must be
+        # equally defensive if ever called with resolved_dependencies=None
+        # explicitly, rather than embedding a null into the predicate.
+        statement = build_statement(**_base_kwargs(resolved_dependencies=None))
+        self.assertEqual(statement["predicate"]["resolved_dependencies"], [])
+
+    def test_resolved_dependencies_is_passed_through_when_provided(self):
+        deps = [
+            {"uri": "pkg:pypi/requests@2.31.0", "digest": {"sha256": "f" * 64}},
+            {"uri": "pkg:npm/lodash@4.17.21", "digest": {}},
+        ]
+        statement = build_statement(**_base_kwargs(resolved_dependencies=deps))
+        self.assertEqual(statement["predicate"]["resolved_dependencies"], deps)
+
+    def test_resolved_dependencies_validates_against_schema(self):
+        deps = [
+            {"uri": "pkg:pypi/requests@2.31.0", "digest": {"sha256": "f" * 64}},
+            {"uri": "pkg:golang/example.com/mod@v1.2.3", "digest": {}},
+        ]
+        statement = build_statement(**_base_kwargs(resolved_dependencies=deps))
+
+        with open(_SCHEMA_PATH, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        validator = Draft202012Validator(schema)
+        errors = list(validator.iter_errors(statement["predicate"]))
+        self.assertEqual(errors, [], msg=[e.message for e in errors])
 
     def test_release_confidence_score_is_embedded(self):
         statement = build_statement(**_base_kwargs())

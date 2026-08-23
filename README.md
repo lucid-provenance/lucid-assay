@@ -25,6 +25,7 @@ cli/
     java_visitor.py               # Tree-sitter Java: JUnit 4/5, AssertJ, Hamcrest, *Test(s).java
   parsers/sarif.py          # SARIF 2.1.0 ingestion -> differential (patch vs. legacy) findings
   parsers/github_rules.py   # GitHub branch protection/ruleset inspection via REST API
+  parsers/lockfiles.py      # uv.lock/package-lock.json/go.sum/Gradle/Maven -> resolved_dependencies
   patch_coverage.py         # git diff base...head, intersected with coverage hit maps
   hashing.py                 # SHA-256 content hashing + WORM key derivation
   scorer.py                  # pure, deterministic Release Confidence Score (RCS)
@@ -139,6 +140,7 @@ a normal run when `--debug` is omitted):
 - AST Assertion Walking:           36.6 ms
 - GitHub Ruleset API:             182.0 ms
 - RCS Scoring Engine:               0.0 ms
+- Lockfile Dependency Detection:     0.8 ms
 - Predicate Serialization:          0.1 ms
 - WORM Upload Dispatch:              0.4 ms
 - Sigstore Signing (Total):    24,120.0 ms
@@ -155,10 +157,13 @@ timed where it actually runs, after patch analysis, but still reported
 under this one line since it's still "parsing"), `diff_patch_analysis`
 (`git diff`-based patch coverage, plus the separate diff SARIF uses to
 cross-reference changed lines), `ast_inspection`, `github_rules_api`,
-`rcs_scoring`, `predicate_assembly`, and `worm_upload` (the fire-and-forget
-dispatch cost only, not the background upload itself). `Total Blocking
-Overhead` is the same figure the 50ms budget check above measures — it
-does not change based on `--debug`.
+`rcs_scoring`, `lockfile_dependencies` (auto-detects and parses uv.lock/
+package-lock.json/go.sum/Gradle/Maven locks under `--repo-dir` into the
+predicate's `resolved_dependencies` -- independent of RCS scoring, feeds
+only predicate assembly), `predicate_assembly`, and `worm_upload` (the
+fire-and-forget dispatch cost only, not the background upload itself).
+`Total Blocking Overhead` is the same figure the 50ms budget check above
+measures — it does not change based on `--debug`.
 
 Sigstore signing (`--sign`/`--dry-run-sign`) is broken out separately by
 `cli/oidc_signer.py::sign_statement`'s `timing` param into ambient OIDC
@@ -385,6 +390,21 @@ pipeline goes through. The digest is both the in-toto `report_sha256` and
 the WORM content-addressed key (`s3://evidence/sha256/<hex>` — same
 content, same key, free dedup and idempotent uploads across re-attested
 runs).
+
+**`parsers/lockfiles.py`** auto-detects and parses lockfiles under
+`--repo-dir` (uv.lock, package-lock.json, go.sum, Gradle/Maven locks — any
+number/combination, at any depth outside vendored/build directories) into
+the predicate's top-level `resolved_dependencies` array: one
+`{uri, digest}` entry per dependency (a `pkg:` PURL plus an
+algorithm→hex-digest map, empty when the lockfile format itself carries no
+digest, e.g. Gradle/Maven), deduplicated by `uri`, `[]` when no recognized
+lockfile is found. Like `static_analysis`, this is purely additive
+predicate data — it's never an RCS scoring input. **It's also unrelated to
+the SLSA v1.0 Build Level 2 checklist's "Materialized Resolved
+Dependencies" item below**, which reads a differently-shaped
+`buildDefinition.resolvedDependencies` on a SLSA-provenance predicate;
+tenax-assay's own predicate isn't SLSA-shaped (see the checklist section),
+so populating this field doesn't change that item's outcome.
 
 ## Signing flow (keyless / Sigstore)
 

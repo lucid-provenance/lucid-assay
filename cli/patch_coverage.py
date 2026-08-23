@@ -118,8 +118,14 @@ def _run_git_diff(base_sha: str, head_sha: str, cwd: str) -> str:
     much an untrusted CLI input here as base_sha/head_sha are, and
     subprocess.run(cwd=...) is as real a sink as the argv list.
     """
-    _validate_git_ref(base_sha, "base_sha")
-    _validate_git_ref(head_sha, "head_sha")
+    # Reassign (not just call-for-side-effect) so the sanitized value, not
+    # the original parameter, is what actually flows into subprocess.run()
+    # below -- static taint analysis follows dataflow through the
+    # variable, not through a discarded validation call's side effect, so
+    # a validator that raises-but-doesn't-rebind still looks "tainted" to
+    # it even though it's fully safe at runtime.
+    base_sha = _validate_git_ref(base_sha, "base_sha")
+    head_sha = _validate_git_ref(head_sha, "head_sha")
     safe_cwd = safe_resolve_path(cwd)
 
     # -c core.quotepath=false prevents git from double-quoting unicode/spaced paths

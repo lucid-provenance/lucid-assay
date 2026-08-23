@@ -116,39 +116,55 @@ def _parse_da_record(m_da: "re.Match[str]") -> Optional[Tuple[int, int]]:
     return num, hits
 
 
+class _LcovState:
+    """Mutable parse state threaded through _process_lcov_line() -- avoids
+    a long parameter list and lets each line-handling branch update just
+    the fields it needs, in place."""
+
+    __slots__ = ("files", "current", "total_lines", "covered_lines")
+
+    def __init__(self) -> None:
+        self.files: Dict[str, FileCoverage] = {}
+        self.current: Optional[str] = None
+        self.total_lines = 0
+        self.covered_lines = 0
+
+
+def _process_lcov_line(line: str, state: _LcovState) -> None:
+    """Handles one already-stripped, non-blank LCOV tracefile line,
+    updating `state` in place: SF: starts a new current file, DA: records
+    one line's hit count against it, and end_of_record clears it."""
+    m_sf = _LCOV_SF.match(line)
+    if m_sf:
+        state.current = _normalize_path(m_sf.group(1))
+        state.files.setdefault(state.current, FileCoverage())
+        return
+
+    m_da = _LCOV_DA.match(line)
+    if m_da and state.current is not None:
+        record = _parse_da_record(m_da)
+        if record is not None:
+            num, hits = record
+            state.files[state.current].line_hits[num] = hits
+            state.total_lines += 1
+            if hits > 0:
+                state.covered_lines += 1
+        return
+
+    if line == "end_of_record":
+        state.current = None
+
+
 def parse_lcov(path: str) -> CoverageReport:
     """LCOV tracefile parser with path canonicalization and safe rate bounds."""
-    files: Dict[str, FileCoverage] = {}
-    current: Optional[str] = None
-    total_lines = 0
-    covered_lines = 0
+    state = _LcovState()
 
     with open(safe_resolve_path(path), "r", encoding="utf-8", errors="replace") as f:
         for raw_line in f:
             line = raw_line.rstrip("\n").strip()
-            if not line:
-                continue
+            if line:
+                _process_lcov_line(line, state)
 
-            m_sf = _LCOV_SF.match(line)
-            if m_sf:
-                current = _normalize_path(m_sf.group(1))
-                files.setdefault(current, FileCoverage())
-                continue
-
-            m_da = _LCOV_DA.match(line)
-            if m_da and current is not None:
-                record = _parse_da_record(m_da)
-                if record is not None:
-                    num, hits = record
-                    files[current].line_hits[num] = hits
-                    total_lines += 1
-                    if hits > 0:
-                        covered_lines += 1
-                continue
-
-            if line == "end_of_record":
-                current = None
-
-    overall_line_rate = (covered_lines / total_lines) if total_lines > 0 else 0.0
+    overall_line_rate = (state.covered_lines / state.total_lines) if state.total_lines > 0 else 0.0
     overall_line_rate = max(0.0, min(1.0, overall_line_rate))
-    return CoverageReport(overall_line_rate, None, files)
+    return CoverageReport(overall_line_rate, None, state.files)

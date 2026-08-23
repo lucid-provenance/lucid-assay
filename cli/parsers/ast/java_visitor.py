@@ -224,32 +224,50 @@ class _BodyWalker:
         self.assertion_count = 0
         self.tautological_count = 0
 
+    def _handle_method_invocation(self, node: Node, src: bytes) -> bool:
+        """Classifies a `method_invocation` as an assertion call (or not)
+        and, if so, walks its children (minus the AssertJ receiver chain
+        already accounted for by the classification). Returns True when
+        the node was fully handled this way -- False means it isn't an
+        assertion call and the caller should fall through to the generic
+        child walk instead."""
+        classified = _classify_method_invocation(node, src)
+        if classified is None:
+            return False
+        is_taut, skip_subtree = classified
+        if is_taut:
+            self.tautological_count += 1
+        else:
+            self.assertion_count += 1
+        for child in node.children:
+            if skip_subtree is not None and child == skip_subtree:
+                continue
+            self.walk(child, src)
+        return True
+
+    def _handle_if_statement(self, node: Node, src: bytes) -> bool:
+        """`if (false) { assertTrue(...); }` is statically dead/live --
+        prune to the branch that actually runs, mirroring
+        python_visitor.py's visit_If. Returns True when the condition
+        folded to a known value (its live branch, if any, has already been
+        walked) -- False means the condition isn't statically known and
+        the caller should fall through to the generic child walk, which
+        walks both branches."""
+        ok, value = _fold_java_literal(node.child_by_field_name("condition"), src)
+        if not ok:
+            return False
+        branch = node.child_by_field_name("consequence" if value else "alternative")
+        if branch is not None:
+            self.walk(branch, src)
+        return True
+
     def walk(self, node: Node, src: bytes) -> None:
         if node.type in _SCOPE_BOUNDARY_TYPES:
             return
-        if node.type == "method_invocation":
-            classified = _classify_method_invocation(node, src)
-            if classified is not None:
-                is_taut, skip_subtree = classified
-                if is_taut:
-                    self.tautological_count += 1
-                else:
-                    self.assertion_count += 1
-                for child in node.children:
-                    if skip_subtree is not None and child == skip_subtree:
-                        continue
-                    self.walk(child, src)
-                return
-        if node.type == "if_statement":
-            # `if (false) { assertTrue(...); }` is statically dead/live --
-            # prune to the branch that actually runs, mirroring
-            # python_visitor.py's visit_If.
-            ok, value = _fold_java_literal(node.child_by_field_name("condition"), src)
-            if ok:
-                branch = node.child_by_field_name("consequence" if value else "alternative")
-                if branch is not None:
-                    self.walk(branch, src)
-                return
+        if node.type == "method_invocation" and self._handle_method_invocation(node, src):
+            return
+        if node.type == "if_statement" and self._handle_if_statement(node, src):
+            return
         for child in node.children:
             self.walk(child, src)
 

@@ -265,6 +265,40 @@ def _is_same_origin_as_api(url: str) -> bool:
     return parsed.scheme == "https" and parsed.netloc == expected.netloc
 
 
+class _NotFoundPage(Exception):
+    """Internal signal raised by _fetch_page() for a 404 response --
+    deliberately distinct from a legitimate JSON `null` body (a valid,
+    if unusual, 200 response) so _github_api_get() never conflates the
+    two: only a real 404 means "not found"."""
+
+
+def _fetch_page(url: str, headers: Dict[str, str], timeout: int, error_path: str) -> Tuple[Any, str]:
+    """Performs one GET, returning (parsed_json_body, Link_header_value).
+    Raises _NotFoundPage on a 404 -- the caller (which knows whether this
+    is the first page of a paginated fetch) decides what that means.
+    Any other non-2xx status or transport/parse error raises
+    GitHubAPIError (tagged with `.status_code` when an HTTP status is
+    available, so callers can special-case auth failures); the message
+    always cites `error_path` -- the original relative API path, not the
+    possibly-paginated absolute `url` -- for a stable, callable-facing
+    error string across pages."""
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            link_header = resp.headers.get("Link", "")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise _NotFoundPage() from e
+        detail = _extract_http_error_detail(e)
+        raise GitHubAPIError(f"GET {error_path} -> HTTP {e.code}: {detail}", status_code=e.code) from e
+    except urllib.error.URLError as e:
+        raise GitHubAPIError(f"GET {error_path} failed: {e.reason}") from e
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        raise GitHubAPIError(f"GET {error_path} failed: {e}") from e
+    return body, link_header
+
+
 def _github_api_get(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) -> Any:
     """GET a GitHub REST API path and return the parsed JSON body.
 
@@ -292,22 +326,12 @@ def _github_api_get(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) -> An
     page = 0
 
     while url and page < MAX_PAGES:
-        req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-                link_header = resp.headers.get("Link", "")
-        except urllib.error.HTTPError as e:
-            if e.code == 404 and page == 0:
+            body, link_header = _fetch_page(url, headers, timeout, path)
+        except _NotFoundPage:
+            if page == 0:
                 return None
-            if e.code == 404:
-                break  # ran out of pages mid-pagination; return what we have so far
-            detail = _extract_http_error_detail(e)
-            raise GitHubAPIError(f"GET {path} -> HTTP {e.code}: {detail}", status_code=e.code) from e
-        except urllib.error.URLError as e:
-            raise GitHubAPIError(f"GET {path} failed: {e.reason}") from e
-        except (json.JSONDecodeError, ValueError, OSError) as e:
-            raise GitHubAPIError(f"GET {path} failed: {e}") from e
+            break  # ran out of pages mid-pagination; return what we have so far
 
         page += 1
 
@@ -339,6 +363,29 @@ def _branch_exists(repository: str, branch: str, token: str, timeout: int) -> Op
     return detail is not None
 
 
+def _bypass_actors_for_ruleset(
+    repository: str, summary: Dict[str, Any], token: str, timeout: int
+) -> List[Dict[str, Any]]:
+    """Returns the bypass actors for one /rulesets list entry, or [] when
+    the summary doesn't qualify for a detail fetch at all (not active, not
+    branch-targeting, or an id that isn't genuinely an integer -- defense
+    in depth: never follow an id that could smuggle extra path segments
+    into the detail-fetch URL) or the detail fetch didn't return the
+    expected shape."""
+    if summary.get("enforcement") != "active":
+        return []
+    if summary.get("target") not in (None, "branch"):
+        return []
+    ruleset_id = summary.get("id")
+    if not isinstance(ruleset_id, int) or isinstance(ruleset_id, bool):
+        return []
+
+    detail = _github_api_get(f"/repos/{repository}/rulesets/{ruleset_id}", token, timeout)
+    if not isinstance(detail, dict):
+        return []
+    return [actor for actor in (detail.get("bypass_actors") or []) if isinstance(actor, dict)]
+
+
 def _collect_bypass_actors(repository: str, token: str, timeout: int) -> List[Dict[str, Any]]:
     """Fetch bypass actors from every *active*, branch-targeting ruleset
     defined on the repo. The list endpoint doesn't inline bypass_actors, so
@@ -349,25 +396,8 @@ def _collect_bypass_actors(repository: str, token: str, timeout: int) -> List[Di
 
     actors: List[Dict[str, Any]] = []
     for summary in summaries:
-        if not isinstance(summary, dict):
-            continue
-        if summary.get("enforcement") != "active":
-            continue
-        if summary.get("target") not in (None, "branch"):
-            continue
-        ruleset_id = summary.get("id")
-        # Defense in depth: only follow ruleset ids that are genuinely
-        # integers from GitHub's own response, never a value that could
-        # smuggle extra path segments into the detail-fetch URL.
-        if not isinstance(ruleset_id, int) or isinstance(ruleset_id, bool):
-            continue
-
-        detail = _github_api_get(f"/repos/{repository}/rulesets/{ruleset_id}", token, timeout)
-        if not isinstance(detail, dict):
-            continue
-        for actor in detail.get("bypass_actors") or []:
-            if isinstance(actor, dict):
-                actors.append(actor)
+        if isinstance(summary, dict):
+            actors.extend(_bypass_actors_for_ruleset(repository, summary, token, timeout))
     return actors
 
 

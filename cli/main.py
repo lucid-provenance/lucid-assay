@@ -15,23 +15,24 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from .builder import build_statement
 from .common import safe_resolve_path
 from .hashing import sha256_file, worm_uri
 from .parsers.ast import inspect_test_suite
 from .parsers.coverage import parse_cobertura, parse_lcov
-from .parsers.github_rules import bypass_permits_unreviewed_change, inspect_branch_governance
+from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
 from .parsers.sarif import (
+    SarifSummaryReport,
     aggregate_sarif_reports,
     merge_sonar_metrics_into_tools,
     parse_sarif_file,
     parse_sonar_metrics_file,
 )
 from .patch_coverage import compute_patch_coverage, compute_patch_modified_lines
-from .scorer import score_pipeline
+from .scorer import RCSResult, score_pipeline
 
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="worm-upload")
 
@@ -130,6 +131,122 @@ def upload_to_worm_async(local_path: str, sha256_hex: str, bucket: str = "eviden
         pass
 
     return _executor.submit(_upload)
+
+
+def _merge_sonar_metrics(sonar_metrics_path: str, sarif_report: SarifSummaryReport) -> None:
+    """--sonar-metrics enriches an existing SARIF tool's extensions; it
+    never creates a new tool entry or a scoring input of its own, so a
+    parse/merge failure here only ever warns (see main()'s step 3c)."""
+    sonar_extension = parse_sonar_metrics_file(sonar_metrics_path)
+    if sonar_extension is None:
+        print(
+            f"WARNING: --sonar-metrics '{sonar_metrics_path}' could not be read/parsed; "
+            "skipping SonarQube metrics enrichment",
+            file=sys.stderr,
+        )
+    elif not merge_sonar_metrics_into_tools(sarif_report.tools, sonar_extension):
+        print(
+            f"WARNING: --sonar-metrics '{sonar_metrics_path}' had no unambiguous SARIF tool to attach to "
+            "(no tool named like 'sonar*' and more than one tool was scanned); skipping enrichment",
+            file=sys.stderr,
+        )
+
+
+def _ingest_sarif(args: argparse.Namespace, stage_ns: Dict[str, int]) -> Optional[SarifSummaryReport]:
+    """Step 3c: SARIF static-analysis ingestion (optional, --sarif may
+    repeat). Returns None when --sarif wasn't passed at all -- scorer and
+    builder both treat that as "not configured", not as a failure."""
+    if not args.sarif:
+        if args.sonar_metrics:
+            print(
+                "WARNING: --sonar-metrics was given without any --sarif input to attach it to; ignoring",
+                file=sys.stderr,
+            )
+        return None
+
+    with _stage(stage_ns, "diff_patch_analysis"):
+        patch_modified_lines = compute_patch_modified_lines(args.base_sha, args.head_sha, args.repo_dir)
+    with _stage(stage_ns, "parse_inputs"):
+        parsed_reports = []
+        for sarif_path in args.sarif:
+            report = parse_sarif_file(sarif_path, patch_modified_lines=patch_modified_lines)
+            if not report.available:
+                print(
+                    f"WARNING: SARIF report '{sarif_path}' could not be read/parsed: "
+                    f"{'; '.join(report.reasons)}",
+                    file=sys.stderr,
+                )
+            parsed_reports.append(report)
+        sarif_report = aggregate_sarif_reports(parsed_reports)
+
+    if not sarif_report.available:
+        print(
+            f"WARNING: static analysis (SARIF) ingestion degraded: {'; '.join(sarif_report.reasons)}",
+            file=sys.stderr,
+        )
+    elif args.sonar_metrics:
+        _merge_sonar_metrics(args.sonar_metrics, sarif_report)
+
+    return sarif_report
+
+
+def _maybe_sign(args: argparse.Namespace, out_path) -> Tuple[Optional[int], Dict[str, int]]:
+    """Step 9: keyless Sigstore signing, gated on --sign/--dry-run-sign.
+    Returns (sign_total_ns, sign_sub_ns) for --debug's stage-profile
+    report; sign_total_ns is None when neither flag was passed."""
+    if not (args.sign or args.dry_run_sign):
+        return None, {}
+
+    from .oidc_signer import sign_statement
+
+    with open(out_path, "rb") as f:
+        envelope_bytes = f.read()
+
+    sign_sub_ns: Dict[str, int] = {}
+    t0 = time.perf_counter_ns()
+    envelope = sign_statement(envelope_bytes, dry_run=args.dry_run_sign, timing=sign_sub_ns)
+    sign_total_ns = time.perf_counter_ns() - t0
+
+    signed_path = safe_resolve_path(derive_signed_path(str(out_path)))
+    with open(signed_path, "w", encoding="utf-8") as f:
+        f.write(envelope.to_json())
+    print(f"signed envelope written to {signed_path}", file=sys.stderr)
+
+    return sign_total_ns, sign_sub_ns
+
+
+def _emit_run_warnings(
+    rcs: RCSResult,
+    branch_governance: BranchGovernanceReport,
+    branch: str,
+    blocking_elapsed_ms: float,
+    skip_perf_budget_check: bool,
+) -> None:
+    """Post-run stderr summary: RCS/degraded status, branch-governance
+    issues, and the 50ms blocking-overhead budget check
+    (--skip-perf-budget-check)."""
+    print(
+        f"RCS={rcs.value} blocking_overhead_ms={blocking_elapsed_ms:.2f} degraded={rcs.degraded}",
+        file=sys.stderr,
+    )
+    if rcs.degraded and rcs.degraded_reasons:
+        print(f"degraded_reasons={rcs.degraded_reasons}", file=sys.stderr)
+
+    if not branch_governance.available:
+        print(
+            f"WARNING: branch governance for '{branch}' could not be verified: {branch_governance.reason}",
+            file=sys.stderr,
+        )
+    elif bypass_permits_unreviewed_change(branch_governance):
+        print(f"WARNING: branch '{branch}' rules permit an unreviewed bypass", file=sys.stderr)
+    for w in branch_governance.warnings:
+        print(f"WARNING: branch governance: {w}", file=sys.stderr)
+
+    if not skip_perf_budget_check and blocking_elapsed_ms > 50.0:
+        print(
+            f"WARNING: blocking overhead {blocking_elapsed_ms:.2f}ms exceeded the 50ms budget",
+            file=sys.stderr,
+        )
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -231,49 +348,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 3c. SARIF static-analysis ingestion (optional, --sarif may repeat).
     # sarif_report stays None when --sarif wasn't passed at all -- scorer
     # and builder both treat that as "not configured", not as a failure.
-    sarif_report = None
-    if args.sarif:
-        with _stage(stage_ns, "diff_patch_analysis"):
-            patch_modified_lines = compute_patch_modified_lines(args.base_sha, args.head_sha, args.repo_dir)
-        with _stage(stage_ns, "parse_inputs"):
-            parsed_reports = []
-            for sarif_path in args.sarif:
-                report = parse_sarif_file(sarif_path, patch_modified_lines=patch_modified_lines)
-                if not report.available:
-                    print(
-                        f"WARNING: SARIF report '{sarif_path}' could not be read/parsed: "
-                        f"{'; '.join(report.reasons)}",
-                        file=sys.stderr,
-                    )
-                parsed_reports.append(report)
-            sarif_report = aggregate_sarif_reports(parsed_reports)
-        if not sarif_report.available:
-            print(
-                f"WARNING: static analysis (SARIF) ingestion degraded: {'; '.join(sarif_report.reasons)}",
-                file=sys.stderr,
-            )
-        elif args.sonar_metrics:
-            # --sonar-metrics enriches an existing SARIF tool's extensions;
-            # it never creates a new tool entry or a scoring input of its
-            # own, so a parse/merge failure here only ever warns.
-            sonar_extension = parse_sonar_metrics_file(args.sonar_metrics)
-            if sonar_extension is None:
-                print(
-                    f"WARNING: --sonar-metrics '{args.sonar_metrics}' could not be read/parsed; "
-                    "skipping SonarQube metrics enrichment",
-                    file=sys.stderr,
-                )
-            elif not merge_sonar_metrics_into_tools(sarif_report.tools, sonar_extension):
-                print(
-                    f"WARNING: --sonar-metrics '{args.sonar_metrics}' had no unambiguous SARIF tool to attach to "
-                    "(no tool named like 'sonar*' and more than one tool was scanned); skipping enrichment",
-                    file=sys.stderr,
-                )
-    elif args.sonar_metrics:
-        print(
-            "WARNING: --sonar-metrics was given without any --sarif input to attach it to; ignoring",
-            file=sys.stderr,
-        )
+    sarif_report = _ingest_sarif(args, stage_ns)
 
     # 4. Hash evidence artifacts
     test_report_sha = sha256_file(args.junit_xml)
@@ -362,52 +437,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         upload_to_worm_async(args.coverage_report, coverage_report_sha)
 
     # 9. Keyless signing
-    sign_total_ns: Optional[int] = None
-    sign_sub_ns: Dict[str, int] = {}
-    if args.sign or args.dry_run_sign:
-        from .oidc_signer import sign_statement
-
-        with open(out_path, "rb") as f:
-            envelope_bytes = f.read()
-
-        _sign_t0 = time.perf_counter_ns()
-        envelope = sign_statement(envelope_bytes, dry_run=args.dry_run_sign, timing=sign_sub_ns)
-        sign_total_ns = time.perf_counter_ns() - _sign_t0
-
-        signed_path = safe_resolve_path(derive_signed_path(str(out_path)))
-
-        with open(signed_path, "w", encoding="utf-8") as f:
-            f.write(envelope.to_json())
-        print(f"signed envelope written to {signed_path}", file=sys.stderr)
+    sign_total_ns, sign_sub_ns = _maybe_sign(args, out_path)
 
     if args.debug:
         wall_elapsed_ns = time.perf_counter_ns() - t_start_ns
         _emit_stage_profile(stage_ns, sign_total_ns, sign_sub_ns, blocking_elapsed_ms, wall_elapsed_ns)
 
-    print(
-        f"RCS={rcs.value} blocking_overhead_ms={blocking_elapsed_ms:.2f} degraded={rcs.degraded}",
-        file=sys.stderr,
-    )
-    if rcs.degraded and rcs.degraded_reasons:
-        print(f"degraded_reasons={rcs.degraded_reasons}", file=sys.stderr)
-
-    if not branch_governance.available:
-        print(
-            f"WARNING: branch governance for '{args.branch}' could not be verified: {branch_governance.reason}",
-            file=sys.stderr,
-        )
-    elif bypass_permits_unreviewed_change(branch_governance):
-        print(
-            f"WARNING: branch '{args.branch}' rules permit an unreviewed bypass", file=sys.stderr
-        )
-    for w in branch_governance.warnings:
-        print(f"WARNING: branch governance: {w}", file=sys.stderr)
-
-    if not args.skip_perf_budget_check and blocking_elapsed_ms > 50.0:
-        print(
-            f"WARNING: blocking overhead {blocking_elapsed_ms:.2f}ms exceeded the 50ms budget",
-            file=sys.stderr,
-        )
+    _emit_run_warnings(rcs, branch_governance, args.branch, blocking_elapsed_ms, args.skip_perf_budget_check)
 
     # 10. Gate enforcement
     if rcs.value < args.min_rcs:

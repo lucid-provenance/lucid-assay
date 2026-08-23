@@ -337,6 +337,27 @@ def _extract_driver_metadata(driver: Dict[str, Any]) -> Dict[str, Optional[str]]
     return {"name": name, "version": version, "information_uri": info_uri}
 
 
+def _extract_int_metric(bag: Dict[str, Any], in_keys: Tuple[str, ...]) -> Optional[int]:
+    """Looks up the first usable, non-negative-clamped integer value among
+    `in_keys` (metric name aliases across SonarQube export shapes) in
+    `bag`. A present-but-non-finite value (NaN/inf) is skipped in favor of
+    the next alias; a present value that raises on numeric coercion stops
+    the search entirely with no value -- mirrors the exact control flow of
+    the inline loop this was extracted from, alias-skip vs. hard-stop
+    included."""
+    for in_key in in_keys:
+        if in_key not in bag or bag[in_key] is None:
+            continue
+        try:
+            fval = float(bag[in_key])
+            if not math.isfinite(fval):
+                continue
+            return max(0, int(fval))  # Clamp to non-negative
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return None
+
+
 def _extract_sonarqube_extension(run: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Looks for tool-specific enrichment data in a SARIF run's `properties`
     bag: preferentially a nested `properties.sonarqube` object, falling back
@@ -364,17 +385,9 @@ def _extract_sonarqube_extension(run: Dict[str, Any]) -> Optional[Dict[str, Any]
         ("cognitive_complexity", ("cognitive_complexity", "cognitiveComplexity")),
         ("technical_debt_minutes", ("technical_debt_minutes", "technicalDebtMinutes")),
     ):
-        for in_key in in_keys:
-            if in_key in bag and bag[in_key] is not None:
-                try:
-                    fval = float(bag[in_key])
-                    if not math.isfinite(fval):
-                        continue
-                    val = int(fval)
-                    result[out_key] = max(0, val)  # Clamp to non-negative
-                except (TypeError, ValueError, OverflowError):
-                    pass
-                break
+        metric = _extract_int_metric(bag, in_keys)
+        if metric is not None:
+            result[out_key] = metric
 
     return result or None
 
@@ -727,6 +740,39 @@ def aggregate_sarif_reports(reports: List[SarifSummaryReport]) -> SarifSummaryRe
     )
 
 
+def _load_sonar_metrics_doc(file_path: Union[str, Path]) -> Optional[Dict[str, Any]]:
+    """Reads and JSON-decodes a --sonar-metrics export, resolving the path
+    via safe_resolve_path() first. Returns None (never raises) on any
+    read/parse/shape failure -- this is enrichment data only and must
+    never be able to fail a run."""
+    try:
+        resolved = safe_resolve_path(file_path)
+        with open(resolved, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, UnsafePathError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _apply_sonar_measure(result: Dict[str, Any], measure: Dict[str, Any]) -> None:
+    """Merges one `measures[]` entry (a {"metric": ..., "value": ...} pair)
+    from a SonarQube export into `result`, in place. Unrecognized metrics
+    and non-coercible values are silently skipped -- this is best-effort
+    enrichment only."""
+    metric = measure.get("metric")
+    value = measure.get("value")
+
+    if metric == "alert_status" and isinstance(value, str):
+        mapped = _SONAR_QUALITY_GATE_ALIASES.get(value.strip().upper())
+        if mapped:
+            result["quality_gate"] = mapped
+    elif metric in _SONAR_METRIC_ALIASES and value is not None:
+        try:
+            result[_SONAR_METRIC_ALIASES[metric]] = int(float(value))
+        except (TypeError, ValueError):
+            pass
+
+
 def parse_sonar_metrics_file(file_path: Union[str, Path]) -> Optional[Dict[str, Any]]:
     """Parses a SonarQube `api/measures/component` JSON export (the
     `--sonar-metrics` CLI flag) into the same {quality_gate,
@@ -736,14 +782,8 @@ def parse_sonar_metrics_file(file_path: Union[str, Path]) -> Optional[Dict[str, 
     its own SARIF output. Never raises: any read/parse/shape failure
     returns None rather than propagating, since this is enrichment data
     only and must never be able to fail a run."""
-    try:
-        resolved = safe_resolve_path(file_path)
-        with open(resolved, "r", encoding="utf-8") as f:
-            doc = json.load(f)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError, UnsafePathError):
-        return None
-
-    if not isinstance(doc, dict):
+    doc = _load_sonar_metrics_doc(file_path)
+    if doc is None:
         return None
 
     component = doc.get("component")
@@ -754,20 +794,8 @@ def parse_sonar_metrics_file(file_path: Union[str, Path]) -> Optional[Dict[str, 
 
     result: Dict[str, Any] = {}
     for m in measures:
-        if not isinstance(m, dict):
-            continue
-        metric = m.get("metric")
-        value = m.get("value")
-
-        if metric == "alert_status" and isinstance(value, str):
-            mapped = _SONAR_QUALITY_GATE_ALIASES.get(value.strip().upper())
-            if mapped:
-                result["quality_gate"] = mapped
-        elif metric in _SONAR_METRIC_ALIASES and value is not None:
-            try:
-                result[_SONAR_METRIC_ALIASES[metric]] = int(float(value))
-            except (TypeError, ValueError):
-                pass
+        if isinstance(m, dict):
+            _apply_sonar_measure(result, m)
 
     return result or None
 

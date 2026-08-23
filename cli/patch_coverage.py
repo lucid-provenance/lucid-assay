@@ -10,6 +10,12 @@ Hardened against:
     not instead of -- --end-of-options; shell=False is used throughout,
     by construction, since every subprocess.run() call here takes a list
     of argv tokens, never a shell string)
+  - Unsafe/unresolvable repo_dir values reaching subprocess.run(cwd=...):
+    resolved via common.safe_resolve_path() (rejects null bytes and
+    unresolvable path strings) alongside base_sha/head_sha validation, in
+    the same _run_git_diff() choke point every git-invoking call in this
+    module goes through -- cwd is as real a subprocess.run() argument as
+    the argv list and gets the same treatment
   - Quoted/escaped filenames in diff headers (-c core.quotepath=false)
   - Path normalization discrepancies between git and coverage parsers
   - Binary / deleted file diffs (/dev/null filtering)
@@ -32,6 +38,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
+from .common import UnsafePathError, safe_resolve_path
 from .parsers.coverage import CoverageReport, FileCoverage
 
 
@@ -99,10 +106,21 @@ class PatchCoverageResult:
     reason_code: Optional[str] = None
 
 
-def _changed_lines_by_file(base_sha: str, head_sha: str, cwd: str) -> Dict[str, List[int]]:
-    """Returns {file_path: [added_line_numbers]} for the diff base_sha...head_sha."""
+def _run_git_diff(base_sha: str, head_sha: str, cwd: str) -> str:
+    """Runs `git diff base_sha...head_sha` in `cwd` and returns raw stdout.
+
+    Every argv token subprocess.run() sees here is validated first: the
+    revision range's two endpoints via _validate_git_ref() (rejects
+    anything that isn't a safe, ref-shaped string before it can reach the
+    git CLI), and the working directory via safe_resolve_path() (the same
+    null-byte/unresolvable-path guard applied to every other
+    operator-supplied path in this codebase) -- a directory string is as
+    much an untrusted CLI input here as base_sha/head_sha are, and
+    subprocess.run(cwd=...) is as real a sink as the argv list.
+    """
     _validate_git_ref(base_sha, "base_sha")
     _validate_git_ref(head_sha, "head_sha")
+    safe_cwd = safe_resolve_path(cwd)
 
     # -c core.quotepath=false prevents git from double-quoting unicode/spaced paths
     # '--end-of-options' ensures the revision range can't be parsed as arbitrary git
@@ -120,29 +138,39 @@ def _changed_lines_by_file(base_sha: str, head_sha: str, cwd: str) -> Dict[str, 
             "--end-of-options",
             f"{base_sha}...{head_sha}",
         ],
-        cwd=cwd,
+        cwd=safe_cwd,
         capture_output=True,
         text=True,
         check=True,
     )
+    return proc.stdout
 
+
+def _extract_target_file(line: str) -> Optional[str]:
+    """Returns the normalized target path for a '+++ b/<path>' diff header
+    line, or None for a deleted file ('+++ /dev/null') or a non-matching
+    line."""
+    m_plus = _DIFF_PLUS.match(line)
+    if not m_plus:
+        return None
+    raw_path = m_plus.group(1)
+    if raw_path == "/dev/null":
+        return None
+    return _normalize_path(raw_path)
+
+
+def _parse_diff_output(diff_text: str) -> Dict[str, List[int]]:
+    """Parses `git diff --unified=0` stdout into {file_path: [added_line_numbers]}."""
     result: Dict[str, List[int]] = {}
     current_file: Optional[str] = None
     next_new_line: Optional[int] = None
 
-    for line in proc.stdout.splitlines():
-        # Track targeted target file, skipping deleted files (+++ /dev/null)
+    for line in diff_text.splitlines():
+        # Track the current target file, skipping deleted files (+++ /dev/null)
         if line.startswith("+++ "):
-            m_plus = _DIFF_PLUS.match(line)
-            if m_plus:
-                raw_path = m_plus.group(1)
-                if raw_path != "/dev/null":
-                    current_file = _normalize_path(raw_path)
-                    result.setdefault(current_file, [])
-                else:
-                    current_file = None
-            else:
-                current_file = None
+            current_file = _extract_target_file(line)
+            if current_file is not None:
+                result.setdefault(current_file, [])
             continue
 
         m_hunk = _HUNK_HEADER.match(line)
@@ -153,16 +181,21 @@ def _changed_lines_by_file(base_sha: str, head_sha: str, cwd: str) -> Dict[str, 
         if current_file is None or next_new_line is None:
             continue
 
-        # In unified=0 diffs, '+' indicates an added/modified line in the new revision
+        # In unified=0 diffs, '+' indicates an added/modified line in the new
+        # revision. '-' (deletions) don't advance the new-file line counter,
+        # and "\ No newline at end of file" markers carry no line info --
+        # both simply fall through here with nothing to do.
         if line.startswith("+") and not line.startswith("+++"):
             result[current_file].append(next_new_line)
             next_new_line += 1
-        elif line.startswith("-") and not line.startswith("---"):
-            pass  # Deletions do not advance the new file line counter
-        elif line.startswith("\\"):
-            pass  # "\ No newline at end of file"
 
     return result
+
+
+def _changed_lines_by_file(base_sha: str, head_sha: str, cwd: str) -> Dict[str, List[int]]:
+    """Returns {file_path: [added_line_numbers]} for the diff base_sha...head_sha."""
+    diff_text = _run_git_diff(base_sha, head_sha, cwd)
+    return _parse_diff_output(diff_text)
 
 
 def compute_patch_modified_lines(
@@ -178,7 +211,7 @@ def compute_patch_modified_lines(
         return {}
     try:
         changed = _changed_lines_by_file(base_sha, head_sha, repo_dir)
-    except (subprocess.CalledProcessError, UnsafeGitRefError):
+    except (subprocess.CalledProcessError, UnsafeGitRefError, UnsafePathError):
         return {}
     return {path: set(lines) for path, lines in changed.items()}
 
@@ -264,6 +297,14 @@ def compute_patch_coverage(
             lines_changed=0,
             lines_covered=0,
             reason=f"git diff refused: {e}",
+        )
+    except UnsafePathError as e:
+        return PatchCoverageResult(
+            available=False,
+            line_rate=None,
+            lines_changed=0,
+            lines_covered=0,
+            reason=f"git diff refused: unsafe repo_dir: {e}",
         )
 
     total_changed = 0

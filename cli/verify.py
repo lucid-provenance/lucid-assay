@@ -1021,27 +1021,62 @@ def load_envelope(path: str) -> Any:
         return json.load(f)
 
 
+def _load_envelope_for_cli(path: str) -> Tuple[Optional[Any], Optional[int]]:
+    """Loads and validates the envelope file on main()'s behalf, collapsing
+    every known failure mode (missing file, oversize, unsafe path,
+    unreadable/malformed JSON, non-object JSON) into a single (None,
+    exit_code) sentinel so main() itself only has to check for that,
+    rather than repeat this dispatch inline."""
+    try:
+        envelope = load_envelope(path)
+    except FileNotFoundError:
+        print(f"ERROR: envelope file not found: {path}", file=sys.stderr)
+        return None, EXIT_FILE_ERROR
+    except EnvelopeTooLargeError as e:
+        print(f"ERROR: Attestation file exceeds maximum allowed size (10MB): {e}", file=sys.stderr)
+        return None, EXIT_FILE_ERROR
+    except UnsafePathError as e:
+        print(f"ERROR: unsafe envelope file path: {e}", file=sys.stderr)
+        return None, EXIT_FILE_ERROR
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"ERROR: failed to read/parse envelope file {path}: {e}", file=sys.stderr)
+        return None, EXIT_FILE_ERROR
+
+    if not isinstance(envelope, dict):
+        print(f"ERROR: envelope file {path} does not contain a JSON object", file=sys.stderr)
+        return None, EXIT_FILE_ERROR
+
+    return envelope, None
+
+
+def _print_verify_result_human(result: VerificationResult) -> None:
+    """Human-readable (non --json) stderr rendering of a completed
+    VerificationResult -- main()'s else branch of --json."""
+    print(f"tenax-assay verify: {'PASS' if result.passed else 'FAIL'}", file=sys.stderr)
+    if result.rcs_value is not None:
+        print(f"  RCS={result.rcs_value} degraded={result.degraded}", file=sys.stderr)
+        if result.degraded and result.degraded_reasons:
+            print(f"  degraded_reasons={result.degraded_reasons}", file=sys.stderr)
+    if result.subject_digests:
+        print(f"  subject_digests={result.subject_digests}", file=sys.stderr)
+    print(f"  identity: {result.identity_status} ({result.identity_detail})", file=sys.stderr)
+    if result.static_analysis_tools:
+        print("  static analysis:", file=sys.stderr)
+        for line in _format_static_analysis_table(result.static_analysis_tools):
+            print(line, file=sys.stderr)
+    for v in result.violations:
+        print(f"  VIOLATION: {v}", file=sys.stderr)
+    for w in result.warnings:
+        if w is not result.identity_detail:
+            print(f"  warning: {w}", file=sys.stderr)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
 
-    try:
-        envelope = load_envelope(args.envelope)
-    except FileNotFoundError:
-        print(f"ERROR: envelope file not found: {args.envelope}", file=sys.stderr)
-        return EXIT_FILE_ERROR
-    except EnvelopeTooLargeError as e:
-        print(f"ERROR: Attestation file exceeds maximum allowed size (10MB): {e}", file=sys.stderr)
-        return EXIT_FILE_ERROR
-    except UnsafePathError as e:
-        print(f"ERROR: unsafe envelope file path: {e}", file=sys.stderr)
-        return EXIT_FILE_ERROR
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"ERROR: failed to read/parse envelope file {args.envelope}: {e}", file=sys.stderr)
-        return EXIT_FILE_ERROR
-
-    if not isinstance(envelope, dict):
-        print(f"ERROR: envelope file {args.envelope} does not contain a JSON object", file=sys.stderr)
-        return EXIT_FILE_ERROR
+    envelope, error_exit_code = _load_envelope_for_cli(args.envelope)
+    if error_exit_code is not None:
+        return error_exit_code
 
     result = verify_dsse_attestation(
         envelope,
@@ -1060,23 +1095,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.json_output:
         print(json.dumps(result.as_dict(), indent=2))
     else:
-        print(f"tenax-assay verify: {'PASS' if result.passed else 'FAIL'}", file=sys.stderr)
-        if result.rcs_value is not None:
-            print(f"  RCS={result.rcs_value} degraded={result.degraded}", file=sys.stderr)
-            if result.degraded and result.degraded_reasons:
-                print(f"  degraded_reasons={result.degraded_reasons}", file=sys.stderr)
-        if result.subject_digests:
-            print(f"  subject_digests={result.subject_digests}", file=sys.stderr)
-        print(f"  identity: {result.identity_status} ({result.identity_detail})", file=sys.stderr)
-        if result.static_analysis_tools:
-            print("  static analysis:", file=sys.stderr)
-            for line in _format_static_analysis_table(result.static_analysis_tools):
-                print(line, file=sys.stderr)
-        for v in result.violations:
-            print(f"  VIOLATION: {v}", file=sys.stderr)
-        for w in result.warnings:
-            if w is not result.identity_detail:
-                print(f"  warning: {w}", file=sys.stderr)
+        _print_verify_result_human(result)
 
     return EXIT_PASS if result.passed else EXIT_POLICY_VIOLATION
 

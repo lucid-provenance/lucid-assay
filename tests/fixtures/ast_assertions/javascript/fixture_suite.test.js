@@ -26,7 +26,12 @@ it("gamed chai equal", () => {
   assert.equal(1, 1);
 });
 
-test("zero assertions", () => {
+// Intentionally assertion-free: this is the "zero assertions" case
+// test_ast_assertions.py::test_javascript_fixture_suite exercises,
+// asserting cli/parsers/ast/tsjs_visitor.py detects it as
+// assertion_count == 0. Adding a real assertion here would defeat the
+// fixture's purpose. NOSONAR: tests should include assertions.
+test("zero assertions", () => { // NOSONAR
   const value = computeSomething();
   console.log(value);
 });

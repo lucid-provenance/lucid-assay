@@ -1,0 +1,49 @@
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+    {
+      "name": "registry.example.com/org/svc",
+      "digest": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  ],
+  "predicateType": "https://slsa.dev/provenance/v1",
+  "predicate": {
+    "buildDefinition": {
+      "buildType": "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1",
+      "externalParameters": {
+        "workflow": {
+          "repository": "https://github.com/org/svc",
+          "path": ".github/workflows/assay.yml",
+          "ref": "refs/heads/main"
+        }
+      },
+      "internalParameters": {},
+      "resolvedDependencies": [
+        {
+          "uri": "git+https://github.com/org/svc",
+          "digest": {
+            "gitCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        },
+        {
+          "uri": "pkg:pypi/requests@2.31.0",
+          "digest": {
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        }
+      ]
+    },
+    "runDetails": {
+      "builder": {
+        "id": "https://github.com/actions/runner"
+      },
+      "metadata": {
+        "startedOn": "2026-08-23T12:00:00Z",
+        "finishedOn": "2026-08-23T12:00:42Z",
+        "invocationId": "https://github.com/org/svc/actions/runs/123456/attempts/1"
+      }
+    }
+  }
+}

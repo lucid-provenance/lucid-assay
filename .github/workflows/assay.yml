@@ -249,6 +249,8 @@ jobs:
             --min-rcs 65 \
             --sign \
             --out build/tenax-assay.dsse.json \
+            --emit-slsa-provenance \
+            --slsa-provenance-out build/tenax-assay.slsa-provenance.dsse.json \
             "${EXTRA_ARGS[@]}"
 
       - name: Verify Tenax Attestation Gate
@@ -268,9 +270,30 @@ jobs:
           fi
 
           uv run --no-sync python -m cli.verify build/tenax-assay.dsse.json "${VERIFY_ARGS[@]}"
+
+      - name: SLSA v1.0 Provenance Checklist (informational)
+        # build/tenax-assay.slsa-provenance.dsse.json (cli/slsa_provenance.py)
+        # is a *separate* statement from build/tenax-assay.dsse.json above --
+        # real SLSA v1.0 provenance shape, not tenax-assay's own RCS
+        # predicate. cli.verify's --min-rcs/--disallow-degraded gates and its
+        # unconditional "unexpected predicateType" check are specific to the
+        # RCS predicate and don't apply here (see README.md's "SLSA v1.0
+        # provenance attestation" section) -- this step only exists to print
+        # the SLSA Build Level 1/2 checklist to the log, so continue-on-error
+        # keeps that unrelated exit code from failing the job.
+        continue-on-error: true
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REF: ${{ github.ref }}
+        run: |
+          uv run --no-sync python -m cli.verify build/tenax-assay.slsa-provenance.dsse.json \
+            --expected-repository "$EXPECTED_REPOSITORY" --expected-ref "$EXPECTED_REF"
+
       - name: Upload In-Toto Attestation Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tenax-assay-attestation
-          path: build/tenax-assay.dsse.json
+          path: |
+            build/tenax-assay.dsse.json
+            build/tenax-assay.slsa-provenance.dsse.json
           if-no-files-found: error

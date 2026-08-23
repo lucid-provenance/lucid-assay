@@ -15,6 +15,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .builder import build_statement
@@ -34,6 +35,7 @@ from .parsers.sarif import (
 )
 from .patch_coverage import compute_patch_coverage, compute_patch_modified_lines
 from .scorer import RCSResult, score_pipeline
+from .slsa_provenance import build_slsa_provenance_statement
 
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="worm-upload")
 
@@ -124,6 +126,24 @@ def derive_signed_path(out_path: str) -> str:
             base_out = base_out[: -len(".unsigned")]
         return f"{base_out}.dsse.json"
     return f"{out_path}.dsse.json"
+
+
+def derive_slsa_provenance_path(out_path: str, explicit: Optional[str]) -> str:
+    """Output path for --emit-slsa-provenance's second statement: honors
+    --slsa-provenance-out verbatim when given, otherwise derives one from
+    --out the same way derive_signed_path() derives the signed-envelope
+    path, so the two outputs sit side by side (e.g.
+    attestation.unsigned.json -> attestation.slsa-provenance.unsigned.json)
+    without a caller having to spell out a second full path by hand."""
+    if explicit:
+        return explicit
+    if out_path.endswith(".unsigned.json"):
+        base_out = out_path[: -len(".unsigned.json")]
+        return f"{base_out}.slsa-provenance.unsigned.json"
+    if out_path.endswith(".json"):
+        base_out = out_path[: -len(".json")]
+        return f"{base_out}.slsa-provenance.json"
+    return f"{out_path}.slsa-provenance.json"
 
 
 def upload_to_worm_async(local_path: str, sha256_hex: str, bucket: str = "evidence"):
@@ -307,6 +327,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--out", default="attestation.unsigned.json")
     p.add_argument("--sign", action="store_true", help="perform keyless Sigstore signing")
     p.add_argument("--dry-run-sign", action="store_true", help="simulate DSSE envelope creation without OIDC")
+    p.add_argument(
+        "--emit-slsa-provenance",
+        action="store_true",
+        dest="emit_slsa_provenance",
+        help="additionally emit a second, separate in-toto Statement shaped as real SLSA v1.0 provenance "
+        "(predicateType https://slsa.dev/provenance/v1) alongside tenax-assay's own RCS predicate -- see "
+        "cli/slsa_provenance.py. Populated only from real ambient GitHub Actions context (GITHUB_REPOSITORY/"
+        "SHA/RUN_ID/WORKFLOW_REF, RUNNER_ENVIRONMENT); fields with no real value off-CI are simply omitted, "
+        "never fabricated, so an off-CI run legitimately produces a less-complete statement.",
+    )
+    p.add_argument(
+        "--slsa-provenance-out",
+        default=None,
+        dest="slsa_provenance_out",
+        help="output path for the --emit-slsa-provenance statement (default: derived from --out, e.g. "
+        "attestation.slsa-provenance.unsigned.json)",
+    )
     p.add_argument("--skip-perf-budget-check", action="store_true")
     p.add_argument(
         "--debug",
@@ -338,6 +375,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(raw_argv)
     t_start = time.perf_counter()
     t_start_ns = time.perf_counter_ns()
+    pipeline_started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     stage_ns: Dict[str, int] = {}
 
     # 1. Parse test report
@@ -447,6 +485,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(statement, f, indent=2)
 
+    # 7b. --emit-slsa-provenance: a second, separate in-toto Statement
+    # shaped as real SLSA v1.0 provenance (see cli/slsa_provenance.py).
+    # Independent of the RCS predicate above -- same subject digest, but
+    # its own file and (if --sign/--dry-run-sign) its own DSSE envelope.
+    slsa_provenance_out_path = None
+    if args.emit_slsa_provenance:
+        slsa_statement = build_slsa_provenance_statement(
+            subject_name=args.image_ref,
+            subject_sha256=image_digest,
+            started_at=pipeline_started_at,
+            resolved_dependencies=resolved_dependencies,
+        )
+        slsa_provenance_out_path = safe_resolve_path(
+            derive_slsa_provenance_path(args.out, args.slsa_provenance_out)
+        )
+        with open(slsa_provenance_out_path, "w", encoding="utf-8") as f:
+            json.dump(slsa_statement, f, indent=2)
+
     # 8. Async WORM uploads (fire-and-forget: the timed cost here is only
     # the dispatch/submission overhead, not the background upload itself)
     with _stage(stage_ns, "worm_upload"):
@@ -455,6 +511,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 9. Keyless signing
     sign_total_ns, sign_sub_ns = _maybe_sign(args, out_path)
+    if slsa_provenance_out_path is not None:
+        _maybe_sign(args, slsa_provenance_out_path)
 
     if args.debug:
         wall_elapsed_ns = time.perf_counter_ns() - t_start_ns

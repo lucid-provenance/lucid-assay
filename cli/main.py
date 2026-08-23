@@ -254,23 +254,24 @@ def _detect_lockfile_dependencies(args: argparse.Namespace, stage_ns: Dict[str, 
 def _maybe_sign(args: argparse.Namespace, out_path) -> Tuple[Optional[int], Dict[str, int]]:
     """Step 9: keyless Sigstore signing, gated on --sign/--dry-run-sign.
     Returns (sign_total_ns, sign_sub_ns) for --debug's stage-profile
-    report; sign_total_ns is None when neither flag was passed."""
+    report; sign_total_ns is None when neither flag was passed.
+
+    Thin wrapper around cli.oidc_signer.sign_file_to_envelope (the same
+    file-in/file-out entry point `tenax-assay sign` -- cli/sign.py -- uses
+    for an isolated signing job that only has an unsigned statement file,
+    not this pipeline's in-process state); this call site just also times
+    it for --debug's stage-profile report."""
     if not (args.sign or args.dry_run_sign):
         return None, {}
 
-    from .oidc_signer import sign_statement
-
-    with open(out_path, "rb") as f:
-        envelope_bytes = f.read()
+    from .oidc_signer import sign_file_to_envelope
 
     sign_sub_ns: Dict[str, int] = {}
     t0 = time.perf_counter_ns()
-    envelope = sign_statement(envelope_bytes, dry_run=args.dry_run_sign, timing=sign_sub_ns)
+    signed_path = sign_file_to_envelope(
+        str(out_path), derive_signed_path(str(out_path)), dry_run=args.dry_run_sign, timing=sign_sub_ns
+    )
     sign_total_ns = time.perf_counter_ns() - t0
-
-    signed_path = safe_resolve_path(derive_signed_path(str(out_path)))
-    with open(signed_path, "w", encoding="utf-8") as f:
-        f.write(envelope.to_json())
     print(f"signed envelope written to {signed_path}", file=sys.stderr)
 
     return sign_total_ns, sign_sub_ns
@@ -392,6 +393,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         from .verify import main as verify_main
 
         return verify_main(raw_argv[1:])
+
+    # `tenax-assay sign ...` dispatches to the standalone signing subcommand
+    # (cli/sign.py) -- signs an already-built unsigned statement *file*
+    # directly, without re-running the pipeline above. See cli/sign.py's
+    # module docstring for why this exists separately from --sign/
+    # --dry-run-sign below (which still build-then-sign in one process).
+    if raw_argv and raw_argv[0] == "sign":
+        from .sign import main as sign_main
+
+        return sign_main(raw_argv[1:])
 
     # `tenax-assay run ...` is an explicit alias for the attestation
     # pipeline below -- it's also what runs with no subcommand at all, so

@@ -1,0 +1,130 @@
+name: Sign In-Toto Statement (Sigstore Keyless)
+
+# Reusable workflow: the trusted signing boundary for tenax-assay-produced
+# attestations. Called via `uses: tenax-io/tenax-attest/.github/workflows/
+# sign.yml@<pinned-sha>` from a *calling* repo's own job (see
+# tenax-io/tenax-assay's .github/workflows/assay.yml `attest` job) -- never
+# invoked directly.
+#
+# Why this lives in its own repo rather than as a job inside the calling
+# repo's own workflow file: `signer-ref` below is a commit SHA the CALLER
+# passes in, but what actually executes is *this file*, checked out from
+# THIS repo at whatever ref the caller's `uses:` line pins (see that
+# line's own `# vX` comment for which one) -- a PR to tenax-assay that
+# rewrites its own workflow file, or the pipeline code `signer-ref` points
+# at, cannot also rewrite what this file does, because this file isn't
+# part of that PR's diff at all. Bumping `signer-ref` (which tenax-assay
+# commit's cli/sign.py + cli/oidc_signer.py this job trusts enough to
+# check out and run) is a separate, deliberate, reviewable act -- not
+# something a build-job compromise can do by itself.
+#
+# id-token: write is granted to exactly one job, in exactly one workflow,
+# in this one repo. No other job anywhere in the calling repo's own
+# workflow has it (see assay.yml's top-level `permissions:` comment).
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: "Name of the workflow-run artifact containing the unsigned *.unsigned.json statement files"
+        required: true
+        type: string
+      statement-files:
+        description: "Newline-separated list of *.unsigned.json filenames (within artifact-name) to sign"
+        required: true
+        type: string
+      signer-ref:
+        description: "Commit SHA of tenax-io/tenax-assay to check out for cli/sign.py + cli/oidc_signer.py -- pinned independently of whatever ref triggered the caller, never the caller's own ref"
+        required: true
+        type: string
+      dry-run-sign:
+        description: "Simulate DSSE envelope creation without a real OIDC/Sigstore round-trip"
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      artifact-name:
+        description: "Name of the workflow-run artifact this job uploads the signed *.dsse.json envelopes to"
+        value: signed-statements
+
+permissions: {}
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required for Sigstore keyless OIDC minting -- see file header
+      contents: read
+
+    steps:
+      # Explicit repository:/ref: -- this is NOT a self-checkout of
+      # tenax-attest. It checks out tenax-io/tenax-assay at the caller-
+      # supplied, independently-pinned inputs.signer-ref, into a
+      # subdirectory, purely to get the small, stable cli/sign.py +
+      # cli/oidc_signer.py signing surface (see those files' own
+      # docstrings) -- nothing from the calling build job's own checkout
+      # is trusted or reused here.
+      - name: Checkout Pinned tenax-assay Signer Code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: tenax-io/tenax-assay
+          ref: ${{ inputs.signer-ref }}
+          path: _signer
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: "_signer/uv.lock"
+
+      - name: Install Signer Dependencies
+        working-directory: _signer
+        run: uv sync --frozen --extra dev
+
+      - name: Cache Sigstore TUF Metadata
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/sigstore-python
+          key: sigstore-tuf-${{ runner.os }}-${{ inputs.signer-ref }}
+          restore-keys: |
+            sigstore-tuf-${{ runner.os }}-
+
+      - name: Download Unsigned Statements
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: unsigned
+
+      # Signs exactly the files the caller named, nothing else -- a file
+      # present in the artifact but not listed in inputs.statement-files
+      # is silently ignored, not swept up. Each `tenax-assay sign` call
+      # (cli/sign.py, checked out above) reads only that one file's bytes;
+      # it never touches anything else this job downloaded.
+      - name: Sign Statements
+        env:
+          STATEMENT_FILES: ${{ inputs.statement-files }}
+          DRY_RUN_SIGN: ${{ inputs.dry-run-sign }}
+        run: |
+          mkdir -p signed
+          DRY_RUN_ARGS=()
+          if [ "$DRY_RUN_SIGN" = "true" ]; then
+            DRY_RUN_ARGS=(--dry-run-sign)
+          fi
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            base="$(basename "$f" .unsigned.json)"
+            (cd _signer && uv run --no-sync python -m cli.main sign \
+              "../unsigned/$f" --out "../signed/${base}.dsse.json" "${DRY_RUN_ARGS[@]}")
+          done <<< "$STATEMENT_FILES"
+
+      - name: Upload Signed Statements
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-statements
+          path: signed/
+          if-no-files-found: error

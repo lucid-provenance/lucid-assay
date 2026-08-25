@@ -25,6 +25,13 @@ This repo is public deliberately: the signing logic isn't secret, and a
 public, independently-inspectable trust boundary is more credible than a
 private one to anyone verifying a `tenax-assay` attestation.
 
+The commit of `tenax-assay` this job trusts enough to check out and run
+(`cli/sign.py` + `cli/oidc_signer.py`) is hardcoded inside `sign.yml` itself
+(`env.TRUSTED_SIGNER_SHA`) — it is deliberately **not** a `workflow_call`
+input the caller can set. The privileged job here (`id-token: write`) must
+never execute code checked out from a ref an untrusted caller supplies
+dynamically; only a commit to *this* repo can move that pin.
+
 ## What's here
 
 - `.github/workflows/sign.yml` — the reusable `workflow_call` workflow.
@@ -54,13 +61,13 @@ private one to anyone verifying a `tenax-assay` attestation.
        statement-files: |
          tenax-assay.unsigned.json
          tenax-assay.slsa-provenance.unsigned.json
-       signer-ref: <a pinned tenax-assay commit SHA providing cli/sign.py>
    ```
 
 5. Whenever `tenax-assay`'s signing code (`cli/sign.py`,
    `cli/oidc_signer.py`) changes in a way you want the signer to pick up,
-   bump `signer-ref` in a deliberate, reviewed commit — never point it at
-   a moving branch.
+   bump `env.TRUSTED_SIGNER_SHA` at the top of *this repo's* `sign.yml`, in
+   a deliberate, reviewed commit — never point it at a moving branch, and
+   never re-expose it as something `tenax-assay`'s workflow can set.
 6. Whenever this repo's own `sign.yml` changes, bump the SHA in
    `tenax-assay`'s `uses:` line the same way every other pinned action in
    that repo is bumped (full commit SHA, `# vX` comment, never a mutable

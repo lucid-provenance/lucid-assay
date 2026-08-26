@@ -1012,6 +1012,55 @@ def _extract_run_identity(statement: Optional[Dict[str, Any]]) -> Dict[str, Any]
     return {"vcs": vcs, "pipeline": pipeline, "subjects": subjects}
 
 
+def _format_vcs_lines(vcs: Dict[str, Any]) -> List[str]:
+    """Renders the Repository/Branch/Commit/Base commit/Pull Request lines
+    of _format_run_identity_report's vcs block -- split out purely to keep
+    that function's cognitive complexity within budget, same rationale as
+    _format_gate_params below."""
+    if not vcs:
+        return ["Repository:    unavailable (no predicate.vcs block in this statement)"]
+
+    pr = vcs.get("pull_request") if isinstance(vcs.get("pull_request"), dict) else {}
+    lines = [
+        f"Repository:    {vcs.get('repository', '-')} ({vcs.get('provider', '-')})",
+        f"Branch:        {vcs.get('branch', '-')}",
+        f"Commit:        {vcs.get('commit_sha', '-')}",
+    ]
+    if vcs.get("base_commit_sha"):
+        lines.append(f"Base commit:   {vcs['base_commit_sha']}")
+    if pr.get("number") is not None:
+        lines.append(f"Pull Request:  #{pr['number']} -> {pr.get('target_branch', '-')}")
+    return lines
+
+
+def _format_pipeline_lines(pipeline: Dict[str, Any]) -> List[str]:
+    """Renders the CI Run/Workflow Ref lines of _format_run_identity_report's
+    pipeline block -- same complexity-budget rationale as _format_vcs_lines."""
+    if not pipeline:
+        return []
+    lines = [
+        f"CI Run:        {pipeline.get('ci_provider', '-')} run {pipeline.get('run_id', '-')} "
+        f"(attempt {pipeline.get('run_attempt', '-')})"
+    ]
+    if pipeline.get("workflow_ref"):
+        lines.append(f"Workflow Ref:  {pipeline['workflow_ref']}")
+    return lines
+
+
+def _format_subject_lines(subjects: List[Any]) -> List[str]:
+    """Renders one "Subject:" line per statement.subject entry of
+    _format_run_identity_report -- same complexity-budget rationale as
+    _format_vcs_lines."""
+    lines = []
+    for s in subjects:
+        if not isinstance(s, dict):
+            continue
+        digest = s.get("digest") if isinstance(s.get("digest"), dict) else {}
+        digest_str = ", ".join(f"{alg}:{val}" for alg, val in digest.items()) or "-"
+        lines.append(f"Subject:       {s.get('name', '-')} @ {digest_str}")
+    return lines
+
+
 def _format_run_identity_report(result: "VerificationResult") -> List[str]:
     """Renders a "where did this come from" header: the source commit/PR/CI
     run this predicate was built from (predicate.vcs/pipeline, when
@@ -1020,39 +1069,16 @@ def _format_run_identity_report(result: "VerificationResult") -> List[str]:
     $GITHUB_STEP_SUMMARY rendering, which is routinely read on its own,
     days later or copy-pasted out of context -- never leaves a reader
     guessing which push/PR produced it or which --min-rcs/--disallow-degraded
-    values are actually enforcing the verdict below."""
+    values are actually enforcing the verdict below. The vcs/pipeline/
+    subjects blocks are each rendered by their own _format_*_lines helper
+    (see their docstrings) purely to keep this function's own cognitive
+    complexity within budget -- this is just their assembly order."""
     identity = _extract_run_identity(result.statement)
-    vcs, pipeline, subjects = identity["vcs"], identity["pipeline"], identity["subjects"]
 
     lines = ["=== Run Identity & Gate Parameters ==="]
-
-    if vcs:
-        pr = vcs.get("pull_request") if isinstance(vcs.get("pull_request"), dict) else {}
-        lines.append(f"Repository:    {vcs.get('repository', '-')} ({vcs.get('provider', '-')})")
-        lines.append(f"Branch:        {vcs.get('branch', '-')}")
-        lines.append(f"Commit:        {vcs.get('commit_sha', '-')}")
-        if vcs.get("base_commit_sha"):
-            lines.append(f"Base commit:   {vcs['base_commit_sha']}")
-        if pr.get("number") is not None:
-            lines.append(f"Pull Request:  #{pr['number']} -> {pr.get('target_branch', '-')}")
-    else:
-        lines.append("Repository:    unavailable (no predicate.vcs block in this statement)")
-
-    if pipeline:
-        lines.append(
-            f"CI Run:        {pipeline.get('ci_provider', '-')} run {pipeline.get('run_id', '-')} "
-            f"(attempt {pipeline.get('run_attempt', '-')})"
-        )
-        if pipeline.get("workflow_ref"):
-            lines.append(f"Workflow Ref:  {pipeline['workflow_ref']}")
-
-    for s in subjects:
-        if not isinstance(s, dict):
-            continue
-        digest = s.get("digest") if isinstance(s.get("digest"), dict) else {}
-        digest_str = ", ".join(f"{alg}:{val}" for alg, val in digest.items()) or "-"
-        lines.append(f"Subject:       {s.get('name', '-')} @ {digest_str}")
-
+    lines.extend(_format_vcs_lines(identity["vcs"]))
+    lines.extend(_format_pipeline_lines(identity["pipeline"]))
+    lines.extend(_format_subject_lines(identity["subjects"]))
     lines.extend(_format_gate_params(result.gate_params))
     lines.append("=====================================")
     return lines

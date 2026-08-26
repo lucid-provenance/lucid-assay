@@ -18,17 +18,34 @@ on:
         type: boolean
         default: true
 
+# `push` fires with no PR context of its own (no base sha, no PR number) --
+# unlike a `pull_request` event's own fields. Without recovering it, every
+# push-triggered run (a merge landing on `main`, or a plain feature-branch
+# push) would mint degraded (no_pr_context/patch_coverage_unavailable).
+# `build`'s "Resolve PR Context for a Push-Triggered Run" step below closes
+# that gap: it looks up whichever PR GitHub associates with the pushed
+# commit (works for merge/squash/rebase alike, and for a still-open PR's
+# branch commits too -- GitHub tracks the association server-side, not by
+# walking commit parents) and feeds its base sha/number into the mint step
+# the same way a `pull_request` event's own fields would. A push with no
+# associated PR (a genuine early WIP push before a PR exists, or the rare
+# admin-privileged direct push to `main`) mints without PR context exactly
+# as it always has -- see `verify`'s --disallow-degraded comment for why
+# that specific case still isn't gate-enforced.
+#
 # No `id-token: write` at the workflow level: that's the Sigstore OIDC
 # minting permission, and it's granted *only* to the `attest` job below --
 # `build` runs the PR's own tests/deps/CodeQL, so it must never be able to
 # reach the signing credential itself (that's the whole point of splitting
 # this into build -> attest -> verify; see the `attest` job's comment).
-# No `pull-requests` or `administration` scope here either: patch coverage
-# is computed from local git diff, not the GitHub API, and `administration`
-# (needed to query /repos/{owner}/{repo}/rules/branches/{branch}) isn't a
-# scope GITHUB_TOKEN can be granted via this block at all -- see the
-# "Generate GitHub App Token" step below, which mints a separate,
-# narrowly-scoped token for that instead.
+# No `administration` scope here either -- it isn't a scope GITHUB_TOKEN
+# can be granted via this block at all (needed to query
+# /repos/{owner}/{repo}/rules/branches/{branch}); see the "Generate GitHub
+# App Token" step below, which mints a separate, narrowly-scoped token for
+# that instead. `pull-requests: read` *is* granted, job-scoped to `build`
+# alone (see its own `permissions:` block) -- needed for the PR-context
+# lookup above; patch coverage itself still comes from local git diff, not
+# the GitHub API.
 permissions:
   contents: read
   security-events: write # Required for github/codeql-action/analyze to upload SARIF to code scanning
@@ -56,6 +73,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      pull-requests: read # "Resolve PR Context for a Push-Triggered Run" below
 
     steps:
       - name: Checkout Repository
@@ -195,6 +213,23 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           permission-administration: read
 
+      # push carries no PR context of its own -- see the `on:` block's
+      # comment for the full rationale. Looks up whichever PR GitHub
+      # associates with the pushed commit itself (works uniformly for
+      # merge/squash/rebase, and for a still-open PR's own branch commits
+      # too); empty outputs (no associated PR) are a legitimate, handled
+      # case -- the mint step below falls back to no PR context exactly
+      # as it already does for workflow_dispatch.
+      - name: Resolve PR Context for a Push-Triggered Run
+        id: pr-context
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pulls_json="$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls")"
+          echo "base-sha=$(echo "$pulls_json" | jq -r '.[0].base.sha // empty')" >> "$GITHUB_OUTPUT"
+          echo "number=$(echo "$pulls_json" | jq -r '.[0].number // empty')" >> "$GITHUB_OUTPUT"
+
       # Deliberately no --sign/--dry-run-sign here: this job has no
       # id-token permission, so it could not mint a Sigstore identity even
       # if it tried. Both statements are written unsigned; the separate
@@ -212,10 +247,12 @@ jobs:
           # on the runner is ambiguous (it reflects the *runner's* current
           # view of history, which can differ from the base GitHub actually
           # resolved the event against) and must never silently substitute
-          # for the authoritative event value.
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # for the authoritative event value. On a push event, falls back
+          # to whatever "Resolve PR Context for a Push-Triggered Run" found
+          # (empty for a push with no associated PR).
+          BASE_SHA: ${{ github.event.pull_request.base.sha || steps.pr-context.outputs.base-sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || steps.pr-context.outputs.number }}
           # On a pull_request event, github.ref_name is the synthetic
           # "<number>/merge" ref (e.g. "5/merge"), not a real branch --
           # querying branch governance for that name 404s/403s every time.
@@ -226,12 +263,15 @@ jobs:
           BRANCH_NAME: ${{ github.event.pull_request.base.ref || github.ref_name }}
         run: |
           EXTRA_ARGS=(--debug)
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            if [ -z "$BASE_SHA" ]; then
-              echo "ERROR: github.event.pull_request.base.sha was empty on a pull_request event; refusing to guess a base commit" >&2
+          if [ -n "$BASE_SHA" ]; then
+            if [ -z "$PR_NUMBER" ]; then
+              echo "ERROR: BASE_SHA resolved but PR_NUMBER did not; refusing to mint with inconsistent PR context" >&2
               exit 1
             fi
             EXTRA_ARGS=(--base-sha "$BASE_SHA" --pr-number "$PR_NUMBER")
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "ERROR: github.event.pull_request.base.sha was empty on a pull_request event; refusing to guess a base commit" >&2
+            exit 1
           fi
 
           # CodeQL always runs (no secret dependency), but the SARIF path
@@ -398,7 +438,16 @@ jobs:
             --cert-identity "$CERT_IDENTITY"
             --cert-oidc-issuer "$CERT_OIDC_ISSUER"
           )
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          # pull_request (pre-merge) and push-to-main (post-merge/promotion,
+          # now that "Resolve PR Context for a Push-Triggered Run" keeps it
+          # from degrading on missing PR context -- see the `on:` block's
+          # comment) are both gate-enforced. A plain push to a feat/**
+          # branch is deliberately NOT enforced here: it may have no
+          # associated PR yet (a genuine early WIP push), in which case
+          # minting without PR context is expected and shouldn't block --
+          # that branch's own eventual PR (or its post-merge push to main)
+          # is what actually gets gated.
+          if [ "${{ github.event_name }}" = "pull_request" ] || [ "$EXPECTED_REF" = "refs/heads/main" ]; then
             VERIFY_ARGS+=(--disallow-degraded)
           fi
 

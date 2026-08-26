@@ -346,15 +346,28 @@ def _slsa_item(label: str, passed: bool, detail: str = "") -> Dict[str, Any]:
     return {"label": label, "passed": passed, "detail": detail}
 
 
-def _slsa_level_result(track: str, level: int, name: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _slsa_level_result(
+    track: str, level: int, name: str, items: List[Dict[str, Any]], origin: Optional[str] = None
+) -> Dict[str, Any]:
     """One level's worth of checklist items (see _slsa_item), for either
     the SLSA Source track or the SLSA Build track. `track` ("Source" or
     "Build") and `level` together drive both the rendered Status line
     (see _format_slsa_level_block) and the FINAL VERDICT banner's
     "(Source Lx / Build Ly)" summary (see _highest_passing_level) -- one
     shape shared by both tracks so the renderer and verdict logic don't
-    need to special-case either one."""
-    return {"track": track, "level": level, "name": name, "items": items, "passed": all(i["passed"] for i in items)}
+    need to special-case either one. `origin` (see _slsa_invocation_origin)
+    is the CI run that produced the statement this level's items were
+    evaluated from -- Build-track callers only, Source track has no
+    runDetails to draw one from -- rendered by _format_slsa_level_block
+    directly inside a failing level's own block."""
+    return {
+        "track": track,
+        "level": level,
+        "name": name,
+        "items": items,
+        "passed": all(i["passed"] for i in items),
+        "origin": origin,
+    }
 
 
 def _slsa_check_statement_envelope(statement: Dict[str, Any]) -> Dict[str, Any]:
@@ -395,6 +408,31 @@ def _slsa_has_invocation_metadata(predicate: Dict[str, Any]) -> bool:
     if metadata.get("invocationId"):
         return True
     return bool(metadata.get("startedOn")) and bool(metadata.get("finishedOn"))
+
+
+def _slsa_invocation_origin(predicate: Dict[str, Any]) -> Optional[str]:
+    """Extracts runDetails.metadata.invocationId -- when present, already a
+    fully-formed https://github.com/<owner>/<repo>/actions/runs/<run_id>/
+    attempts/<attempt> URL identifying the exact CI run that produced *this
+    SLSA statement* (see slsa_provenance.py::_invocation_metadata, the only
+    place that field is ever set). Deliberately not the same thing as
+    _format_run_identity_report's "CI Run:" line -- that's sourced from the
+    RCS/assay statement's predicate.pipeline, which can legitimately be a
+    *different* run than the one that constructed the SLSA statement (e.g.
+    the untrusted caller's build job vs. tenax-attest's isolated signer
+    job). A failed Build Level checklist item needs a link to the run that
+    actually produced *its own* predicate, so this is threaded through
+    _slsa_level_result and rendered directly inside that level's block (see
+    _format_slsa_level_block) instead. Returns None, not "", when absent --
+    an off-CI or self-hosted-runner statement legitimately has no
+    invocationId at all, same fail-closed contract as the rest of this
+    module."""
+    run_details = predicate.get("runDetails")
+    run_details = run_details if isinstance(run_details, dict) else {}
+    metadata = run_details.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    invocation_id = metadata.get("invocationId")
+    return invocation_id if isinstance(invocation_id, str) and invocation_id.strip() else None
 
 
 def _slsa_check_build_definition(predicate: Dict[str, Any]) -> Dict[str, Any]:
@@ -442,7 +480,7 @@ def _evaluate_slsa_l1(statement: Dict[str, Any]) -> Dict[str, Any]:
         _slsa_check_build_definition(predicate),
         _slsa_check_subject_digest(statement),
     ]
-    return _slsa_level_result("Build", 1, "SLSA Build Level 1", items)
+    return _slsa_level_result("Build", 1, "SLSA Build Level 1", items, origin=_slsa_invocation_origin(predicate))
 
 
 def _slsa_check_hosted_builder(predicate: Dict[str, Any]) -> Dict[str, Any]:
@@ -546,7 +584,7 @@ def _evaluate_slsa_l2(
         _slsa_check_source_binding(predicate, expected_repository),
         _slsa_check_resolved_dependencies(predicate),
     ]
-    return _slsa_level_result("Build", 2, "SLSA Build Level 2", items)
+    return _slsa_level_result("Build", 2, "SLSA Build Level 2", items, origin=_slsa_invocation_origin(predicate))
 
 
 def _slsa_check_control_plane_builder_identity(predicate: Dict[str, Any]) -> Dict[str, Any]:
@@ -682,7 +720,7 @@ def _evaluate_slsa_l3(
         _slsa_check_isolated_provenance_generation(predicate, identity_status=identity_status, cert_identity=cert_identity),
         _slsa_check_materialized_dependencies(predicate),
     ]
-    return _slsa_level_result("Build", 3, "SLSA Build Level 3", items)
+    return _slsa_level_result("Build", 3, "SLSA Build Level 3", items, origin=_slsa_invocation_origin(predicate))
 
 
 def _source_check_version_controlled(vcs: Dict[str, Any]) -> Dict[str, Any]:
@@ -891,11 +929,15 @@ def _evaluate_slsa_checklists(
 
 def _format_slsa_level_block(assessment: Dict[str, Any], overall_passed: bool) -> List[str]:
     """Renders one level's checklist -- header, one [✓]/[✗] row per item
-    (with a trailing failure description on any [✗] row), and a Status
-    line. `overall_passed` is taken from the caller rather than
-    `assessment["passed"]` directly so _format_track_report can fold in
-    each level's cumulative-on-lower-levels requirement without this
-    function needing to know about that rule."""
+    (with a trailing failure description on any [✗] row), an Origin CI Run
+    line when this level failed and its statement carried one (see
+    _slsa_invocation_origin -- the run that produced *this* statement, so a
+    failing item can be traced back without cross-referencing the report's
+    top-of-document "CI Run:" line, which reflects a possibly different
+    run), and a Status line. `overall_passed` is taken from the caller
+    rather than `assessment["passed"]` directly so _format_track_report can
+    fold in each level's cumulative-on-lower-levels requirement without
+    this function needing to know about that rule."""
     lines = [f"=== {assessment['name']} Assessment ==="]
     for item in assessment["items"]:
         mark = "✓" if item["passed"] else "✗"
@@ -903,6 +945,8 @@ def _format_slsa_level_block(assessment: Dict[str, Any], overall_passed: bool) -
         if not item["passed"] and item["detail"]:
             line += f" -- {item['detail']}"
         lines.append(line)
+    if not overall_passed and assessment.get("origin"):
+        lines.append(f"Origin CI Run:  {assessment['origin']}")
     status = "PASSED" if overall_passed else "FAILED"
     lines.append(f"Status: {status} (SLSA {assessment['track']} Level {assessment['level']})")
     return lines

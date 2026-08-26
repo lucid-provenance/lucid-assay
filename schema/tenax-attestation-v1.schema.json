@@ -66,6 +66,21 @@
             "review_state": { "type": "string", "enum": ["approved", "changes_requested", "pending", "not_applicable"] }
           },
           "required": ["approvers", "required_approvals", "review_state"]
+        },
+        "commit_author": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "Live GitHub commit-author identity check (cli/parsers/commit_author.py): whether the commit's author resolves to a linked, verified GitHub account (GitHub's own `author.login`, distinct from the trivially-spoofable free-text git author name/email). Null when not collected (e.g. off-CI, no GITHUB_TOKEN, or an attestation predating this field) -- absence must not be read as verified.",
+          "properties": {
+            "available": { "type": "boolean" },
+            "commit_sha": { "type": "string" },
+            "name": { "type": ["string", "null"] },
+            "email": { "type": ["string", "null"] },
+            "github_login": { "type": ["string", "null"] },
+            "verified_github_account": { "type": "boolean" },
+            "reason": { "type": "string" }
+          },
+          "required": ["available", "commit_sha", "verified_github_account", "reason"]
         }
       }
     },

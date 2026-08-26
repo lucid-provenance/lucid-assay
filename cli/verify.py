@@ -726,16 +726,35 @@ def _source_check_verified_history(vcs: Dict[str, Any]) -> Dict[str, Any]:
     return _slsa_item(label, True)
 
 
-def _source_check_retained_history() -> Dict[str, Any]:
+def _source_check_retained_history(vcs: Dict[str, Any]) -> Dict[str, Any]:
     """Source Level 3: SLSA's "retained history" requires verifiable
-    commit-author identity and tamper-evident history retention. Neither
-    is captured anywhere in the predicate today (predicate.vcs has no
-    author/committer field at all) -- this is an honest, permanent [✗]
-    until that data-collection gap is closed in a future change, not a
-    hardcoded stub: it reports exactly what it can (nothing) rather than
-    fabricating a pass."""
-    label = "Retained History & Author Identity (commit author / history-retention provenance)"
-    return _slsa_item(label, False, "commit author / history-retention identity is not yet captured in the predicate")
+    commit-author identity -- not merely a free-text git author
+    name/email, which is self-reported by whoever authored the commit
+    object and trivially spoofable (`git commit --author=...`, or simply
+    an unconfigured `git config user.*`). This check requires
+    vcs.commit_author.verified_github_account (see
+    cli/parsers/commit_author.py): the commit author's email resolved,
+    via GitHub's own commits API, to a *linked, verified* GitHub account
+    -- GitHub's `author.login`, populated only on a genuine email match,
+    never inferred from the free-text name/email alone. Cryptographic
+    commit signing would be a stronger binding still, but isn't required
+    here -- a verified GitHub account is the bar this check enforces.
+    Fails closed: absent, unavailable, or unverified all report [✗] with
+    a distinct reason -- never silently treated as "not applicable"."""
+    label = "Retained History & Author Identity (commit author resolves to a verified GitHub account)"
+    commit_author = vcs.get("commit_author")
+    if not isinstance(commit_author, dict):
+        return _slsa_item(label, False, "vcs.commit_author is not captured in this predicate")
+    if not commit_author.get("available"):
+        reason = commit_author.get("reason") or "commit author identity could not be verified"
+        return _slsa_item(label, False, str(reason))
+    if not commit_author.get("verified_github_account"):
+        email = commit_author.get("email") or "unknown"
+        return _slsa_item(
+            label, False, f"commit author email ({email}) does not resolve to a linked, verified GitHub account"
+        )
+    login = commit_author.get("github_login")
+    return _slsa_item(f"{label} (author: @{login})", True)
 
 
 def _source_check_two_party_review(branch_governance: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -772,9 +791,9 @@ def _evaluate_source_l2(vcs: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-def _evaluate_source_l3() -> Dict[str, Any]:
+def _evaluate_source_l3(vcs: Dict[str, Any]) -> Dict[str, Any]:
     return _slsa_level_result(
-        "Source", 3, "Source Level 3: Retained History & Author Identity", [_source_check_retained_history()]
+        "Source", 3, "Source Level 3: Retained History & Author Identity", [_source_check_retained_history(vcs)]
     )
 
 
@@ -832,7 +851,7 @@ def _evaluate_source_checklist(assay_statement: Dict[str, Any]) -> Tuple[Dict[st
     return (
         _evaluate_source_l1(vcs),
         _evaluate_source_l2(vcs),
-        _evaluate_source_l3(),
+        _evaluate_source_l3(vcs),
         _evaluate_source_l4(branch_governance),
     )
 

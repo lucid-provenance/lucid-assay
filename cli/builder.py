@@ -14,6 +14,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from .parsers.commit_author import CommitAuthorReport
 from .parsers.coverage import CoverageReport
 from .parsers.github_rules import BranchGovernanceReport
 from .parsers.junit import TestTotals
@@ -51,6 +52,7 @@ def build_statement(
     pr_required_approvals: int,
     pr_review_state: str,
     branch_governance: BranchGovernanceReport,
+    commit_author: Optional[CommitAuthorReport] = None,
     test_framework: str,
     test_report_sha256: str,
     test_report_uri: str,
@@ -157,6 +159,15 @@ def build_statement(
                 base_commit_sha.strip().lower() if base_commit_sha else None
             ),
             "pull_request": pull_request,
+            # Live GitHub commit-author identity check
+            # (cli/parsers/commit_author.py): whether HEAD's commit author
+            # resolves to a linked, verified GitHub account, distinct from
+            # the trivially-spoofable free-text git author name/email.
+            # None on an attestation predating this field, or when the
+            # caller didn't supply one at all (e.g. most existing tests) --
+            # cli/verify.py's Source Level 3 check treats that identically
+            # to an unverified author, never as "not applicable".
+            "commit_author": commit_author.as_dict() if commit_author is not None else None,
         },
         "branch_governance": {
             "available": branch_governance.available,

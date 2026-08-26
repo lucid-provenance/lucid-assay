@@ -25,6 +25,7 @@ cli/
     java_visitor.py               # Tree-sitter Java: JUnit 4/5, AssertJ, Hamcrest, *Test(s).java
   parsers/sarif.py          # SARIF 2.1.0 ingestion -> differential (patch vs. legacy) findings
   parsers/github_rules.py   # GitHub branch protection/ruleset inspection via REST API
+  parsers/commit_author.py  # GitHub commit-author identity (verified account) via REST API
   parsers/lockfiles.py      # uv.lock/package-lock.json/go.sum/Gradle/Maven -> resolved_dependencies
   patch_coverage.py         # git diff base...head, intersected with coverage hit maps
   hashing.py                 # SHA-256 content hashing + WORM key derivation
@@ -45,6 +46,7 @@ tests/
                                     # registry dispatch, and DSSE predicate telemetry tests
   test_sarif.py                    # SARIF parsing, path-matching, and fail-closed aggregation tests
   test_github_rules.py              # branch governance API client tests (auth, pagination, bypass modes)
+  test_commit_author.py              # commit-author identity API client tests (SLSA Source Level 3)
   test_verify.py                     # DSSE/Sigstore verification + policy-gate tests
   test_verify_boundaries.py           # verify.py hardening/edge-case suite
   test_verify_hardening.py             # envelope size guard, diagnostic schema validation, OIDC fetch retry
@@ -657,12 +659,12 @@ Status: PASSED (SLSA Source Level 1)
 Status: PASSED (SLSA Source Level 2)
 
 === Source Level 3: Retained History & Author Identity Assessment ===
-[✗] Retained History & Author Identity (commit author / history-retention provenance) -- commit author / history-retention identity is not yet captured in the predicate
-Status: FAILED (SLSA Source Level 3)
+[✓] Retained History & Author Identity (commit author resolves to a verified GitHub account) (author: @octocat)
+Status: PASSED (SLSA Source Level 3)
 
 === Source Level 4: Two-Party Code Review & Branch Governance Assessment ===
 [✓] Two-Party Code Review & Branch Governance (branch_governance.approvals_required >= 1) (2 approval(s) required)
-Status: FAILED (SLSA Source Level 4)
+Status: PASSED (SLSA Source Level 4)
 =====================================
 
 SLSA Build Track
@@ -695,7 +697,7 @@ Component breakdown:
   ...
 
 ================================================================================
-FINAL VERDICT: GATED (Source L2 / Build L2) — SLSA Build L3 Incomplete
+FINAL VERDICT: GATED (Source L4 / Build L2) — SLSA Build L3 Incomplete
 ================================================================================
 ```
 
@@ -705,11 +707,19 @@ cumulative, same rule as the Build track below):
 - **Level 2** — `vcs.commit_sha` and `vcs.base_commit_sha` are both present
   and hash-shaped; when this run has PR context, `vcs.pull_request.number`
   and `.target_branch` are present too (explicit lineage).
-- **Level 3** — verifiable commit-author identity and tamper-evident
-  history retention. **Always `[✗]` today**: no predicate field captures
-  either yet (`predicate.vcs` has no author/committer field at all) — an
-  honest, permanent gap, not a stub, until that data-collection work is
-  done.
+- **Level 3** — `vcs.commit_author.verified_github_account` is `true`:
+  the commit's author email resolves, via GitHub's own commits API
+  (`GET /repos/{repo}/commits/{sha}`), to a linked, *verified* GitHub
+  account (`author.login`) — not merely a free-text git author
+  name/email, which is self-reported by whoever authored the commit
+  object and trivially spoofable (`git commit --author=...`, or simply
+  an unconfigured `git config user.*`). Collected by
+  `parsers/commit_author.py` using the same ambient `GITHUB_TOKEN` as
+  branch governance; fails closed (`[✗]`) on a missing/unavailable
+  check (no token, API failure) exactly the same as an unverified
+  author — the two are distinguished by reason text, not by outcome.
+  Cryptographic commit signing would be a stronger binding still, but
+  isn't required to pass this check.
 - **Level 4** — `branch_governance.approvals_required >= 1` (the branch's
   own rule, not merely that this PR happened to get a reviewer — see
   `vcs.pull_request.required_approvals` for that separate, PR-scoped

@@ -226,6 +226,15 @@ class VerificationResult:
     # Empty string until verify_dsse_attestation computes it (e.g. the
     # top-level malformed-envelope guard returns before doing so).
     verdict: str = ""
+    # The exact admission-gate parameters this call was invoked with
+    # (min_rcs, disallow_degraded, cert_identity, expected_repository, ...)
+    # -- verbatim, not re-derived -- so a report can be read on its own and
+    # still answer "what threshold/flags produced this verdict", without
+    # cross-referencing the CI job's command line separately. Always
+    # populated (even on the malformed-envelope early return), since it
+    # reflects what verify_dsse_attestation was called with, not anything
+    # about the envelope itself. See _format_run_identity_report.
+    gate_params: Dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -251,6 +260,7 @@ class VerificationResult:
             "source_level4": self.source_level4,
             "rcs_components": self.rcs_components,
             "verdict": self.verdict,
+            "gate_params": self.gate_params,
         }
 
 
@@ -336,15 +346,28 @@ def _slsa_item(label: str, passed: bool, detail: str = "") -> Dict[str, Any]:
     return {"label": label, "passed": passed, "detail": detail}
 
 
-def _slsa_level_result(track: str, level: int, name: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _slsa_level_result(
+    track: str, level: int, name: str, items: List[Dict[str, Any]], origin: Optional[str] = None
+) -> Dict[str, Any]:
     """One level's worth of checklist items (see _slsa_item), for either
     the SLSA Source track or the SLSA Build track. `track` ("Source" or
     "Build") and `level` together drive both the rendered Status line
     (see _format_slsa_level_block) and the FINAL VERDICT banner's
     "(Source Lx / Build Ly)" summary (see _highest_passing_level) -- one
     shape shared by both tracks so the renderer and verdict logic don't
-    need to special-case either one."""
-    return {"track": track, "level": level, "name": name, "items": items, "passed": all(i["passed"] for i in items)}
+    need to special-case either one. `origin` (see _slsa_invocation_origin)
+    is the CI run that produced the statement this level's items were
+    evaluated from -- Build-track callers only, Source track has no
+    runDetails to draw one from -- rendered by _format_slsa_level_block
+    directly inside a failing level's own block."""
+    return {
+        "track": track,
+        "level": level,
+        "name": name,
+        "items": items,
+        "passed": all(i["passed"] for i in items),
+        "origin": origin,
+    }
 
 
 def _slsa_check_statement_envelope(statement: Dict[str, Any]) -> Dict[str, Any]:
@@ -385,6 +408,31 @@ def _slsa_has_invocation_metadata(predicate: Dict[str, Any]) -> bool:
     if metadata.get("invocationId"):
         return True
     return bool(metadata.get("startedOn")) and bool(metadata.get("finishedOn"))
+
+
+def _slsa_invocation_origin(predicate: Dict[str, Any]) -> Optional[str]:
+    """Extracts runDetails.metadata.invocationId -- when present, already a
+    fully-formed https://github.com/<owner>/<repo>/actions/runs/<run_id>/
+    attempts/<attempt> URL identifying the exact CI run that produced *this
+    SLSA statement* (see slsa_provenance.py::_invocation_metadata, the only
+    place that field is ever set). Deliberately not the same thing as
+    _format_run_identity_report's "CI Run:" line -- that's sourced from the
+    RCS/assay statement's predicate.pipeline, which can legitimately be a
+    *different* run than the one that constructed the SLSA statement (e.g.
+    the untrusted caller's build job vs. tenax-attest's isolated signer
+    job). A failed Build Level checklist item needs a link to the run that
+    actually produced *its own* predicate, so this is threaded through
+    _slsa_level_result and rendered directly inside that level's block (see
+    _format_slsa_level_block) instead. Returns None, not "", when absent --
+    an off-CI or self-hosted-runner statement legitimately has no
+    invocationId at all, same fail-closed contract as the rest of this
+    module."""
+    run_details = predicate.get("runDetails")
+    run_details = run_details if isinstance(run_details, dict) else {}
+    metadata = run_details.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    invocation_id = metadata.get("invocationId")
+    return invocation_id if isinstance(invocation_id, str) and invocation_id.strip() else None
 
 
 def _slsa_check_build_definition(predicate: Dict[str, Any]) -> Dict[str, Any]:
@@ -432,7 +480,7 @@ def _evaluate_slsa_l1(statement: Dict[str, Any]) -> Dict[str, Any]:
         _slsa_check_build_definition(predicate),
         _slsa_check_subject_digest(statement),
     ]
-    return _slsa_level_result("Build", 1, "SLSA Build Level 1", items)
+    return _slsa_level_result("Build", 1, "SLSA Build Level 1", items, origin=_slsa_invocation_origin(predicate))
 
 
 def _slsa_check_hosted_builder(predicate: Dict[str, Any]) -> Dict[str, Any]:
@@ -536,7 +584,7 @@ def _evaluate_slsa_l2(
         _slsa_check_source_binding(predicate, expected_repository),
         _slsa_check_resolved_dependencies(predicate),
     ]
-    return _slsa_level_result("Build", 2, "SLSA Build Level 2", items)
+    return _slsa_level_result("Build", 2, "SLSA Build Level 2", items, origin=_slsa_invocation_origin(predicate))
 
 
 def _slsa_check_control_plane_builder_identity(predicate: Dict[str, Any]) -> Dict[str, Any]:
@@ -672,7 +720,7 @@ def _evaluate_slsa_l3(
         _slsa_check_isolated_provenance_generation(predicate, identity_status=identity_status, cert_identity=cert_identity),
         _slsa_check_materialized_dependencies(predicate),
     ]
-    return _slsa_level_result("Build", 3, "SLSA Build Level 3", items)
+    return _slsa_level_result("Build", 3, "SLSA Build Level 3", items, origin=_slsa_invocation_origin(predicate))
 
 
 def _source_check_version_controlled(vcs: Dict[str, Any]) -> Dict[str, Any]:
@@ -881,11 +929,15 @@ def _evaluate_slsa_checklists(
 
 def _format_slsa_level_block(assessment: Dict[str, Any], overall_passed: bool) -> List[str]:
     """Renders one level's checklist -- header, one [✓]/[✗] row per item
-    (with a trailing failure description on any [✗] row), and a Status
-    line. `overall_passed` is taken from the caller rather than
-    `assessment["passed"]` directly so _format_track_report can fold in
-    each level's cumulative-on-lower-levels requirement without this
-    function needing to know about that rule."""
+    (with a trailing failure description on any [✗] row), an Origin CI Run
+    line when this level failed and its statement carried one (see
+    _slsa_invocation_origin -- the run that produced *this* statement, so a
+    failing item can be traced back without cross-referencing the report's
+    top-of-document "CI Run:" line, which reflects a possibly different
+    run), and a Status line. `overall_passed` is taken from the caller
+    rather than `assessment["passed"]` directly so _format_track_report can
+    fold in each level's cumulative-on-lower-levels requirement without
+    this function needing to know about that rule."""
     lines = [f"=== {assessment['name']} Assessment ==="]
     for item in assessment["items"]:
         mark = "✓" if item["passed"] else "✗"
@@ -893,6 +945,8 @@ def _format_slsa_level_block(assessment: Dict[str, Any], overall_passed: bool) -
         if not item["passed"] and item["detail"]:
             line += f" -- {item['detail']}"
         lines.append(line)
+    if not overall_passed and assessment.get("origin"):
+        lines.append(f"Origin CI Run:  {assessment['origin']}")
     status = "PASSED" if overall_passed else "FAILED"
     lines.append(f"Status: {status} (SLSA {assessment['track']} Level {assessment['level']})")
     return lines
@@ -940,6 +994,125 @@ def _format_track_report(levels: List[Dict[str, Any]]) -> Tuple[List[str], List[
         lines.extend(_format_slsa_level_block(lvl, ok))
     lines.append("=====================================")
     return lines, cumulative_status
+
+
+def _extract_run_identity(statement: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Pulls the "where did this predicate come from" fields -- source
+    commit/PR (predicate.vcs), CI run (predicate.pipeline), and subject
+    artifact -- out of an already-decoded statement, defensively. Shared by
+    _format_run_identity_report (text/$GITHUB_STEP_SUMMARY) and
+    _build_verify_json_payload so both renderings read the identical
+    extraction rather than risk disagreeing about it."""
+    predicate = statement.get("predicate") if isinstance(statement, dict) else None
+    predicate = predicate if isinstance(predicate, dict) else {}
+    vcs = predicate.get("vcs") if isinstance(predicate.get("vcs"), dict) else {}
+    pipeline = predicate.get("pipeline") if isinstance(predicate.get("pipeline"), dict) else {}
+    subjects = statement.get("subject") if isinstance(statement, dict) else None
+    subjects = subjects if isinstance(subjects, list) else []
+    return {"vcs": vcs, "pipeline": pipeline, "subjects": subjects}
+
+
+def _format_vcs_lines(vcs: Dict[str, Any]) -> List[str]:
+    """Renders the Repository/Branch/Commit/Base commit/Pull Request lines
+    of _format_run_identity_report's vcs block -- split out purely to keep
+    that function's cognitive complexity within budget, same rationale as
+    _format_gate_params below."""
+    if not vcs:
+        return ["Repository:    unavailable (no predicate.vcs block in this statement)"]
+
+    pr = vcs.get("pull_request") if isinstance(vcs.get("pull_request"), dict) else {}
+    lines = [
+        f"Repository:    {vcs.get('repository', '-')} ({vcs.get('provider', '-')})",
+        f"Branch:        {vcs.get('branch', '-')}",
+        f"Commit:        {vcs.get('commit_sha', '-')}",
+    ]
+    if vcs.get("base_commit_sha"):
+        lines.append(f"Base commit:   {vcs['base_commit_sha']}")
+    if pr.get("number") is not None:
+        lines.append(f"Pull Request:  #{pr['number']} -> {pr.get('target_branch', '-')}")
+    return lines
+
+
+def _format_pipeline_lines(pipeline: Dict[str, Any]) -> List[str]:
+    """Renders the CI Run/Workflow Ref lines of _format_run_identity_report's
+    pipeline block -- same complexity-budget rationale as _format_vcs_lines."""
+    if not pipeline:
+        return []
+    lines = [
+        f"CI Run:        {pipeline.get('ci_provider', '-')} run {pipeline.get('run_id', '-')} "
+        f"(attempt {pipeline.get('run_attempt', '-')})"
+    ]
+    if pipeline.get("workflow_ref"):
+        lines.append(f"Workflow Ref:  {pipeline['workflow_ref']}")
+    return lines
+
+
+def _format_subject_lines(subjects: List[Any]) -> List[str]:
+    """Renders one "Subject:" line per statement.subject entry of
+    _format_run_identity_report -- same complexity-budget rationale as
+    _format_vcs_lines."""
+    lines = []
+    for s in subjects:
+        if not isinstance(s, dict):
+            continue
+        digest = s.get("digest") if isinstance(s.get("digest"), dict) else {}
+        digest_str = ", ".join(f"{alg}:{val}" for alg, val in digest.items()) or "-"
+        lines.append(f"Subject:       {s.get('name', '-')} @ {digest_str}")
+    return lines
+
+
+def _format_run_identity_report(result: "VerificationResult") -> List[str]:
+    """Renders a "where did this come from" header: the source commit/PR/CI
+    run this predicate was built from (predicate.vcs/pipeline, when
+    present) and the exact admission-gate parameters this verify call was
+    invoked with (result.gate_params). Exists so a report -- especially the
+    $GITHUB_STEP_SUMMARY rendering, which is routinely read on its own,
+    days later or copy-pasted out of context -- never leaves a reader
+    guessing which push/PR produced it or which --min-rcs/--disallow-degraded
+    values are actually enforcing the verdict below. The vcs/pipeline/
+    subjects blocks are each rendered by their own _format_*_lines helper
+    (see their docstrings) purely to keep this function's own cognitive
+    complexity within budget -- this is just their assembly order."""
+    identity = _extract_run_identity(result.statement)
+
+    lines = ["=== Run Identity & Gate Parameters ==="]
+    lines.extend(_format_vcs_lines(identity["vcs"]))
+    lines.extend(_format_pipeline_lines(identity["pipeline"]))
+    lines.extend(_format_subject_lines(identity["subjects"]))
+    lines.extend(_format_gate_params(result.gate_params))
+    lines.append("=====================================")
+    return lines
+
+
+def _format_gate_params(gate_params: Optional[Dict[str, Any]]) -> List[str]:
+    """Renders the admission-gate parameters (--min-rcs/--disallow-degraded/
+    --cert-identity/--expected-*) a verify call was invoked with -- split
+    out of _format_run_identity_report purely to keep that function short.
+    Identity-pinning and --expected-* lines are omitted entirely when unset
+    (None/empty for every field in that group) rather than printed as a row
+    of '-'s, since the vast majority of calls don't set them."""
+    gp = gate_params or {}
+    if not gp:
+        return []
+
+    lines = [
+        "Gate:          "
+        f"min_rcs={gp.get('min_rcs')} disallow_degraded={gp.get('disallow_degraded')} "
+        f"require_digest={gp.get('require_digest')} require_slsa_build_l3={gp.get('require_slsa_build_l3')} "
+        f"dry_run={gp.get('dry_run')}"
+    ]
+    if gp.get("cert_identity") or gp.get("cert_oidc_issuer"):
+        lines.append(
+            "Identity pin:  "
+            f"cert_identity={gp.get('cert_identity') or '-'} cert_oidc_issuer={gp.get('cert_oidc_issuer') or '-'}"
+        )
+    if gp.get("expected_repository") or gp.get("expected_workflow") or gp.get("expected_ref"):
+        lines.append(
+            "Expected:      "
+            f"repository={gp.get('expected_repository') or '-'} workflow={gp.get('expected_workflow') or '-'} "
+            f"ref={gp.get('expected_ref') or '-'}"
+        )
+    return lines
 
 
 def _format_assay_health_report(result: "VerificationResult") -> List[str]:
@@ -1120,9 +1293,14 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
     inside verify_dsse_attestation() -- json and text output must never
     disagree about SLSA compliance, so this reads the identical
     already-computed result rather than recomputing its own assessment),
-    plus the synthesized FINAL VERDICT headline (result.verdict). Never
-    raises -- every field it reads off `result` is already defensively
-    populated by verify_dsse_attestation()."""
+    plus the synthesized FINAL VERDICT headline (result.verdict), plus
+    run_identity/gate_params (see _extract_run_identity and
+    VerificationResult.gate_params -- the same "where did this come from,
+    what gate was enforced" fields _format_run_identity_report renders as
+    text, kept here so a --format json consumer gets the identical
+    traceability without having to parse the text report). Never raises --
+    every field it reads off `result` is already defensively populated by
+    verify_dsse_attestation()."""
     statement = result.statement or {}
     subjects = statement.get("subject")
     return {
@@ -1134,6 +1312,8 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
             "predicate_type": statement.get("predicateType"),
             "subject": subjects if isinstance(subjects, list) else [],
         },
+        "run_identity": _extract_run_identity(result.statement),
+        "gate_params": result.gate_params,
         "source": {
             "level_1": result.source_level1,
             "level_2": result.source_level2,
@@ -1825,12 +2005,31 @@ def verify_dsse_attestation(
       _verify_sigstore_identity      -- best-effort Sigstore identity check
       _evaluate_informational_tracks -- SLSA Source Level 1-4 + Build Level 1-3 checklists
     """
+    # Captured verbatim from this call's own arguments, not re-derived --
+    # see VerificationResult.gate_params. Built once, up front, so it's
+    # identical on every return path (including the malformed-envelope
+    # guard immediately below).
+    gate_params: Dict[str, Any] = {
+        "min_rcs": min_rcs,
+        "require_digest": require_digest,
+        "disallow_degraded": disallow_degraded,
+        "dry_run": dry_run,
+        "cert_identity": cert_identity,
+        "cert_oidc_issuer": cert_oidc_issuer,
+        "expected_issuer": expected_issuer,
+        "expected_repository": expected_repository,
+        "expected_workflow": expected_workflow,
+        "expected_ref": expected_ref,
+        "require_slsa_build_l3": require_slsa_build_l3,
+    }
+
     if not isinstance(envelope, dict):
         return VerificationResult(
             passed=False,
             violations=["DSSE envelope is not a JSON object"],
             identity_status="skipped",
             identity_detail="envelope malformed; identity verification not attempted",
+            gate_params=gate_params,
         )
 
     statement, violations, warnings = _decode_envelope_statement(envelope)
@@ -1966,6 +2165,7 @@ def verify_dsse_attestation(
         source_level3=source_level3,
         source_level4=source_level4,
         rcs_components=rcs_components,
+        gate_params=gate_params,
     )
 
     source_levels = [source_level1, source_level2, source_level3, source_level4]
@@ -2113,16 +2313,19 @@ def _load_envelope_for_cli(path: str) -> Tuple[Optional[Any], Optional[int]]:
 
 
 def _render_track_sections(result: VerificationResult) -> List[str]:
-    """Renders the full unified report -- SLSA Source Track (Levels 1-4),
-    SLSA Build Track (Levels 1-3), Assay Health & Governance Metrics, and
-    the synthesized FINAL VERDICT banner -- as plain-text lines, shared by
-    both the stderr human renderer and the $GITHUB_STEP_SUMMARY markdown
-    writer (the same [✓]/[✗] plain-text rows read fine as GFM markdown
-    verbatim, wrapped in a fenced code block -- see
-    _render_step_summary_markdown). A no-op section (empty list) for any
-    track whose levels are absent (e.g. a VerificationResult built
-    directly by a test without going through verify_dsse_attestation())."""
-    lines: List[str] = []
+    """Renders the full unified report -- Run Identity & Gate Parameters
+    (see _format_run_identity_report; the source commit/PR/CI run this
+    predicate traces back to, and the exact --min-rcs/--disallow-degraded/
+    etc. this call enforced), SLSA Source Track (Levels 1-4), SLSA Build
+    Track (Levels 1-3), Assay Health & Governance Metrics, and the
+    synthesized FINAL VERDICT banner -- as plain-text lines, shared by both
+    the stderr human renderer and the $GITHUB_STEP_SUMMARY markdown writer
+    (the same [✓]/[✗] plain-text rows read fine as GFM markdown verbatim,
+    wrapped in a fenced code block -- see _render_step_summary_markdown). A
+    no-op section (empty list) for any track whose levels are absent (e.g.
+    a VerificationResult built directly by a test without going through
+    verify_dsse_attestation())."""
+    lines: List[str] = _format_run_identity_report(result)
     source_levels = [result.source_level1, result.source_level2, result.source_level3, result.source_level4]
     build_levels = [result.slsa_level1, result.slsa_level2, result.slsa_level3]
 

@@ -60,11 +60,11 @@ permissions:
 # `${{ env.SIGNER_WORKFLOW_SHA }}` to build --cert-identity, so the gate can
 # never drift from what `attest` actually invoked.
 env:
-  SIGNER_WORKFLOW_SHA: 8730ecaf79e4d55cb18be9a89ecd5cea645bba75 # v2 (2026-08-23: remove signer-ref input) -- keep in sync with attest job's `uses:` pin
+  SIGNER_WORKFLOW_SHA: ddc340f1c442957c0d1801ff3db69cc820bbc307 # fix(pass-builder-id-explicitly) -- keep in sync with attest job's `uses:` pin
 
 jobs:
   # Runs the PR's own code: tests, coverage, CodeQL, SonarQube, RCS scoring.
-  # Produces two *unsigned* statement files and nothing else that crosses
+  # Produces one *unsigned* RCS statement file and nothing else that crosses
   # into the attest job below -- no id-token permission here at all, so
   # nothing running in this job (including a compromised dependency or a
   # malicious test-suite change) can mint a Sigstore signing identity.
@@ -74,6 +74,14 @@ jobs:
       contents: read
       security-events: write
       pull-requests: read # "Resolve PR Context for a Push-Triggered Run" below
+    outputs:
+      # Consumed by `attest` below as subject-name/subject-digest -- the
+      # only provenance-relevant values tenax-attest's isolated signer job
+      # accepts from this (untrusted) job; everything else it needs to
+      # construct real SLSA Build Level 3 provenance comes from its own
+      # trusted context instead (see that job's `uses:` comment).
+      image-ref: ${{ steps.mint.outputs.image-ref }}
+      image-digest: ${{ steps.mint.outputs.image-digest }}
 
     steps:
       - name: Checkout Repository
@@ -232,11 +240,17 @@ jobs:
 
       # Deliberately no --sign/--dry-run-sign here: this job has no
       # id-token permission, so it could not mint a Sigstore identity even
-      # if it tried. Both statements are written unsigned; the separate
-      # `attest` job below (the only one with id-token: write) signs them
-      # from the artifact this step uploads, never from anything it
-      # computes itself.
+      # if it tried. Written unsigned; the separate `attest` job below
+      # (the only one with id-token: write) signs it from the artifact
+      # this step uploads, never from anything it computes itself.
+      #
+      # No --emit-slsa-provenance here anymore: this job only mints the
+      # assay/v1 RCS statement now. SLSA v1.0 provenance (Build Level 3)
+      # is constructed by `attest` below, inside tenax-attest's isolated
+      # signer job, from that job's own trusted context -- not by this
+      # (untrusted) job -- see that job's `uses:` comment for why.
       - name: Mint Unsigned Tenax Attestation
+        id: mint
         env:
           GOVPLANE_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           EVENT_NAME: ${{ github.event_name }}
@@ -292,66 +306,77 @@ jobs:
 
           echo "Running with EXTRA_ARGS: ${EXTRA_ARGS[*]}"
 
+          IMAGE_REF="ghcr.io/${{ github.repository }}:${HEAD_SHA}"
+          IMAGE_DIGEST="sha256:$(git rev-parse HEAD | sha256sum | awk '{print $1}')"
+          echo "image-ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
+          echo "image-digest=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+
           uv run --no-sync python -m cli.main \
             --junit-xml build/junit.xml \
             --coverage-report build/coverage.xml \
-            --image-ref "ghcr.io/${{ github.repository }}:${HEAD_SHA}" \
-            --image-digest "sha256:$(git rev-parse HEAD | sha256sum | awk '{print $1}')" \
+            --image-ref "$IMAGE_REF" \
+            --image-digest "$IMAGE_DIGEST" \
             --head-sha "${HEAD_SHA}" \
             --repository "${{ github.repository }}" \
             --branch "${BRANCH_NAME}" \
             --github-token "$GOVPLANE_GITHUB_TOKEN" \
             --min-rcs 65 \
             --out build/tenax-assay.unsigned.json \
-            --emit-slsa-provenance \
-            --slsa-provenance-out build/tenax-assay.slsa-provenance.unsigned.json \
             "${EXTRA_ARGS[@]}"
 
       - name: Upload Unsigned Statements
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: unsigned-statements
-          path: |
-            build/tenax-assay.unsigned.json
-            build/tenax-assay.slsa-provenance.unsigned.json
+          path: build/tenax-assay.unsigned.json
           if-no-files-found: error
 
-  # The *only* job with id-token: write -- signs exactly the two files
-  # `build` uploaded, and nothing it computes itself. The signing job's
-  # code lives entirely in tenax-io/tenax-attest (a separate, branch-
-  # protected repo -- see contrib/tenax-attest-repo/ in this repo for its
-  # content/rationale), checked out there at a commit SHA (`uses:` below)
-  # pinned independently of whatever ref triggered this run -- so a PR
-  # that fully rewrites this workflow file, or tenax-assay's own pipeline
-  # code, in the same PR cannot also change what the signer trusts, since
-  # that code isn't part of this PR's diff at all.
+  # The *only* job with id-token: write -- signs the RCS statement `build`
+  # uploaded, and -- via subject-name/subject-digest below -- additionally
+  # CONSTRUCTS a SLSA v1.0 provenance statement (SLSA Build Level 3) from
+  # its own trusted context and signs that too, atomically. The signing
+  # job's code lives entirely in tenax-io/tenax-attest (a separate,
+  # branch-protected repo -- see contrib/tenax-attest-repo/ in this repo
+  # for its content/rationale), checked out there at a commit SHA (`uses:`
+  # below) pinned independently of whatever ref triggered this run -- so a
+  # PR that fully rewrites this workflow file, or tenax-assay's own
+  # pipeline code, in the same PR cannot also change what the signer
+  # trusts, since that code isn't part of this PR's diff at all.
+  #
+  # subject-name/subject-digest are the only provenance-relevant values
+  # tenax-attest's isolated signer job accepts from this (untrusted) job:
+  # everything else that makes the statement SLSA-meaningful -- builder
+  # identity, source binding, resolved dependencies -- comes from
+  # tenax-attest's own ambient context and its own read-only source
+  # checkout, never from anything this job computed.
   #
   # This job has no way to choose which tenax-assay commit sign.yml checks
-  # out for cli/sign.py/cli/oidc_signer.py: that pin lives hardcoded inside
-  # tenax-attest's own sign.yml (env.TRUSTED_SIGNER_SHA), not as a
-  # `workflow_call` input here -- a caller-supplied `signer-ref` input was
-  # deliberately removed so the privileged signing job can never be pointed
-  # at caller-chosen code. Bumping which tenax-assay commit the signer
-  # trusts is exclusively a tenax-attest-repo change, same discipline as
-  # bumping the `uses:` SHA below whenever tenax-attest's own sign.yml
-  # changes.
+  # out for cli/sign.py/cli/oidc_signer.py/cli/provenance.py: that pin
+  # lives hardcoded inside tenax-attest's own sign.yml
+  # (env.TRUSTED_SIGNER_SHA), not as a `workflow_call` input here -- a
+  # caller-supplied `signer-ref` input was deliberately removed so the
+  # privileged signing job can never be pointed at caller-chosen code.
+  # Bumping which tenax-assay commit the signer trusts is exclusively a
+  # tenax-attest-repo change, same discipline as bumping the `uses:` SHA
+  # below whenever tenax-attest's own sign.yml changes.
   attest:
     needs: build
     permissions:
       id-token: write # Required for Sigstore keyless OIDC minting
       contents: read
-    uses: tenax-io/tenax-attest/.github/workflows/sign.yml@8730ecaf79e4d55cb18be9a89ecd5cea645bba75 # v2 (2026-08-23: remove signer-ref input)
+    uses: tenax-io/tenax-attest/.github/workflows/sign.yml@ddc340f1c442957c0d1801ff3db69cc820bbc307 # keep in sync with env.SIGNER_WORKFLOW_SHA above
     with:
       artifact-name: unsigned-statements
       statement-files: |
         tenax-assay.unsigned.json
-        tenax-assay.slsa-provenance.unsigned.json
+      subject-name: ${{ needs.build.outputs.image-ref }}
+      subject-digest: ${{ needs.build.outputs.image-digest }}
 
   # Downloads the signed envelopes `attest` produced and evaluates
-  # tenax-assay's own admission policy gates against them, plus the
-  # informational SLSA checklist for the SLSA-shaped statement. No
-  # id-token permission here either -- reading/verifying a signature
-  # doesn't require one, only minting one does.
+  # tenax-assay's own admission policy gates against them, plus both SLSA
+  # tracks (Source, Build) in one unified report. No id-token permission
+  # here either -- reading/verifying a signature doesn't require one,
+  # only minting one does.
   verify:
     needs: attest
     runs-on: ubuntu-latest
@@ -437,6 +462,7 @@ jobs:
             --expected-workflow "$EXPECTED_WORKFLOW"
             --cert-identity "$CERT_IDENTITY"
             --cert-oidc-issuer "$CERT_OIDC_ISSUER"
+            --slsa-envelope build/provenance.dsse.json
           )
           # pull_request (pre-merge) and push-to-main (post-merge/promotion,
           # now that "Resolve PR Context for a Push-Triggered Run" keeps it
@@ -453,37 +479,11 @@ jobs:
 
           uv run --no-sync python -m cli.verify build/tenax-assay.dsse.json "${VERIFY_ARGS[@]}"
 
-      - name: SLSA v1.0 Provenance Checklist (informational)
-        # build/tenax-assay.slsa-provenance.dsse.json (cli/slsa_provenance.py)
-        # is a *separate* statement from build/tenax-assay.dsse.json above --
-        # real SLSA v1.0 provenance shape, not tenax-assay's own RCS
-        # predicate. cli.verify's --min-rcs/--disallow-degraded gates and its
-        # unconditional "unexpected predicateType" check are specific to the
-        # RCS predicate and don't apply here (see README.md's "SLSA v1.0
-        # provenance attestation" section) -- this step only exists to print
-        # the SLSA Build Level 1/2 checklist to the log, and its own exit
-        # code is expected to be nonzero (irrelevant RCS-gate violations
-        # against a non-RCS predicate). The trailing `|| true` swallows
-        # that within the step itself, so the step reports a clean success
-        # with no red ✗/"Process completed with exit code N" styling in
-        # the log -- continue-on-error alone keeps the *job* from failing
-        # on this, but GitHub still renders the step itself as failed,
-        # which reads as a false alarm on every single run. continue-on-
-        # error is left in place too as a belt-and-suspenders backstop in
-        # case a future edit here drops the `|| true`.
-        continue-on-error: true
-        env:
-          EXPECTED_REPOSITORY: ${{ github.repository }}
-          EXPECTED_REF: ${{ github.ref }}
-        run: |
-          uv run --no-sync python -m cli.verify build/tenax-assay.slsa-provenance.dsse.json \
-            --expected-repository "$EXPECTED_REPOSITORY" --expected-ref "$EXPECTED_REF" || true
-
       - name: Upload In-Toto Attestation Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tenax-assay-attestation
           path: |
             build/tenax-assay.dsse.json
-            build/tenax-assay.slsa-provenance.dsse.json
+            build/provenance.dsse.json
           if-no-files-found: error

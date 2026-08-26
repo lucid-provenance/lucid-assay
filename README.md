@@ -813,13 +813,15 @@ test_satisfies_verify_py_slsa_build_level_1_and_2_checklists` asserts this
 directly against `_evaluate_slsa_l1`/`_evaluate_slsa_l2`. Note that
 `cli.verify`'s own `--min-rcs`/`--disallow-degraded`/`--require-digest`
 gates (and its unconditional `predicateType`/`release_confidence_score`
-checks) are specific to tenax-assay's RCS predicate and will always report
-`passed: false` against this statement — that's expected and unrelated to
-the SLSA checklist's outcome; `.github/workflows/assay.yml`'s "SLSA v1.0
-Provenance Checklist" step runs `cli.verify` against it with
-`continue-on-error: true` for exactly this reason, purely to print the
-checklist to the log. See `tests/fixtures/slsa_provenance_statement.output.json`
-for a minimal fully-populated example.
+checks) are specific to tenax-assay's RCS predicate and would always
+report `passed: false` if evaluated against a lone SLSA statement outside
+`--slsa-envelope` — that's expected and unrelated to the SLSA checklist's
+outcome. `.github/workflows/assay.yml`'s own `verify` job evaluates both
+statements together in one `cli.verify --slsa-envelope` call rather than
+as a separate step (see "Isolating signing from the build" below for how
+that statement is constructed and signed in the first place). See
+`tests/fixtures/slsa_provenance_statement.output.json` for a minimal
+fully-populated example.
 
 ## Isolating signing from the build (`tenax-assay sign`)
 
@@ -847,17 +849,19 @@ additive, not a replacement.
 ```text
 build (contents: read, security-events: write)
   checkout -> tests -> coverage -> CodeQL -> RCS score
-  -> unsigned statement.json (no id-token permission at all)
+  -> unsigned RCS statement.json (no id-token permission at all)
   -> upload-artifact "unsigned-statements"
          |
          v  (artifacts only -- no shared runner/credentials)
 attest (id-token: write -- the ONLY job with it)
-  download-artifact -> `tenax-assay sign` -> upload-artifact "signed-statements"
+  download-artifact -> `tenax-assay provenance` (constructs SLSA statement
+  from this job's own trusted context, not build's) -> `tenax-assay sign`
+  (both statements, atomically) -> upload-artifact "signed-statements"
          |
          v
 verify (contents: read)
-  download-artifact -> admission gate (--min-rcs/--disallow-degraded)
-  -> SLSA checklist -> final attestation artifact
+  download-artifact -> admission gate + both SLSA tracks in one
+  `cli.verify --slsa-envelope` call -> final attestation artifact
 ```
 
 `build`'s test/dependency execution can never reach the Sigstore signing
@@ -878,41 +882,33 @@ cross-references it.
 
 What this still doesn't claim: reproducible builds, ephemeral/hardened
 isolation of individual build *steps* within the `build` job itself, or
-third-party/official certification — that's further SLSA Build Level 3
-territory and independent-assessment territory respectively, both out of
-scope here. The concrete, verifiable claim this architecture supports is
-narrower and accurate: the code that builds and tests a PR cannot mint the
-identity that signs what gets said about it.
+third-party/official certification — the former is genuinely further
+scope (hermetic build inputs, not just an isolated signer), and the
+latter is independent-assessment territory, neither attempted here. The
+concrete, verifiable claim this architecture *does* support, as of the
+provenance-construction shift below: the code that builds and tests a PR
+cannot mint the identity that signs what gets said about it, **and**
+cannot forge the content of what gets signed either.
 
-`cli/verify.py`'s SLSA Build Level 3 checklist (see "SLSA Source & Build
-Track checklists" above) reports exactly this gap today, honestly and by
-design: it fails closed for every caller, because the *content* of the
-SLSA provenance statement — `buildDefinition`/`runDetails` — is still
-constructed in the untrusted `build` job above and only signed, not
-authored, by `attest`. Level 2's signature check can't catch that: a
-compromised `build` job could still assemble a false `buildDefinition`
-(wrong builder claims, wrong resolved dependencies) for `attest` to
-faithfully sign. Closing that gap means moving provenance *construction*
-into `attest`'s isolated job itself, using its own trusted ambient
-context rather than anything `build` claims.
-
-**`tenax-assay provenance`** (`cli/provenance.py`) is the building block
-for that: `tenax-assay provenance --subject-name NAME --subject-digest
-sha256:HEX --repo-dir DIR --out PATH` constructs a SLSA v1.0 provenance
-statement using nothing but *this process's own* ambient GitHub Actions
-context — the same `cli.slsa_provenance.build_slsa_provenance_statement()`
-`--emit-slsa-provenance` already uses, completely unchanged, just called
-from a new entry point. Run it from inside `attest` instead of `build`,
-and every `buildDefinition`/`runDetails` field (builder identity, source
-binding, resolved dependencies) is derived from the trusted signer job's
-own environment and its own read-only checkout of the source commit
-(for lockfile scanning only — the checkout is never executed), not from
-anything the untrusted `build` job claims. Pair it with `tenax-assay
-sign` in the same job to construct *and* sign atomically. Rolling this
-into `tenax-attest`'s `sign.yml` (new `subject-name`/`subject-digest`
-workflow inputs, a read-only source checkout, this subcommand, then the
-existing signing loop) is the tracked next step — not yet wired into
-`tenax-attest` as of this writing.
+**`tenax-assay provenance`** (`cli/provenance.py`) is what makes that
+second half real: `tenax-assay provenance --subject-name NAME
+--subject-digest sha256:HEX --repo-dir DIR --builder-id ID --out PATH`
+constructs a SLSA v1.0 provenance statement using nothing but *this
+process's own* ambient GitHub Actions context — the same
+`cli.slsa_provenance.build_slsa_provenance_statement()`
+`--emit-slsa-provenance` already used, completely unchanged, just called
+from a new entry point (and `--builder-id`, asserting the caller's own
+known identity explicitly rather than an ambient signal — see that
+flag's own help text for why: `GITHUB_WORKFLOW_REF` reflects the
+top-level *calling* workflow, not the reusable workflow file actually
+executing a `workflow_call` job, a distinction a real run caught before
+this flag existed). `attest` above runs it instead of `build`, so every
+`buildDefinition`/`runDetails` field (builder identity, source binding,
+resolved dependencies) is derived from the trusted signer job's own
+environment and its own read-only checkout of the source commit (for
+lockfile scanning only — the checkout is never executed), not from
+anything the untrusted `build` job claims — then signs both statements
+atomically in the same job via `tenax-assay sign`.
 
 ## Try it
 

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -60,6 +61,27 @@ def _normalize_digest(raw: str) -> str:
     if digest.startswith("sha256:"):
         digest = digest[len("sha256:"):]
     return digest
+
+
+def _control_plane_builder_id() -> Optional[str]:
+    """Derives *this process's own* trusted workflow identity from ambient
+    GITHUB_WORKFLOW_REF (e.g. 'tenax-io/tenax-attest/.github/workflows/
+    sign.yml@<ref>' -> 'https://github.com/tenax-io/tenax-attest/.github/
+    workflows/sign.yml') -- the same job-workflow-ref identity Fulcio's
+    GitHub Actions OIDC certificate extension encodes for whatever job
+    calls this. Deliberately not hardcoded to any specific repo/path: this
+    subcommand is meant to run inside an isolated signer job wherever one
+    is hosted, and its output should assert that job's own real identity,
+    not a value invented here. None (never fabricated) when
+    GITHUB_WORKFLOW_REF isn't set (off-CI) or doesn't contain the expected
+    '<path>@<ref>' shape."""
+    workflow_ref = os.environ.get("GITHUB_WORKFLOW_REF")
+    if not workflow_ref or "@" not in workflow_ref:
+        return None
+    path, _ref = workflow_ref.rsplit("@", 1)
+    if not path:
+        return None
+    return f"https://github.com/{path}"
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -107,6 +129,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         started_at=started_at,
         finished_at=finished_at,
         resolved_dependencies=resolved_dependencies,
+        builder_id=_control_plane_builder_id(),
     )
 
     try:

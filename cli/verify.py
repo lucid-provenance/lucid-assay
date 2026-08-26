@@ -69,32 +69,37 @@ EXPECTED_PREDICATE_TYPE = "https://tenax.io/attestations/assay/v1"
 # handed to this same admission gate.
 SLSA_PROVENANCE_PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
 
+# Builder IDs trusted as SLSA Build Level 3 "isolated control-plane"
+# identities -- i.e. the specific, isolated signer workflow that
+# constructs *and* signs provenance atomically. Deliberately not encoding
+# a ref/SHA: this identifies the split-signer *workflow* (repo+path),
+# which is stable across TRUSTED_SIGNER_SHA bumps in that repo; the
+# cryptographic pin to an exact trusted commit is separately enforced by
+# Sigstore's --cert-identity check (see
+# _slsa_check_isolated_provenance_generation), which does encode the ref.
+TRUSTED_CONTROL_PLANE_BUILDER_IDS = frozenset({
+    "https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml",
+})
+
 # Builder IDs trusted as SLSA Build Level 2 "hosted"/tamper-resistant
 # build platforms. Deliberately a narrow, explicit allowlist rather than
 # a prefix/pattern match: a hosted-builder claim is exactly the kind of
 # claim that must fail closed on anything not explicitly recognized.
+# Includes TRUSTED_CONTROL_PLANE_BUILDER_IDS deliberately (duplicated
+# literals, not a computed union -- see _ALLOWED_DEGRADED_REASONS's own
+# comment for why this module prefers that): SLSA's levels are cumulative,
+# so a builder identity specific and verifiable enough to satisfy Level
+# 3's stricter check must, a fortiori, also satisfy Level 2's weaker
+# "some trusted hosted platform" one -- otherwise Level 3 could never
+# actually be reached even once its own two checks pass, since Level 2
+# would independently block the cumulative Status line. Until the
+# caller's provenance is actually constructed inside that isolated job
+# (see the SLSA Build Level 3 section below), runDetails.builder.id will
+# still be the plain generic runner id, so Level 3 fails closed for every
+# caller today regardless -- by design, not as a stub.
 TRUSTED_HOSTED_BUILDER_IDS = frozenset({
     "https://github.com/actions/runner",
-})
-
-# Builder IDs trusted as SLSA Build Level 3 "isolated control-plane"
-# identities -- i.e. the specific, isolated signer workflow that
-# constructs *and* signs provenance atomically, as opposed to
-# TRUSTED_HOSTED_BUILDER_IDS above, which only proves "some GitHub-hosted
-# runner ran this" (the untrusted build job is a GitHub-hosted runner
-# too). Deliberately narrower and deliberately not encoding a ref/SHA:
-# this identifies the split-signer *workflow* (repo+path), which is
-# stable across TRUSTED_SIGNER_SHA bumps in that repo; the cryptographic
-# pin to an exact trusted commit is separately enforced by Sigstore's
-# --cert-identity check (see _slsa_check_isolated_provenance_generation),
-# which does encode the ref. Until the caller's provenance is actually
-# constructed inside that isolated job (see cli/verify.py's SLSA Build
-# Level 3 section below), runDetails.builder.id will still be the
-# generic TRUSTED_HOSTED_BUILDER_IDS value, so this check fails closed
-# for every caller -- by design, not as a stub.
-TRUSTED_CONTROL_PLANE_BUILDER_IDS = frozenset({
-    "https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml",
-})
+} | TRUSTED_CONTROL_PLANE_BUILDER_IDS)
 
 # GitHub Actions' well-known OIDC token issuer. GitHub-Actions-specific
 # identity claims (repository/workflow/ref) are only meaningful -- and only

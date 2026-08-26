@@ -59,7 +59,14 @@ class ProvenanceSubcommandTests(_TempDirTestCase):
 
         self.assertEqual(statement["predicateType"], SLSA_PROVENANCE_PREDICATE_TYPE)
         self.assertEqual(statement["subject"][0]["digest"]["sha256"], "a" * 64)
-        self.assertEqual(statement["predicate"]["runDetails"]["builder"]["id"], GITHUB_HOSTED_BUILDER_ID)
+        # Not the generic GITHUB_HOSTED_BUILDER_ID: builder.id asserts
+        # *this process's own* trusted workflow identity (derived from
+        # ambient GITHUB_WORKFLOW_REF), which is the whole point of this
+        # subcommand -- see _control_plane_builder_id()'s docstring.
+        self.assertEqual(
+            statement["predicate"]["runDetails"]["builder"]["id"],
+            "https://github.com/acme/widgets/.github/workflows/sign.yml",
+        )
 
     def test_bare_hex_digest_normalized_same_as_sha256_prefixed(self):
         tmp = self._tmp()
@@ -73,6 +80,27 @@ class ProvenanceSubcommandTests(_TempDirTestCase):
         with open(out_path, "r", encoding="utf-8") as f:
             statement = json.load(f)
         self.assertEqual(statement["subject"][0]["digest"]["sha256"], "a" * 64)
+
+    def test_falls_back_to_generic_hosted_builder_id_without_workflow_ref(self):
+        """RUNNER_ENVIRONMENT=github-hosted but no GITHUB_WORKFLOW_REF
+        (shouldn't happen in real Actions, but must still fail closed to
+        *something* real rather than crash): falls back to the same
+        generic GITHUB_HOSTED_BUILDER_ID the untrusted build job's
+        --emit-slsa-provenance path always used."""
+        tmp = self._tmp()
+        out_path = os.path.join(tmp, "provenance.unsigned.json")
+        env = dict(_GITHUB_ENV)
+        del env["GITHUB_WORKFLOW_REF"]
+
+        with mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("GITHUB_WORKFLOW_REF", None)
+            provenance_main(
+                ["--subject-name", "x", "--subject-digest", "sha256:" + "a" * 64, "--repo-dir", tmp, "--out", out_path]
+            )
+
+        with open(out_path, "r", encoding="utf-8") as f:
+            statement = json.load(f)
+        self.assertEqual(statement["predicate"]["runDetails"]["builder"]["id"], GITHUB_HOSTED_BUILDER_ID)
 
     def test_off_ci_produces_a_legitimately_less_complete_statement(self):
         """Ground-truth-only, fail-closed: with no ambient GitHub Actions

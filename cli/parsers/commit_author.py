@@ -44,7 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from .github_rules import DEFAULT_TIMEOUT, GITHUB_API_BASE, _REPO_RE, _extract_http_error_detail
 
@@ -81,6 +81,70 @@ def _unavailable(commit_sha: str, reason: str) -> CommitAuthorReport:
     return CommitAuthorReport(available=False, commit_sha=commit_sha, reason=reason)
 
 
+def _as_dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _resolve_token(token: Optional[str]) -> Optional[str]:
+    return token if token is not None else os.environ.get("GITHUB_TOKEN")
+
+
+def _fetch_commit_body(
+    repository: str, commit_sha: str, headers: Dict[str, str], timeout: int
+) -> Tuple[Optional[Dict[str, Any]], Optional[CommitAuthorReport]]:
+    """Performs the GitHub commits API request. Returns (body, None) on
+    success, or (None, error_report) for any transport/auth/parse failure
+    -- isolated here purely to keep inspect_commit_author's cognitive
+    complexity low; behavior is unchanged from the inline version.
+    """
+    url = f"{GITHUB_API_BASE}/repos/{repository}/commits/{urllib.parse.quote(commit_sha, safe='')}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8")), None
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            reason = f"commit {commit_sha} not found in {repository} (or not accessible to the provided token)"
+        else:
+            reason = f"GitHub API request failed (HTTP {e.code}): {_extract_http_error_detail(e)}"
+        return None, _unavailable(commit_sha, reason)
+    except urllib.error.URLError as e:
+        return None, _unavailable(commit_sha, f"GitHub API request failed: {e.reason}")
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        return None, _unavailable(commit_sha, f"GitHub API request failed: {e}")
+
+
+def _report_from_commit_body(body: Any, commit_sha: str) -> CommitAuthorReport:
+    if not isinstance(body, dict):
+        return _unavailable(commit_sha, "unexpected response shape from GitHub commits API")
+
+    commit_obj = _as_dict(body.get("commit"))
+    author_obj = _as_dict(commit_obj.get("author"))
+    name = author_obj.get("name")
+    email = author_obj.get("email")
+
+    # The *linked GitHub account* (null unless GitHub matched the commit's
+    # author email to a verified account) -- distinct from commit_obj's
+    # free-text author name/email above, and the only field this check
+    # trusts as "verified".
+    login = _as_dict(body.get("author")).get("login")
+    login = login if isinstance(login, str) and login else None
+
+    return CommitAuthorReport(
+        available=True,
+        commit_sha=commit_sha,
+        name=name if isinstance(name, str) else None,
+        email=email if isinstance(email, str) else None,
+        github_login=login,
+        verified_github_account=login is not None,
+        reason=(
+            f"commit author email resolved to verified GitHub account '{login}'"
+            if login
+            else "commit author email does not resolve to a linked, verified GitHub account"
+        ),
+    )
+
+
 def inspect_commit_author(
     repository: str,
     commit_sha: str,
@@ -103,61 +167,19 @@ def inspect_commit_author(
     if not isinstance(commit_sha, str) or not _SHA_RE.match(commit_sha):
         return _unavailable(commit_sha, f"invalid commit sha {commit_sha!r}")
 
-    resolved_token = token if token is not None else os.environ.get("GITHUB_TOKEN")
+    resolved_token = _resolve_token(token)
     if not resolved_token:
         return _unavailable(commit_sha, "no GITHUB_TOKEN available (neither passed explicitly nor set in the "
                                           "environment); commit author identity could not be verified")
 
-    url = f"{GITHUB_API_BASE}/repos/{repository}/commits/{urllib.parse.quote(commit_sha, safe='')}"
     headers = {
         "Authorization": f"Bearer {resolved_token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "tenax-assay",
     }
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return _unavailable(commit_sha, f"commit {commit_sha} not found in {repository} (or not accessible "
-                                              "to the provided token)")
-        detail = _extract_http_error_detail(e)
-        return _unavailable(commit_sha, f"GitHub API request failed (HTTP {e.code}): {detail}")
-    except urllib.error.URLError as e:
-        return _unavailable(commit_sha, f"GitHub API request failed: {e.reason}")
-    except (json.JSONDecodeError, ValueError, OSError) as e:
-        return _unavailable(commit_sha, f"GitHub API request failed: {e}")
+    body, error_report = _fetch_commit_body(repository, commit_sha, headers, timeout)
+    if error_report is not None:
+        return error_report
 
-    if not isinstance(body, dict):
-        return _unavailable(commit_sha, "unexpected response shape from GitHub commits API")
-
-    commit_obj = body.get("commit")
-    commit_obj = commit_obj if isinstance(commit_obj, dict) else {}
-    author_obj = commit_obj.get("author")
-    author_obj = author_obj if isinstance(author_obj, dict) else {}
-    name = author_obj.get("name")
-    email = author_obj.get("email")
-
-    # The *linked GitHub account* (null unless GitHub matched the commit's
-    # author email to a verified account) -- distinct from commit_obj's
-    # free-text author name/email above, and the only field this check
-    # trusts as "verified".
-    github_author = body.get("author")
-    login = github_author.get("login") if isinstance(github_author, dict) else None
-    login = login if isinstance(login, str) and login else None
-
-    return CommitAuthorReport(
-        available=True,
-        commit_sha=commit_sha,
-        name=name if isinstance(name, str) else None,
-        email=email if isinstance(email, str) else None,
-        github_login=login,
-        verified_github_account=login is not None,
-        reason=(
-            f"commit author email resolved to verified GitHub account '{login}'"
-            if login
-            else "commit author email does not resolve to a linked, verified GitHub account"
-        ),
-    )
+    return _report_from_commit_body(body, commit_sha)

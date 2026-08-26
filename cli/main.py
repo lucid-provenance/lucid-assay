@@ -22,6 +22,7 @@ from .builder import build_statement
 from .common import safe_resolve_path
 from .hashing import sha256_file, worm_uri
 from .parsers.ast import inspect_test_suite
+from .parsers.commit_author import CommitAuthorReport, inspect_commit_author
 from .parsers.coverage import parse_cobertura, parse_lcov
 from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
@@ -286,10 +287,11 @@ def _emit_run_warnings(
     branch: str,
     blocking_elapsed_ms: float,
     skip_perf_budget_check: bool,
+    commit_author: Optional[CommitAuthorReport] = None,
 ) -> None:
     """Post-run stderr summary: RCS/degraded status, branch-governance
-    issues, and the 50ms blocking-overhead budget check
-    (--skip-perf-budget-check)."""
+    issues, commit-author-identity data-collection failures, and the
+    50ms blocking-overhead budget check (--skip-perf-budget-check)."""
     print(
         f"RCS={rcs.value} blocking_overhead_ms={blocking_elapsed_ms:.2f} degraded={rcs.degraded}",
         file=sys.stderr,
@@ -306,6 +308,18 @@ def _emit_run_warnings(
         print(f"WARNING: branch '{branch}' rules permit an unreviewed bypass", file=sys.stderr)
     for w in branch_governance.warnings:
         print(f"WARNING: branch governance: {w}", file=sys.stderr)
+
+    # Unlike branch governance, an *unverified* author (verified_github_
+    # account=False) is a legitimate, common outcome -- not a data-
+    # collection failure -- and is already surfaced via SLSA Source Level
+    # 3 in `tenax-assay verify`'s output; only warn here when the check
+    # itself couldn't run at all (available=False).
+    if commit_author is not None and not commit_author.available:
+        print(
+            f"WARNING: commit author identity for {commit_author.commit_sha} could not be verified: "
+            f"{commit_author.reason}",
+            file=sys.stderr,
+        )
 
     if not skip_perf_budget_check and blocking_elapsed_ms > 50.0:
         print(
@@ -470,6 +484,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 3b. Branch governance / ruleset inspection (ambient GITHUB_TOKEN unless overridden)
     with _stage(stage_ns, "github_rules_api"):
         branch_governance = inspect_branch_governance(args.repository, args.branch, token=args.github_token)
+        # SLSA Source Level 3 (see cli/verify.py's _source_check_retained_history):
+        # whether HEAD's commit author resolves to a linked, verified GitHub
+        # account. Same GitHub REST API / token as branch governance above,
+        # so it shares that stage's timing bucket.
+        commit_author = inspect_commit_author(args.repository, args.head_sha, token=args.github_token)
 
     # 3c. SARIF static-analysis ingestion (optional, --sarif may repeat).
     # sarif_report stays None when --sarif wasn't passed at all -- scorer
@@ -532,6 +551,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             pr_required_approvals=args.pr_required_approvals,
             pr_review_state=args.pr_review_state,
             branch_governance=branch_governance,
+            commit_author=commit_author,
             test_framework="junit",
             test_report_sha256=test_report_sha,
             test_report_uri=worm_uri(test_report_sha),
@@ -586,7 +606,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         wall_elapsed_ns = time.perf_counter_ns() - t_start_ns
         _emit_stage_profile(stage_ns, sign_total_ns, sign_sub_ns, blocking_elapsed_ms, wall_elapsed_ns)
 
-    _emit_run_warnings(rcs, branch_governance, args.branch, blocking_elapsed_ms, args.skip_perf_budget_check)
+    _emit_run_warnings(
+        rcs, branch_governance, args.branch, blocking_elapsed_ms, args.skip_perf_budget_check, commit_author
+    )
 
     # 10. Gate enforcement
     if rcs.value < args.min_rcs:

@@ -367,6 +367,32 @@ class BuilderStatementTests(unittest.TestCase):
         bg_block = statement["predicate"]["branch_governance"]
         self.assertEqual(bg_block["reason_code"], "platform_unsupported_tier")
 
+    def test_commit_author_defaults_to_none(self):
+        """No caller-supplied CommitAuthorReport (most existing callers) --
+        vcs.commit_author is None, never fabricated, and the key is still
+        present so schema validation's additionalProperties=false holds."""
+        statement = build_statement(**_base_kwargs())
+        vcs = statement["predicate"]["vcs"]
+        self.assertIn("commit_author", vcs)
+        self.assertIsNone(vcs["commit_author"])
+
+    def test_commit_author_is_embedded_when_supplied(self):
+        from cli.parsers.commit_author import CommitAuthorReport
+
+        report = CommitAuthorReport(
+            available=True,
+            commit_sha="b" * 40,
+            name="Bill Wonch",
+            email="bill.wonch@gmail.com",
+            github_login="billwonch",
+            verified_github_account=True,
+            reason="commit author email resolved to verified GitHub account 'billwonch'",
+        )
+        statement = build_statement(**_base_kwargs(commit_author=report))
+        commit_author_block = statement["predicate"]["vcs"]["commit_author"]
+        self.assertEqual(commit_author_block["github_login"], "billwonch")
+        self.assertTrue(commit_author_block["verified_github_account"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -114,14 +114,59 @@ class SourceLevel2Tests(unittest.TestCase):
 
 
 class SourceLevel3Tests(unittest.TestCase):
-    def test_always_fails_honestly(self):
-        """No predicate field captures commit-author/history-retention
-        identity today (see cli/verify.py's _source_check_retained_history
-        docstring) -- this is a permanent, honest [✗] until that
-        data-collection gap is closed, not a stub that happens to fail."""
-        result = _evaluate_source_l3()
+    def test_missing_commit_author_fails(self):
+        """No vcs.commit_author field at all (an attestation predating
+        this field, or a caller that didn't supply one) -- an honest [✗],
+        never treated as "not applicable"."""
+        result = _evaluate_source_l3(_full_vcs())
         self.assertFalse(result["passed"])
-        self.assertIn("not yet captured", result["items"][0]["detail"])
+        self.assertIn("not captured", result["items"][0]["detail"])
+
+    def test_unavailable_data_collection_fails_with_reason(self):
+        """The GitHub API check itself failed (no token, transport error,
+        ...) -- reports that specific reason, not a generic message."""
+        vcs = _full_vcs()
+        vcs["commit_author"] = {
+            "available": False,
+            "commit_sha": "b" * 40,
+            "verified_github_account": False,
+            "reason": "no GITHUB_TOKEN available",
+        }
+        result = _evaluate_source_l3(vcs)
+        self.assertFalse(result["passed"])
+        self.assertIn("no GITHUB_TOKEN available", result["items"][0]["detail"])
+
+    def test_unverified_author_email_fails(self):
+        """The check ran, but the commit author's email doesn't resolve to
+        a linked GitHub account -- a legitimate, common [✗]."""
+        vcs = _full_vcs()
+        vcs["commit_author"] = {
+            "available": True,
+            "commit_sha": "b" * 40,
+            "name": "Some Author",
+            "email": "someone@example.com",
+            "github_login": None,
+            "verified_github_account": False,
+            "reason": "commit author email does not resolve to a linked, verified GitHub account",
+        }
+        result = _evaluate_source_l3(vcs)
+        self.assertFalse(result["passed"])
+        self.assertIn("someone@example.com", result["items"][0]["detail"])
+
+    def test_verified_github_account_passes(self):
+        vcs = _full_vcs()
+        vcs["commit_author"] = {
+            "available": True,
+            "commit_sha": "b" * 40,
+            "name": "Bill Wonch",
+            "email": "bill.wonch@gmail.com",
+            "github_login": "billwonch",
+            "verified_github_account": True,
+            "reason": "commit author email resolved to verified GitHub account 'billwonch'",
+        }
+        result = _evaluate_source_l3(vcs)
+        self.assertTrue(result["passed"])
+        self.assertIn("@billwonch", result["items"][0]["label"])
 
 
 class SourceLevel4Tests(unittest.TestCase):

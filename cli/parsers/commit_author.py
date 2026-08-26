@@ -1,0 +1,163 @@
+"""
+GitHub commit-author identity verification.
+
+Confirms whether the author of a specific commit resolves to a linked,
+verified GitHub account -- exactly what SLSA v1.0 Source Track Level 3
+("Retained History & Author Identity") requires. A git commit's author
+name/email is self-reported by whoever authored the commit object
+(trivially set via `git commit --author="Anyone <anyone@example.com>"`,
+or simply because the local `git config user.*` was never set to
+anything real) -- entirely unverified without something binding it to
+a hosting-platform identity.
+
+GitHub's `GET /repos/{repo}/commits/{sha}` response exposes that
+binding directly: the top-level `author` field (distinct from the
+nested `commit.author` free-text name/email) is populated only when
+GitHub has matched the commit's author email to a *verified* email
+address on a GitHub account -- an unmatched email, a typo'd address,
+or a spoofed "Author:" line all leave `author` null. This module
+reports `verified_github_account` from that field alone; it never
+infers verification from the free-text `commit.author.name`/`email`,
+and it does not require cryptographic commit signing (GPG/SSH-signed
+commits would be a stronger binding still, but cli.verify's Source
+Level 3 check doesn't demand it -- see that module's docstring).
+
+Hardened against (mirrors cli.parsers.github_rules -- see that
+module's docstring for the shared rationale, reused here directly
+rather than re-implemented):
+  - Missing/expired GITHUB_TOKEN (degrades to available=False, never raises)
+  - Path/URL injection via `repository` (same strict `owner/repo` allowlist)
+    and via `commit_sha` (hash-shape validated before any URL is built,
+    then percent-encoded regardless)
+  - Auth failures (401/403) invalidate the result (available=False)
+  - 404 (commit/repo not found or not accessible) degrades cleanly,
+    never conflated with a genuine "author unverified" finding
+  - Transport/timeout/malformed-JSON/unexpected-shape failures degrade
+    to available=False with the failure captured in `reason`
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+from .github_rules import DEFAULT_TIMEOUT, GITHUB_API_BASE, _REPO_RE, _extract_http_error_detail
+
+# Accepts any plausible git abbreviated-or-full SHA -- this module treats
+# commit_sha as an opaque hex string, same as cli.verify does elsewhere;
+# just enough to reject an empty/malformed value before it reaches a URL.
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+
+@dataclass
+class CommitAuthorReport:
+    __test__ = False
+    available: bool
+    commit_sha: str
+    name: Optional[str] = None
+    email: Optional[str] = None
+    github_login: Optional[str] = None
+    verified_github_account: bool = False
+    reason: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "available": self.available,
+            "commit_sha": self.commit_sha,
+            "name": self.name,
+            "email": self.email,
+            "github_login": self.github_login,
+            "verified_github_account": self.verified_github_account,
+            "reason": self.reason,
+        }
+
+
+def _unavailable(commit_sha: str, reason: str) -> CommitAuthorReport:
+    return CommitAuthorReport(available=False, commit_sha=commit_sha, reason=reason)
+
+
+def inspect_commit_author(
+    repository: str,
+    commit_sha: str,
+    token: Optional[str] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> CommitAuthorReport:
+    """Inspects `GET /repos/{repository}/commits/{commit_sha}` and reports
+    whether the commit's author resolves to a linked, verified GitHub
+    account, authenticating with the ambient GITHUB_TOKEN when `token`
+    isn't supplied explicitly.
+
+    Fails closed to available=False (never raises) on invalid input, a
+    missing token, or any transport/auth/parse/shape failure -- callers
+    (cli.verify's Source Level 3 check) must treat available=False the
+    same as "not verified", never as "check skipped, assume fine".
+    """
+    if not isinstance(repository, str) or not _REPO_RE.match(repository):
+        return _unavailable(commit_sha, f"invalid repository identifier {repository!r}; expected 'owner/repo'")
+
+    if not isinstance(commit_sha, str) or not _SHA_RE.match(commit_sha):
+        return _unavailable(commit_sha, f"invalid commit sha {commit_sha!r}")
+
+    resolved_token = token if token is not None else os.environ.get("GITHUB_TOKEN")
+    if not resolved_token:
+        return _unavailable(commit_sha, "no GITHUB_TOKEN available (neither passed explicitly nor set in the "
+                                          "environment); commit author identity could not be verified")
+
+    url = f"{GITHUB_API_BASE}/repos/{repository}/commits/{urllib.parse.quote(commit_sha, safe='')}"
+    headers = {
+        "Authorization": f"Bearer {resolved_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "tenax-assay",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return _unavailable(commit_sha, f"commit {commit_sha} not found in {repository} (or not accessible "
+                                              "to the provided token)")
+        detail = _extract_http_error_detail(e)
+        return _unavailable(commit_sha, f"GitHub API request failed (HTTP {e.code}): {detail}")
+    except urllib.error.URLError as e:
+        return _unavailable(commit_sha, f"GitHub API request failed: {e.reason}")
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        return _unavailable(commit_sha, f"GitHub API request failed: {e}")
+
+    if not isinstance(body, dict):
+        return _unavailable(commit_sha, "unexpected response shape from GitHub commits API")
+
+    commit_obj = body.get("commit")
+    commit_obj = commit_obj if isinstance(commit_obj, dict) else {}
+    author_obj = commit_obj.get("author")
+    author_obj = author_obj if isinstance(author_obj, dict) else {}
+    name = author_obj.get("name")
+    email = author_obj.get("email")
+
+    # The *linked GitHub account* (null unless GitHub matched the commit's
+    # author email to a verified account) -- distinct from commit_obj's
+    # free-text author name/email above, and the only field this check
+    # trusts as "verified".
+    github_author = body.get("author")
+    login = github_author.get("login") if isinstance(github_author, dict) else None
+    login = login if isinstance(login, str) and login else None
+
+    return CommitAuthorReport(
+        available=True,
+        commit_sha=commit_sha,
+        name=name if isinstance(name, str) else None,
+        email=email if isinstance(email, str) else None,
+        github_login=login,
+        verified_github_account=login is not None,
+        reason=(
+            f"commit author email resolved to verified GitHub account '{login}'"
+            if login
+            else "commit author email does not resolve to a linked, verified GitHub account"
+        ),
+    )

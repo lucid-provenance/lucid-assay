@@ -26,7 +26,10 @@ from cli.verify import (
     _evaluate_slsa_l1,
     _evaluate_slsa_l2,
     _extract_cert_ref,
+    _format_slsa_level_block,
     _format_track_report,
+    _slsa_invocation_origin,
+    _slsa_level_result,
     _static_analysis_tools_by_name,
     _verify_sigstore_identity,
 )
@@ -1413,6 +1416,111 @@ class FormatSlsaReportTests(unittest.TestCase):
         self.assertIn("[✗] Hosted Builder Identity -- missing runDetails.builder.id", text)
         self.assertIn("[✓] Cryptographic Envelope Signature (Sigstore Keyless OIDC)", text)
         self.assertIn("Status: FAILED (SLSA Build Level 2)", text)
+
+
+class SlsaInvocationOriginTests(unittest.TestCase):
+    """_slsa_invocation_origin() extracts runDetails.metadata.invocationId
+    -- the CI run URL slsa_provenance.py's _invocation_metadata() already
+    populates -- defensively, the same fail-closed-to-None contract as the
+    rest of this module's predicate parsing."""
+
+    def test_extracts_invocation_id_when_present(self):
+        predicate = {"runDetails": {"metadata": {"invocationId": "https://github.com/acme/widgets/actions/runs/1/attempts/1"}}}
+        self.assertEqual(
+            _slsa_invocation_origin(predicate), "https://github.com/acme/widgets/actions/runs/1/attempts/1"
+        )
+
+    def test_missing_run_details_returns_none(self):
+        self.assertIsNone(_slsa_invocation_origin({}))
+
+    def test_non_dict_run_details_returns_none(self):
+        self.assertIsNone(_slsa_invocation_origin({"runDetails": "not-a-dict"}))
+
+    def test_missing_metadata_returns_none(self):
+        self.assertIsNone(_slsa_invocation_origin({"runDetails": {}}))
+
+    def test_non_dict_metadata_returns_none(self):
+        self.assertIsNone(_slsa_invocation_origin({"runDetails": {"metadata": "not-a-dict"}}))
+
+    def test_missing_invocation_id_returns_none(self):
+        self.assertIsNone(_slsa_invocation_origin({"runDetails": {"metadata": {"startedOn": "x"}}}))
+
+    def test_non_string_invocation_id_returns_none(self):
+        self.assertIsNone(_slsa_invocation_origin({"runDetails": {"metadata": {"invocationId": 12345}}}))
+
+    def test_blank_invocation_id_returns_none(self):
+        self.assertIsNone(_slsa_invocation_origin({"runDetails": {"metadata": {"invocationId": "   "}}}))
+
+
+class SlsaLevelResultOriginTests(unittest.TestCase):
+    def test_origin_defaults_to_none(self):
+        self.assertIsNone(_slsa_level_result("Build", 1, "SLSA Build Level 1", [])["origin"])
+
+    def test_origin_is_carried_through_when_given(self):
+        result = _slsa_level_result("Build", 1, "SLSA Build Level 1", [], origin="https://example.com/run/1")
+        self.assertEqual(result["origin"], "https://example.com/run/1")
+
+
+class EvaluateSlsaOriginIntegrationTests(unittest.TestCase):
+    """_evaluate_slsa_l1/_l2 thread _slsa_invocation_origin(predicate)
+    through to the level's own "origin" field -- see
+    FormatSlsaLevelBlockOriginTests for how that's rendered."""
+
+    def test_l1_origin_reflects_statement_invocation_id(self):
+        statement = _slsa_provenance_statement(invocation_id="https://github.com/acme/widgets/actions/runs/42/attempts/1")
+        self.assertEqual(
+            _evaluate_slsa_l1(statement)["origin"], "https://github.com/acme/widgets/actions/runs/42/attempts/1"
+        )
+
+    def test_l2_origin_reflects_statement_invocation_id(self):
+        statement = _slsa_provenance_statement(invocation_id="https://github.com/acme/widgets/actions/runs/42/attempts/1")
+        assessment = _evaluate_slsa_l2(statement, identity_status="verified", identity_detail="ok")
+        self.assertEqual(assessment["origin"], "https://github.com/acme/widgets/actions/runs/42/attempts/1")
+
+    def test_origin_is_none_when_statement_has_no_invocation_id(self):
+        statement = _slsa_provenance_statement(invocation_id=None, started_on=None, finished_on=None)
+        self.assertIsNone(_evaluate_slsa_l1(statement)["origin"])
+
+
+class FormatSlsaLevelBlockOriginTests(unittest.TestCase):
+    """The "Origin CI Run:" line _format_slsa_level_block renders only
+    belongs inside a *failed* level's own block -- a passing level, or a
+    failed level whose statement carried no invocationId, renders exactly
+    as before this line existed."""
+
+    def _level(self, *, item_passed: bool, origin):
+        items = [{"label": "X", "passed": item_passed, "detail": "" if item_passed else "boom"}]
+        return _slsa_level_result("Build", 1, "SLSA Build Level 1", items, origin=origin)
+
+    def test_origin_line_shown_when_level_failed_and_origin_present(self):
+        assessment = self._level(item_passed=False, origin="https://github.com/acme/widgets/actions/runs/1/attempts/1")
+
+        lines = _format_slsa_level_block(assessment, overall_passed=False)
+
+        self.assertIn("Origin CI Run:  https://github.com/acme/widgets/actions/runs/1/attempts/1", lines)
+
+    def test_origin_line_omitted_when_level_passed_even_if_origin_present(self):
+        assessment = self._level(item_passed=True, origin="https://github.com/acme/widgets/actions/runs/1/attempts/1")
+
+        lines = _format_slsa_level_block(assessment, overall_passed=True)
+
+        self.assertFalse(any(line.startswith("Origin CI Run:") for line in lines))
+
+    def test_origin_line_omitted_when_no_origin_available(self):
+        assessment = self._level(item_passed=False, origin=None)
+
+        lines = _format_slsa_level_block(assessment, overall_passed=False)
+
+        self.assertFalse(any(line.startswith("Origin CI Run:") for line in lines))
+
+    def test_origin_line_rendered_immediately_before_status_line(self):
+        assessment = self._level(item_passed=False, origin="https://example.com/run/1")
+
+        lines = _format_slsa_level_block(assessment, overall_passed=False)
+
+        origin_idx = next(i for i, line in enumerate(lines) if line.startswith("Origin CI Run:"))
+        status_idx = next(i for i, line in enumerate(lines) if line.startswith("Status:"))
+        self.assertEqual(origin_idx, status_idx - 1)
 
 
 class VerifyDsseAttestationSlsaIntegrationTests(unittest.TestCase):

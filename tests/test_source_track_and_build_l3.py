@@ -25,6 +25,7 @@ from cli.verify import (
     main,
     verify_dsse_attestation,
     _build_verify_json_payload,
+    _evaluate_slsa_l3,
     _evaluate_source_l1,
     _evaluate_source_l2,
     _evaluate_source_l3,
@@ -241,6 +242,26 @@ class BuildLevel3ChecksTests(unittest.TestCase):
         result = _slsa_check_materialized_dependencies(predicate)
         self.assertTrue(result["passed"])
         self.assertIn("1 packages recorded", result["items"][0]["label"] if "items" in result else result["label"])
+
+    def test_l3_origin_reflects_statement_invocation_id(self):
+        """_evaluate_slsa_l3 threads _slsa_invocation_origin(predicate)
+        through the same way _evaluate_slsa_l1/_l2 do, so a failed Level 3
+        block (the common case -- see test_build_level3_fails_by_default_
+        for_every_caller_today below) can still be traced back to the run
+        that produced it."""
+        statement = {
+            "predicate": {
+                "runDetails": {
+                    "builder": {"id": "https://github.com/actions/runner"},
+                    "metadata": {"invocationId": "https://github.com/acme/widgets/actions/runs/42/attempts/1"},
+                },
+            },
+        }
+
+        assessment = _evaluate_slsa_l3(statement, identity_status="skipped", cert_identity=None)
+
+        self.assertFalse(assessment["passed"])  # fails closed, same as every other caller today
+        self.assertEqual(assessment["origin"], "https://github.com/acme/widgets/actions/runs/42/attempts/1")
 
     def test_build_level3_fails_by_default_for_every_caller_today(self):
         """The whole point of the fail-closed requirement: a fully-populated,

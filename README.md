@@ -515,9 +515,17 @@ same data reshaped into `static_analysis.tools` (see below).
       "predicate_type": "https://tenax.io/attestations/assay/v1",
       "subject": [{"name": "registry.example.com/org/svc", "digest": {"sha256": "..."}}]
     },
+    "verdict": "FINAL VERDICT: GATED (Source L2 / Build L1) — SLSA Build L2 Incomplete",
+    "source": {
+      "level_1": {"level": 1, "track": "Source", "name": "Source Level 1: Version Controlled Source", "passed": true, "items": ["..."]},
+      "level_2": {"level": 2, "track": "Source", "name": "Source Level 2: Verified History & Explicit Lineage", "passed": true, "items": ["..."]},
+      "level_3": {"level": 3, "track": "Source", "name": "Source Level 3: Retained History & Author Identity", "passed": false, "items": ["..."]},
+      "level_4": {"level": 4, "track": "Source", "name": "Source Level 4: Two-Party Code Review & Branch Governance", "passed": false, "items": ["..."]}
+    },
     "slsa": {
       "level_1": {
         "level": 1,
+        "track": "Build",
         "name": "SLSA Build Level 1",
         "passed": true,
         "items": [
@@ -529,6 +537,7 @@ same data reshaped into `static_analysis.tools` (see below).
       },
       "level_2": {
         "level": 2,
+        "track": "Build",
         "name": "SLSA Build Level 2",
         "passed": false,
         "items": [
@@ -537,22 +546,27 @@ same data reshaped into `static_analysis.tools` (see below).
           {"label": "Authenticated Source Repository Binding", "passed": true, "detail": ""},
           {"label": "Materialized Resolved Dependencies", "passed": false, "detail": "buildDefinition.resolvedDependencies is missing or empty"}
         ]
-      }
+      },
+      "level_3": {"level": 3, "track": "Build", "name": "SLSA Build Level 3", "passed": false, "items": ["..."]}
     },
-    "release_confidence_score": {"score": 89, "degraded": false, "degraded_field_present": true, "degraded_reasons": []},
+    "release_confidence_score": {"score": 89, "degraded": false, "degraded_field_present": true, "degraded_reasons": [], "components": {"...": "..."}},
     "static_analysis": {"tools": {"codeql": {"errors": 0, "warnings": 0}, "sonarcloud": {"quality_gate": "PASSED"}}},
     "identity": {"status": "verified", "detail": "..."},
     "violations": [],
     "warnings": []
   }
   ```
-  `slsa.level_1`/`slsa.level_2` are exactly `slsa_level1`/`slsa_level2` —
-  the same SLSA v1.0 Build Level 1/2 checklist the text formatter renders
-  to stderr via `_format_slsa_report` (see "SLSA v1.0 Build Level 1/2
-  checklist" below for what each item means and how Level 2 builds on
-  Level 1), reshaped as JSON here rather than recomputed, so `--format
-  json` and the default text output can never disagree about SLSA
-  compliance for the same run.
+  `source.level_1`..`level_4` and `slsa.level_1`..`level_3` are exactly
+  `result.source_level1`..`source_level4`/`slsa_level1`..`slsa_level3` —
+  the same SLSA Source Track and Build Track checklists the text
+  formatter renders to stderr via `_format_track_report` (see "SLSA
+  Source & Build Track checklists" below for what each item means and
+  how each level builds on the one below it), reshaped as JSON here
+  rather than recomputed, so `--format json` and the default text output
+  can never disagree about SLSA compliance for the same run. `verdict` is
+  the same synthesized `FINAL VERDICT: ...` headline the text banner
+  prints (see below) — the highest level each track cumulatively
+  satisfies, plus the actual hard-gate outcome.
 
   `--json` (no `-f`) is kept as a **deprecated alias** for `--format json`
   — it emits the same payload and prints a one-line deprecation notice to
@@ -611,24 +625,47 @@ Identity verification (best-effort, four possible outcomes):
 
 Exit codes: `0` = pass, `1` = file/parse error, `2` = policy violation.
 
-**SLSA v1.0 Build Level 1/2 checklist** (informational, non-gating):
-every `verify` run additionally evaluates the decoded statement against
-the [SLSA v1.0 provenance](https://slsa.dev/spec/v1.0/provenance) Build
-Level 1 and Level 2 requirements and prints a scannable checklist to
-stderr (`--format json` carries the same data under `slsa.level_1`/
-`slsa.level_2`; the deprecated `--json` alias does too).
-This check is independent of tenax-assay's own RCS predicate/policy
-gates above — it evaluates the SLSA-specific fields (`predicateType`,
-`buildDefinition`, `runDetails`, `externalParameters`) directly, so it
-applies to any SLSA v1.0 provenance statement handed to this same
-admission gate, not just tenax-assay's own attestations (whose
-predicate isn't SLSA-provenance-shaped, so most items there legitimately
-show `[✗]` today — that's by design, see "SLSA v1.0 provenance
-attestation" below for the statement that's actually meant to satisfy
-this checklist). Neither level's outcome ever affects `passed`/the
-exit code:
+**SLSA Source & Build Track checklists** (informational by default,
+non-gating): every `verify` run additionally evaluates the decoded
+statement(s) against both halves of the SLSA v1.0 framework — the
+[Source track](https://slsa.dev/spec/v1.0/source-requirements) (Levels
+1-4) and the [Build track](https://slsa.dev/spec/v1.0/provenance) (Levels
+1-3) — and prints a scannable, grouped report to stderr (`--format json`
+carries the same data under `source.level_1`..`level_4` and
+`slsa.level_1`..`level_3`; the deprecated `--json` alias does too).
+
+**`--slsa-envelope PATH`** loads a *second* DSSE envelope alongside the
+primary one so both tracks can be evaluated together from the right
+source: the Source track reads `vcs`/`branch_governance` off whichever
+loaded statement is tenax-assay's own RCS predicate, and the Build track
+reads `buildDefinition`/`runDetails` off whichever is SLSA-provenance-
+shaped — regardless of which one is the primary positional argument.
+Without `--slsa-envelope` (unchanged from before it existed), both
+tracks evaluate against whatever the single envelope decodes to,
+honestly reporting missing/wrong-shaped fields as failures rather than a
+separate "unavailable" state — the same fail-closed contract this
+checklist has always had.
 
 ```text
+SLSA Source Track
+=== Source Level 1: Version Controlled Source Assessment ===
+[✓] Version Controlled Source (VCS provider & branch binding)
+Status: PASSED (SLSA Source Level 1)
+
+=== Source Level 2: Verified History & Explicit Lineage Assessment ===
+[✓] Verified History & Explicit Lineage (commit SHA, base SHA, PR lineage)
+Status: PASSED (SLSA Source Level 2)
+
+=== Source Level 3: Retained History & Author Identity Assessment ===
+[✗] Retained History & Author Identity (commit author / history-retention provenance) -- commit author / history-retention identity is not yet captured in the predicate
+Status: FAILED (SLSA Source Level 3)
+
+=== Source Level 4: Two-Party Code Review & Branch Governance Assessment ===
+[✓] Two-Party Code Review & Branch Governance (branch_governance.approvals_required >= 1) (2 approval(s) required)
+Status: FAILED (SLSA Source Level 4)
+=====================================
+
+SLSA Build Track
 === SLSA Build Level 1 Assessment ===
 [✓] in-toto v1 Statement Envelope
 [✓] SLSA v1.0 Provenance Predicate
@@ -642,26 +679,94 @@ Status: PASSED (SLSA Build Level 1)
 [✓] Authenticated Source Repository Binding
 [✓] Materialized Resolved Dependencies (142 packages recorded)
 Status: PASSED (SLSA Build Level 2)
+
+=== SLSA Build Level 3 Assessment ===
+[✗] Unforgeable Control-Plane Builder Identity (https://github.com/actions/runner) -- builder id is not in the trusted isolated-control-plane allowlist [...]
+[✗] Isolated Provenance Generation (signer identity matches builder identity) -- ...
+[✓] Materialized Locked Dependencies (142 packages recorded)
+Status: FAILED (SLSA Build Level 3)
 =====================================
+
+=== Assay Health & Governance Metrics ===
+Release Confidence Score (RCS): 89 (degraded=False)
+Component breakdown:
+  - governance: raw=100.0 weight=0.15 weighted=15.0
+      2/2 required approvals (approved)
+  ...
+
+================================================================================
+FINAL VERDICT: GATED (Source L2 / Build L2) — SLSA Build L3 Incomplete
+================================================================================
 ```
 
+**Source track** (each level is one check; SLSA's own leveling is
+cumulative, same rule as the Build track below):
+- **Level 1** — `vcs.provider`/`vcs.repository`/`vcs.branch` are all present.
+- **Level 2** — `vcs.commit_sha` and `vcs.base_commit_sha` are both present
+  and hash-shaped; when this run has PR context, `vcs.pull_request.number`
+  and `.target_branch` are present too (explicit lineage).
+- **Level 3** — verifiable commit-author identity and tamper-evident
+  history retention. **Always `[✗]` today**: no predicate field captures
+  either yet (`predicate.vcs` has no author/committer field at all) — an
+  honest, permanent gap, not a stub, until that data-collection work is
+  done.
+- **Level 4** — `branch_governance.approvals_required >= 1` (the branch's
+  own rule, not merely that this PR happened to get a reviewer — see
+  `vcs.pull_request.required_approvals` for that separate, PR-scoped
+  field); fails on `0`, a missing `branch_governance` block, or a
+  `platform_unsupported_tier` reason code.
+
+**Build track**:
 - **Level 1** — `_type` is `https://in-toto.io/Statement/v1`; `predicateType`
   is `https://slsa.dev/provenance/v1`; `buildDefinition.buildType` is
   present *and* `runDetails.metadata` carries either an `invocationId` or
   both `startedOn`/`finishedOn` (combined into one checklist row); and at
   least one subject digest is attested.
-- **Level 2** builds on Level 1 (SLSA's own leveling is cumulative — the
-  combined `Status` line for Level 2 only reads `PASSED` when every Level
-  1 item *and* every Level 2 item passed, even though each block still
-  marks its own items independently): `runDetails.builder.id` is a
-  trusted hosted builder (currently just
-  `https://github.com/actions/runner` — a deliberately narrow, explicit
-  allowlist); the envelope's Sigstore identity check (the same
-  `identity_status` computed above) came back `verified`;
+- **Level 2** — `runDetails.builder.id` is a trusted hosted builder
+  (currently just `https://github.com/actions/runner` — a deliberately
+  narrow, explicit allowlist); the envelope's Sigstore identity check
+  (the same `identity_status` computed above) came back `verified`;
   `buildDefinition.externalParameters.workflow.repository` is present
   (and matches `--expected-repository` when that flag is set); and
   `buildDefinition.resolvedDependencies` has at least one entry with a
   non-empty `uri`.
+- **Level 3** — an *unforgeable* builder identity: `runDetails.builder.id`
+  names the isolated control-plane signer workflow itself (a narrower
+  allowlist than Level 2's, currently
+  `https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml`),
+  *and* the verified Sigstore signer identity (`--cert-identity`) is
+  provably that same workflow — proving the entity that signed the
+  envelope is the same one that claims to have built it, so an untrusted
+  build job can no longer forge `buildDefinition`/`runDetails` even
+  though it never could forge the signature either. Plus materialized
+  locked dependencies: at least one `buildDefinition.resolvedDependencies`
+  entry must be a real `pkg:` PURL with a `sha256` digest, not just the
+  synthetic source-commit entry every statement already carries.
+  **Fails closed for every caller today** — the architecture that would
+  make the first two checks pass (provenance constructed inside
+  `tenax-attest`'s isolated signer job, not the untrusted build job — see
+  "Isolating signing from the build" below) doesn't exist yet.
+
+**`--require-slsa-build-l3`** (off by default) folds the Build track's
+cumulative Level 3 outcome into `passed`/exit code — opt-in, so no
+existing caller's gate changes until they choose to require full Build
+Level 3 compliance (which, per the above, no caller can satisfy yet).
+
+**FINAL VERDICT banner**: one synthesized line summarizing the whole
+report — `PASSED` when the hard gate passed *and* both tracks are fully
+compliant through their top level; `GATED` when the hard gate passed but
+one or both tracks aren't fully compliant yet (shippable, not yet fully
+certified); `FAILED` when the hard gate itself rejected the run. The
+`(Source Lx / Build Ly)` pair is the highest level each track
+cumulatively satisfies, and the trailing clause names the first
+incomplete level standing between `GATED` and `PASSED`.
+
+**`$GITHUB_STEP_SUMMARY`**: whenever that environment variable is set
+(i.e. running as a GitHub Actions job step), `verify` additionally
+*appends* the same report as markdown to the file it points at — a
+one-line PASS/FAIL heading, the plain-text report in a fenced code
+block, and a bulleted violations list when any exist. A no-op (never
+raises) everywhere else, or if the file can't be written.
 
 ## SLSA v1.0 provenance attestation (`--emit-slsa-provenance`)
 
@@ -778,6 +883,36 @@ territory and independent-assessment territory respectively, both out of
 scope here. The concrete, verifiable claim this architecture supports is
 narrower and accurate: the code that builds and tests a PR cannot mint the
 identity that signs what gets said about it.
+
+`cli/verify.py`'s SLSA Build Level 3 checklist (see "SLSA Source & Build
+Track checklists" above) reports exactly this gap today, honestly and by
+design: it fails closed for every caller, because the *content* of the
+SLSA provenance statement — `buildDefinition`/`runDetails` — is still
+constructed in the untrusted `build` job above and only signed, not
+authored, by `attest`. Level 2's signature check can't catch that: a
+compromised `build` job could still assemble a false `buildDefinition`
+(wrong builder claims, wrong resolved dependencies) for `attest` to
+faithfully sign. Closing that gap means moving provenance *construction*
+into `attest`'s isolated job itself, using its own trusted ambient
+context rather than anything `build` claims.
+
+**`tenax-assay provenance`** (`cli/provenance.py`) is the building block
+for that: `tenax-assay provenance --subject-name NAME --subject-digest
+sha256:HEX --repo-dir DIR --out PATH` constructs a SLSA v1.0 provenance
+statement using nothing but *this process's own* ambient GitHub Actions
+context — the same `cli.slsa_provenance.build_slsa_provenance_statement()`
+`--emit-slsa-provenance` already uses, completely unchanged, just called
+from a new entry point. Run it from inside `attest` instead of `build`,
+and every `buildDefinition`/`runDetails` field (builder identity, source
+binding, resolved dependencies) is derived from the trusted signer job's
+own environment and its own read-only checkout of the source commit
+(for lockfile scanning only — the checkout is never executed), not from
+anything the untrusted `build` job claims. Pair it with `tenax-assay
+sign` in the same job to construct *and* sign atomically. Rolling this
+into `tenax-attest`'s `sign.yml` (new `subject-name`/`subject-digest`
+workflow inputs, a read-only source checkout, this subcommand, then the
+existing signing loop) is the tracked next step — not yet wired into
+`tenax-attest` as of this writing.
 
 ## Try it
 

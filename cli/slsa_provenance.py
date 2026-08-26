@@ -131,16 +131,27 @@ def _lockfile_resolved_dependencies(resolved_dependencies: Optional[List[Dict[st
     return out
 
 
-def _hosted_builder() -> Dict[str, Any]:
-    """Only claims the trusted hosted-builder id when the runner actually
+def _hosted_builder(builder_id: Optional[str] = None) -> Dict[str, Any]:
+    """Only claims a trusted hosted-builder id when the runner actually
     reports itself as GitHub-hosted (RUNNER_ENVIRONMENT=github-hosted,
     ambient and unspoofable by workflow YAML). A self-hosted runner, or a
     local/off-CI invocation, gets an empty builder object rather than a
     false "hosted" claim -- that's exactly the tamper-resistance signal
     SLSA Build Level 2 is meant to gate on, so it fails closed the same
-    way the rest of this module does."""
+    way the rest of this module does.
+
+    `builder_id`, when given, overrides the default generic
+    GITHUB_HOSTED_BUILDER_ID with a more specific identity -- used by
+    `cli/provenance.py` (run from inside an isolated, trusted signer job)
+    to assert *that job's own* workflow identity instead of the generic
+    "some hosted runner ran this" claim, which is what SLSA Build Level 3's
+    unforgeable-builder-identity check needs (see cli/verify.py's
+    TRUSTED_CONTROL_PLANE_BUILDER_IDS). Every other, existing caller (the
+    untrusted build job's own --emit-slsa-provenance path) omits it and
+    gets exactly the same GITHUB_HOSTED_BUILDER_ID behavior as before this
+    parameter existed."""
     if os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted":
-        return {"id": GITHUB_HOSTED_BUILDER_ID}
+        return {"id": builder_id or GITHUB_HOSTED_BUILDER_ID}
     return {}
 
 
@@ -168,6 +179,7 @@ def build_slsa_provenance_statement(
     started_at: str,
     finished_at: Optional[str] = None,
     resolved_dependencies: Optional[List[Dict[str, Any]]] = None,
+    builder_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assembles a real, spec-shaped SLSA v1.0 provenance in-toto Statement
     for the same subject artifact tenax-assay's own RCS predicate attests
@@ -176,7 +188,10 @@ def build_slsa_provenance_statement(
     isn't available are simply absent rather than guessed. `subject_sha256`
     should already be a clean lowercase hex digest (cli/main.py normalizes
     --image-digest before calling this, same as it does for
-    cli.builder.build_statement)."""
+    cli.builder.build_statement). `builder_id` overrides the default
+    generic hosted-runner builder identity -- see _hosted_builder()'s
+    docstring; omitted, behavior is unchanged from before this parameter
+    existed."""
     resolved: List[Dict[str, Any]] = []
     source_dep = _source_resolved_dependency()
     if source_dep is not None:
@@ -191,7 +206,7 @@ def build_slsa_provenance_statement(
     }
 
     run_details: Dict[str, Any] = {
-        "builder": _hosted_builder(),
+        "builder": _hosted_builder(builder_id),
         "metadata": _invocation_metadata(started_at, finished_at),
     }
 

@@ -8,11 +8,13 @@ project plan "SLSA Source/Build Track Reporting + Fail-Closed Build L3".
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from typing import Any, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,10 +33,12 @@ from cli.verify import (
     _evaluate_source_l3,
     _evaluate_source_l4,
     _format_verdict_banner,
+    _print_verify_result_human,
     _render_step_summary_markdown,
     _slsa_check_control_plane_builder_identity,
     _slsa_check_isolated_provenance_generation,
     _slsa_check_materialized_dependencies,
+    _verdict_word,
 )
 
 SUBJECT_DIGEST = "a" * 64
@@ -370,6 +374,76 @@ class VerdictBannerTests(unittest.TestCase):
         lines = _format_verdict_banner(self._result(True), source_highest=4, build_highest=3)
         self.assertIn("PASSED", lines[1])
         self.assertNotIn("Incomplete", lines[1])
+
+    def test_verdict_word_agrees_with_format_verdict_banner_failed(self):
+        self.assertEqual(_verdict_word(self._result(False), source_highest=0, build_highest=0), "FAILED")
+
+    def test_verdict_word_agrees_with_format_verdict_banner_gated(self):
+        self.assertEqual(_verdict_word(self._result(True), source_highest=2, build_highest=1), "GATED")
+
+    def test_verdict_word_agrees_with_format_verdict_banner_passed(self):
+        self.assertEqual(_verdict_word(self._result(True), source_highest=4, build_highest=3), "PASSED")
+
+    def test_verdict_word_ignores_track_levels_when_gate_failed(self):
+        # A rejected hard gate is FAILED regardless of how SLSA-compliant
+        # the tracks otherwise look -- mirrors _format_verdict_banner's own
+        # `if not result.passed` short-circuit.
+        self.assertEqual(_verdict_word(self._result(False), source_highest=4, build_highest=3), "FAILED")
+
+
+class VerdictHeadingConsistencyTests(unittest.TestCase):
+    """Regression coverage for the PASS-heading-vs-GATED-verdict confusion:
+    _print_verify_result_human's and _render_step_summary_markdown's
+    top-of-report headings must always show the exact same word as FINAL
+    VERDICT below them, never a separately-computed PASS/FAIL binary (see
+    _verdict_word's docstring)."""
+
+    def test_gated_run_shows_gated_in_heading_not_pass(self):
+        # The exact real-world case that motivated this: a --dry-run with
+        # no --slsa-envelope is admissible (RCS clears --min-rcs) but the
+        # SLSA tracks are all incomplete -- GATED, not the old "✅ PASS".
+        envelope = _envelope(_rcs_statement())
+
+        result = verify_dsse_attestation(envelope, dry_run=True)
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.verdict_word, "GATED")
+        self.assertIn("FINAL VERDICT: GATED", result.verdict)
+
+        markdown = _render_step_summary_markdown(result)
+        self.assertIn("## tenax-assay verify: ⚠️ GATED", markdown)
+        self.assertNotIn("PASS", markdown.split("\n")[0])
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            _print_verify_result_human(result)
+        self.assertIn("tenax-assay verify: GATED", buf.getvalue())
+
+    def test_fully_compliant_result_shows_passed_in_heading(self):
+        # Constructed directly (rather than driven through
+        # verify_dsse_attestation(), which would need a real, cryptographically
+        # verified Sigstore signature to ever reach identity_status=="verified")
+        # so this exercises exactly the heading code path in isolation --
+        # VerdictBannerTests above already covers _verdict_word's own PASSED
+        # decision from source_highest/build_highest.
+        from cli.verify import VerificationResult
+
+        result = VerificationResult(passed=True, verdict_word="PASSED")
+
+        markdown = _render_step_summary_markdown(result)
+        self.assertIn("## tenax-assay verify: ✅ PASSED", markdown)
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            _print_verify_result_human(result)
+        self.assertIn("tenax-assay verify: PASSED", buf.getvalue())
+
+    def test_malformed_envelope_reports_failed_not_blank(self):
+        result = verify_dsse_attestation("not-a-dict", dry_run=True)  # type: ignore[arg-type]
+
+        self.assertEqual(result.verdict_word, "FAILED")
+        markdown = _render_step_summary_markdown(result)
+        self.assertIn("## tenax-assay verify: ❌ FAILED", markdown)
 
 
 class StepSummaryWriterTests(unittest.TestCase):

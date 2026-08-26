@@ -501,6 +501,8 @@ class VerifyJsonPayloadTests(unittest.TestCase):
         for key in (
             "version",
             "verified",
+            "verdict",
+            "verdict_word",
             "envelope",
             "slsa",
             "release_confidence_score",
@@ -510,6 +512,7 @@ class VerifyJsonPayloadTests(unittest.TestCase):
             "warnings",
         ):
             self.assertIn(key, payload)
+        self.assertIn(payload["verdict_word"], ("FAILED", "GATED", "PASSED"))
         json.dumps(payload)  # must be JSON-serializable end to end
 
     def test_json_payload_degraded_never_null(self):
@@ -1552,6 +1555,8 @@ class VerifyDsseAttestationSlsaIntegrationTests(unittest.TestCase):
         self.assertIn("slsa_level2", d)
         self.assertEqual(d["slsa_level1"]["level"], 1)
         self.assertEqual(d["slsa_level2"]["level"], 2)
+        self.assertIn("verdict_word", d)
+        self.assertIn(d["verdict_word"], ("FAILED", "GATED", "PASSED"))
 
     def test_malformed_envelope_still_yields_no_slsa_assessment(self):
         # verify_dsse_attestation()'s top-level malformed-envelope guard

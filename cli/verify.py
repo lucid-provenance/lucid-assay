@@ -226,6 +226,17 @@ class VerificationResult:
     # Empty string until verify_dsse_attestation computes it (e.g. the
     # top-level malformed-envelope guard returns before doing so).
     verdict: str = ""
+    # The bare FAILED/GATED/PASSED word out of `verdict` above (see
+    # _verdict_word) -- also the word _print_verify_result_human/
+    # _render_step_summary_markdown use for the top-of-report heading, so
+    # that heading and FINAL VERDICT always agree instead of the heading
+    # computing its own separate PASS/FAIL binary under a word that
+    # collides with FINAL VERDICT's own distinct "PASSED" state. Explicitly
+    # "FAILED" (not "") on the malformed-envelope early return -- unlike
+    # `verdict` above, this one is always safe to display even when
+    # nothing else was computed, since result.passed=False there always
+    # implies FAILED regardless of source/build level.
+    verdict_word: str = ""
     # The exact admission-gate parameters this call was invoked with
     # (min_rcs, disallow_degraded, cert_identity, expected_repository, ...)
     # -- verbatim, not re-derived -- so a report can be read on its own and
@@ -260,6 +271,7 @@ class VerificationResult:
             "source_level4": self.source_level4,
             "rcs_components": self.rcs_components,
             "verdict": self.verdict,
+            "verdict_word": self.verdict_word,
             "gate_params": self.gate_params,
         }
 
@@ -1148,9 +1160,26 @@ def _format_assay_health_report(result: "VerificationResult") -> List[str]:
     return lines
 
 
+def _verdict_word(result: "VerificationResult", source_highest: int, build_highest: int) -> str:
+    """The bare FAILED/GATED/PASSED word (see _format_verdict_banner's own
+    docstring for what each means) -- factored out so the top-of-report
+    heading (_print_verify_result_human/_render_step_summary_markdown) can
+    share the exact word FINAL VERDICT uses, rather than computing its own
+    separate PASS/FAIL binary that only answers the narrower "did the hard
+    admission gate reject this" question under a word ("PASS") that
+    collides with FINAL VERDICT's own distinct "PASSED" state -- confusing
+    to skim, especially for a reader (e.g. an auditor) who reads only the
+    heading and never reaches FINAL VERDICT below it."""
+    if not result.passed:
+        return "FAILED"
+    if source_highest >= 4 and build_highest >= 3:
+        return "PASSED"
+    return "GATED"
+
+
 def _format_verdict_banner(result: "VerificationResult", source_highest: int, build_highest: int) -> List[str]:
     """Synthesizes the single FINAL VERDICT line summarizing the whole
-    report. Three words, not two:
+    report. Three words, not two (see _verdict_word):
       FAILED - the hard admission gate itself rejected this run
                (result.passed is False: --min-rcs/--disallow-degraded/
                identity -- exactly as before; the SLSA checklists never
@@ -1163,13 +1192,8 @@ def _format_verdict_banner(result: "VerificationResult", source_highest: int, bu
                (cumulatively) compliant through their top level.
     The trailing clause names the first incomplete track/level standing
     between GATED and PASSED; omitted once both tracks are maxed."""
+    verdict_word = _verdict_word(result, source_highest, build_highest)
     fully_compliant = source_highest >= 4 and build_highest >= 3
-    if not result.passed:
-        verdict_word = "FAILED"
-    elif fully_compliant:
-        verdict_word = "PASSED"
-    else:
-        verdict_word = "GATED"
 
     incomplete = None
     if not fully_compliant:
@@ -1293,8 +1317,9 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
     inside verify_dsse_attestation() -- json and text output must never
     disagree about SLSA compliance, so this reads the identical
     already-computed result rather than recomputing its own assessment),
-    plus the synthesized FINAL VERDICT headline (result.verdict), plus
-    run_identity/gate_params (see _extract_run_identity and
+    plus the synthesized FINAL VERDICT headline (result.verdict) and its
+    bare FAILED/GATED/PASSED word (result.verdict_word, see
+    _verdict_word), plus run_identity/gate_params (see _extract_run_identity and
     VerificationResult.gate_params -- the same "where did this come from,
     what gate was enforced" fields _format_run_identity_report renders as
     text, kept here so a --format json consumer gets the identical
@@ -1307,6 +1332,7 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
         "version": "1.0.0",
         "verified": result.passed,
         "verdict": result.verdict,
+        "verdict_word": result.verdict_word or "FAILED",
         "envelope": {
             "statement_type": statement.get("_type"),
             "predicate_type": statement.get("predicateType"),
@@ -2030,6 +2056,7 @@ def verify_dsse_attestation(
             identity_status="skipped",
             identity_detail="envelope malformed; identity verification not attempted",
             gate_params=gate_params,
+            verdict_word="FAILED",
         )
 
     statement, violations, warnings = _decode_envelope_statement(envelope)
@@ -2172,6 +2199,7 @@ def verify_dsse_attestation(
     build_levels = [slsa_level1, slsa_level2, slsa_level3]
     source_highest = _highest_passing_level(source_levels, _cumulative_track_status(source_levels))
     build_highest = _highest_passing_level(build_levels, _cumulative_track_status(build_levels))
+    result.verdict_word = _verdict_word(result, source_highest, build_highest)
     result.verdict = _format_verdict_banner(result, source_highest, build_highest)[1]
 
     return result
@@ -2359,8 +2387,11 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
 
 def _print_verify_result_human(result: VerificationResult) -> None:
     """Human-readable (non --json) stderr rendering of a completed
-    VerificationResult -- main()'s else branch of --json."""
-    print(f"tenax-assay verify: {'PASS' if result.passed else 'FAIL'}", file=sys.stderr)
+    VerificationResult -- main()'s else branch of --json. The heading uses
+    result.verdict_word (FAILED/GATED/PASSED, see _verdict_word) rather
+    than a separately-computed PASS/FAIL binary, so it always agrees with
+    FINAL VERDICT below it."""
+    print(f"tenax-assay verify: {result.verdict_word or 'FAILED'}", file=sys.stderr)
     if result.rcs_value is not None:
         print(f"  RCS={result.rcs_value} degraded={result.degraded}", file=sys.stderr)
         if result.degraded and result.degraded_reasons:
@@ -2381,14 +2412,21 @@ def _print_verify_result_human(result: VerificationResult) -> None:
             print(f"  warning: {w}", file=sys.stderr)
 
 
+_VERDICT_EMOJI = {"PASSED": "✅", "GATED": "⚠️", "FAILED": "❌"}
+
+
 def _render_step_summary_markdown(result: VerificationResult) -> str:
     """Renders the same unified report _print_verify_result_human prints
     to stderr as a $GITHUB_STEP_SUMMARY markdown document: a one-line
-    PASS/FAIL heading, then the identical Source/Build/Assay-Health/
-    verdict plain-text report wrapped in a fenced code block (its [✓]/[✗]
-    rows and "====" banners are already fixed-width plain text, not
-    meant to be reformatted as markdown headings/tables)."""
-    heading = "## tenax-assay verify: " + ("✅ PASS" if result.passed else "❌ FAIL")
+    FAILED/GATED/PASSED heading (result.verdict_word, same word and same
+    meaning as FINAL VERDICT below it -- see _verdict_word's docstring for
+    why this deliberately isn't its own PASS/FAIL binary), then the
+    identical Source/Build/Assay-Health/verdict plain-text report wrapped
+    in a fenced code block (its [✓]/[✗] rows and "====" banners are
+    already fixed-width plain text, not meant to be reformatted as
+    markdown headings/tables)."""
+    word = result.verdict_word or "FAILED"
+    heading = f"## tenax-assay verify: {_VERDICT_EMOJI.get(word, '❌')} {word}"
     body = "\n".join(_render_track_sections(result)).strip("\n")
     parts = [heading]
     if body:

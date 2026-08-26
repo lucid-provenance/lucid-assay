@@ -57,6 +57,22 @@ class PrintVerifyResultHumanTests(unittest.TestCase):
         self.assertNotIn("static analysis:", out)
         self.assertNotIn("RCS=", out)
 
+    def test_heading_uses_verdict_word_not_a_separate_pass_fail_binary(self):
+        # See _verdict_word's docstring: the heading must show the same
+        # word FINAL VERDICT does, not its own PASS/FAIL binary.
+        result = VerificationResult(passed=True, verdict_word="GATED")
+        out = self._render(result)
+        self.assertIn("tenax-assay verify: GATED", out)
+        self.assertNotIn("tenax-assay verify: PASS", out)
+
+    def test_heading_falls_back_to_failed_when_verdict_word_unset(self):
+        # e.g. a VerificationResult built directly by a test/caller without
+        # going through verify_dsse_attestation() -- never render a blank
+        # heading.
+        result = VerificationResult(passed=True)
+        out = self._render(result)
+        self.assertIn("tenax-assay verify: FAILED", out)
+
 
 if __name__ == "__main__":
     unittest.main()

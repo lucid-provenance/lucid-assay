@@ -14,12 +14,17 @@ that distinction matters). `tenax-assay provenance` is the narrow surface
 that makes that possible: run it from inside `tenax-attest`'s isolated
 `sign` job (see that repo's `sign.yml`), and it builds the statement
 using *that job's own* ambient GitHub Actions context (GITHUB_REPOSITORY/
-_SHA/_WORKFLOW_REF/RUNNER_ENVIRONMENT, as seen by the trusted job, not
-whatever the untrusted build job claims) plus a read-only, code-never-
-executed checkout of the source commit for lockfile scanning. It performs
-zero pipeline logic beyond that -- no scoring, coverage, or SARIF
-ingestion, and no signing (pair with `tenax-assay sign` for that) -- so a
-job invoking only this subcommand never needs read access to any of it.
+_SHA/RUNNER_ENVIRONMENT, as seen by the trusted job, not whatever the
+untrusted build job claims) plus a read-only, code-never-executed
+checkout of the source commit for lockfile scanning. The one exception is
+`runDetails.builder.id` itself: the caller must pass `--builder-id`
+explicitly (see `_control_plane_builder_id`'s docstring for why ambient
+GITHUB_WORKFLOW_REF can't supply this when running inside a
+`workflow_call` job -- a real run proved it wrong, not a hypothetical).
+This subcommand performs zero pipeline logic beyond construction -- no
+scoring, coverage, or SARIF ingestion, and no signing (pair with
+`tenax-assay sign` for that) -- so a job invoking only this subcommand
+never needs read access to any of it.
 
 Reuses cli.slsa_provenance.build_slsa_provenance_statement() and
 cli.parsers.lockfiles.detect_and_parse_dependencies() completely
@@ -64,17 +69,42 @@ def _normalize_digest(raw: str) -> str:
 
 
 def _control_plane_builder_id() -> Optional[str]:
-    """Derives *this process's own* trusted workflow identity from ambient
-    GITHUB_WORKFLOW_REF (e.g. 'tenax-io/tenax-attest/.github/workflows/
-    sign.yml@<ref>' -> 'https://github.com/tenax-io/tenax-attest/.github/
-    workflows/sign.yml') -- the same job-workflow-ref identity Fulcio's
-    GitHub Actions OIDC certificate extension encodes for whatever job
-    calls this. Deliberately not hardcoded to any specific repo/path: this
-    subcommand is meant to run inside an isolated signer job wherever one
-    is hosted, and its output should assert that job's own real identity,
-    not a value invented here. None (never fabricated) when
-    GITHUB_WORKFLOW_REF isn't set (off-CI) or doesn't contain the expected
-    '<path>@<ref>' shape."""
+    """Best-effort fallback for --builder-id when the caller doesn't pass
+    one explicitly: derives an identity from ambient GITHUB_WORKFLOW_REF
+    (e.g. 'org/repo/.github/workflows/foo.yml@<ref>' ->
+    'https://github.com/org/repo/.github/workflows/foo.yml').
+
+    Disproven by a real run, do not re-derive this assumption: this does
+    NOT reliably identify "the isolated signer workflow currently
+    executing this job" when this subcommand runs inside a
+    `workflow_call` job (tenax-attest's sign.yml, invoked by some other
+    repo's caller workflow). GITHUB_WORKFLOW_REF is a *run-level* context
+    value -- constant for every job in the run, always the ref of the
+    top-level, *calling* workflow that GitHub's UI attributes the run to
+    -- not a *job*-level one. A real run observed this directly: invoked
+    from tenax-dsse-collector's assay.yml, this returned
+    'https://github.com/tenax-io/tenax-dsse-collector/.github/workflows/
+    assay.yml' -- the caller's own workflow, not
+    'https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml'
+    -- so cli/verify.py's SLSA Build Level 2/3 checks correctly failed
+    the resulting statement's builder-identity claim.
+
+    (Fulcio's job_workflow_ref OIDC certificate extension -- what
+    --cert-identity checks -- does not have this problem: it genuinely
+    scopes to the specific reusable workflow file that defines the
+    executing job, which is exactly why identity verification has always
+    worked correctly here. GITHUB_WORKFLOW_REF and job_workflow_ref are
+    two different GitHub Actions concepts that happen to look similar;
+    this function's whole existence was conflating them.)
+
+    tenax-attest's sign.yml now always passes --builder-id explicitly
+    (it's the one caller that authoritatively knows its own identity,
+    hardcoded the same way TRUSTED_SIGNER_SHA is), so this fallback is
+    only ever exercised by a direct, non-nested invocation -- where
+    GITHUB_WORKFLOW_REF genuinely is this process's own top-level
+    workflow, and the derivation is correct. None (never fabricated) when
+    GITHUB_WORKFLOW_REF isn't set (off-CI) or doesn't contain the
+    expected '<path>@<ref>' shape."""
     workflow_ref = os.environ.get("GITHUB_WORKFLOW_REF")
     if not workflow_ref or "@" not in workflow_ref:
         return None
@@ -100,6 +130,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "(default: current directory)",
     )
     p.add_argument("--out", required=True, help="output path for the unsigned provenance statement JSON")
+    p.add_argument(
+        "--builder-id",
+        default=None,
+        dest="builder_id",
+        help="explicit runDetails.builder.id to assert, e.g. https://github.com/tenax-io/tenax-attest/"
+        ".github/workflows/sign.yml -- the caller's own known identity, not derived here. Required for "
+        "correctness when running inside a workflow_call job (see _control_plane_builder_id's docstring "
+        "for why ambient GITHUB_WORKFLOW_REF can't supply this in that case); falls back to a best-effort "
+        "ambient derivation when omitted, correct only for a direct, non-nested invocation.",
+    )
     p.add_argument(
         "--started-at",
         default=None,
@@ -129,7 +169,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         started_at=started_at,
         finished_at=finished_at,
         resolved_dependencies=resolved_dependencies,
-        builder_id=_control_plane_builder_id(),
+        builder_id=args.builder_id or _control_plane_builder_id(),
     )
 
     try:

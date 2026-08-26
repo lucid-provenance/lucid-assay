@@ -404,6 +404,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         return sign_main(raw_argv[1:])
 
+    # `tenax-assay provenance ...` dispatches to the standalone SLSA v1.0
+    # provenance-construction subcommand (cli/provenance.py) -- builds a
+    # provenance statement from *this process's own* ambient GitHub
+    # Actions context, intended to run inside an isolated, trusted signer
+    # job rather than the untrusted job that built the subject artifact
+    # (see cli/provenance.py's module docstring for why this differs from
+    # --emit-slsa-provenance below).
+    if raw_argv and raw_argv[0] == "provenance":
+        from .provenance import main as provenance_main
+
+        return provenance_main(raw_argv[1:])
+
     # `tenax-assay run ...` is an explicit alias for the attestation
     # pipeline below -- it's also what runs with no subcommand at all, so
     # `run` is stripped rather than required, keeping `tenax-assay --sarif

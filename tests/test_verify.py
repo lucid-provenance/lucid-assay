@@ -26,12 +26,22 @@ from cli.verify import (
     _evaluate_slsa_l1,
     _evaluate_slsa_l2,
     _extract_cert_ref,
-    _format_slsa_report,
+    _format_track_report,
     _static_analysis_tools_by_name,
     _verify_sigstore_identity,
 )
 
 SUBJECT_DIGEST = "a" * 64
+
+
+def _format_slsa_report(l1: Dict[str, Any], l2: Dict[str, Any]):
+    """Test-local shim: cli.verify's old two-level-specific
+    _format_slsa_report(l1, l2) was generalized into
+    _format_track_report(levels) -> (lines, cumulative_status) to also
+    render the SLSA Source Track's four levels. Existing call sites below
+    only ever asserted on the rendered lines, so this shim keeps them
+    unchanged."""
+    return _format_track_report([l1, l2])[0]
 
 
 _DEGRADED_REASONS_OMITTED = object()  # sentinel: distinct from None/[] -- key left out of the predicate entirely

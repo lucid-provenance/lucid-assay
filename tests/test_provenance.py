@@ -59,13 +59,46 @@ class ProvenanceSubcommandTests(_TempDirTestCase):
 
         self.assertEqual(statement["predicateType"], SLSA_PROVENANCE_PREDICATE_TYPE)
         self.assertEqual(statement["subject"][0]["digest"]["sha256"], "a" * 64)
-        # Not the generic GITHUB_HOSTED_BUILDER_ID: builder.id asserts
-        # *this process's own* trusted workflow identity (derived from
-        # ambient GITHUB_WORKFLOW_REF), which is the whole point of this
-        # subcommand -- see _control_plane_builder_id()'s docstring.
+        # No --builder-id given: falls back to the ambient-derivation
+        # helper. Only correct for a direct, non-nested invocation (which
+        # this test simulates) -- see _control_plane_builder_id's
+        # docstring for why this fallback is provably wrong when this
+        # subcommand instead runs inside a workflow_call job.
         self.assertEqual(
             statement["predicate"]["runDetails"]["builder"]["id"],
             "https://github.com/acme/widgets/.github/workflows/sign.yml",
+        )
+
+    def test_explicit_builder_id_overrides_ambient_derivation(self):
+        """Reproduces the real bug: GITHUB_WORKFLOW_REF reflects the
+        top-level *calling* workflow (e.g. a caller repo's assay.yml),
+        never the reusable sign.yml job actually executing this
+        subcommand. --builder-id must win over that ambient value, not
+        just supplement it -- this is exactly what tenax-attest's
+        sign.yml now always passes explicitly."""
+        tmp = self._tmp()
+        out_path = os.path.join(tmp, "provenance.unsigned.json")
+        env = dict(_GITHUB_ENV)
+        # Simulates the observed real-run value: the *caller's* workflow,
+        # not tenax-attest's own sign.yml.
+        env["GITHUB_WORKFLOW_REF"] = "tenax-io/tenax-dsse-collector/.github/workflows/assay.yml@refs/heads/main"
+
+        with mock.patch.dict(os.environ, env, clear=False):
+            provenance_main(
+                [
+                    "--subject-name", "x",
+                    "--subject-digest", "sha256:" + "a" * 64,
+                    "--repo-dir", tmp,
+                    "--out", out_path,
+                    "--builder-id", "https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml",
+                ]
+            )
+
+        with open(out_path, "r", encoding="utf-8") as f:
+            statement = json.load(f)
+        self.assertEqual(
+            statement["predicate"]["runDetails"]["builder"]["id"],
+            "https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml",
         )
 
     def test_bare_hex_digest_normalized_same_as_sha256_prefixed(self):

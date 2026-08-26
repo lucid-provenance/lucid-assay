@@ -114,14 +114,17 @@ def _emit_stage_profile(
     print("====================================", file=sys.stderr)
 
 
+JSON_SUFFIX = ".json"
+
+
 def derive_signed_path(out_path: str) -> str:
     """Derive the DSSE signed envelope path from --out, without
     double-appending the .dsse.json suffix when --out already ends in
     .dsse.json or .json (e.g. avoid *.dsse.dsse.json)."""
     if out_path.endswith(".dsse.json"):
         return out_path
-    if out_path.endswith(".json"):
-        base_out = out_path[: -len(".json")]
+    if out_path.endswith(JSON_SUFFIX):
+        base_out = out_path[: -len(JSON_SUFFIX)]
         if base_out.endswith(".unsigned"):
             base_out = base_out[: -len(".unsigned")]
         return f"{base_out}.dsse.json"
@@ -140,8 +143,8 @@ def derive_slsa_provenance_path(out_path: str, explicit: Optional[str]) -> str:
     if out_path.endswith(".unsigned.json"):
         base_out = out_path[: -len(".unsigned.json")]
         return f"{base_out}.slsa-provenance.unsigned.json"
-    if out_path.endswith(".json"):
-        base_out = out_path[: -len(".json")]
+    if out_path.endswith(JSON_SUFFIX):
+        base_out = out_path[: -len(JSON_SUFFIX)]
         return f"{base_out}.slsa-provenance.json"
     return f"{out_path}.slsa-provenance.json"
 
@@ -384,12 +387,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    raw_argv = argv if argv is not None else sys.argv[1:]
+def _dispatch_standalone_subcommand(raw_argv: List[str]) -> Optional[int]:
+    """Dispatches `tenax-assay {verify,sign,provenance} ...` to their
+    standalone subcommand entry points, each of which owns its own
+    argument parsing entirely separately from parse_args()/the
+    attestation-building pipeline below. Returns the subcommand's exit
+    code, or None when `raw_argv` doesn't name one of these -- the caller
+    (main()) then continues on to the pipeline itself. Split out of
+    main() so each `if raw_argv[0] == ...` branch's own complexity is
+    contained here rather than compounding with the pipeline's (same
+    rationale as _ingest_sarif/_detect_lockfile_dependencies/_maybe_sign
+    above)."""
+    if not raw_argv:
+        return None
 
     # `tenax`/`tenax-assay verify ...` dispatches to the standalone
     # admission gatekeeper instead of the attestation-building pipeline below.
-    if raw_argv and raw_argv[0] == "verify":
+    if raw_argv[0] == "verify":
         from .verify import main as verify_main
 
         return verify_main(raw_argv[1:])
@@ -399,7 +413,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # directly, without re-running the pipeline above. See cli/sign.py's
     # module docstring for why this exists separately from --sign/
     # --dry-run-sign below (which still build-then-sign in one process).
-    if raw_argv and raw_argv[0] == "sign":
+    if raw_argv[0] == "sign":
         from .sign import main as sign_main
 
         return sign_main(raw_argv[1:])
@@ -411,10 +425,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     # job rather than the untrusted job that built the subject artifact
     # (see cli/provenance.py's module docstring for why this differs from
     # --emit-slsa-provenance below).
-    if raw_argv and raw_argv[0] == "provenance":
+    if raw_argv[0] == "provenance":
         from .provenance import main as provenance_main
 
         return provenance_main(raw_argv[1:])
+
+    return None
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    raw_argv = argv if argv is not None else sys.argv[1:]
+
+    subcommand_exit_code = _dispatch_standalone_subcommand(raw_argv)
+    if subcommand_exit_code is not None:
+        return subcommand_exit_code
 
     # `tenax-assay run ...` is an explicit alias for the attestation
     # pipeline below -- it's also what runs with no subcommand at all, so

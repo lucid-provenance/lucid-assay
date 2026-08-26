@@ -1710,6 +1710,57 @@ def _evaluate_policy_gates(
     return violations, warnings
 
 
+def _evaluate_informational_tracks(
+    statement: Optional[Dict[str, Any]],
+    slsa_statement: Optional[Dict[str, Any]],
+    *,
+    identity_status: str,
+    identity_detail: str,
+    cert_identity: Optional[str],
+    expected_repository: Optional[str],
+    require_slsa_build_l3: bool,
+) -> Tuple[
+    Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any],
+    Dict[str, Any], Dict[str, Any], Dict[str, Any], List[str],
+]:
+    """Computes the informational SLSA Source Level 1-4 and Build Level
+    1-3 checklists (see _evaluate_source_checklist/_evaluate_slsa_checklists)
+    and, only when `require_slsa_build_l3` opts in, the one additional
+    violation that folds Build Level 3's cumulative outcome into the hard
+    gate. Split out of verify_dsse_attestation() purely to keep that
+    function's own cognitive complexity down -- every one of these calls
+    is still made unconditionally on every verify run, in the same order,
+    with the same non-gating contract as static_analysis_tools; nothing
+    about *when* or *whether* this runs changed, only where the code
+    lives. Returns (source_level1..4, slsa_level1..3, extra_violations)
+    -- the caller extends its own `violations` list with the last one,
+    matching the (violations, warnings) pattern _evaluate_policy_gates
+    already uses rather than mutating a caller-owned list in place."""
+    assay_stmt, build_stmt = _classify_statements(statement, slsa_statement)
+    source_level1, source_level2, source_level3, source_level4 = _evaluate_source_checklist(assay_stmt)
+    slsa_level1, slsa_level2, slsa_level3 = _evaluate_slsa_checklists(
+        build_stmt,
+        identity_status=identity_status,
+        identity_detail=identity_detail,
+        cert_identity=cert_identity,
+        expected_repository=expected_repository,
+    )
+
+    extra_violations: List[str] = []
+    if require_slsa_build_l3:
+        build_cumulative = _cumulative_track_status([slsa_level1, slsa_level2, slsa_level3])
+        if not build_cumulative[-1]:
+            extra_violations.append(
+                "--require-slsa-build-l3 was set, but this run does not fully satisfy SLSA Build "
+                "Level 3 (see the SLSA Build Track section above for which check(s) failed)"
+            )
+
+    return (
+        source_level1, source_level2, source_level3, source_level4,
+        slsa_level1, slsa_level2, slsa_level3, extra_violations,
+    )
+
+
 def verify_dsse_attestation(
     envelope: Dict[str, Any],
     *,
@@ -1752,9 +1803,8 @@ def verify_dsse_attestation(
       _validate_against_schema     -- optional/diagnostic JSON Schema check
       _validate_rcs_block          -- RCS field type/range validation
       _evaluate_policy_gates       -- --min-rcs/--require-digest/--disallow-degraded
-      _verify_sigstore_identity    -- best-effort Sigstore identity check
-      _evaluate_source_checklist   -- informational SLSA Source Level 1-4 checklist
-      _evaluate_slsa_checklists    -- informational SLSA Build Level 1-3 checklist
+      _verify_sigstore_identity      -- best-effort Sigstore identity check
+      _evaluate_informational_tracks -- SLSA Source Level 1-4 + Build Level 1-3 checklists
     """
     if not isinstance(envelope, dict):
         return VerificationResult(
@@ -1849,27 +1899,28 @@ def verify_dsse_attestation(
 
     # Purely informational SLSA v1.0 Source Level 1-4 / Build Level 1-3
     # compliance checklists, never folded into violations/warnings/passed
-    # above (unless require_slsa_build_l3 opts in below) -- same
-    # non-gating contract as static_analysis_tools. See
-    # _evaluate_source_checklist/_evaluate_slsa_checklists' own docstrings
-    # for why these are their own helpers rather than inlined here.
-    assay_stmt, build_stmt = _classify_statements(statement, slsa_statement)
-    source_level1, source_level2, source_level3, source_level4 = _evaluate_source_checklist(assay_stmt)
-    slsa_level1, slsa_level2, slsa_level3 = _evaluate_slsa_checklists(
-        build_stmt,
+    # above (unless require_slsa_build_l3 opts in) -- same non-gating
+    # contract as static_analysis_tools. See _evaluate_informational_tracks'
+    # own docstring for why this is its own helper rather than inlined here.
+    (
+        source_level1,
+        source_level2,
+        source_level3,
+        source_level4,
+        slsa_level1,
+        slsa_level2,
+        slsa_level3,
+        track_violations,
+    ) = _evaluate_informational_tracks(
+        statement,
+        slsa_statement,
         identity_status=identity_status,
         identity_detail=identity_detail,
         cert_identity=cert_identity,
         expected_repository=expected_repository,
+        require_slsa_build_l3=require_slsa_build_l3,
     )
-
-    if require_slsa_build_l3:
-        build_cumulative = _cumulative_track_status([slsa_level1, slsa_level2, slsa_level3])
-        if not build_cumulative[-1]:
-            violations.append(
-                "--require-slsa-build-l3 was set, but this run does not fully satisfy SLSA Build "
-                "Level 3 (see the SLSA Build Track section above for which check(s) failed)"
-            )
+    violations.extend(track_violations)
 
     rcs_components = _extract_rcs_components(predicate) if statement is not None else None
 

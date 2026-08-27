@@ -1007,13 +1007,31 @@ python3 -m pytest -n auto -v tests/
 
 ## Not yet built (flagged, not hidden)
 
-- `main.py`'s `pipeline.run_id` / `workflow_ref` are placeholders pending
-  wiring to `GITHUB_RUN_ID`/`GITHUB_WORKFLOW_REF` or GitLab CI equivalents.
 - The WORM upload body in `upload_to_worm_async()` is an integration
   point (swap in `boto3` S3 Object Lock COMPLIANCE-mode PUT or
   `minio-py`), intentionally left unimplemented here since it's
   infra-credential-dependent and out of scope for the schema/scoring
   foundation this task covers.
+- **Native per-tool SARIF output for server-side scanners** (SonarQube,
+  Snyk, Wiz, and similar tools that analyze server-side and never write a
+  local SARIF file the way CodeQL does). Today the only bridge for these
+  is `--sonar-metrics`: it pulls SonarQube's quality-gate/cognitive-
+  complexity/technical-debt metrics from its Measures API and merges them
+  into whichever SARIF tool was actually scanned (see
+  `merge_sonar_metrics_into_tools` in `cli/parsers/sarif.py`) -- on this
+  repo's own workflow, that's the sole "CodeQL" tool, since no dedicated
+  SonarQube-named SARIF entry exists to match by name. `--verify`'s
+  static-analysis table labels that merged row `CodeQL (+ SonarQube)`
+  (`_format_static_analysis_table` in `cli/verify.py`) so the merge is at
+  least visible rather than silently missing, but SonarQube's actual
+  per-finding issues never reach the SARIF/RCS pipeline this way -- only
+  the quality-gate summary does. The planned fix is a per-tool converter
+  (e.g. SonarCloud/SonarQube Server's Issues Search API, Snyk's/Wiz's own
+  JSON export) into a genuine SARIF 2.1.0 document per tool, fed in via
+  its own `--sarif` input, so each tool gets a real, distinctly-named row
+  with real findings -- which also means those findings start feeding the
+  same patch-differential scoring (newly-introduced-in-this-PR findings
+  weighted more heavily) that CodeQL's already get.
 
 ## License
 

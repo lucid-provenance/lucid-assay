@@ -39,14 +39,30 @@ def _get_valid_statement_base(rcs_value=100, degraded=False):
 class TestIdentityAndCertificateBoundaries:
     
     def test_repository_mismatch_strictly_rejected(self):
-        # Even with dry_run=True, we bypass sigstore verification, but the policy
-        # setup itself handles expected_repository logic. However, since the actual
-        # verification uses Sigstore, to mock it effectively without external dependencies,
-        # we can't fully execute the sigstore validation. But we can ensure that if we pass
-        # bad data for expected parameters, it behaves correctly or we mock the wrapper.
-        # Given we want to test boundaries and logic, let's focus on what we CAN test:
-        # verifying fail-closed behavior on corrupted inputs.
-        pass
+        # dry_run=True (used elsewhere in this file) skips identity
+        # verification entirely, so it can't exercise a repository
+        # mismatch at all -- unit test the composed policy object
+        # directly instead (same approach as
+        # tests/test_verify.py::CertificateIdentityClaimsTests), against
+        # a synthetic Fulcio-shaped cert genuinely minted for a different
+        # repository than --expected-repository asserts.
+        from sigstore.errors import VerificationError
+
+        from cli.verify import GITHUB_ACTIONS_OIDC_ISSUER, _build_identity_policy
+        from tests._fulcio_cert_helpers import _make_fulcio_style_cert
+
+        cert = _make_fulcio_style_cert(repository="acme/widgets", issuer=GITHUB_ACTIONS_OIDC_ISSUER)
+        policy, _, _ = _build_identity_policy(
+            cert_identity=None,
+            cert_oidc_issuer=None,
+            expected_issuer=None,
+            expected_repository="attacker/evil-fork",
+            expected_workflow=None,
+            expected_ref=None,
+        )
+
+        with pytest.raises(VerificationError):
+            policy.verify(cert)
 
     def test_malformed_envelope_payloads(self):
         # 1. Invalid JSON in base64 payload

@@ -9,6 +9,8 @@ from typing import Any, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests._fulcio_cert_helpers import _der_utf8_string, _make_fulcio_style_cert
+
 from cli.verify import (
     EXIT_FILE_ERROR,
     EXIT_PASS,
@@ -550,83 +552,6 @@ class VerifyJsonPayloadTests(unittest.TestCase):
         )
 
 
-def _der_utf8_string(value: str) -> bytes:
-    """DER-encodes `value` as a primitive ASN.1 UTF8String with a short-form
-    length, matching how Fulcio v2 certificate extensions are encoded (and
-    how cli.verify._der_decode_short_utf8_string expects to read them)."""
-    encoded = value.encode("utf-8")
-    assert len(encoded) < 128, "test helper only supports short-form DER lengths"
-    return bytes([0x0C, len(encoded)]) + encoded
-
-
-def _make_fulcio_style_cert(
-    *,
-    san_uri=None,
-    issuer=None,
-    repository=None,
-    source_repository_uri=None,
-    workflow_name=None,
-    ref=None,
-    ref_is_v2=False,
-):
-    """Builds a self-signed X.509 certificate carrying the same GitHub
-    Actions OIDC extensions (and SAN) that a real Fulcio-issued certificate
-    would carry, so cli.verify's policy-composition logic can be unit
-    tested directly against `.verify(cert)` without a live Sigstore/Fulcio
-    round-trip (which needs network access and a trusted root)."""
-    from cryptography import x509
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-    from cryptography.x509.oid import NameOID
-
-    key = ed25519.Ed25519PrivateKey.generate()
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "tenax-assay-test")])
-    now = datetime.datetime.now(datetime.timezone.utc)
-
-    builder = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(minutes=1))
-        .not_valid_after(now + datetime.timedelta(minutes=10))
-    )
-
-    if san_uri:
-        builder = builder.add_extension(
-            x509.SubjectAlternativeName([x509.UniformResourceIdentifier(san_uri)]), critical=False
-        )
-
-    def _v1(oid: str, value: str) -> x509.UnrecognizedExtension:
-        return x509.UnrecognizedExtension(x509.ObjectIdentifier(oid), value.encode("utf-8"))
-
-    if issuer:
-        builder = builder.add_extension(_v1("1.3.6.1.4.1.57264.1.1", issuer), critical=False)
-    if repository:
-        builder = builder.add_extension(_v1("1.3.6.1.4.1.57264.1.5", repository), critical=False)
-    if workflow_name:
-        builder = builder.add_extension(_v1("1.3.6.1.4.1.57264.1.4", workflow_name), critical=False)
-    if source_repository_uri:
-        builder = builder.add_extension(
-            x509.UnrecognizedExtension(
-                x509.ObjectIdentifier("1.3.6.1.4.1.57264.1.12"), _der_utf8_string(source_repository_uri)
-            ),
-            critical=False,
-        )
-    if ref:
-        if ref_is_v2:
-            builder = builder.add_extension(
-                x509.UnrecognizedExtension(
-                    x509.ObjectIdentifier("1.3.6.1.4.1.57264.1.14"), _der_utf8_string(ref)
-                ),
-                critical=False,
-            )
-        else:
-            builder = builder.add_extension(_v1("1.3.6.1.4.1.57264.1.6", ref), critical=False)
-
-    return builder.sign(key, None)
-
-
 class CertificateIdentityClaimsTests(unittest.TestCase):
     """Unit tests for cli.verify's certificate SAN / GitHub OIDC extension
     claims matching, exercised directly against synthetic Fulcio-shaped
@@ -697,7 +622,10 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
             cert_identity=None, cert_oidc_issuer=None, expected_issuer=None,
             expected_repository="acme/widgets", expected_workflow=None, expected_ref=None,
         )
-        policy.verify(cert)  # must not raise -- AnyOf(v1, v2) accepts the v2-only cert
+        # AnyOf(v1, v2) accepts the v2-only cert -- policy.verify() returns
+        # None on success (raises on failure), so assertIsNone both proves
+        # it didn't raise and pins the documented return contract.
+        self.assertIsNone(policy.verify(cert))
 
     def test_ref_glob_pattern_matches(self):
         cert = self._cert(ref="refs/heads/release/1.0")
@@ -705,7 +633,7 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
             cert_identity=None, cert_oidc_issuer=None, expected_issuer=None,
             expected_repository=None, expected_workflow=None, expected_ref="refs/heads/release/*",
         )
-        policy.verify(cert)
+        self.assertIsNone(policy.verify(cert))
 
     def test_ref_glob_pattern_mismatch_fails(self):
         cert = self._cert(ref="refs/heads/feature/x")
@@ -774,7 +702,8 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
             expected_issuer="https://token.actions.githubusercontent.com/enterprise-slug",
             expected_repository="acme/widgets", expected_workflow=None, expected_ref=None,
         )
-        policy.verify(cert)  # must not raise: explicit issuer wins over the GH Actions default
+        # explicit issuer wins over the GH Actions default
+        self.assertIsNone(policy.verify(cert))
 
     def test_cert_identity_and_issuer_combination_still_supported(self):
         cert = self._cert(
@@ -937,10 +866,12 @@ class EnvelopeToBundleJsonTests(unittest.TestCase):
         envelope = _envelope(_statement(), signatures=[{"sig": "s", "certificate": "c"}])
         envelope["_sigstore_bundle"] = full_bundle
 
-        # Must not raise: every field Bundle's pydantic schema requires
-        # (including the tlogEntries fields the old hand-reconstruction
-        # dropped) is present in the embedded bundle.
-        Bundle.from_json(_envelope_to_bundle_json(envelope))
+        # Every field Bundle's pydantic schema requires (including the
+        # tlogEntries fields the old hand-reconstruction dropped) is
+        # present in the embedded bundle, so parsing succeeds and returns
+        # a real Bundle rather than raising.
+        bundle = Bundle.from_json(_envelope_to_bundle_json(envelope))
+        self.assertIsInstance(bundle, Bundle)
 
     def test_missing_embedded_bundle_falls_back_to_legacy_reconstruction(self):
         # Envelopes minted before `_sigstore_bundle` existed (no key at

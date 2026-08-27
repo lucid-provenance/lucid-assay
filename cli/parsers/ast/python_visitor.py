@@ -13,7 +13,13 @@ Hardened against:
     (`assert [1, 2]`, `assert "string"`, `assert 123`)
   - Empty test bodies (`pass`-only / docstring-only / `...`-only) being
     counted as exercised coverage, including empty `with pytest.raises(...)`/
-    `with pytest.warns(...)` blocks
+    `with pytest.warns(...)`/`with self.assertRaises(...)`/
+    `with self.assertWarns(...)` blocks
+  - `with self.assertRaises(...)`/`with self.assertWarns(...)` (unittest's
+    own exception/warning context-manager idiom, distinct from pytest's)
+    going completely unrecognized -- not just uncredited as an assertion,
+    but never visited at all, so a real, common assertion pattern was
+    silently invisible to this engine rather than merely undercounted
   - Assertions that are statically unreachable: inside a dead `if False:`
     branch, inside a nested function/lambda/class defined in the test body
     (never proven to execute), or inside a `try:` whose `except
@@ -325,6 +331,27 @@ def _is_pytest_raises_or_warns(call: ast.Call) -> bool:
     return False
 
 
+# unittest.TestCase's own exception/warning-assertion methods, when used as
+# a context manager (`with self.assertRaises(Exc):`) rather than called
+# directly with a callable+args (`self.assertRaises(Exc, fn, *args)` --
+# that direct-call form is already credited generically by visit_Call's
+# _assert_method_name dispatch, same as any other assert* call).
+# assertRaisesRegexp/assertWarnsRegexp are unittest's deprecated
+# (pre-3.2-spelling) aliases, still valid and occasionally seen.
+_ASSERT_RAISES_OR_WARNS_METHODS = {
+    "assertRaises", "assertRaisesRegex", "assertRaisesRegexp",
+    "assertWarns", "assertWarnsRegex", "assertWarnsRegexp",
+}
+
+
+def _is_assert_raises_or_warns_call(call: ast.Call) -> bool:
+    """Matches `<obj>.assertRaises(...)` / `<obj>.assertWarns(...)` (and
+    their *Regex variants), unittest's own context-manager counterpart to
+    `_is_pytest_raises_or_warns` -- the idiom `_handle_with` used to miss
+    entirely."""
+    return _assert_method_name(call) in _ASSERT_RAISES_OR_WARNS_METHODS
+
+
 def _is_matcher_expectation_call(call: ast.Call) -> bool:
     """`expect(x).to_equal(...)` / `expect(x).to_be_true()`-style fluent
     matcher idiom (Jasmine/Chai-flavored expectation libraries)."""
@@ -438,12 +465,19 @@ class _TestBodyVisitor(ast.NodeVisitor):
         self._handle_with(node)
 
     def _handle_with(self, node) -> None:
+        """Credits `with pytest.raises(...)`/`with pytest.warns(...)` and
+        unittest's own `with self.assertRaises(...)`/`with
+        self.assertWarns(...)` idiom alike as a real assertion -- both
+        verify something (an exception/warning was raised) on `__exit__`,
+        just via two different libraries' context managers. An empty body
+        under either is never credited (see _is_empty_body's call site
+        below): nothing in the block can actually raise, so the check
+        never really executes."""
         for item in node.items:
             call = item.context_expr
-            if isinstance(call, ast.Call) and _is_pytest_raises_or_warns(call):
-                # An empty `with pytest.raises(...): pass` body never
-                # actually exercises the code under test -- nothing raises,
-                # so nothing is actually verified.
+            if isinstance(call, ast.Call) and (
+                _is_pytest_raises_or_warns(call) or _is_assert_raises_or_warns_call(call)
+            ):
                 if not _is_empty_body(node.body):
                     self.assertion_count += 1
         for stmt in node.body:

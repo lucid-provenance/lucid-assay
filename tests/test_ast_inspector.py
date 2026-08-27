@@ -73,6 +73,88 @@ class ASTInspectorTests(unittest.TestCase):
         self.assertEqual(metrics.total_assertions, 2)
         self.assertEqual(metrics.tautological_assertions, 0)
 
+    def test_self_assert_raises_context_manager_is_counted(self):
+        # Regression guard: unittest's own `with self.assertRaises(...):`
+        # idiom used to be completely invisible to this engine -- neither
+        # counted as an assertion nor even generically visited -- because
+        # _handle_with only special-cased pytest.raises/pytest.warns.
+        metrics = self._inspect("test_unittest_raises.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                def test_raises(self):
+                    with self.assertRaises(ValueError):
+                        int("nope")
+        """)
+        self.assertEqual(metrics.total_test_functions, 1)
+        self.assertEqual(metrics.total_assertions, 1)
+        self.assertEqual(metrics.valid_test_functions, 1)
+
+    def test_self_assert_warns_context_manager_is_counted(self):
+        metrics = self._inspect("test_unittest_warns.py", """
+            import unittest
+            import warnings
+
+            class MyTests(unittest.TestCase):
+                def test_warns(self):
+                    with self.assertWarns(DeprecationWarning):
+                        warnings.warn("old", DeprecationWarning)
+        """)
+        self.assertEqual(metrics.total_test_functions, 1)
+        self.assertEqual(metrics.total_assertions, 1)
+
+    def test_assert_raises_regex_context_manager_is_counted(self):
+        metrics = self._inspect("test_unittest_raises_regex.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                def test_raises_regex(self):
+                    with self.assertRaisesRegex(ValueError, "nope"):
+                        int("nope")
+        """)
+        self.assertEqual(metrics.total_assertions, 1)
+
+    def test_assert_raises_context_manager_as_clause_is_counted(self):
+        # `as cm:` binding the exception context must not change detection.
+        metrics = self._inspect("test_unittest_raises_as.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                def test_raises_as(self):
+                    with self.assertRaises(ValueError) as cm:
+                        int("nope")
+                    self.assertIn("invalid literal", str(cm.exception))
+        """)
+        # The context manager itself, plus the follow-up assertIn.
+        self.assertEqual(metrics.total_assertions, 2)
+
+    def test_empty_body_under_self_assert_raises_is_not_counted(self):
+        # Mirrors the existing empty `with pytest.raises(...): pass` case:
+        # nothing in the block can actually raise, so it's still vanity.
+        metrics = self._inspect("test_unittest_raises_empty.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                def test_raises_empty(self):
+                    with self.assertRaises(ValueError):
+                        pass
+        """)
+        self.assertEqual(metrics.total_assertions, 0)
+        self.assertEqual(metrics.valid_test_functions, 0)
+
+    def test_assert_raises_direct_call_form_still_counted(self):
+        # The older, non-context-manager form (self.assertRaises(Exc, fn,
+        # *args)) was already handled by visit_Call's generic assert*
+        # dispatch -- confirms the new _handle_with path didn't regress it.
+        metrics = self._inspect("test_unittest_raises_direct.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                def test_raises_direct(self):
+                    self.assertRaises(ValueError, int, "nope")
+        """)
+        self.assertEqual(metrics.total_assertions, 1)
+
     def test_suffix_named_test_function_is_discovered(self):
         metrics = self._inspect("checks_test.py", """
             def addition_test():

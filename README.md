@@ -701,7 +701,7 @@ Status: FAILED (SLSA Build Level 3)
 === Assay Health & Governance Metrics ===
 Release Confidence Score (RCS): 89 (degraded=False)
 Coverage:       87.1% of total code covered, 92.5% of new/patch code covered
-Test Validity:  93.4% valid (670/717 test functions; 47 vanity)
+Test Validity:  96.8% valid (700/723 test functions; 23 vanity)
 Component breakdown:
   - governance: raw=100.0 weight=0.15 weighted=15.0
       2/2 required approvals (approved)

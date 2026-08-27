@@ -1366,12 +1366,14 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
     }
 
 
-def _format_static_analysis_table(tools: List[Dict[str, Any]]) -> List[str]:
-    """Renders a clean, fixed-width summary table (tool, error/warning
-    counts, SonarQube quality gate status when present) for --verify's
-    human-readable (non-JSON) output. Missing/malformed fields degrade to
-    '-' rather than raising -- this is a display helper over data that
-    `_extract_static_analysis_tools` already validated defensively.
+def _static_analysis_table_row(t: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """Builds one tool's (display_name, errors, warnings, quality_gate)
+    display row for _format_static_analysis_table -- split out purely to
+    keep that function's cyclomatic/cognitive complexity down (it hit 15
+    of the allowed 15 once this row-labeling logic moved in; same
+    rationale as _static_analysis_tool_entry above, split out of
+    _static_analysis_tools_by_name for the identical reason). Missing/
+    malformed fields degrade to '-' rather than raising.
 
     A tool's `extensions.sonarqube` block isn't necessarily *from* a
     SonarQube SARIF driver: SonarQube Cloud/Server doesn't emit a local
@@ -1387,25 +1389,32 @@ def _format_static_analysis_table(tools: List[Dict[str, Any]]) -> List[str]:
     name suffixed with "(+ SonarQube)" whenever it carries that merged-in
     extension, making the source of the quality gate column explicit
     without inventing a separate, unbacked "SonarQube" row."""
+    name = str(t.get("name") or "unknown")
+    summary = t.get("summary") if isinstance(t.get("summary"), dict) else {}
+    errors = summary.get("errors")
+    warnings = summary.get("warnings")
+    extensions = t.get("extensions") if isinstance(t.get("extensions"), dict) else {}
+    sonarqube = extensions.get("sonarqube") if isinstance(extensions.get("sonarqube"), dict) else {}
+    quality_gate = sonarqube.get("quality_gate")
+    display_name = f"{name} (+ SonarQube)" if sonarqube and "sonar" not in name.lower() else name
+    return (
+        display_name,
+        str(errors) if isinstance(errors, int) else "-",
+        str(warnings) if isinstance(warnings, int) else "-",
+        str(quality_gate) if isinstance(quality_gate, str) else "-",
+    )
+
+
+def _format_static_analysis_table(tools: List[Dict[str, Any]]) -> List[str]:
+    """Renders a clean, fixed-width summary table (tool, error/warning
+    counts, SonarQube quality gate status when present) for --verify's
+    human-readable (non-JSON) output -- purely a layout/alignment pass over
+    rows already built defensively by _static_analysis_table_row (which see
+    for what each column means and where the data comes from)."""
     if not tools:
         return []
 
-    rows = []
-    for t in tools:
-        name = str(t.get("name") or "unknown")
-        summary = t.get("summary") if isinstance(t.get("summary"), dict) else {}
-        errors = summary.get("errors")
-        warnings = summary.get("warnings")
-        extensions = t.get("extensions") if isinstance(t.get("extensions"), dict) else {}
-        sonarqube = extensions.get("sonarqube") if isinstance(extensions.get("sonarqube"), dict) else {}
-        quality_gate = sonarqube.get("quality_gate")
-        display_name = f"{name} (+ SonarQube)" if sonarqube and "sonar" not in name.lower() else name
-        rows.append((
-            display_name,
-            str(errors) if isinstance(errors, int) else "-",
-            str(warnings) if isinstance(warnings, int) else "-",
-            str(quality_gate) if isinstance(quality_gate, str) else "-",
-        ))
+    rows = [_static_analysis_table_row(t) for t in tools]
 
     header = ("TOOL", "ERRORS", "WARNINGS", "QUALITY GATE")
     widths = [max(len(header[i]), *(len(r[i]) for r in rows)) for i in range(len(header))]

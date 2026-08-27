@@ -498,8 +498,17 @@ When the predicate carries a `static_analysis.tools[]` block, the
 human-readable (`--format text`, the default) output prints a clean summary
 table — per-tool error/warning counts and SonarQube quality-gate status when
 present — purely for display; it's never a gating input, so a malformed or
-missing table never affects `passed`. `--format json` output carries the
-same data reshaped into `static_analysis.tools` (see below).
+missing table never affects `passed`. The same table also renders into
+`$GITHUB_STEP_SUMMARY` (see `_write_github_step_summary` below) — both
+renderers share one code path so they can't drift apart. When a row's
+SonarQube quality-gate data was merged in from a `--sonar-metrics` export
+rather than that tool's own SARIF driver (e.g. onto a lone `CodeQL` row,
+per `merge_sonar_metrics_into_tools` above), its name is suffixed
+`(+ SonarQube)` so the merge is visible in the table itself — otherwise a
+row named e.g. `CodeQL` carrying SonarQube's quality gate never mentions
+SonarQube anywhere, and looks like that data went missing. `--format json`
+output carries the same underlying data reshaped into `static_analysis.tools`
+(see below), unaffected by this display-only label.
 
 **`--format {text,json}` / `-f`** (default: `text`) controls output shape:
 - `text` (default) prints the human-readable summary above to **stderr**

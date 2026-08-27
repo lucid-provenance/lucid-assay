@@ -1371,7 +1371,22 @@ def _format_static_analysis_table(tools: List[Dict[str, Any]]) -> List[str]:
     counts, SonarQube quality gate status when present) for --verify's
     human-readable (non-JSON) output. Missing/malformed fields degrade to
     '-' rather than raising -- this is a display helper over data that
-    `_extract_static_analysis_tools` already validated defensively."""
+    `_extract_static_analysis_tools` already validated defensively.
+
+    A tool's `extensions.sonarqube` block isn't necessarily *from* a
+    SonarQube SARIF driver: SonarQube Cloud/Server doesn't emit a local
+    SARIF file at all (see cli.parsers.sarif's module docstring), so its
+    quality-gate/complexity/debt metrics are fed in externally via
+    --sonar-metrics and `merge_sonar_metrics_into_tools()`, which attaches
+    them to whichever SARIF tool matched by name -- or, when nothing
+    matched "sonar*", to the sole scanned tool as an unambiguous fallback
+    (e.g. a lone "CodeQL" row). Left unlabeled, that row shows a quality
+    gate with no indication the data came from SonarQube at all -- which
+    read as "SonarQube info is missing" even though it was merged in.
+    So a tool whose own name doesn't already say "sonar" gets its display
+    name suffixed with "(+ SonarQube)" whenever it carries that merged-in
+    extension, making the source of the quality gate column explicit
+    without inventing a separate, unbacked "SonarQube" row."""
     if not tools:
         return []
 
@@ -1384,8 +1399,9 @@ def _format_static_analysis_table(tools: List[Dict[str, Any]]) -> List[str]:
         extensions = t.get("extensions") if isinstance(t.get("extensions"), dict) else {}
         sonarqube = extensions.get("sonarqube") if isinstance(extensions.get("sonarqube"), dict) else {}
         quality_gate = sonarqube.get("quality_gate")
+        display_name = f"{name} (+ SonarQube)" if sonarqube and "sonar" not in name.lower() else name
         rows.append((
-            name,
+            display_name,
             str(errors) if isinstance(errors, int) else "-",
             str(warnings) if isinstance(warnings, int) else "-",
             str(quality_gate) if isinstance(quality_gate, str) else "-",

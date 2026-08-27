@@ -687,13 +687,32 @@ def _slsa_check_isolated_provenance_generation(
     return _slsa_item(label, True)
 
 
+# Both are real, currently-unbroken cryptographic hash algorithms suitable
+# for a materialization/hermeticity proof -- sha1/md5 deliberately are not
+# in this set. Not just a sha256-with-a-sha512-exception either: which one
+# a lockfile carries is an ecosystem convention, not a strength signal
+# worth gating on. uv.lock (Python) and go.sum emit sha256 natively; npm's
+# package-lock.json v2/v3 `integrity` field is SRI, and
+# cli/parsers/lockfiles.py's own _decode_sri_integrity already prefers
+# sha512 over sha256 when an entry carries both, since sha512 is the
+# stronger digest and virtually every real npm package ships only that one
+# -- so requiring sha256 specifically meant no JS/TS repo's lockfile could
+# ever satisfy this check, structurally, regardless of how well-pinned it
+# was. Confirmed via a real run (tenax-io/tenax-console PR #1, 2026-08-27):
+# a genuine, fully hash-pinned package-lock.json still failed this check
+# with "no 'pkg:' PURL entries with a sha256 digest found" purely because
+# every one of its ~569 resolved entries carried sha512, never sha256.
+_MATERIALIZED_DIGEST_ALGORITHMS = ("sha256", "sha512")
+
+
 def _slsa_check_materialized_dependencies(predicate: Dict[str, Any]) -> Dict[str, Any]:
     """Stricter sibling of _slsa_check_resolved_dependencies (Level 2's
     "some non-empty resolvedDependencies list"): Level 3's hermeticity
     claim requires at least one *package-level* entry -- a real `pkg:`
-    PURL with a sha256 digest -- not just the synthetic source-commit
-    entry every provenance statement already carries (see
-    cli/slsa_provenance.py's _source_resolved_dependency)."""
+    PURL with a sha256 or sha512 digest (see _MATERIALIZED_DIGEST_ALGORITHMS
+    above for why both) -- not just the synthetic source-commit entry every
+    provenance statement already carries (see cli/slsa_provenance.py's
+    _source_resolved_dependency)."""
     build_definition = predicate.get("buildDefinition")
     build_definition = build_definition if isinstance(build_definition, dict) else {}
     resolved = build_definition.get("resolvedDependencies")
@@ -709,14 +728,16 @@ def _slsa_check_materialized_dependencies(predicate: Dict[str, Any]) -> Dict[str
         if not isinstance(uri, str) or not uri.startswith("pkg:"):
             return False
         digest = d.get("digest")
-        return isinstance(digest, dict) and isinstance(digest.get("sha256"), str) and bool(digest.get("sha256").strip())
+        if not isinstance(digest, dict):
+            return False
+        return any(isinstance(digest.get(algo), str) and bool(digest.get(algo).strip()) for algo in _MATERIALIZED_DIGEST_ALGORITHMS)
 
     valid_count = sum(1 for d in resolved if _is_materialized_package_entry(d))
     if valid_count == 0:
         return _slsa_item(
             label, False,
-            "no 'pkg:' PURL entries with a sha256 digest found (only the source-commit entry is "
-            "present, or dependencies aren't hash-pinned to a lockfile)",
+            "no 'pkg:' PURL entries with a sha256 or sha512 digest found (only the source-commit "
+            "entry is present, or dependencies aren't hash-pinned to a lockfile)",
         )
     return _slsa_item(f"{label} ({valid_count} packages recorded)", True)
 

@@ -247,6 +247,61 @@ class BuildLevel3ChecksTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertIn("1 packages recorded", result["items"][0]["label"] if "items" in result else result["label"])
 
+    def test_materialized_dependencies_passes_with_sha512_digest(self):
+        """npm's package-lock.json v2/v3 `integrity` field is SRI, and
+        cli/parsers/lockfiles.py's _decode_sri_integrity prefers sha512
+        over sha256 when an entry carries both -- meaning a real,
+        genuinely hash-pinned npm lockfile almost always produces sha512
+        entries here, never sha256. Confirmed via a real run
+        (tenax-io/tenax-console PR #1, 2026-08-27): this check failed
+        against a fully-materialized ~569-package npm lockfile purely
+        because every entry was sha512, before this test/fix existed."""
+        predicate = {
+            "buildDefinition": {
+                "resolvedDependencies": [
+                    {"uri": "git+https://github.com/acme/widgets", "digest": {"gitCommit": "e" * 40}},
+                    {"uri": "pkg:npm/left-pad@1.3.0", "digest": {"sha512": "a" * 128}},
+                ]
+            }
+        }
+        result = _slsa_check_materialized_dependencies(predicate)
+        self.assertTrue(result["passed"])
+        self.assertIn("1 packages recorded", result["items"][0]["label"] if "items" in result else result["label"])
+
+    def test_materialized_dependencies_rejects_weak_digest_algorithms(self):
+        """sha1/md5 are deliberately NOT accepted alongside sha256/sha512
+        -- this isn't "accept whatever key is present", it's specifically
+        the two algorithms strong enough to back a hermeticity claim."""
+        predicate = {
+            "buildDefinition": {
+                "resolvedDependencies": [
+                    {"uri": "pkg:npm/ancient-package@0.0.1", "digest": {"sha1": "b" * 40}},
+                    {"uri": "pkg:npm/other-package@0.0.1", "digest": {"md5": "c" * 32}},
+                ]
+            }
+        }
+        result = _slsa_check_materialized_dependencies(predicate)
+        self.assertFalse(result["passed"])
+        self.assertIn("no 'pkg:' PURL entries", result["detail"])
+
+    def test_materialized_dependencies_rejects_non_dict_digest(self):
+        """A `pkg:`-prefixed uri with a malformed `digest` (missing, or not
+        itself a dict/object) must not crash or count as materialized --
+        the `isinstance(digest, dict)` guard this exercises is new code
+        added alongside sha512 acceptance, not covered by any existing
+        case above."""
+        predicate = {
+            "buildDefinition": {
+                "resolvedDependencies": [
+                    {"uri": "pkg:npm/no-digest-field@1.0.0"},
+                    {"uri": "pkg:npm/malformed-digest@1.0.0", "digest": "sha256:" + "d" * 64},
+                ]
+            }
+        }
+        result = _slsa_check_materialized_dependencies(predicate)
+        self.assertFalse(result["passed"])
+        self.assertIn("no 'pkg:' PURL entries", result["detail"])
+
     def test_l3_origin_reflects_statement_invocation_id(self):
         """_evaluate_slsa_l3 threads _slsa_invocation_origin(predicate)
         through the same way _evaluate_slsa_l1/_l2 do, so a failed Level 3

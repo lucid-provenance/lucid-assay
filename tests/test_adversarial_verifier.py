@@ -104,7 +104,7 @@ def test_build_l3_malformed_dependencies(monkeypatch):
     # The "Materialized Locked Dependencies" check should fail
     dep_check = next(i for i in l3_result["items"] if "Materialized Locked Dependencies" in i["label"])
     assert dep_check["passed"] is False
-    assert "no 'pkg:' PURL entries with a sha256 digest found" in dep_check["detail"]
+    assert "no 'pkg:' PURL entries with a sha256 or sha512 digest found" in dep_check["detail"]
 
 def test_load_envelope_size_boundary(tmp_path):
     """Assert that load_envelope enforces MAX_ENVELOPE_SIZE (10MB)."""

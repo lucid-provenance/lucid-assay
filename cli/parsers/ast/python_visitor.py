@@ -508,7 +508,9 @@ class _TestBodyVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _analyze_function(node: ast.AST, filename: str, class_skipped: bool = False) -> TestFunctionMetrics:
+def _analyze_function(
+    node: ast.AST, filename: str, class_skipped: bool = False, class_name: Optional[str] = None
+) -> TestFunctionMetrics:
     visitor = _TestBodyVisitor()
     for stmt in node.body:  # type: ignore[attr-defined]
         visitor.visit(stmt)
@@ -522,6 +524,7 @@ def _analyze_function(node: ast.AST, filename: str, class_skipped: bool = False)
         tautological_count=visitor.tautological_count,
         is_empty_body=_is_empty_body(node.body),  # type: ignore[attr-defined]
         is_skipped=class_skipped or _is_skip_decorated(node.decorator_list),  # type: ignore[attr-defined]
+        class_name=class_name,
     )
 
 
@@ -539,10 +542,16 @@ class _TestFunctionVisitor(ast.NodeVisitor):
         # individually decorated) -- a stack rather than a single bool
         # since class bodies can nest.
         self._class_skip_stack: List[bool] = []
+        # Parallel stack of enclosing class names, joined "::" (matching
+        # pytest's own nested-class node id convention) to produce
+        # TestFunctionMetrics.class_name -- see that field's docstring.
+        self._class_name_stack: List[str] = []
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._class_skip_stack.append(_is_skip_decorated(node.decorator_list))
+        self._class_name_stack.append(node.name)
         self.generic_visit(node)
+        self._class_name_stack.pop()
         self._class_skip_stack.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -554,7 +563,8 @@ class _TestFunctionVisitor(ast.NodeVisitor):
     def _handle(self, node: ast.AST) -> None:
         if _is_test_function_name(node.name):  # type: ignore[attr-defined]
             class_skipped = any(self._class_skip_stack)
-            self.functions.append(_analyze_function(node, self.filename, class_skipped))
+            class_name = "::".join(self._class_name_stack) if self._class_name_stack else None
+            self.functions.append(_analyze_function(node, self.filename, class_skipped, class_name))
         # Deliberately do not descend into the function's own body here: a
         # `def` nested inside it is a separate lexical scope to discover
         # test functions in, not a sibling to enumerate at this level.

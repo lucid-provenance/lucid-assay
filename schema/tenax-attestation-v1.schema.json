@@ -218,6 +218,15 @@
             "overall_met": { "type": "boolean" },
             "patch_met": { "type": "boolean" }
           }
+        },
+        "real": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Vanity-test-aware coverage (see $defs/realCoverageTrack); absent on an attestation predating this field.",
+          "properties": {
+            "overall": { "$ref": "#/$defs/realCoverageTrack" },
+            "patch": { "$ref": "#/$defs/realCoverageTrack" }
+          }
         }
       }
     },
@@ -442,6 +451,21 @@
         "raw_score": { "type": "number", "minimum": 0, "maximum": 100 },
         "weighted_score": { "type": "number", "minimum": 0, "maximum": 100 },
         "reason": { "type": "string", "description": "Human/auditor-readable justification, e.g. 'zero tests executed', 'patch coverage unavailable, fell back to overall*0.7'." }
+      }
+    },
+    "realCoverageTrack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "reason", "measured_line_rate", "real_line_rate", "total_lines", "measured_covered_lines", "vanity_only_lines"],
+      "description": "One track (overall or patch) of vanity-test-aware coverage (cli.real_coverage): measured_line_rate is the same rate coverage.overall/patch.line_rate already reports over this same line set; real_line_rate subtracts lines covered only by tests the AST engine flags as vanity (zero real assertions) from the numerator, same denominator. available=false (with a reason) when --coverage-contexts wasn't provided, the export was malformed, or -- for the patch track specifically -- no patch-modified-lines data was available.",
+      "properties": {
+        "available": { "type": "boolean" },
+        "reason": { "type": "string" },
+        "measured_line_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "real_line_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "total_lines": { "type": "integer", "minimum": 0 },
+        "measured_covered_lines": { "type": "integer", "minimum": 0 },
+        "vanity_only_lines": { "type": "integer", "minimum": 0, "description": "Lines counted covered in measured_line_rate whose every attributed covering test is vanity -- discounted from real_line_rate's numerator." }
       }
     }
   }

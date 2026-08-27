@@ -24,6 +24,7 @@ from .hashing import sha256_file, worm_uri
 from .parsers.ast import inspect_test_suite
 from .parsers.commit_author import CommitAuthorReport, inspect_commit_author
 from .parsers.coverage import parse_cobertura, parse_lcov
+from .parsers.coverage_contexts import parse_coverage_contexts
 from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
 from .parsers.lockfiles import detect_and_parse_dependencies
@@ -35,6 +36,7 @@ from .parsers.sarif import (
     parse_sonar_metrics_file,
 )
 from .patch_coverage import compute_patch_coverage, compute_patch_modified_lines
+from .real_coverage import CoverageTrackResult, RealCoverageResult, compute_real_coverage
 from .scorer import RCSResult, score_pipeline
 from .slsa_provenance import build_slsa_provenance_statement
 
@@ -255,6 +257,40 @@ def _detect_lockfile_dependencies(args: argparse.Namespace, stage_ns: Dict[str, 
         return detect_and_parse_dependencies(args.repo_dir)
 
 
+def _compute_real_coverage_analysis(
+    args: argparse.Namespace,
+    coverage,
+    ast_metrics,
+    stage_ns: Dict[str, int],
+) -> RealCoverageResult:
+    """Step 6c: vanity-test-aware "real" coverage (see cli.real_coverage),
+    optional via --coverage-contexts. Both tracks (overall/patch) report
+    available=False with a clear reason -- never an omitted block --
+    when the flag wasn't passed at all, matching every other optional
+    input's "absent, not silently missing" contract in this predicate.
+    Scoring-independent, same rationale as _ingest_sarif/
+    _detect_lockfile_dependencies above."""
+    if not args.coverage_contexts:
+        unavailable = CoverageTrackResult(available=False, reason="--coverage-contexts not provided for this run")
+        return RealCoverageResult(overall=unavailable, patch=unavailable)
+
+    with _stage(stage_ns, "real_coverage_analysis"):
+        context_report = parse_coverage_contexts(args.coverage_contexts)
+        if not context_report.available:
+            print(
+                f"WARNING: --coverage-contexts '{args.coverage_contexts}' could not be used: "
+                f"{context_report.reason}",
+                file=sys.stderr,
+            )
+        patch_modified_lines = compute_patch_modified_lines(args.base_sha, args.head_sha, args.repo_dir)
+        return compute_real_coverage(
+            test_suite_metrics=ast_metrics,
+            coverage=coverage,
+            context_report=context_report,
+            patch_modified_lines=patch_modified_lines,
+        )
+
+
 def _maybe_sign(args: argparse.Namespace, out_path) -> Tuple[Optional[int], Dict[str, int]]:
     """Step 9: keyless Sigstore signing, gated on --sign/--dry-run-sign.
     Returns (sign_total_ns, sign_sub_ns) for --debug's stage-profile
@@ -366,6 +402,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="path to a SonarQube 'api/measures/component' JSON export; merges quality-gate/cognitive-complexity/"
         "technical-debt metrics into the SonarQube tool's extensions when a --sarif input didn't already embed "
         "them (requires at least one --sarif input to attach to)",
+    )
+    p.add_argument(
+        "--coverage-contexts",
+        default=None,
+        dest="coverage_contexts",
+        help="path to a `coverage json --show-contexts` export (collected with `--cov-context=test`, e.g. "
+        "`pytest --cov=... --cov-context=test`) -- when given, computes vanity-test-aware 'real' coverage "
+        "(cli/real_coverage.py): how much of the reported total/patch coverage is exercised only by tests "
+        "the AST assertion-integrity engine flags as vanity (zero real assertions), for both the overall "
+        "and patch/new-code tracks. Purely informational (embedded in predicate.coverage.real); omitted "
+        "entirely, this analysis is simply unavailable, never fabricated.",
     )
     p.add_argument("--patch-coverage-min", type=float, default=0.80)
     p.add_argument("--overall-coverage-min", type=float, default=0.60)
@@ -536,6 +583,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 6b. Lockfile dependency detection (see _detect_lockfile_dependencies)
     resolved_dependencies = _detect_lockfile_dependencies(args, stage_ns)
 
+    # 6c. Vanity-test-aware real coverage (see _compute_real_coverage_analysis)
+    real_coverage = _compute_real_coverage_analysis(args, coverage, ast_metrics, stage_ns)
+
     # 7. Build unsigned in-toto Statement
     with _stage(stage_ns, "predicate_assembly"):
         statement = build_statement(
@@ -574,6 +624,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             ast_skipped_test_functions=ast_skipped,
             ast_languages=ast_languages,
             resolved_dependencies=resolved_dependencies,
+            real_coverage=real_coverage,
         )
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0

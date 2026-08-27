@@ -21,6 +21,7 @@ from .parsers.github_rules import BranchGovernanceReport
 from .parsers.junit import TestTotals
 from .parsers.sarif import SarifSummaryReport
 from .patch_coverage import PatchCoverageResult
+from .real_coverage import RealCoverageResult
 from .scorer import RCSResult
 
 DEFAULT_PREDICATE_TYPE = "https://tenax.io/attestations/assay/v1"
@@ -84,6 +85,34 @@ def _clean_sha256(raw_sha: str) -> str:
     return s
 
 
+# Both tracks (overall/patch) of predicate.coverage.real when
+# --coverage-contexts wasn't provided for this run at all -- an explicit
+# available=False block with a reason, never an omitted key, matching
+# every other optional analysis in this predicate (static_analysis's own
+# "not configured" fallback right below).
+_REAL_COVERAGE_TRACK_UNAVAILABLE: Dict[str, Any] = {
+    "available": False,
+    "reason": "--coverage-contexts not provided for this run",
+    "measured_line_rate": None,
+    "real_line_rate": None,
+    "total_lines": 0,
+    "measured_covered_lines": 0,
+    "vanity_only_lines": 0,
+}
+
+
+def _build_real_coverage_block(real_coverage: Optional["RealCoverageResult"]) -> Dict[str, Any]:
+    """predicate.coverage.real: vanity-test-aware coverage (see
+    cli.real_coverage), or an explicit "not configured" pair of
+    unavailable tracks when this analysis wasn't run at all for this
+    statement (real_coverage is None) -- e.g. every caller predating
+    --coverage-contexts, and every existing test's build_statement()
+    call that doesn't pass it."""
+    if real_coverage is None:
+        return {"overall": dict(_REAL_COVERAGE_TRACK_UNAVAILABLE), "patch": dict(_REAL_COVERAGE_TRACK_UNAVAILABLE)}
+    return real_coverage.as_dict()
+
+
 def build_statement(
     *,
     subject_name: str,
@@ -122,6 +151,7 @@ def build_statement(
     ast_languages: Optional[Dict[str, Dict[str, int]]] = None,
     resolved_dependencies: Optional[List[Dict[str, Any]]] = None,
     valid_test_functions: int = 0,
+    real_coverage: Optional[RealCoverageResult] = None,
 ) -> Dict[str, Any]:
     """Returns a dict matching the lifecycle/v0.1 predicate schema, wrapped
     in a standard in-toto Statement envelope."""
@@ -155,6 +185,8 @@ def build_statement(
         patch_met = patch_coverage.line_rate >= patch_coverage_min
 
     clean_subj_sha = _clean_sha256(subject_sha256)
+
+    real_coverage_block = _build_real_coverage_block(real_coverage)
 
     if sarif_report is not None:
         static_analysis = {
@@ -278,6 +310,13 @@ def build_statement(
                 "overall_met": coverage.overall_line_rate >= overall_coverage_min,
                 "patch_met": patch_met,
             },
+            # Vanity-test-aware coverage (see cli.real_coverage /
+            # --coverage-contexts): how much of overall.line_rate/
+            # patch.line_rate above is exercised only by tests the AST
+            # engine flags as vanity (zero real assertions). Both tracks
+            # report available=False with a reason when
+            # --coverage-contexts wasn't provided for this run.
+            "real": real_coverage_block,
         },
         "assertion_density": {
             "total_assertions": total_assertions,

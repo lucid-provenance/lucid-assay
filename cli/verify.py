@@ -320,6 +320,8 @@ def _extract_metrics(predicate: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(coverage, dict):
         metrics["coverage_overall"] = coverage.get("overall")
         metrics["coverage_patch"] = coverage.get("patch")
+        metrics["coverage_thresholds"] = coverage.get("thresholds")
+        metrics["coverage_real"] = coverage.get("real")
     assertion_density = predicate.get("assertion_density")
     if isinstance(assertion_density, dict):
         metrics["assertion_density"] = assertion_density
@@ -1188,12 +1190,85 @@ def _format_test_validity_line(metrics: Dict[str, Any]) -> Optional[str]:
     return f"Test Validity:  {_format_pct(valid / total)} valid ({valid}/{total} test functions; {vanity} vanity)"
 
 
+# (display label, predicate.coverage.real key, predicate.coverage.thresholds key)
+_REAL_COVERAGE_TRACKS = (("Total", "overall", "overall_min"), ("Patch", "patch", "patch_min"))
+
+
+def _format_real_coverage_track_line(label: str, track: Any) -> Optional[str]:
+    """One line for a single real-coverage track (overall or patch), or
+    None if this track wasn't available -- --coverage-contexts wasn't
+    provided at all, or (patch specifically) no patch-modified-lines data
+    was available for this run. Never fabricates a percentage for an
+    unavailable track."""
+    if not isinstance(track, dict) or not track.get("available"):
+        return None
+    measured = _format_pct(track.get("measured_line_rate"))
+    real = _format_pct(track.get("real_line_rate"))
+    vanity_only = track.get("vanity_only_lines")
+    line = f"Real {label} Coverage: {real} (measured {measured}"
+    if isinstance(vanity_only, int) and vanity_only > 0:
+        line += f", {vanity_only} vanity-only-covered line(s) of {track.get('total_lines')}"
+    return line + ")"
+
+
+def _format_real_coverage_threshold_warning(label: str, track: Any, threshold: Any) -> Optional[str]:
+    """Flags the exact scenario this whole analysis exists to catch:
+    measured coverage clears the configured --overall-coverage-min/
+    --patch-coverage-min threshold, but real (vanity-discounted) coverage
+    does not -- i.e. some of the coverage the gate is trusting is only
+    exercised by tests that verify nothing. None when either rate is
+    unavailable/non-numeric or no threshold is configured for this track,
+    or when real coverage doesn't actually fall short."""
+    if not isinstance(track, dict) or not track.get("available") or not isinstance(threshold, (int, float)):
+        return None
+    real_rate = track.get("real_line_rate")
+    measured_rate = track.get("measured_line_rate")
+    if not isinstance(real_rate, (int, float)) or not isinstance(measured_rate, (int, float)):
+        return None
+    if not (real_rate < threshold <= measured_rate):
+        return None
+    return (
+        f"  ⚠ real {label.lower()} coverage {_format_pct(real_rate)} is BELOW the "
+        f"{_format_pct(threshold)} threshold, even though measured {label.lower()} coverage "
+        f"{_format_pct(measured_rate)} passes it"
+    )
+
+
+def _format_real_coverage_summary(metrics: Dict[str, Any]) -> List[str]:
+    """Renders the "Real <Total|Patch> Coverage: ..." line (and, when it
+    actually applies, the threshold-crossing warning right under it) for
+    each track --coverage-contexts data is available for. A no-op ([])
+    entirely when predicate.coverage.real is absent (--coverage-contexts
+    wasn't used for this run) -- same "absent, not fabricated" contract
+    as every other optional block in this report."""
+    real = metrics.get("coverage_real")
+    real = real if isinstance(real, dict) else {}
+    thresholds = metrics.get("coverage_thresholds")
+    thresholds = thresholds if isinstance(thresholds, dict) else {}
+
+    lines: List[str] = []
+    for label, track_key, threshold_key in _REAL_COVERAGE_TRACKS:
+        track = real.get(track_key)
+        track_line = _format_real_coverage_track_line(label, track)
+        if not track_line:
+            continue
+        lines.append(track_line)
+        warning = _format_real_coverage_threshold_warning(label, track, thresholds.get(threshold_key))
+        if warning:
+            lines.append(warning)
+    return lines
+
+
 def _format_test_coverage_summary(result: "VerificationResult") -> List[str]:
-    """Renders the three at-a-glance percentages every report/step-summary
-    should lead with: total code coverage, new/patch code coverage, and
-    the valid-vs-vanity test ratio. A no-op ([]) when result.metrics
-    itself is empty (e.g. a VerificationResult built directly by a test,
-    or a decode failure that never reached _extract_metrics) -- same
+    """Renders the at-a-glance percentages every report/step-summary
+    should lead with: total code coverage, new/patch code coverage, the
+    valid-vs-vanity test ratio, and -- when --coverage-contexts was used
+    for this run -- vanity-test-discounted "real" coverage for each
+    track (see _format_real_coverage_summary), including a threshold-
+    crossing warning when real coverage alone would fail a gate measured
+    coverage currently passes. A no-op ([]) when result.metrics itself is
+    empty (e.g. a VerificationResult built directly by a test, or a
+    decode failure that never reached _extract_metrics) -- same
     "absent, not fabricated" contract as every other optional block in
     this report."""
     if not result.metrics:
@@ -1202,6 +1277,7 @@ def _format_test_coverage_summary(result: "VerificationResult") -> List[str]:
     validity_line = _format_test_validity_line(result.metrics)
     if validity_line:
         lines.append(validity_line)
+    lines.extend(_format_real_coverage_summary(result.metrics))
     return lines
 
 

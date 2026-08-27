@@ -32,6 +32,9 @@ from cli.verify import (
     _format_assay_health_report,
     _format_coverage_line,
     _format_pct,
+    _format_real_coverage_summary,
+    _format_real_coverage_threshold_warning,
+    _format_real_coverage_track_line,
     _format_slsa_level_block,
     _format_test_coverage_summary,
     _format_test_validity_line,
@@ -1584,6 +1587,110 @@ class FormatTestValidityLineTests(unittest.TestCase):
         self.assertIn("0 vanity", line)
 
 
+class FormatRealCoverageTrackLineTests(unittest.TestCase):
+    def test_renders_real_and_measured_with_vanity_count(self):
+        line = _format_real_coverage_track_line(
+            "Total",
+            {"available": True, "measured_line_rate": 0.90, "real_line_rate": 0.85, "vanity_only_lines": 5, "total_lines": 200},
+        )
+        self.assertIn("Real Total Coverage: 85.0%", line)
+        self.assertIn("measured 90.0%", line)
+        self.assertIn("5 vanity-only-covered line(s) of 200", line)
+
+    def test_zero_vanity_lines_omits_the_count_clause(self):
+        line = _format_real_coverage_track_line(
+            "Patch",
+            {"available": True, "measured_line_rate": 1.0, "real_line_rate": 1.0, "vanity_only_lines": 0, "total_lines": 40},
+        )
+        self.assertNotIn("vanity-only-covered", line)
+
+    def test_none_when_track_unavailable(self):
+        self.assertIsNone(_format_real_coverage_track_line("Total", {"available": False, "reason": "x"}))
+
+    def test_none_when_track_missing_or_malformed(self):
+        self.assertIsNone(_format_real_coverage_track_line("Total", None))
+        self.assertIsNone(_format_real_coverage_track_line("Total", "not-a-dict"))
+
+
+class FormatRealCoverageThresholdWarningTests(unittest.TestCase):
+    def test_warns_when_real_below_threshold_but_measured_passes(self):
+        warning = _format_real_coverage_threshold_warning(
+            "Patch", {"available": True, "measured_line_rate": 0.92, "real_line_rate": 0.78}, 0.80
+        )
+        self.assertIsNotNone(warning)
+        self.assertIn("78.0%", warning)
+        self.assertIn("80.0%", warning)
+        self.assertIn("92.0%", warning)
+        self.assertIn("BELOW", warning)
+
+    def test_no_warning_when_both_pass(self):
+        warning = _format_real_coverage_threshold_warning(
+            "Patch", {"available": True, "measured_line_rate": 0.92, "real_line_rate": 0.85}, 0.80
+        )
+        self.assertIsNone(warning)
+
+    def test_no_warning_when_both_fail(self):
+        # Not this warning's job -- the existing patch_coverage RCS
+        # component/threshold gate already reports a plain measured-coverage
+        # failure in that case.
+        warning = _format_real_coverage_threshold_warning(
+            "Patch", {"available": True, "measured_line_rate": 0.70, "real_line_rate": 0.60}, 0.80
+        )
+        self.assertIsNone(warning)
+
+    def test_no_warning_when_threshold_missing(self):
+        warning = _format_real_coverage_threshold_warning(
+            "Patch", {"available": True, "measured_line_rate": 0.92, "real_line_rate": 0.78}, None
+        )
+        self.assertIsNone(warning)
+
+    def test_no_warning_when_track_unavailable(self):
+        warning = _format_real_coverage_threshold_warning("Patch", {"available": False}, 0.80)
+        self.assertIsNone(warning)
+
+
+class FormatRealCoverageSummaryTests(unittest.TestCase):
+    def test_both_tracks_rendered_with_warnings(self):
+        metrics = {
+            "coverage_real": {
+                "overall": {
+                    "available": True, "measured_line_rate": 0.90, "real_line_rate": 0.85,
+                    "vanity_only_lines": 5, "total_lines": 200,
+                },
+                "patch": {
+                    "available": True, "measured_line_rate": 0.92, "real_line_rate": 0.78,
+                    "vanity_only_lines": 3, "total_lines": 40,
+                },
+            },
+            "coverage_thresholds": {"overall_min": 0.60, "patch_min": 0.80},
+        }
+
+        lines = _format_real_coverage_summary(metrics)
+        text = "\n".join(lines)
+
+        self.assertIn("Real Total Coverage:", text)
+        self.assertIn("Real Patch Coverage:", text)
+        self.assertIn("BELOW", text)  # only the patch track crosses its threshold
+
+    def test_empty_when_coverage_real_absent(self):
+        # --coverage-contexts wasn't used for this run at all.
+        self.assertEqual(_format_real_coverage_summary({}), [])
+
+    def test_unavailable_patch_track_yields_no_patch_line(self):
+        metrics = {
+            "coverage_real": {
+                "overall": {
+                    "available": True, "measured_line_rate": 0.90, "real_line_rate": 0.90,
+                    "vanity_only_lines": 0, "total_lines": 100,
+                },
+                "patch": {"available": False, "reason": "no patch-modified-lines data available"},
+            },
+        }
+        lines = _format_real_coverage_summary(metrics)
+        self.assertTrue(any("Real Total Coverage" in l for l in lines))
+        self.assertFalse(any("Real Patch Coverage" in l for l in lines))
+
+
 class FormatTestCoverageSummaryTests(unittest.TestCase):
     def test_empty_metrics_yields_no_lines(self):
         self.assertEqual(_format_test_coverage_summary(VerificationResult(passed=True, metrics={})), [])
@@ -1605,6 +1712,23 @@ class FormatTestCoverageSummaryTests(unittest.TestCase):
         lines = _format_test_coverage_summary(result)
         self.assertEqual(len(lines), 2)
         self.assertIn("Test Validity:", lines[1])
+
+    def test_real_coverage_lines_appended_when_available(self):
+        result = VerificationResult(
+            passed=True,
+            metrics={
+                "coverage_overall": {"line_rate": 0.90},
+                "coverage_real": {
+                    "overall": {
+                        "available": True, "measured_line_rate": 0.90, "real_line_rate": 0.85,
+                        "vanity_only_lines": 5, "total_lines": 200,
+                    },
+                    "patch": {"available": False, "reason": "no patch-modified-lines data available"},
+                },
+            },
+        )
+        lines = _format_test_coverage_summary(result)
+        self.assertTrue(any("Real Total Coverage" in l for l in lines))
 
 
 class FormatAssayHealthReportTests(unittest.TestCase):

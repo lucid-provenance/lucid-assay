@@ -44,6 +44,20 @@ SKIP_DIR_NAMES = {
     ".eggs",
     ".next",
     ".nuxt",
+    # This engine's own multi-language calibration fixtures (see
+    # tests/fixtures/ast_assertions/ and pyproject.toml's
+    # [tool.pytest.ini_options] norecursedirs, which excludes the Python
+    # ones from pytest's own collection for the same reason): source-text
+    # fixtures containing deliberately gamed/zero-assertion/skipped test
+    # functions, used to prove this detector catches them -- not real
+    # test-suite code, and never executed by any test runner. Repo-wide
+    # discovery skipping this directory (matched by basename, like every
+    # other entry here) keeps total_test_functions/valid_test_functions
+    # answering "how healthy is the test suite that actually runs",
+    # matching what a test runner's own collector reports, rather than
+    # also counting this engine's own detector-calibration data as if it
+    # were part of the suite.
+    "ast_assertions",
 }
 
 
@@ -58,6 +72,16 @@ class TestFunctionMetrics:
     tautological_count: int = 0
     is_empty_body: bool = False
     is_skipped: bool = False
+    # The innermost enclosing class name (e.g. a unittest.TestCase
+    # subclass), when this test function is a method rather than a
+    # module-level function. None for a bare `def test_x():` and for
+    # every non-Python language (only the Python visitor currently
+    # populates this). Needed to reconstruct the exact pytest node id
+    # ("path::Class::method" vs "path::function") that
+    # cli.real_coverage cross-references against coverage.py's per-test
+    # line-coverage contexts -- a bare method name alone can collide
+    # across two different classes in the same file.
+    class_name: Optional[str] = None
 
 
 @dataclass

@@ -746,7 +746,7 @@ Status: FAILED (SLSA Build Level 3)
 === Assay Health & Governance Metrics ===
 Release Confidence Score (RCS): 89 (degraded=False)
 Coverage:       87.1% of total code covered, 92.5% of new/patch code covered
-Test Validity:  97.9% valid (708/723 test functions; 15 vanity)
+Test Validity:  100.0% valid (747/747 test functions; 0 vanity)
 Real Total Coverage: 85.5% (measured 87.1%, 12 vanity-only-covered line(s) of 4130)
 Real Patch Coverage: 78.3% (measured 92.5%, 2 vanity-only-covered line(s) of 40)
   ⚠ real patch coverage 78.3% is BELOW the 80.0% threshold, even though measured patch coverage 92.5% passes it

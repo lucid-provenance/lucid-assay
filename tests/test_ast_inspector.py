@@ -454,6 +454,25 @@ class ASTInspectorTests(unittest.TestCase):
         self.assertEqual(metrics.files_scanned, 0)
         self.assertEqual(metrics.total_test_functions, 0)
 
+    def test_skips_ast_assertions_calibration_fixtures_during_repo_wide_discovery(self):
+        # Regression guard: this engine's own detector-calibration
+        # fixtures (tests/fixtures/ast_assertions/ in the real repo --
+        # deliberately gamed/zero-assertion/skipped test functions used
+        # to prove the detector catches them) must not be counted as
+        # real test-suite health, the same way pytest's own collector
+        # never runs them (norecursedirs). Repo-wide discovery only --
+        # explicit target_files scanning (how tests/test_ast_assertions.py
+        # exercises these same fixtures directly) is unaffected.
+        fixtures_dir = os.path.join(self.repo_dir, "ast_assertions", "python")
+        os.makedirs(fixtures_dir, exist_ok=True)
+        _write_test_file(fixtures_dir, "test_fixture_suite.py", """
+            def test_gamed_literal_true():
+                assert True
+        """)
+        metrics = inspect_test_suite(self.repo_dir)
+        self.assertEqual(metrics.files_scanned, 0)
+        self.assertEqual(metrics.total_test_functions, 0)
+
     # -- error handling -------------------------------------------------------
 
     def test_syntax_error_is_captured_not_raised(self):

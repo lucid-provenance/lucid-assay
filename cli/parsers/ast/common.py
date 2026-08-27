@@ -44,6 +44,20 @@ SKIP_DIR_NAMES = {
     ".eggs",
     ".next",
     ".nuxt",
+    # This engine's own multi-language calibration fixtures (see
+    # tests/fixtures/ast_assertions/ and pyproject.toml's
+    # [tool.pytest.ini_options] norecursedirs, which excludes the Python
+    # ones from pytest's own collection for the same reason): source-text
+    # fixtures containing deliberately gamed/zero-assertion/skipped test
+    # functions, used to prove this detector catches them -- not real
+    # test-suite code, and never executed by any test runner. Repo-wide
+    # discovery skipping this directory (matched by basename, like every
+    # other entry here) keeps total_test_functions/valid_test_functions
+    # answering "how healthy is the test suite that actually runs",
+    # matching what a test runner's own collector reports, rather than
+    # also counting this engine's own detector-calibration data as if it
+    # were part of the suite.
+    "ast_assertions",
 }
 
 

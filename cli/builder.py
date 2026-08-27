@@ -10,6 +10,7 @@ Hardened against:
 """
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -27,6 +28,52 @@ DEFAULT_PREDICATE_TYPE = "https://tenax.io/attestations/assay/v1"
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# tenax-attestation-v1.schema.json requires pipeline.run_id/workflow_ref to
+# be non-empty strings -- unlike cli/slsa_provenance.py's SLSA statement,
+# which can omit an entire optional field when the ambient GitHub Actions
+# context isn't present, this predicate's pipeline block can't simply leave
+# them out. "not-run-in-ci" is an explicit, unambiguous sentinel for that
+# case -- ground-truth-only (CLAUDE.md "Supply Chain Integrity &
+# Attestation Invariants") means never asserting something that could be
+# mistaken for a real run id/ref when this tool wasn't actually invoked
+# inside CI.
+_OFF_CI_SENTINEL = "not-run-in-ci"
+
+
+def _ambient_run_id() -> str:
+    """GITHUB_RUN_ID, when actually running inside a GitHub Actions job."""
+    return os.environ.get("GITHUB_RUN_ID") or _OFF_CI_SENTINEL
+
+
+def _ambient_run_attempt() -> int:
+    """GITHUB_RUN_ATTEMPT, Actions-provided starting from "1" (genuinely
+    unset, not a guess, on a workflow's first attempt -- same convention
+    slsa_provenance.py's _invocation_metadata() already uses). Falls back
+    to 1 both off-CI and on any unparseable value, rather than raising."""
+    raw = os.environ.get("GITHUB_RUN_ATTEMPT")
+    try:
+        return int(raw) if raw else 1
+    except ValueError:
+        return 1
+
+
+def _ambient_workflow_ref() -> str:
+    """GITHUB_WORKFLOW_REF, Actions-provided already pre-assembled exactly
+    in the shape the schema documents ("org/repo/.github/workflows/ci.yml@
+    refs/heads/main") -- no parsing needed here, unlike slsa_provenance.py's
+    builder, which further splits this same env var into path/ref for its
+    own separate schema shape."""
+    return os.environ.get("GITHUB_WORKFLOW_REF") or _OFF_CI_SENTINEL
+
+
+def _ambient_runner_environment() -> str:
+    """RUNNER_ENVIRONMENT, Actions-provided ("github-hosted"/"self-hosted"),
+    matching the schema's own enum exactly -- "unknown" (the schema's own
+    documented default) when genuinely absent, never fabricated as either
+    specific value."""
+    return os.environ.get("RUNNER_ENVIRONMENT") or "unknown"
 
 
 def _clean_sha256(raw_sha: str) -> str:
@@ -143,10 +190,10 @@ def build_statement(
         "predicate_version": "0.1.0",
         "pipeline": {
             "ci_provider": "github-actions",
-            "run_id": "PLACEHOLDER_RUN_ID",
-            "run_attempt": 1,
-            "workflow_ref": "PLACEHOLDER_WORKFLOW_REF",
-            "runner_environment": "unknown",
+            "run_id": _ambient_run_id(),
+            "run_attempt": _ambient_run_attempt(),
+            "workflow_ref": _ambient_workflow_ref(),
+            "runner_environment": _ambient_runner_environment(),
             "started_at": _now_iso(),
             "finished_at": _now_iso(),
         },

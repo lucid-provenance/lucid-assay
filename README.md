@@ -498,8 +498,17 @@ When the predicate carries a `static_analysis.tools[]` block, the
 human-readable (`--format text`, the default) output prints a clean summary
 table — per-tool error/warning counts and SonarQube quality-gate status when
 present — purely for display; it's never a gating input, so a malformed or
-missing table never affects `passed`. `--format json` output carries the
-same data reshaped into `static_analysis.tools` (see below).
+missing table never affects `passed`. The same table also renders into
+`$GITHUB_STEP_SUMMARY` (see `_write_github_step_summary` below) — both
+renderers share one code path so they can't drift apart. When a row's
+SonarQube quality-gate data was merged in from a `--sonar-metrics` export
+rather than that tool's own SARIF driver (e.g. onto a lone `CodeQL` row,
+per `merge_sonar_metrics_into_tools` above), its name is suffixed
+`(+ SonarQube)` so the merge is visible in the table itself — otherwise a
+row named e.g. `CodeQL` carrying SonarQube's quality gate never mentions
+SonarQube anywhere, and looks like that data went missing. `--format json`
+output carries the same underlying data reshaped into `static_analysis.tools`
+(see below), unaffected by this display-only label.
 
 **`--format {text,json}` / `-f`** (default: `text`) controls output shape:
 - `text` (default) prints the human-readable summary above to **stderr**
@@ -998,13 +1007,31 @@ python3 -m pytest -n auto -v tests/
 
 ## Not yet built (flagged, not hidden)
 
-- `main.py`'s `pipeline.run_id` / `workflow_ref` are placeholders pending
-  wiring to `GITHUB_RUN_ID`/`GITHUB_WORKFLOW_REF` or GitLab CI equivalents.
 - The WORM upload body in `upload_to_worm_async()` is an integration
   point (swap in `boto3` S3 Object Lock COMPLIANCE-mode PUT or
   `minio-py`), intentionally left unimplemented here since it's
   infra-credential-dependent and out of scope for the schema/scoring
   foundation this task covers.
+- **Native per-tool SARIF output for server-side scanners** (SonarQube,
+  Snyk, Wiz, and similar tools that analyze server-side and never write a
+  local SARIF file the way CodeQL does). Today the only bridge for these
+  is `--sonar-metrics`: it pulls SonarQube's quality-gate/cognitive-
+  complexity/technical-debt metrics from its Measures API and merges them
+  into whichever SARIF tool was actually scanned (see
+  `merge_sonar_metrics_into_tools` in `cli/parsers/sarif.py`) -- on this
+  repo's own workflow, that's the sole "CodeQL" tool, since no dedicated
+  SonarQube-named SARIF entry exists to match by name. `--verify`'s
+  static-analysis table labels that merged row `CodeQL (+ SonarQube)`
+  (`_format_static_analysis_table` in `cli/verify.py`) so the merge is at
+  least visible rather than silently missing, but SonarQube's actual
+  per-finding issues never reach the SARIF/RCS pipeline this way -- only
+  the quality-gate summary does. The planned fix is a per-tool converter
+  (e.g. SonarCloud/SonarQube Server's Issues Search API, Snyk's/Wiz's own
+  JSON export) into a genuine SARIF 2.1.0 document per tool, fed in via
+  its own `--sarif` input, so each tool gets a real, distinctly-named row
+  with real findings -- which also means those findings start feeding the
+  same patch-differential scoring (newly-introduced-in-this-PR findings
+  weighted more heavily) that CodeQL's already get.
 
 ## License
 

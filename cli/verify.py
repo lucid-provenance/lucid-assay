@@ -1366,30 +1366,55 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
     }
 
 
+def _static_analysis_table_row(t: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """Builds one tool's (display_name, errors, warnings, quality_gate)
+    display row for _format_static_analysis_table -- split out purely to
+    keep that function's cyclomatic/cognitive complexity down (it hit 15
+    of the allowed 15 once this row-labeling logic moved in; same
+    rationale as _static_analysis_tool_entry above, split out of
+    _static_analysis_tools_by_name for the identical reason). Missing/
+    malformed fields degrade to '-' rather than raising.
+
+    A tool's `extensions.sonarqube` block isn't necessarily *from* a
+    SonarQube SARIF driver: SonarQube Cloud/Server doesn't emit a local
+    SARIF file at all (see cli.parsers.sarif's module docstring), so its
+    quality-gate/complexity/debt metrics are fed in externally via
+    --sonar-metrics and `merge_sonar_metrics_into_tools()`, which attaches
+    them to whichever SARIF tool matched by name -- or, when nothing
+    matched "sonar*", to the sole scanned tool as an unambiguous fallback
+    (e.g. a lone "CodeQL" row). Left unlabeled, that row shows a quality
+    gate with no indication the data came from SonarQube at all -- which
+    read as "SonarQube info is missing" even though it was merged in.
+    So a tool whose own name doesn't already say "sonar" gets its display
+    name suffixed with "(+ SonarQube)" whenever it carries that merged-in
+    extension, making the source of the quality gate column explicit
+    without inventing a separate, unbacked "SonarQube" row."""
+    name = str(t.get("name") or "unknown")
+    summary = t.get("summary") if isinstance(t.get("summary"), dict) else {}
+    errors = summary.get("errors")
+    warnings = summary.get("warnings")
+    extensions = t.get("extensions") if isinstance(t.get("extensions"), dict) else {}
+    sonarqube = extensions.get("sonarqube") if isinstance(extensions.get("sonarqube"), dict) else {}
+    quality_gate = sonarqube.get("quality_gate")
+    display_name = f"{name} (+ SonarQube)" if sonarqube and "sonar" not in name.lower() else name
+    return (
+        display_name,
+        str(errors) if isinstance(errors, int) else "-",
+        str(warnings) if isinstance(warnings, int) else "-",
+        str(quality_gate) if isinstance(quality_gate, str) else "-",
+    )
+
+
 def _format_static_analysis_table(tools: List[Dict[str, Any]]) -> List[str]:
     """Renders a clean, fixed-width summary table (tool, error/warning
     counts, SonarQube quality gate status when present) for --verify's
-    human-readable (non-JSON) output. Missing/malformed fields degrade to
-    '-' rather than raising -- this is a display helper over data that
-    `_extract_static_analysis_tools` already validated defensively."""
+    human-readable (non-JSON) output -- purely a layout/alignment pass over
+    rows already built defensively by _static_analysis_table_row (which see
+    for what each column means and where the data comes from)."""
     if not tools:
         return []
 
-    rows = []
-    for t in tools:
-        name = str(t.get("name") or "unknown")
-        summary = t.get("summary") if isinstance(t.get("summary"), dict) else {}
-        errors = summary.get("errors")
-        warnings = summary.get("warnings")
-        extensions = t.get("extensions") if isinstance(t.get("extensions"), dict) else {}
-        sonarqube = extensions.get("sonarqube") if isinstance(extensions.get("sonarqube"), dict) else {}
-        quality_gate = sonarqube.get("quality_gate")
-        rows.append((
-            name,
-            str(errors) if isinstance(errors, int) else "-",
-            str(warnings) if isinstance(warnings, int) else "-",
-            str(quality_gate) if isinstance(quality_gate, str) else "-",
-        ))
+    rows = [_static_analysis_table_row(t) for t in tools]
 
     header = ("TOOL", "ERRORS", "WARNINGS", "QUALITY GATE")
     widths = [max(len(header[i]), *(len(r[i]) for r in rows)) for i in range(len(header))]
@@ -2344,16 +2369,26 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
     """Renders the full unified report -- Run Identity & Gate Parameters
     (see _format_run_identity_report; the source commit/PR/CI run this
     predicate traces back to, and the exact --min-rcs/--disallow-degraded/
-    etc. this call enforced), SLSA Source Track (Levels 1-4), SLSA Build
-    Track (Levels 1-3), Assay Health & Governance Metrics, and the
-    synthesized FINAL VERDICT banner -- as plain-text lines, shared by both
-    the stderr human renderer and the $GITHUB_STEP_SUMMARY markdown writer
-    (the same [✓]/[✗] plain-text rows read fine as GFM markdown verbatim,
-    wrapped in a fenced code block -- see _render_step_summary_markdown). A
-    no-op section (empty list) for any track whose levels are absent (e.g.
-    a VerificationResult built directly by a test without going through
-    verify_dsse_attestation())."""
+    etc. this call enforced), Static Analysis (the per-tool SARIF/SonarQube
+    breakdown from _format_static_analysis_table, when any tools were
+    ingested), SLSA Source Track (Levels 1-4), SLSA Build Track (Levels
+    1-3), Assay Health & Governance Metrics, and the synthesized FINAL
+    VERDICT banner -- as plain-text lines, shared by both the stderr human
+    renderer and the $GITHUB_STEP_SUMMARY markdown writer (the same
+    [✓]/[✗] plain-text rows read fine as GFM markdown verbatim, wrapped in
+    a fenced code block -- see _render_step_summary_markdown). Static
+    Analysis lives here, not as a block either caller prints on its own,
+    specifically so the two renderers can't drift apart on which sections
+    they include -- they did, once: the SARIF table used to be printed
+    directly by _print_verify_result_human and was silently absent from
+    every $GITHUB_STEP_SUMMARY. A no-op section (empty list) for any track
+    whose levels are absent (e.g. a VerificationResult built directly by a
+    test without going through verify_dsse_attestation())."""
     lines: List[str] = _format_run_identity_report(result)
+    if result.static_analysis_tools:
+        lines.append("")
+        lines.append("  static analysis:")
+        lines.extend(_format_static_analysis_table(result.static_analysis_tools))
     source_levels = [result.source_level1, result.source_level2, result.source_level3, result.source_level4]
     build_levels = [result.slsa_level1, result.slsa_level2, result.slsa_level3]
 
@@ -2399,10 +2434,6 @@ def _print_verify_result_human(result: VerificationResult) -> None:
     if result.subject_digests:
         print(f"  subject_digests={result.subject_digests}", file=sys.stderr)
     print(f"  identity: {result.identity_status} ({result.identity_detail})", file=sys.stderr)
-    if result.static_analysis_tools:
-        print("  static analysis:", file=sys.stderr)
-        for line in _format_static_analysis_table(result.static_analysis_tools):
-            print(line, file=sys.stderr)
     for line in _render_track_sections(result):
         print(line, file=sys.stderr)
     for v in result.violations:

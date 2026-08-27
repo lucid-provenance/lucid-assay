@@ -538,6 +538,22 @@ class VerifyTableRenderingTests(unittest.TestCase):
         self.assertTrue(any("semgrep" in line and "2" in line for line in lines))
         self.assertTrue(any("sonarqube" in line and "FAILED" in line for line in lines))
 
+    def test_merged_sonar_metrics_on_non_sonar_tool_are_labeled(self):
+        """Regression coverage: SonarQube Cloud/Server doesn't emit its own
+        SARIF file, so --sonar-metrics merges its quality-gate data into
+        whatever SARIF tool was actually scanned (e.g. a lone "CodeQL" run
+        -- see merge_sonar_metrics_into_tools). Left unlabeled, that row
+        never mentions "SonarQube" at all despite carrying its data, which
+        reads as the SonarQube info being silently dropped from the table."""
+        from cli.verify import _format_static_analysis_table
+
+        tools = [
+            {"name": "CodeQL", "summary": {"errors": 0, "warnings": 0},
+             "extensions": {"sonarqube": {"quality_gate": "PASSED"}}},
+        ]
+        lines = _format_static_analysis_table(tools)
+        self.assertTrue(any("CodeQL" in line and "SonarQube" in line and "PASSED" in line for line in lines))
+
     def test_empty_tools_renders_no_lines(self):
         from cli.verify import _format_static_analysis_table
 

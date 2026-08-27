@@ -73,6 +73,88 @@ class ASTInspectorTests(unittest.TestCase):
         self.assertEqual(metrics.total_assertions, 2)
         self.assertEqual(metrics.tautological_assertions, 0)
 
+    def test_self_assert_raises_context_manager_is_counted(self):
+        # Regression guard: unittest's own `with self.assertRaises(...):`
+        # idiom used to be completely invisible to this engine -- neither
+        # counted as an assertion nor even generically visited -- because
+        # _handle_with only special-cased pytest.raises/pytest.warns.
+        metrics = self._inspect("test_unittest_raises.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                def test_raises(self):
+                    with self.assertRaises(ValueError):
+                        int("nope")
+        """)
+        self.assertEqual(metrics.total_test_functions, 1)
+        self.assertEqual(metrics.total_assertions, 1)
+        self.assertEqual(metrics.valid_test_functions, 1)
+
+    def test_self_assert_warns_context_manager_is_counted(self):
+        metrics = self._inspect("test_unittest_warns.py", """
+            import unittest
+            import warnings
+
+            class MyTests(unittest.TestCase):
+                def test_warns(self):
+                    with self.assertWarns(DeprecationWarning):
+                        warnings.warn("old", DeprecationWarning)
+        """)
+        self.assertEqual(metrics.total_test_functions, 1)
+        self.assertEqual(metrics.total_assertions, 1)
+
+    def test_assert_raises_regex_context_manager_is_counted(self):
+        metrics = self._inspect("test_unittest_raises_regex.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                def test_raises_regex(self):
+                    with self.assertRaisesRegex(ValueError, "nope"):
+                        int("nope")
+        """)
+        self.assertEqual(metrics.total_assertions, 1)
+
+    def test_assert_raises_context_manager_as_clause_is_counted(self):
+        # `as cm:` binding the exception context must not change detection.
+        metrics = self._inspect("test_unittest_raises_as.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                def test_raises_as(self):
+                    with self.assertRaises(ValueError) as cm:
+                        int("nope")
+                    self.assertIn("invalid literal", str(cm.exception))
+        """)
+        # The context manager itself, plus the follow-up assertIn.
+        self.assertEqual(metrics.total_assertions, 2)
+
+    def test_empty_body_under_self_assert_raises_is_not_counted(self):
+        # Mirrors the existing empty `with pytest.raises(...): pass` case:
+        # nothing in the block can actually raise, so it's still vanity.
+        metrics = self._inspect("test_unittest_raises_empty.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                def test_raises_empty(self):
+                    with self.assertRaises(ValueError):
+                        pass
+        """)
+        self.assertEqual(metrics.total_assertions, 0)
+        self.assertEqual(metrics.valid_test_functions, 0)
+
+    def test_assert_raises_direct_call_form_still_counted(self):
+        # The older, non-context-manager form (self.assertRaises(Exc, fn,
+        # *args)) was already handled by visit_Call's generic assert*
+        # dispatch -- confirms the new _handle_with path didn't regress it.
+        metrics = self._inspect("test_unittest_raises_direct.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                def test_raises_direct(self):
+                    self.assertRaises(ValueError, int, "nope")
+        """)
+        self.assertEqual(metrics.total_assertions, 1)
+
     def test_suffix_named_test_function_is_discovered(self):
         metrics = self._inspect("checks_test.py", """
             def addition_test():
@@ -147,6 +229,72 @@ class ASTInspectorTests(unittest.TestCase):
         """)
         self.assertEqual(metrics.total_assertions, 1)
         self.assertEqual(metrics.tautological_assertions, 1)
+
+    # -- valid (non-vanity) test functions -----------------------------------
+
+    def test_function_with_real_assertion_is_valid(self):
+        metrics = self._inspect("test_valid.py", """
+            def test_real():
+                assert 1 + 1 == 2
+        """)
+        self.assertEqual(metrics.valid_test_functions, 1)
+        self.assertEqual(metrics.valid_test_ratio, 1.0)
+
+    def test_function_with_only_tautological_assertion_is_not_valid(self):
+        metrics = self._inspect("test_vanity_taut.py", """
+            def test_bogus():
+                assert True
+        """)
+        self.assertEqual(metrics.valid_test_functions, 0)
+        self.assertEqual(metrics.valid_test_ratio, 0.0)
+
+    def test_empty_body_function_is_not_valid(self):
+        metrics = self._inspect("test_vanity_empty.py", """
+            def test_todo():
+                pass
+        """)
+        self.assertEqual(metrics.valid_test_functions, 0)
+
+    def test_function_with_one_real_and_one_tautological_assertion_is_valid(self):
+        # Regression guard: assertion_count/tautological_count are disjoint
+        # per-assertion counters (see cli.parsers.ast._tally's own
+        # comment), so a function isn't penalized to "not valid" just for
+        # also containing a tautological assertion alongside a real one.
+        metrics = self._inspect("test_mixed_valid.py", """
+            def test_partial_bogus():
+                result = do_work()
+                assert result is not None
+                assert True
+        """)
+        self.assertEqual(metrics.valid_test_functions, 1)
+
+    def test_valid_test_ratio_across_mixed_suite(self):
+        metrics = self._inspect("test_ratio.py", """
+            def test_one():
+                assert 1 + 1 == 2
+
+            def test_two():
+                assert True
+
+            def test_three():
+                pass
+        """)
+        self.assertEqual(metrics.total_test_functions, 3)
+        self.assertEqual(metrics.valid_test_functions, 1)
+        self.assertAlmostEqual(metrics.valid_test_ratio, 1 / 3)
+
+    def test_skipped_test_function_excluded_from_valid_test_ratio(self):
+        metrics = self._inspect("test_skip.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                @unittest.skip("flaky")
+                def test_disabled(self):
+                    assert 1 == 1
+        """)
+        self.assertEqual(metrics.total_test_functions, 0)
+        self.assertEqual(metrics.valid_test_functions, 0)
+        self.assertEqual(metrics.valid_test_ratio, 0.0)
 
     # -- empty test bodies --------------------------------------------------
 

@@ -514,8 +514,13 @@ class StepSummaryWriterTests(unittest.TestCase):
 
         os.environ.pop("GITHUB_STEP_SUMMARY", None)
         from cli.verify import _write_github_step_summary
+        from unittest import mock
 
-        _write_github_step_summary(result)  # must not raise
+        # "No-op" means no I/O is attempted at all, not merely "didn't
+        # raise" -- proves the early-return, not just its side effect.
+        with mock.patch("builtins.open") as mock_open:
+            _write_github_step_summary(result)
+        mock_open.assert_not_called()
 
     def test_never_raises_on_unwritable_path(self):
         envelope = _envelope(_rcs_statement())
@@ -526,7 +531,10 @@ class StepSummaryWriterTests(unittest.TestCase):
         env_backup = os.environ.get("GITHUB_STEP_SUMMARY")
         os.environ["GITHUB_STEP_SUMMARY"] = "/nonexistent-dir/does-not-exist/summary.md"
         try:
-            _write_github_step_summary(result)  # must not raise
+            with redirect_stderr(io.StringIO()) as captured:
+                _write_github_step_summary(result)  # must not raise
+            # ... and the failure is reported, not silently swallowed.
+            self.assertIn("could not write $GITHUB_STEP_SUMMARY", captured.getvalue())
         finally:
             if env_backup is None:
                 os.environ.pop("GITHUB_STEP_SUMMARY", None)

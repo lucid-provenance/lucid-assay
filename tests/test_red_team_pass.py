@@ -96,31 +96,31 @@ def test_sarif_nan_infinity_metrics(tmp_path):
     assert report2.tools[0].extensions["sonarqube"]["technical_debt_minutes"] == 0
 
 def test_sarif_deep_nesting(tmp_path):
-    # Recursion bomb
-    deep_dict = {}
-    current = deep_dict
-    for _ in range(1000):
-        current["nested"] = {}
-        current = current["nested"]
-    
-    sarif_content = {
-        "runs": [
-            {
-                "tool": {"driver": {"name": "test-tool"}},
-                "properties": deep_dict,
-                "results": []
-            }
-        ]
-    }
-    
+    # Recursion bomb: write the raw nested-brace text directly, not via
+    # json.dumps() on a hand-built dict -- the encoder is just as
+    # recursive as the decoder, so dumping a 1000-level dict would crash
+    # right here, before parse_sarif_file() is ever reached. A depth of
+    # 10,000 reliably exceeds sys.getrecursionlimit() regardless of how
+    # much stack the surrounding call chain (pytest, this function) has
+    # already used, so the RecursionError path is deterministically
+    # exercised rather than depending on exactly how close a depth of
+    # 1000 sits to the ambient limit at the moment of the call.
+    depth = 10_000
+    properties_json = ("{\"a\":" * depth) + "1" + ("}" * depth)
+    sarif_text = (
+        '{"runs":[{"tool":{"driver":{"name":"test-tool"}},'
+        f'"properties":{properties_json},"results":[]}}]}}'
+    )
+
     f = tmp_path / "deep.sarif"
-    f.write_text(json.dumps(sarif_content))
-    
-    try:
-        report = parse_sarif_file(f)
-        assert report.available
-    except RecursionError:
-        pytest.fail("RecursionError was not caught during parsing")
+    f.write_text(sarif_text)
+
+    report = parse_sarif_file(f)
+
+    # A hostile/pathologically-deep SARIF file must fail closed
+    # (available=False, RecursionError caught internally), never crash
+    # the caller with an unhandled RecursionError.
+    assert report.available is False
 
 # 4. DSSE Envelope Tampering & Size Ceilings
 

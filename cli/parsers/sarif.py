@@ -18,6 +18,13 @@ gate / cognitive complexity / technical debt, sourced from a SARIF run's own
 Hardened against:
   - Missing/unreadable/malformed SARIF files (`available=False`, never raises)
   - Non-object / missing `runs`/`results` SARIF documents
+  - Pathologically deep JSON nesting (e.g. `{"a":{"a":{"a":...}}}` thousands
+    of levels deep): CPython's `json.loads`/`json.load` are recursive
+    descent, so a hostile SARIF or `--sonar-metrics` file crafted to exceed
+    `sys.getrecursionlimit()` raises `RecursionError`, not
+    `json.JSONDecodeError` -- caught alongside it at both parse sites so
+    this degrades to `available=False`/`None` (fail closed) the same as
+    any other malformed input, never an unhandled exception
   - Absolute or CI-runner-workspace-prefixed artifact URIs that don't match
     the repo-root-relative paths git diff produces (suffix-match fallback,
     mirroring cli.patch_coverage._lookup_file_coverage)
@@ -632,7 +639,7 @@ def parse_sarif_file(
 
     try:
         doc = json.loads(raw_bytes.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as e:
         return SarifSummaryReport(available=False, reasons=[f"failed to read/parse SARIF file {path}: {e}"])
 
     if not isinstance(doc, dict):
@@ -749,7 +756,7 @@ def _load_sonar_metrics_doc(file_path: Union[str, Path]) -> Optional[Dict[str, A
         resolved = safe_resolve_path(file_path)
         with open(resolved, "r", encoding="utf-8") as f:
             doc = json.load(f)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError, UnsafePathError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, UnsafePathError, RecursionError):
         return None
     return doc if isinstance(doc, dict) else None
 

@@ -69,16 +69,25 @@ class TestAdversarialGovernanceAndExemptions:
                 _github_api_get("/repos/acme/repo", "token")
             assert "failed" in str(exc.value)
 
-        # 2. Deeply nested JSON / excessive data (if valid JSON, it shouldn't crash just return)
+        # 2. Deeply nested JSON: a hostile/pathologically-deep response body
+        # is exactly as suspect as garbled binary (case 1) or an HTML error
+        # page (case 3) -- must degrade the same way, a clean GitHubAPIError,
+        # not an unhandled RecursionError. Depth of 10,000 reliably exceeds
+        # sys.getrecursionlimit() regardless of how much stack the
+        # surrounding call chain already used, so this is deterministic
+        # rather than depending on exactly how close a depth of 1000 sits
+        # to the ambient limit at the moment of the call.
         with patch("urllib.request.urlopen") as mock_urlopen:
             mock_resp = MagicMock()
-            deep_json = b'{"a":' * 1000 + b'1' + b'}' * 1000
+            depth = 10_000
+            deep_json = b'{"a":' * depth + b'1' + b'}' * depth
             mock_resp.read.return_value = deep_json
             mock_resp.headers.get.return_value = ""
             mock_urlopen.return_value.__enter__.return_value = mock_resp
-            
-            res = _github_api_get("/repos/acme/repo", "token")
-            assert isinstance(res, dict)
+
+            with pytest.raises(GitHubAPIError) as exc:
+                _github_api_get("/repos/acme/repo", "token")
+            assert "failed" in str(exc.value)
             
         # 3. HTTPError with malformed HTML (e.g. Cloudflare 502 error page)
         with patch("urllib.request.urlopen") as mock_urlopen:

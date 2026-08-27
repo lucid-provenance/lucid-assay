@@ -700,6 +700,8 @@ Status: FAILED (SLSA Build Level 3)
 
 === Assay Health & Governance Metrics ===
 Release Confidence Score (RCS): 89 (degraded=False)
+Coverage:       87.1% of total code covered, 92.5% of new/patch code covered
+Test Validity:  97.9% valid (708/723 test functions; 15 vanity)
 Component breakdown:
   - governance: raw=100.0 weight=0.15 weighted=15.0
       2/2 required approvals (approved)
@@ -709,6 +711,27 @@ Component breakdown:
 FINAL VERDICT: GATED (Source L4 / Build L2) — SLSA Build L3 Incomplete
 ================================================================================
 ```
+
+The `Coverage:`/`Test Validity:` lines lead the Assay Health block (ahead of
+the RCS component breakdown, which buries the same coverage numbers inside
+individual `overall_coverage`/`patch_coverage` component reason strings) so
+the three headline percentages are scannable at a glance:
+- **Total code coverage** — `coverage.overall.line_rate`.
+- **New/patch code coverage** — `coverage.patch.line_rate` when
+  `coverage.patch.available` is `true`; otherwise `n/a (<reason>)` (e.g. no
+  base commit SHA to diff against), never a fabricated percentage.
+- **Valid vs. vanity tests** — `assertion_density.valid_test_ratio`:
+  the fraction of non-skipped test functions with at least one *real*
+  (non-tautological) assertion, as opposed to a "vanity" test — an empty
+  body, or one whose only assertions are tautological (`assert True`,
+  `self.assertEqual(x, x)`, ...). Computed once, per test function, by the
+  AST assertion engine (`cli/parsers/ast/_tally`) and embedded as
+  `assertion_density.valid_test_functions`/`.valid_test_ratio`; absent
+  (the line itself is omitted, not shown as `0%`) on an attestation
+  predating this field. Both lines are also carried in `--format json`
+  under the new top-level `test_coverage` key (the same
+  `result.metrics` block: `coverage_overall`, `coverage_patch`,
+  `assertion_density`).
 
 **Source track** (each level is one check; SLSA's own leveling is
 cumulative, same rule as the Build track below):

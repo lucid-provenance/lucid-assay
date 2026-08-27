@@ -110,7 +110,7 @@ def _fetch_commit_body(
         return None, _unavailable(commit_sha, reason)
     except urllib.error.URLError as e:
         return None, _unavailable(commit_sha, f"GitHub API request failed: {e.reason}")
-    except (json.JSONDecodeError, ValueError, OSError) as e:
+    except (json.JSONDecodeError, ValueError, OSError, RecursionError) as e:
         return None, _unavailable(commit_sha, f"GitHub API request failed: {e}")
 
 

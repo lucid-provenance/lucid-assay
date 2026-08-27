@@ -255,7 +255,7 @@ def parse_package_lock_json(path: Union[str, Path]) -> List[ResolvedDependency]:
 
     try:
         doc = json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         return []
 
     packages = doc.get("packages") if isinstance(doc, dict) else None

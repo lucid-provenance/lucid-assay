@@ -141,7 +141,8 @@ class SignStatementTimingHookTests(unittest.TestCase):
 
     def test_dry_run_without_timing_dict_does_not_raise(self):
         # timing=None is the default -- must be a no-op, not an AttributeError.
-        sign_statement(b'{"fake": true}', dry_run=True, timing=None)
+        envelope = sign_statement(b'{"fake": true}', dry_run=True, timing=None)
+        self.assertEqual(envelope.signatures[0]["sig"], "DRY_RUN_UNSIGNED")
 
 
 if __name__ == "__main__":

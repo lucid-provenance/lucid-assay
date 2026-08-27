@@ -196,6 +196,30 @@ class BuilderStatementTests(unittest.TestCase):
             statement["predicate"]["assertion_density"]["density_ratio"], 1.5
         )
 
+    def test_valid_test_ratio_is_none_when_no_test_functions(self):
+        statement = build_statement(
+            **_base_kwargs(total_assertions=0, total_test_functions=0, valid_test_functions=0)
+        )
+        self.assertIsNone(statement["predicate"]["assertion_density"]["valid_test_ratio"])
+        self.assertEqual(statement["predicate"]["assertion_density"]["valid_test_functions"], 0)
+
+    def test_valid_test_ratio_is_computed_and_rounded(self):
+        statement = build_statement(
+            **_base_kwargs(total_assertions=200, total_test_functions=156, valid_test_functions=142)
+        )
+        assertion_density = statement["predicate"]["assertion_density"]
+        self.assertEqual(assertion_density["valid_test_functions"], 142)
+        self.assertEqual(assertion_density["valid_test_ratio"], round(142 / 156, 3))
+
+    def test_valid_test_functions_defaults_to_zero_when_not_passed(self):
+        # _base_kwargs() never sets valid_test_functions -- confirms the
+        # parameter's own default keeps every pre-existing build_statement()
+        # caller/test in this file working unchanged.
+        statement = build_statement(**_base_kwargs(total_test_functions=100))
+        assertion_density = statement["predicate"]["assertion_density"]
+        self.assertEqual(assertion_density["valid_test_functions"], 0)
+        self.assertEqual(assertion_density["valid_test_ratio"], 0.0)
+
     def test_skipped_ratio_avoids_zero_division_when_no_tests(self):
         statement = build_statement(
             **_base_kwargs(
@@ -311,6 +335,17 @@ class BuilderStatementTests(unittest.TestCase):
             {"uri": "pkg:golang/example.com/mod@v1.2.3", "digest": {}},
         ]
         statement = build_statement(**_base_kwargs(resolved_dependencies=deps))
+
+        with open(_SCHEMA_PATH, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        validator = Draft202012Validator(schema)
+        errors = list(validator.iter_errors(statement["predicate"]))
+        self.assertEqual(errors, [], msg=[e.message for e in errors])
+
+    def test_valid_test_functions_validates_against_schema(self):
+        statement = build_statement(
+            **_base_kwargs(total_assertions=200, total_test_functions=156, valid_test_functions=142)
+        )
 
         with open(_SCHEMA_PATH, "r", encoding="utf-8") as f:
             schema = json.load(f)

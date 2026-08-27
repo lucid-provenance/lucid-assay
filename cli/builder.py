@@ -121,6 +121,7 @@ def build_statement(
     ast_skipped_test_functions: int = 0,
     ast_languages: Optional[Dict[str, Dict[str, int]]] = None,
     resolved_dependencies: Optional[List[Dict[str, Any]]] = None,
+    valid_test_functions: int = 0,
 ) -> Dict[str, Any]:
     """Returns a dict matching the lifecycle/v0.1 predicate schema, wrapped
     in a standard in-toto Statement envelope."""
@@ -137,6 +138,11 @@ def build_statement(
 
     density_ratio = (
         round(total_assertions / total_test_functions, 3)
+        if total_test_functions > 0
+        else None
+    )
+    valid_test_ratio = (
+        round(valid_test_functions / total_test_functions, 3)
         if total_test_functions > 0
         else None
     )
@@ -277,6 +283,14 @@ def build_statement(
             "total_assertions": total_assertions,
             "total_test_functions": total_test_functions,
             "density_ratio": density_ratio,
+            # Non-skipped test functions with >=1 real (non-tautological)
+            # assertion -- i.e. total_test_functions minus "vanity" tests
+            # (an empty body, or one whose only assertions are
+            # tautological, e.g. `assert True`). valid_test_ratio is null
+            # under the same total_test_functions==0 condition as
+            # density_ratio.
+            "valid_test_functions": valid_test_functions,
+            "valid_test_ratio": valid_test_ratio,
             "heuristics": {
                 "empty_test_bodies": empty_test_bodies,
                 "assertion_only_true": assertion_only_true,

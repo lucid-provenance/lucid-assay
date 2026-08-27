@@ -25,6 +25,14 @@ Hardened against:
     verification: when no identity assertion is provided at all, the
     UnsafeNoOp fallback is called out explicitly in identity_detail
     rather than being indistinguishable from a real identity check
+  - Pathologically deep JSON nesting in the envelope file (well under
+    MAX_ENVELOPE_SIZE by byte count -- 1,000 levels of `{"a":...}` is only
+    a few KB, so the size guard alone doesn't catch this): `json.load`/
+    `json.loads` are recursive descent, so a hostile envelope crafted to
+    exceed `sys.getrecursionlimit()` raises `RecursionError`, not
+    `json.JSONDecodeError` -- caught alongside it wherever the envelope or
+    its decoded payload is parsed, same clean file-error exit code as any
+    other malformed envelope, never an unhandled crash
 """
 from __future__ import annotations
 
@@ -1127,19 +1135,94 @@ def _format_gate_params(gate_params: Optional[Dict[str, Any]]) -> List[str]:
     return lines
 
 
+def _format_pct(rate: Any) -> str:
+    """Formats a 0.0-1.0 line-rate/ratio as a percentage string with one
+    decimal place. Returns "n/a" for anything not a finite, non-bool
+    number -- missing/malformed input degrades to a display placeholder,
+    never a raised exception."""
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool):
+        return "n/a"
+    if math.isnan(rate) or math.isinf(rate):
+        return "n/a"
+    return f"{rate * 100:.1f}%"
+
+
+def _format_coverage_line(metrics: Dict[str, Any]) -> str:
+    """Total code coverage and new/patch code coverage, side by side --
+    the two coverage.overall.line_rate / coverage.patch.line_rate values
+    already embedded in the predicate (see cli.builder), just surfaced as
+    a single scannable summary line instead of requiring a reader to dig
+    them out of the per-component RCS breakdown below."""
+    overall = metrics.get("coverage_overall")
+    overall = overall if isinstance(overall, dict) else {}
+    patch = metrics.get("coverage_patch")
+    patch = patch if isinstance(patch, dict) else {}
+
+    total_pct = _format_pct(overall.get("line_rate"))
+    if patch.get("available") is False:
+        patch_pct = f"n/a ({patch.get('reason') or 'unavailable'})"
+    else:
+        patch_pct = _format_pct(patch.get("line_rate"))
+
+    return f"Coverage:       {total_pct} of total code covered, {patch_pct} of new/patch code covered"
+
+
+def _format_test_validity_line(metrics: Dict[str, Any]) -> Optional[str]:
+    """The fraction of test functions that are "valid" (>=1 real,
+    non-tautological assertion) rather than "vanity" (an empty body, or
+    every assertion in it tautological, e.g. `assert True`) -- see
+    cli.parsers.ast._tally. Returns None (not a "0%" line) when
+    valid_test_functions/total_test_functions are absent, which is
+    expected on an attestation predating this field or a hand-built test
+    fixture that never populated assertion_density at all -- silence is
+    the honest answer there, not a fabricated zero."""
+    assertion_density = metrics.get("assertion_density")
+    assertion_density = assertion_density if isinstance(assertion_density, dict) else {}
+    total = assertion_density.get("total_test_functions")
+    valid = assertion_density.get("valid_test_functions")
+
+    if not isinstance(total, int) or total <= 0 or not isinstance(valid, int):
+        return None
+
+    vanity = max(total - valid, 0)
+    return f"Test Validity:  {_format_pct(valid / total)} valid ({valid}/{total} test functions; {vanity} vanity)"
+
+
+def _format_test_coverage_summary(result: "VerificationResult") -> List[str]:
+    """Renders the three at-a-glance percentages every report/step-summary
+    should lead with: total code coverage, new/patch code coverage, and
+    the valid-vs-vanity test ratio. A no-op ([]) when result.metrics
+    itself is empty (e.g. a VerificationResult built directly by a test,
+    or a decode failure that never reached _extract_metrics) -- same
+    "absent, not fabricated" contract as every other optional block in
+    this report."""
+    if not result.metrics:
+        return []
+    lines = [_format_coverage_line(result.metrics)]
+    validity_line = _format_test_validity_line(result.metrics)
+    if validity_line:
+        lines.append(validity_line)
+    return lines
+
+
 def _format_assay_health_report(result: "VerificationResult") -> List[str]:
-    """Renders the Assay Health & Governance Metrics block: the Release
-    Confidence Score, its per-component breakdown (test health, assertion
-    density, coverage, governance, ...), and itemized degraded reasons.
-    Reports "unavailable" rather than fabricating a score when no RCS
-    predicate was loaded (e.g. --slsa-envelope was the only statement
-    that decoded successfully)."""
+    """Renders the Assay Health & Governance Metrics block: total/patch
+    code coverage and the valid-vs-vanity test ratio (see
+    _format_test_coverage_summary) up front, then the Release Confidence
+    Score, its per-component breakdown (test health, assertion density,
+    coverage, governance, ...), and itemized degraded reasons. Reports
+    "unavailable" rather than fabricating a score when no RCS predicate
+    was loaded (e.g. --slsa-envelope was the only statement that decoded
+    successfully) -- the coverage/validity summary is still attempted in
+    that case, since it's independent of whether an RCS score exists."""
     lines = ["=== Assay Health & Governance Metrics ==="]
     if result.rcs_value is None:
         lines.append("Release Confidence Score: unavailable (no release_confidence_score predicate loaded)")
+        lines.extend(_format_test_coverage_summary(result))
         return lines
 
     lines.append(f"Release Confidence Score (RCS): {result.rcs_value} (degraded={result.degraded})")
+    lines.extend(_format_test_coverage_summary(result))
     if result.rcs_components:
         lines.append("Component breakdown:")
         for name in sorted(result.rcs_components):
@@ -1354,6 +1437,7 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
             "degraded_reasons": result.degraded_reasons or [],
             "components": result.rcs_components,
         },
+        "test_coverage": result.metrics,
         "static_analysis": {
             "tools": _static_analysis_tools_by_name(result.static_analysis_tools),
         },
@@ -2354,7 +2438,7 @@ def _load_envelope_for_cli(path: str) -> Tuple[Optional[Any], Optional[int]]:
     except UnsafePathError as e:
         print(f"ERROR: unsafe envelope file path: {e}", file=sys.stderr)
         return None, EXIT_FILE_ERROR
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, json.JSONDecodeError, RecursionError) as e:
         print(f"ERROR: failed to read/parse envelope file {path}: {e}", file=sys.stderr)
         return None, EXIT_FILE_ERROR
 

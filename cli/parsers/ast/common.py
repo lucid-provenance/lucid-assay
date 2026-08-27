@@ -81,6 +81,11 @@ class LanguageMetrics:
     tautological_assertions: int = 0
     empty_test_bodies: int = 0
     skipped_test_functions: int = 0
+    # Non-skipped test functions with at least one *real* (non-tautological)
+    # assertion -- i.e. total_test_functions minus "vanity" tests (empty
+    # bodies + tests whose only assertions are tautological). See
+    # cli.parsers.ast._tally for the exact per-function classification.
+    valid_test_functions: int = 0
 
     def as_dict(self) -> dict:
         # `language` is deliberately omitted -- it's already the dict key
@@ -97,6 +102,9 @@ class TestSuiteMetrics:
     tautological_assertions: int = 0
     empty_test_bodies: int = 0
     skipped_test_functions: int = 0
+    # See LanguageMetrics.valid_test_functions -- same definition, summed
+    # across every language.
+    valid_test_functions: int = 0
     files: List[FileInspectionResult] = field(default_factory=list)
     parse_errors: List[str] = field(default_factory=list)
     languages: "dict[str, LanguageMetrics]" = field(default_factory=dict)
@@ -106,3 +114,14 @@ class TestSuiteMetrics:
         if self.total_test_functions <= 0:
             return 0.0
         return self.total_assertions / self.total_test_functions
+
+    @property
+    def valid_test_ratio(self) -> float:
+        """valid_test_functions / total_test_functions -- the fraction of
+        non-skipped test functions that have at least one real assertion,
+        as opposed to a "vanity" test (an empty body, or one whose only
+        assertions are tautological, e.g. `assert True`). 0.0 when there
+        are no non-skipped test functions to compute a ratio from."""
+        if self.total_test_functions <= 0:
+            return 0.0
+        return self.valid_test_functions / self.total_test_functions

@@ -284,6 +284,24 @@ class BuildLevel3ChecksTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertIn("no 'pkg:' PURL entries", result["detail"])
 
+    def test_materialized_dependencies_rejects_non_dict_digest(self):
+        """A `pkg:`-prefixed uri with a malformed `digest` (missing, or not
+        itself a dict/object) must not crash or count as materialized --
+        the `isinstance(digest, dict)` guard this exercises is new code
+        added alongside sha512 acceptance, not covered by any existing
+        case above."""
+        predicate = {
+            "buildDefinition": {
+                "resolvedDependencies": [
+                    {"uri": "pkg:npm/no-digest-field@1.0.0"},
+                    {"uri": "pkg:npm/malformed-digest@1.0.0", "digest": "sha256:" + "d" * 64},
+                ]
+            }
+        }
+        result = _slsa_check_materialized_dependencies(predicate)
+        self.assertFalse(result["passed"])
+        self.assertIn("no 'pkg:' PURL entries", result["detail"])
+
     def test_l3_origin_reflects_statement_invocation_id(self):
         """_evaluate_slsa_l3 threads _slsa_invocation_origin(predicate)
         through the same way _evaluate_slsa_l1/_l2 do, so a failed Level 3

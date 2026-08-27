@@ -16,6 +16,7 @@ from cli.verify import (
     GITHUB_ACTIONS_OIDC_ISSUER,
     SLSA_PROVENANCE_PREDICATE_TYPE,
     TRUSTED_HOSTED_BUILDER_IDS,
+    VerificationResult,
     main,
     parse_args,
     verify_dsse_attestation,
@@ -26,7 +27,12 @@ from cli.verify import (
     _evaluate_slsa_l1,
     _evaluate_slsa_l2,
     _extract_cert_ref,
+    _format_assay_health_report,
+    _format_coverage_line,
+    _format_pct,
     _format_slsa_level_block,
+    _format_test_coverage_summary,
+    _format_test_validity_line,
     _format_track_report,
     _slsa_invocation_origin,
     _slsa_level_result,
@@ -1565,6 +1571,198 @@ class VerifyDsseAttestationSlsaIntegrationTests(unittest.TestCase):
 
         self.assertIsNone(result.slsa_level1)
         self.assertIsNone(result.slsa_level2)
+
+
+class FormatPctTests(unittest.TestCase):
+    def test_formats_one_decimal_percentage(self):
+        self.assertEqual(_format_pct(0.871), "87.1%")
+
+    def test_zero_and_one_are_valid_rates(self):
+        self.assertEqual(_format_pct(0.0), "0.0%")
+        self.assertEqual(_format_pct(1.0), "100.0%")
+
+    def test_non_numeric_is_not_available(self):
+        self.assertEqual(_format_pct(None), "n/a")
+        self.assertEqual(_format_pct("87%"), "n/a")
+
+    def test_bool_is_not_treated_as_numeric(self):
+        # bool is a subclass of int -- must not silently format True/False
+        # as "100.0%"/"0.0%".
+        self.assertEqual(_format_pct(True), "n/a")
+
+    def test_nan_and_inf_are_not_available(self):
+        self.assertEqual(_format_pct(float("nan")), "n/a")
+        self.assertEqual(_format_pct(float("inf")), "n/a")
+
+
+class FormatCoverageLineTests(unittest.TestCase):
+    def test_total_and_patch_coverage_both_present(self):
+        line = _format_coverage_line(
+            {
+                "coverage_overall": {"line_rate": 0.871},
+                "coverage_patch": {"available": True, "line_rate": 0.925},
+            }
+        )
+        self.assertIn("87.1%", line)
+        self.assertIn("92.5%", line)
+        self.assertIn("total code covered", line)
+        self.assertIn("new/patch code covered", line)
+
+    def test_patch_unavailable_shows_reason_not_a_percentage(self):
+        line = _format_coverage_line(
+            {
+                "coverage_overall": {"line_rate": 0.50},
+                "coverage_patch": {"available": False, "reason": "no PR base ref"},
+            }
+        )
+        self.assertIn("50.0%", line)
+        self.assertIn("n/a (no PR base ref)", line)
+
+    def test_missing_metrics_degrades_to_na_without_raising(self):
+        line = _format_coverage_line({})
+        self.assertIn("n/a", line)
+
+
+class FormatTestValidityLineTests(unittest.TestCase):
+    def test_renders_valid_ratio_and_counts(self):
+        line = _format_test_validity_line(
+            {"assertion_density": {"total_test_functions": 156, "valid_test_functions": 142}}
+        )
+        self.assertIsNotNone(line)
+        self.assertIn("91.0%", line)
+        self.assertIn("142/156", line)
+        self.assertIn("14 vanity", line)
+
+    def test_none_when_fields_absent(self):
+        # An older attestation predating valid_test_functions, or a
+        # hand-built fixture that never populated assertion_density --
+        # silence, not a fabricated "0% valid" claim.
+        self.assertIsNone(_format_test_validity_line({}))
+        self.assertIsNone(_format_test_validity_line({"assertion_density": {"total_test_functions": 10}}))
+
+    def test_none_when_zero_test_functions(self):
+        self.assertIsNone(
+            _format_test_validity_line({"assertion_density": {"total_test_functions": 0, "valid_test_functions": 0}})
+        )
+
+    def test_all_valid_shows_zero_vanity(self):
+        line = _format_test_validity_line(
+            {"assertion_density": {"total_test_functions": 10, "valid_test_functions": 10}}
+        )
+        self.assertIn("100.0%", line)
+        self.assertIn("0 vanity", line)
+
+
+class FormatTestCoverageSummaryTests(unittest.TestCase):
+    def test_empty_metrics_yields_no_lines(self):
+        self.assertEqual(_format_test_coverage_summary(VerificationResult(passed=True, metrics={})), [])
+
+    def test_coverage_line_always_present_when_metrics_nonempty(self):
+        result = VerificationResult(passed=True, metrics={"coverage_overall": {"line_rate": 0.5}})
+        lines = _format_test_coverage_summary(result)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Coverage:", lines[0])
+
+    def test_validity_line_appended_when_available(self):
+        result = VerificationResult(
+            passed=True,
+            metrics={
+                "coverage_overall": {"line_rate": 0.5},
+                "assertion_density": {"total_test_functions": 10, "valid_test_functions": 8},
+            }
+        )
+        lines = _format_test_coverage_summary(result)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("Test Validity:", lines[1])
+
+
+class FormatAssayHealthReportTests(unittest.TestCase):
+    def test_coverage_and_validity_lines_appear_before_component_breakdown(self):
+        result = VerificationResult(
+            passed=True,
+            rcs_value=82,
+            degraded=False,
+            rcs_components={},
+            metrics={
+                "coverage_overall": {"line_rate": 0.871},
+                "coverage_patch": {"available": True, "line_rate": 0.925},
+                "assertion_density": {"total_test_functions": 156, "valid_test_functions": 142},
+            },
+        )
+        lines = _format_assay_health_report(result)
+        text = "\n".join(lines)
+
+        self.assertIn("Coverage:       87.1% of total code covered, 92.5% of new/patch code covered", text)
+        self.assertIn("Test Validity:  91.0% valid (142/156 test functions; 14 vanity)", text)
+        rcs_idx = next(i for i, l in enumerate(lines) if l.startswith("Release Confidence Score"))
+        coverage_idx = next(i for i, l in enumerate(lines) if l.startswith("Coverage:"))
+        self.assertLess(rcs_idx, coverage_idx)
+
+    def test_no_rcs_still_shows_coverage_summary(self):
+        result = VerificationResult(
+            passed=True,
+            rcs_value=None,
+            metrics={"coverage_overall": {"line_rate": 0.5}},
+        )
+        lines = _format_assay_health_report(result)
+        text = "\n".join(lines)
+
+        self.assertIn("Release Confidence Score: unavailable", text)
+        self.assertIn("Coverage:", text)
+
+    def test_no_metrics_at_all_omits_coverage_lines(self):
+        result = VerificationResult(passed=True, rcs_value=70, metrics={})
+        lines = _format_assay_health_report(result)
+        self.assertFalse(any(l.startswith("Coverage:") for l in lines))
+        self.assertFalse(any(l.startswith("Test Validity:") for l in lines))
+
+
+class VerifyDsseAttestationTestCoverageIntegrationTests(unittest.TestCase):
+    """End-to-end: coverage.patch + assertion_density fields on a real
+    decoded statement flow all the way through _extract_metrics into
+    result.metrics, and from there into both the text report and the
+    --format json payload."""
+
+    def _statement_with_test_coverage_data(self):
+        statement = _statement(rcs_value=82)
+        statement["predicate"]["coverage"]["patch"] = {"available": True, "line_rate": 0.925}
+        statement["predicate"]["assertion_density"] = {
+            "total_assertions": 200,
+            "total_test_functions": 156,
+            "density_ratio": 1.282,
+            "valid_test_functions": 142,
+            "valid_test_ratio": 0.910,
+        }
+        return statement
+
+    def test_metrics_populated_on_result(self):
+        envelope = _envelope(self._statement_with_test_coverage_data())
+
+        result = verify_dsse_attestation(envelope, dry_run=True)
+
+        self.assertEqual(result.metrics["coverage_patch"]["line_rate"], 0.925)
+        self.assertEqual(result.metrics["assertion_density"]["valid_test_functions"], 142)
+
+    def test_lines_appear_in_full_track_sections_report(self):
+        from cli.verify import _render_track_sections
+
+        envelope = _envelope(self._statement_with_test_coverage_data())
+        result = verify_dsse_attestation(envelope, dry_run=True)
+
+        text = "\n".join(_render_track_sections(result))
+        self.assertIn("Coverage:", text)
+        self.assertIn("Test Validity:", text)
+        self.assertIn("91.0%", text)
+
+    def test_test_coverage_block_present_in_json_payload(self):
+        envelope = _envelope(self._statement_with_test_coverage_data())
+        result = verify_dsse_attestation(envelope, dry_run=True)
+
+        payload = _build_verify_json_payload(result)
+
+        self.assertIn("test_coverage", payload)
+        self.assertEqual(payload["test_coverage"]["assertion_density"]["valid_test_functions"], 142)
+        json.dumps(payload)  # must stay JSON-serializable end to end
 
 
 if __name__ == "__main__":

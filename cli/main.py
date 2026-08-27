@@ -510,6 +510,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         empty_bodies = ast_metrics.empty_test_bodies
         tautological = ast_metrics.tautological_assertions
         ast_skipped = ast_metrics.skipped_test_functions
+        valid_test_functions = ast_metrics.valid_test_functions
         ast_languages = {lang: m.as_dict() for lang, m in ast_metrics.languages.items()}
 
     # 6. Deterministic scoring
@@ -567,6 +568,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             total_test_functions=total_test_functions,
             empty_test_bodies=empty_bodies,
             assertion_only_true=tautological,
+            valid_test_functions=valid_test_functions,
             rcs=rcs,
             sarif_report=sarif_report,
             ast_skipped_test_functions=ast_skipped,

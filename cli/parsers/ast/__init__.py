@@ -106,12 +106,22 @@ def _tally(metrics: TestSuiteMetrics, lang_metrics: LanguageMetrics, fn: TestFun
         metrics.skipped_test_functions += 1
         lang_metrics.skipped_test_functions += 1
         return
+    # assertion_count and tautological_count are disjoint counters -- every
+    # visitor increments exactly one or the other per assertion call (see
+    # e.g. python_visitor.py's _visit_assert), so assertion_count already
+    # excludes tautological ones. "Valid" is therefore simply "has at
+    # least one counted (real) assertion"; an empty-bodied function has
+    # assertion_count == 0 the same as a not-empty, all-tautological one,
+    # so no separate empty-body branch is needed here.
+    is_valid = fn.assertion_count > 0
     for target in (metrics, lang_metrics):
         target.total_test_functions += 1
         target.total_assertions += fn.assertion_count
         target.tautological_assertions += fn.tautological_count
         if fn.is_empty_body:
             target.empty_test_bodies += 1
+        if is_valid:
+            target.valid_test_functions += 1
 
 
 def inspect_test_suite(repo_dir: str, target_files: Optional[List[str]] = None) -> TestSuiteMetrics:

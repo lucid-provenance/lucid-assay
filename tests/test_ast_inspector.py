@@ -148,6 +148,72 @@ class ASTInspectorTests(unittest.TestCase):
         self.assertEqual(metrics.total_assertions, 1)
         self.assertEqual(metrics.tautological_assertions, 1)
 
+    # -- valid (non-vanity) test functions -----------------------------------
+
+    def test_function_with_real_assertion_is_valid(self):
+        metrics = self._inspect("test_valid.py", """
+            def test_real():
+                assert 1 + 1 == 2
+        """)
+        self.assertEqual(metrics.valid_test_functions, 1)
+        self.assertEqual(metrics.valid_test_ratio, 1.0)
+
+    def test_function_with_only_tautological_assertion_is_not_valid(self):
+        metrics = self._inspect("test_vanity_taut.py", """
+            def test_bogus():
+                assert True
+        """)
+        self.assertEqual(metrics.valid_test_functions, 0)
+        self.assertEqual(metrics.valid_test_ratio, 0.0)
+
+    def test_empty_body_function_is_not_valid(self):
+        metrics = self._inspect("test_vanity_empty.py", """
+            def test_todo():
+                pass
+        """)
+        self.assertEqual(metrics.valid_test_functions, 0)
+
+    def test_function_with_one_real_and_one_tautological_assertion_is_valid(self):
+        # Regression guard: assertion_count/tautological_count are disjoint
+        # per-assertion counters (see cli.parsers.ast._tally's own
+        # comment), so a function isn't penalized to "not valid" just for
+        # also containing a tautological assertion alongside a real one.
+        metrics = self._inspect("test_mixed_valid.py", """
+            def test_partial_bogus():
+                result = do_work()
+                assert result is not None
+                assert True
+        """)
+        self.assertEqual(metrics.valid_test_functions, 1)
+
+    def test_valid_test_ratio_across_mixed_suite(self):
+        metrics = self._inspect("test_ratio.py", """
+            def test_one():
+                assert 1 + 1 == 2
+
+            def test_two():
+                assert True
+
+            def test_three():
+                pass
+        """)
+        self.assertEqual(metrics.total_test_functions, 3)
+        self.assertEqual(metrics.valid_test_functions, 1)
+        self.assertAlmostEqual(metrics.valid_test_ratio, 1 / 3)
+
+    def test_skipped_test_function_excluded_from_valid_test_ratio(self):
+        metrics = self._inspect("test_skip.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                @unittest.skip("flaky")
+                def test_disabled(self):
+                    assert 1 == 1
+        """)
+        self.assertEqual(metrics.total_test_functions, 0)
+        self.assertEqual(metrics.valid_test_functions, 0)
+        self.assertEqual(metrics.valid_test_ratio, 0.0)
+
     # -- empty test bodies --------------------------------------------------
 
     def test_pass_only_body_is_empty(self):

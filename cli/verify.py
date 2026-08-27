@@ -2344,16 +2344,26 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
     """Renders the full unified report -- Run Identity & Gate Parameters
     (see _format_run_identity_report; the source commit/PR/CI run this
     predicate traces back to, and the exact --min-rcs/--disallow-degraded/
-    etc. this call enforced), SLSA Source Track (Levels 1-4), SLSA Build
-    Track (Levels 1-3), Assay Health & Governance Metrics, and the
-    synthesized FINAL VERDICT banner -- as plain-text lines, shared by both
-    the stderr human renderer and the $GITHUB_STEP_SUMMARY markdown writer
-    (the same [✓]/[✗] plain-text rows read fine as GFM markdown verbatim,
-    wrapped in a fenced code block -- see _render_step_summary_markdown). A
-    no-op section (empty list) for any track whose levels are absent (e.g.
-    a VerificationResult built directly by a test without going through
-    verify_dsse_attestation())."""
+    etc. this call enforced), Static Analysis (the per-tool SARIF/SonarQube
+    breakdown from _format_static_analysis_table, when any tools were
+    ingested), SLSA Source Track (Levels 1-4), SLSA Build Track (Levels
+    1-3), Assay Health & Governance Metrics, and the synthesized FINAL
+    VERDICT banner -- as plain-text lines, shared by both the stderr human
+    renderer and the $GITHUB_STEP_SUMMARY markdown writer (the same
+    [✓]/[✗] plain-text rows read fine as GFM markdown verbatim, wrapped in
+    a fenced code block -- see _render_step_summary_markdown). Static
+    Analysis lives here, not as a block either caller prints on its own,
+    specifically so the two renderers can't drift apart on which sections
+    they include -- they did, once: the SARIF table used to be printed
+    directly by _print_verify_result_human and was silently absent from
+    every $GITHUB_STEP_SUMMARY. A no-op section (empty list) for any track
+    whose levels are absent (e.g. a VerificationResult built directly by a
+    test without going through verify_dsse_attestation())."""
     lines: List[str] = _format_run_identity_report(result)
+    if result.static_analysis_tools:
+        lines.append("")
+        lines.append("  static analysis:")
+        lines.extend(_format_static_analysis_table(result.static_analysis_tools))
     source_levels = [result.source_level1, result.source_level2, result.source_level3, result.source_level4]
     build_levels = [result.slsa_level1, result.slsa_level2, result.slsa_level3]
 
@@ -2399,10 +2409,6 @@ def _print_verify_result_human(result: VerificationResult) -> None:
     if result.subject_digests:
         print(f"  subject_digests={result.subject_digests}", file=sys.stderr)
     print(f"  identity: {result.identity_status} ({result.identity_detail})", file=sys.stderr)
-    if result.static_analysis_tools:
-        print("  static analysis:", file=sys.stderr)
-        for line in _format_static_analysis_table(result.static_analysis_tools):
-            print(line, file=sys.stderr)
     for line in _render_track_sections(result):
         print(line, file=sys.stderr)
     for v in result.violations:

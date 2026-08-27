@@ -446,6 +446,39 @@ class VerdictHeadingConsistencyTests(unittest.TestCase):
         self.assertIn("## tenax-assay verify: ❌ FAILED", markdown)
 
 
+class StaticAnalysisInStepSummaryTests(unittest.TestCase):
+    """Regression coverage for the SARIF/static-analysis table being
+    stderr-only: it used to be printed directly by
+    _print_verify_result_human and was silently absent from every
+    $GITHUB_STEP_SUMMARY, since _render_step_summary_markdown never
+    rendered it. Both renderers now go through the same
+    _render_track_sections block, so they can't drift apart on this
+    again."""
+
+    def test_static_analysis_table_appears_in_step_summary_markdown(self):
+        from cli.verify import VerificationResult
+
+        result = VerificationResult(
+            passed=True,
+            verdict_word="PASSED",
+            static_analysis_tools=[
+                {"name": "semgrep", "summary": {"errors": 1, "warnings": 0}, "extensions": {}}
+            ],
+        )
+
+        markdown = _render_step_summary_markdown(result)
+        self.assertIn("static analysis:", markdown)
+        self.assertIn("semgrep", markdown)
+
+    def test_no_static_analysis_section_when_no_tools_ran(self):
+        from cli.verify import VerificationResult
+
+        result = VerificationResult(passed=True, verdict_word="PASSED")
+
+        markdown = _render_step_summary_markdown(result)
+        self.assertNotIn("static analysis:", markdown)
+
+
 class StepSummaryWriterTests(unittest.TestCase):
     def test_writes_markdown_to_github_step_summary_env_var(self):
         envelope = _envelope(_rcs_statement())

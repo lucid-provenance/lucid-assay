@@ -16,6 +16,7 @@ from cli.parsers.coverage import CoverageReport
 from cli.parsers.github_rules import BranchGovernanceReport
 from cli.parsers.junit import TestTotals
 from cli.patch_coverage import PatchCoverageResult, REASON_CODE_NO_COVERABLE_LINES
+from cli.real_coverage import CoverageTrackResult, RealCoverageResult
 from cli.scorer import score_pipeline
 
 
@@ -308,6 +309,52 @@ class BuilderStatementTests(unittest.TestCase):
         sbom = {"bomFormat": "CycloneDX", "components": []}
         statement = build_statement(**_base_kwargs(sbom=sbom))
         self.assertEqual(statement["predicate"]["artifact"]["sbom"], sbom)
+
+    def test_real_coverage_defaults_to_unavailable_when_not_passed(self):
+        statement = build_statement(**_base_kwargs())
+        real = statement["predicate"]["coverage"]["real"]
+
+        self.assertFalse(real["overall"]["available"])
+        self.assertFalse(real["patch"]["available"])
+        self.assertIn("--coverage-contexts", real["overall"]["reason"])
+
+    def test_real_coverage_is_embedded_when_provided(self):
+        real_coverage = RealCoverageResult(
+            overall=CoverageTrackResult(
+                available=True,
+                measured_line_rate=0.90,
+                real_line_rate=0.85,
+                total_lines=200,
+                measured_covered_lines=180,
+                vanity_only_lines=10,
+            ),
+            patch=CoverageTrackResult(available=False, reason="no patch-modified-lines data available"),
+        )
+        statement = build_statement(**_base_kwargs(real_coverage=real_coverage))
+        real = statement["predicate"]["coverage"]["real"]
+
+        self.assertTrue(real["overall"]["available"])
+        self.assertEqual(real["overall"]["real_line_rate"], 0.85)
+        self.assertEqual(real["overall"]["vanity_only_lines"], 10)
+        self.assertFalse(real["patch"]["available"])
+
+    def test_real_coverage_validates_against_schema(self):
+        real_coverage = RealCoverageResult(
+            overall=CoverageTrackResult(
+                available=True, measured_line_rate=1.0, real_line_rate=0.75,
+                total_lines=4, measured_covered_lines=4, vanity_only_lines=1,
+            ),
+            patch=CoverageTrackResult(
+                available=True, measured_line_rate=1.0, real_line_rate=1.0,
+                total_lines=2, measured_covered_lines=2, vanity_only_lines=0,
+            ),
+        )
+        statement = build_statement(**_base_kwargs(real_coverage=real_coverage))
+
+        with open(_SCHEMA_PATH, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        errors = list(Draft202012Validator(schema).iter_errors(statement["predicate"]))
+        self.assertEqual(errors, [], msg=[e.message for e in errors])
 
     def test_resolved_dependencies_defaults_to_empty_list(self):
         statement = build_statement(**_base_kwargs())

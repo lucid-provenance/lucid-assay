@@ -15,6 +15,7 @@ cli/
   common.py                 # safe_resolve_path(): path-safety guard shared by every module below that opens an operator-supplied file
   parsers/junit.py          # streaming JUnit XML -> TestTotals (flaky-retry aware)
   parsers/coverage.py       # Cobertura XML + LCOV -> CoverageReport (per-line hit maps)
+  parsers/coverage_contexts.py # `coverage json --show-contexts` -> per-test line attribution
   parsers/ast_inspector.py  # backward-compat shim -> re-exports parsers/ast/
   parsers/ast/              # multi-language assertion integrity engine (registry/dispatcher)
     __init__.py                # inspect_test_suite(): discovery + per-language aggregation
@@ -28,6 +29,7 @@ cli/
   parsers/commit_author.py  # GitHub commit-author identity (verified account) via REST API
   parsers/lockfiles.py      # uv.lock/package-lock.json/go.sum/Gradle/Maven -> resolved_dependencies
   patch_coverage.py         # git diff base...head, intersected with coverage hit maps
+  real_coverage.py           # vanity-test-aware coverage: which covered lines are only exercised by vanity tests
   hashing.py                 # SHA-256 content hashing + WORM key derivation
   scorer.py                  # pure, deterministic Release Confidence Score (RCS)
   builder.py                 # assembles the unsigned in-toto Statement
@@ -55,6 +57,8 @@ tests/
   test_slsa_provenance.py               # SLSA v1.0 provenance builder: ground-truth/fail-closed tests, and proof
                                          # a genuine statement satisfies cli/verify.py's SLSA Level 1/2 checklist
   test_sign.py                          # `tenax-assay sign` CLI + cli.oidc_signer.sign_file_to_envelope tests
+  test_coverage_contexts.py             # `coverage json --show-contexts` export parsing tests
+  test_real_coverage.py                 # vanity-test-aware coverage cross-reference tests
   fixtures/                             # sample cobertura.xml and a rendered statement
   fixtures/ast_assertions/                # per-language source-text fixtures for the AST engine
                                            # (python/, typescript/, javascript/, go/, java/) --
@@ -413,6 +417,47 @@ Dependencies" item below**, which reads a differently-shaped
 tenax-assay's own predicate isn't SLSA-shaped (see the checklist section),
 so populating this field doesn't change that item's outcome.
 
+### Vanity-test-aware "real" coverage (`--coverage-contexts`)
+
+Line coverage and assertion validity are computed as two independent
+signals: a "vanity" test (an empty body, or one whose only assertions are
+tautological, e.g. `assert True`) still *executes* whatever code it calls
+before failing to verify anything — so it inflates the reported coverage
+percentage exactly as much as a real test would, without any of the
+assurance that percentage is meant to imply. Line coverage tools alone
+can't tell the two apart.
+
+`--coverage-contexts <path>` closes that gap. Given a
+`coverage json --show-contexts` export (collected with
+`pytest --cov-context=test`, coverage.py's per-test line-coverage
+attribution), `cli/real_coverage.py` cross-references which test(s)
+covered each line against which tests `cli/parsers/ast/` flagged as
+vanity, for both the overall/total-code and patch/new-code tracks. A line
+counts as **vanity-only covered** when it has at least one attributed
+covering test and *every one* of them is vanity — a line with no
+attributed context at all (e.g. covered at module import time) is left
+alone, since there's no evidence it's vanity-only. "Real" coverage
+subtracts only vanity-only-covered lines from the numerator, keeping the
+exact same denominator the existing `coverage.overall`/`coverage.patch`
+figures already use, so "measured" and "real" stay directly comparable.
+Embedded as `predicate.coverage.real.{overall,patch}` (each track:
+`available`, `measured_line_rate`, `real_line_rate`, `total_lines`,
+`measured_covered_lines`, `vanity_only_lines`) — `tenax-assay verify`
+renders both as `Real Total/Patch Coverage: ...` lines, plus an explicit
+`⚠ ... is BELOW the ... threshold` warning whenever real coverage alone
+would fail a gate measured coverage currently passes (see "Verification
+(admission gate)" below for the full example). Purely informational, like
+`resolved_dependencies` above — never an RCS scoring input, and every
+track degrades independently to `available=false` (never a fabricated
+number) when the flag wasn't passed, the export was malformed, or (patch
+track only) no patch-modified-lines data was available for this run.
+
+Python-only, currently: coverage.py's dynamic-context mechanism has no
+equivalent wired up for the other three languages' test runners
+(Jest/Vitest, `go test`, JUnit) in this pipeline, so a TS/JS/Go/Java
+vanity test simply never shows up in a coverage context — harmless, not a
+false negative this analysis claims to catch.
+
 ## Signing flow (keyless / Sigstore)
 
 `oidc_signer.py` implements the ambient-credential keyless model end to
@@ -702,6 +747,9 @@ Status: FAILED (SLSA Build Level 3)
 Release Confidence Score (RCS): 89 (degraded=False)
 Coverage:       87.1% of total code covered, 92.5% of new/patch code covered
 Test Validity:  97.9% valid (708/723 test functions; 15 vanity)
+Real Total Coverage: 85.5% (measured 87.1%, 12 vanity-only-covered line(s) of 4130)
+Real Patch Coverage: 78.3% (measured 92.5%, 2 vanity-only-covered line(s) of 40)
+  ⚠ real patch coverage 78.3% is BELOW the 80.0% threshold, even though measured patch coverage 92.5% passes it
 Component breakdown:
   - governance: raw=100.0 weight=0.15 weighted=15.0
       2/2 required approvals (approved)
@@ -728,10 +776,25 @@ the three headline percentages are scannable at a glance:
   AST assertion engine (`cli/parsers/ast/_tally`) and embedded as
   `assertion_density.valid_test_functions`/`.valid_test_ratio`; absent
   (the line itself is omitted, not shown as `0%`) on an attestation
-  predating this field. Both lines are also carried in `--format json`
-  under the new top-level `test_coverage` key (the same
-  `result.metrics` block: `coverage_overall`, `coverage_patch`,
-  `assertion_density`).
+  predating this field.
+- **Real (vanity-discounted) coverage** — `Real Total/Patch Coverage:
+  ...`, present only when `--coverage-contexts` was used for this run
+  (see "Vanity-test-aware 'real' coverage" above); each track's
+  `real_line_rate` and `vanity_only_lines` come from
+  `predicate.coverage.real.{overall,patch}`. The `⚠ ... is BELOW the ...
+  threshold` warning appears specifically when real coverage would fail
+  the same `coverage.thresholds.overall_min`/`patch_min` that measured
+  coverage currently passes — the exact "is our reported coverage
+  actually propped up by vanity tests" question this feature exists to
+  answer. This is diagnostic only: it never changes `degraded`,
+  `release_confidence_score`, or `passed` on its own; a repo that wants
+  it enforced would need to fail its build on that warning (or a future
+  `--disallow-real-coverage-gap`-style gate) explicitly.
+
+All of these lines are also carried in `--format json` under the
+top-level `test_coverage` key (the same `result.metrics` block:
+`coverage_overall`, `coverage_patch`, `coverage_thresholds`,
+`coverage_real`, `assertion_density`).
 
 **Source track** (each level is one check; SLSA's own leveling is
 cumulative, same rule as the Build track below):
@@ -969,12 +1032,17 @@ python3 -m cli.main \
   --pr-number 42 --pr-approvers alice,bob --pr-required-approvals 2 --pr-review-state approved \
   --sarif path/to/semgrep.sarif.json --sarif path/to/sonarqube.sarif.json \
   --sonar-metrics path/to/sonar-measures.json \
+  --coverage-contexts build/coverage-contexts.json \
   --skip-perf-budget-check --debug \
   --emit-slsa-provenance --slsa-provenance-out /tmp/attestation.slsa-provenance.unsigned.json \
   --out /tmp/attestation.unsigned.json
 # `tenax-assay run --sarif ... --sonar-metrics ...` is an equivalent, explicit
 # spelling of the same pipeline invocation above. Omit --emit-slsa-provenance/
 # --slsa-provenance-out to skip the second, SLSA-shaped statement entirely.
+# --coverage-contexts is generated by:
+#   pytest --cov=cli --cov-context=test --cov-report=xml:build/coverage.xml tests/
+#   coverage json --show-contexts -o build/coverage-contexts.json
+# Omit it to skip the vanity-test-aware "real" coverage analysis entirely.
 
 # Admission gate against the unsigned statement's DSSE-shaped output
 # (only meaningful once --sign/--dry-run-sign has produced a real envelope):

@@ -134,12 +134,22 @@ jobs:
       - name: Execute Tests with Telemetry
         run: |
           mkdir -p build
+          # --cov-context=test tags every covered line with which test(s)
+          # executed it (coverage.py's "dynamic contexts"), needed for
+          # cli.real_coverage's vanity-test-aware coverage cross-reference
+          # below -- survives pytest-xdist's automatic per-worker
+          # .coverage combine, confirmed empirically. --cov-report=xml
+          # (Cobertura, no context info) still feeds cli.main's own
+          # --coverage-report as before; the context data lives in the
+          # exported JSON produced by the next step instead.
           uv run --no-sync pytest \
             -n auto \
             --junitxml=build/junit.xml \
             --cov=cli \
+            --cov-context=test \
             --cov-report=xml:build/coverage.xml \
             tests/
+          uv run --no-sync coverage json --show-contexts -o build/coverage-contexts.json
 
       # `output` is a directory, not a file: the CodeQL CLI names the SARIF
       # file after the analyzed language itself, so a single `languages:
@@ -302,6 +312,16 @@ jobs:
           fi
           if [ -f build/sonar-measures.json ]; then
             EXTRA_ARGS+=(--sonar-metrics build/sonar-measures.json)
+          fi
+          # Same existence-guarded pattern: the "Execute Tests with
+          # Telemetry" step above always produces this file, but degrading
+          # to "real coverage analysis unavailable" (cli.main treats a
+          # missing --coverage-contexts as simply not configured) rather
+          # than failing the mint step if that ever stops being true.
+          if [ -f build/coverage-contexts.json ]; then
+            EXTRA_ARGS+=(--coverage-contexts build/coverage-contexts.json)
+          else
+            echo "WARNING: build/coverage-contexts.json not found; skipping real-coverage analysis" >&2
           fi
 
           echo "Running with EXTRA_ARGS: ${EXTRA_ARGS[*]}"

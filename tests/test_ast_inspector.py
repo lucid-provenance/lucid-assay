@@ -56,6 +56,56 @@ class ASTInspectorTests(unittest.TestCase):
         self.assertEqual(metrics.total_assertions, 3)
         self.assertEqual(metrics.tautological_assertions, 0)
 
+    def test_class_name_captured_for_unittest_testcase_method(self):
+        metrics = self._inspect("test_class_name.py", """
+            import unittest
+
+            class MyTests(unittest.TestCase):
+                def test_things(self):
+                    self.assertEqual(1, 1 + 0)
+        """)
+        fn = metrics.files[0].test_functions[0]
+        self.assertEqual(fn.class_name, "MyTests")
+
+    def test_class_name_none_for_module_level_function(self):
+        metrics = self._inspect("test_no_class.py", """
+            def test_bare():
+                assert 1 + 1 == 2
+        """)
+        fn = metrics.files[0].test_functions[0]
+        self.assertIsNone(fn.class_name)
+
+    def test_class_name_distinguishes_same_method_name_in_two_classes(self):
+        # Regression guard for the exact ambiguity class_name exists to
+        # resolve: two different TestCase classes each defining a
+        # same-named method must not be conflated.
+        metrics = self._inspect("test_two_classes.py", """
+            import unittest
+
+            class FirstTests(unittest.TestCase):
+                def test_it(self):
+                    assert 1 + 1 == 2
+
+            class SecondTests(unittest.TestCase):
+                def test_it(self):
+                    assert True
+        """)
+        by_class = {fn.class_name: fn for fn in metrics.files[0].test_functions}
+        self.assertEqual(by_class["FirstTests"].assertion_count, 1)
+        self.assertEqual(by_class["SecondTests"].tautological_count, 1)
+
+    def test_class_name_joins_nested_classes_with_double_colon(self):
+        metrics = self._inspect("test_nested_class.py", """
+            import unittest
+
+            class Outer:
+                class Inner(unittest.TestCase):
+                    def test_nested(self):
+                        assert 1 + 1 == 2
+        """)
+        fn = metrics.files[0].test_functions[0]
+        self.assertEqual(fn.class_name, "Outer::Inner")
+
     def test_pytest_raises_and_warns_are_counted(self):
         metrics = self._inspect("test_pytest_style.py", """
             import pytest

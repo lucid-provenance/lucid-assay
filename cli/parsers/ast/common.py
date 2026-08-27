@@ -58,6 +58,16 @@ class TestFunctionMetrics:
     tautological_count: int = 0
     is_empty_body: bool = False
     is_skipped: bool = False
+    # The innermost enclosing class name (e.g. a unittest.TestCase
+    # subclass), when this test function is a method rather than a
+    # module-level function. None for a bare `def test_x():` and for
+    # every non-Python language (only the Python visitor currently
+    # populates this). Needed to reconstruct the exact pytest node id
+    # ("path::Class::method" vs "path::function") that
+    # cli.real_coverage cross-references against coverage.py's per-test
+    # line-coverage contexts -- a bare method name alone can collide
+    # across two different classes in the same file.
+    class_name: Optional[str] = None
 
 
 @dataclass

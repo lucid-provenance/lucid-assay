@@ -394,5 +394,96 @@ class BuilderStatementTests(unittest.TestCase):
         self.assertTrue(commit_author_block["verified_github_account"])
 
 
+class PipelineBlockTests(unittest.TestCase):
+    """predicate.pipeline (schema-required: run_id/workflow_ref/ci_provider/
+    run_attempt/started_at/finished_at all non-empty) used to hardcode
+    literal "PLACEHOLDER_RUN_ID"/"PLACEHOLDER_WORKFLOW_REF" strings
+    unconditionally, on every run -- including real, signed, production
+    attestations. Now sourced from the same ambient GitHub Actions env vars
+    cli/slsa_provenance.py already reads correctly for the separate SLSA
+    statement (see _ambient_run_id/_ambient_run_attempt/
+    _ambient_workflow_ref/_ambient_runner_environment's own docstrings)."""
+
+    _ENV_KEYS = ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_WORKFLOW_REF", "RUNNER_ENVIRONMENT")
+
+    def setUp(self):
+        # This suite runs inside real GitHub Actions jobs too, where these
+        # would genuinely be set ambiently -- clear them for test isolation
+        # (see tests/conftest.py's GITHUB_STEP_SUMMARY fixture for the same
+        # concern applied elsewhere) and restore whatever was really there
+        # afterward.
+        self._env_backup = {k: os.environ.get(k) for k in self._ENV_KEYS}
+        for k in self._ENV_KEYS:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._env_backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_off_ci_uses_explicit_sentinel_not_a_fake_looking_placeholder(self):
+        statement = build_statement(**_base_kwargs())
+        pipeline = statement["predicate"]["pipeline"]
+
+        self.assertEqual(pipeline["run_id"], "not-run-in-ci")
+        self.assertEqual(pipeline["workflow_ref"], "not-run-in-ci")
+        self.assertEqual(pipeline["run_attempt"], 1)
+        self.assertEqual(pipeline["runner_environment"], "unknown")
+        self.assertNotIn("PLACEHOLDER", pipeline["run_id"])
+        self.assertNotIn("PLACEHOLDER", pipeline["workflow_ref"])
+
+    def test_ambient_github_actions_context_is_used_when_present(self):
+        os.environ["GITHUB_RUN_ID"] = "123456789"
+        os.environ["GITHUB_RUN_ATTEMPT"] = "2"
+        os.environ["GITHUB_WORKFLOW_REF"] = "tenax-io/tenax-assay/.github/workflows/assay.yml@refs/heads/main"
+        os.environ["RUNNER_ENVIRONMENT"] = "github-hosted"
+
+        statement = build_statement(**_base_kwargs())
+        pipeline = statement["predicate"]["pipeline"]
+
+        self.assertEqual(pipeline["run_id"], "123456789")
+        self.assertEqual(pipeline["run_attempt"], 2)
+        self.assertEqual(
+            pipeline["workflow_ref"], "tenax-io/tenax-assay/.github/workflows/assay.yml@refs/heads/main"
+        )
+        self.assertEqual(pipeline["runner_environment"], "github-hosted")
+
+    def test_run_attempt_defaults_to_one_when_env_var_genuinely_unset(self):
+        os.environ["GITHUB_RUN_ID"] = "123456789"
+        # GITHUB_RUN_ATTEMPT deliberately left unset -- genuinely absent on
+        # a workflow's first attempt, not a guess (matches
+        # slsa_provenance.py's own documented convention for this).
+        statement = build_statement(**_base_kwargs())
+        self.assertEqual(statement["predicate"]["pipeline"]["run_attempt"], 1)
+
+    def test_run_attempt_falls_back_to_one_on_unparseable_value(self):
+        os.environ["GITHUB_RUN_ATTEMPT"] = "not-a-number"
+        statement = build_statement(**_base_kwargs())  # must not raise
+        self.assertEqual(statement["predicate"]["pipeline"]["run_attempt"], 1)
+
+    def test_pipeline_block_validates_against_schema_off_ci(self):
+        statement = build_statement(**_base_kwargs())
+
+        with open(_SCHEMA_PATH, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        errors = list(Draft202012Validator(schema).iter_errors(statement["predicate"]))
+        self.assertEqual(errors, [], msg=[e.message for e in errors])
+
+    def test_pipeline_block_validates_against_schema_on_ci(self):
+        os.environ["GITHUB_RUN_ID"] = "123456789"
+        os.environ["GITHUB_RUN_ATTEMPT"] = "1"
+        os.environ["GITHUB_WORKFLOW_REF"] = "tenax-io/tenax-assay/.github/workflows/assay.yml@refs/heads/main"
+        os.environ["RUNNER_ENVIRONMENT"] = "github-hosted"
+
+        statement = build_statement(**_base_kwargs())
+
+        with open(_SCHEMA_PATH, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        errors = list(Draft202012Validator(schema).iter_errors(statement["predicate"]))
+        self.assertEqual(errors, [], msg=[e.message for e in errors])
+
+
 if __name__ == "__main__":
     unittest.main()

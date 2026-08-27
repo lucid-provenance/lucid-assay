@@ -25,6 +25,14 @@ Hardened against:
     verification: when no identity assertion is provided at all, the
     UnsafeNoOp fallback is called out explicitly in identity_detail
     rather than being indistinguishable from a real identity check
+  - Pathologically deep JSON nesting in the envelope file (well under
+    MAX_ENVELOPE_SIZE by byte count -- 1,000 levels of `{"a":...}` is only
+    a few KB, so the size guard alone doesn't catch this): `json.load`/
+    `json.loads` are recursive descent, so a hostile envelope crafted to
+    exceed `sys.getrecursionlimit()` raises `RecursionError`, not
+    `json.JSONDecodeError` -- caught alongside it wherever the envelope or
+    its decoded payload is parsed, same clean file-error exit code as any
+    other malformed envelope, never an unhandled crash
 """
 from __future__ import annotations
 
@@ -2430,7 +2438,7 @@ def _load_envelope_for_cli(path: str) -> Tuple[Optional[Any], Optional[int]]:
     except UnsafePathError as e:
         print(f"ERROR: unsafe envelope file path: {e}", file=sys.stderr)
         return None, EXIT_FILE_ERROR
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, json.JSONDecodeError, RecursionError) as e:
         print(f"ERROR: failed to read/parse envelope file {path}: {e}", file=sys.stderr)
         return None, EXIT_FILE_ERROR
 

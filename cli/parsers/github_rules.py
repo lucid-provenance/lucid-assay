@@ -30,7 +30,12 @@ Hardened against:
   - Unbounded/adversarial pagination (bounded to MAX_PAGES, following
     only same-origin HTTPS `Link: rel="next"` targets)
   - Transport/timeout/malformed-JSON failures on either endpoint (degrades
-    to available=False with the failure captured in `reason`)
+    to available=False with the failure captured in `reason`), including
+    pathologically deep JSON nesting in a response body: `json.loads` is
+    recursive descent, so a malicious/compromised endpoint response
+    crafted to exceed `sys.getrecursionlimit()` raises `RecursionError`,
+    not `json.JSONDecodeError` -- caught alongside it wherever a response
+    body is parsed, same fail-closed outcome as any other malformed body
   - Bypass actors with an unrecognized/unknown `bypass_mode`: only the
     explicitly-known least-dangerous mode (bypass_mode="pull_request") is
     treated as not fully bypassing the branch's rules; anything else
@@ -161,7 +166,7 @@ def _extract_http_error_detail(e: "urllib.error.HTTPError") -> str:
         msg = body.get("message") if isinstance(body, dict) else None
         if isinstance(msg, str) and msg.strip():
             return msg.strip()
-    except (OSError, ValueError, UnicodeDecodeError, AttributeError):
+    except (OSError, ValueError, UnicodeDecodeError, AttributeError, RecursionError):
         pass
     return e.reason
 
@@ -294,7 +299,7 @@ def _fetch_page(url: str, headers: Dict[str, str], timeout: int, error_path: str
         raise GitHubAPIError(f"GET {error_path} -> HTTP {e.code}: {detail}", status_code=e.code) from e
     except urllib.error.URLError as e:
         raise GitHubAPIError(f"GET {error_path} failed: {e.reason}") from e
-    except (json.JSONDecodeError, ValueError, OSError) as e:
+    except (json.JSONDecodeError, ValueError, OSError, RecursionError) as e:
         raise GitHubAPIError(f"GET {error_path} failed: {e}") from e
     return body, link_header
 

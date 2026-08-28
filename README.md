@@ -28,6 +28,7 @@ cli/
   parsers/github_rules.py   # GitHub branch protection/ruleset inspection via REST API
   parsers/commit_author.py  # GitHub commit-author identity (verified account) via REST API
   parsers/lockfiles.py      # uv.lock/package-lock.json/go.sum/Gradle/Maven -> resolved_dependencies
+  parsers/s2c2f.py          # S2C2F control evaluation (subset with a real, checkable signal) -> predicate.s2c2f
   patch_coverage.py         # git diff base...head, intersected with coverage hit maps
   real_coverage.py           # vanity-test-aware coverage: which covered lines are only exercised by vanity tests
   hashing.py                 # SHA-256 content hashing + WORM key derivation
@@ -458,6 +459,38 @@ equivalent wired up for the other three languages' test runners
 vanity test simply never shows up in a coverage context — harmless, not a
 false negative this analysis claims to catch.
 
+## S2C2F control evaluation (`predicate.s2c2f`)
+
+`parsers/s2c2f.py` evaluates a subset of Microsoft's S2C2F (Secure Supply
+Chain Consumption Framework) control catalog against data this pipeline
+either already collected (`resolved_dependencies`, `static_analysis`,
+`branch_governance`) or can cheaply check for itself (a couple of GitHub
+API calls, a local config-file scan) — never the full published taxonomy.
+Every control this module doesn't implement is simply absent from
+`predicate.s2c2f.controls[]`; it is never guessed at as met or unmet. Each
+control that *is* evaluated reports one of three states:
+
+- `met` / `unmet` — the check ran and got a definitive answer.
+- `not_yet_reported` — the check couldn't run (no token, a rate limit or
+  auth failure, an invalid repository identifier) *or* no generic,
+  repo-observable signal exists for that control at all (e.g. UPD-1
+  "Manual Updates" describes a documented process, not an artifact).
+  Never conflated with `unmet`: a check that didn't run must never look
+  like one that ran and failed.
+
+Currently evaluated: `ING-1`/`ING-2` (lockfile presence / private package
+proxy config), `SCA-1`/`SCA-2` (SARIF tool-name matching against known
+SCA/license-scanning tools, or GitHub's vulnerability-alerts API), `INV-1`
+(resolved-dependency inventory), `UPD-1` (always `not_yet_reported` — see
+above), `SCA-3` (GitHub Dependabot alerts API reachability), `INV-2`
+(`SECURITY.md` via the GitHub community-profile API), `UPD-3`
+(a Dependabot/Renovate config file), `AUD-2`/`AUD-3` (resolved-dependency
+inventory / pkg: PURL + sha256/sha512 digest — the same hermeticity check
+`cli/verify.py`'s SLSA Build Level 3 checklist uses), `ENF-1` (branch
+requires a PR and blocks direct pushes), and `AUD-1` (a required status
+check on the branch names a provenance/attestation verification job —
+see `github_rules.BranchGovernanceReport.required_status_check_contexts`).
+
 ## Signing flow (keyless / Sigstore)
 
 `oidc_signer.py` implements the ambient-credential keyless model end to
@@ -482,6 +515,33 @@ delegate to internally:
    Rekor for an inclusion proof.
 4. Discard the ephemeral private key — no long-lived signing key exists
    to rotate or leak.
+
+The resulting envelope's `_rekor` block (`DSSEEnvelope.to_dict()`) carries
+`logIndex`/`logId` plus a `logUrl` — a direct `search.sigstore.dev` link
+to the public transparency-log entry, derived from `logIndex` alone (no
+separate per-entry UUID lookup needed). `null` on `--dry-run-sign` (no
+real Rekor entry was minted) — never a fabricated link. The full,
+untouched Sigstore bundle (`_sigstore_bundle`) is also preserved verbatim
+alongside it.
+
+**Automatic verdict annotation.** Whenever `--sign`/`--dry-run-sign` (or
+`tenax-assay run --sign`) produces a signed envelope, `cli/main.py`
+immediately runs `cli.verify.verify_dsse_attestation()` against it —
+using `--min-rcs`, the same threshold this pipeline already gates its own
+exit code on — and writes the resulting verdict into the envelope's
+`_verdict` field, the equivalent of a separate `tenax-assay verify
+--write-verdict` call (see "Verification (admission gate)" below for the
+field's exact shape and why it's an unsigned, re-derivable sibling field
+rather than baked into the signed predicate). This means a downstream CI
+pipeline no longer needs its own explicit verify step just to get a
+verdict onto the artifact before uploading it to the ingestion API — one
+still exists for callers that need `--cert-identity`/`--expected-*`/
+`--disallow-degraded` actually *enforced*, since `tenax-assay run --sign`
+never collects those flags itself. A GATED/FAILED verdict here is a
+normal outcome, not an error, and never changes this run's own exit code
+(still decided solely by step 10's `--min-rcs` check); only a genuine
+failure to load or re-write the envelope file degrades to a `WARNING` on
+stderr, since signing itself already succeeded by the time this runs.
 
 The library call is used deliberately over the `sigstore sign` CLI
 subcommand: `sigstore sign` always produces a hashedrekord/messageSignature
@@ -627,6 +687,44 @@ output carries the same underlying data reshaped into `static_analysis.tools`
   `--json` (no `-f`) is kept as a **deprecated alias** for `--format json`
   — it emits the same payload and prints a one-line deprecation notice to
   stderr (never stdout, so it can't corrupt a `--json` consumer's parsing).
+
+**`--write-verdict`** persists this call's computed FAILED/GATED/PASSED
+verdict onto the envelope itself, as an unsigned `_verdict` sibling field
+(`_build_verdict_envelope_block`) — the same trust tier as the envelope's
+existing `_rekor`/`_sigstore_bundle` fields (`cli/oidc_signer.py`), never
+part of the signed DSSE payload:
+
+```json
+"_verdict": {
+  "word": "GATED",
+  "banner": "FINAL VERDICT: GATED (Source L3 / Build L3) — SLSA Source L4 Incomplete",
+  "passed": true,
+  "rcs_value": 86,
+  "degraded": true,
+  "source_level": 3,
+  "build_level": 3,
+  "gate_params": {"min_rcs": 65, "disallow_degraded": false, "...": "..."},
+  "computed_at": "2026-08-28T16:53:56Z"
+}
+```
+
+Deliberately **not** baked into the signed predicate at build time: a
+verdict is a function of *this call's* gate parameters (`--min-rcs`,
+`--disallow-degraded`, `--cert-identity`, ...), not an intrinsic fact
+about the artifact the way the RCS score or SLSA checklist inputs are —
+freezing one call's policy into the predicate would make it look
+permanent when a different `--min-rcs` next month would legitimately
+produce a different verdict for the same artifact. Written to
+`--verdict-out` when given, or **in place over the input envelope**
+otherwise — the common flow is `tenax-assay verify env.dsse.json
+--write-verdict` immediately before uploading that same file to the
+ingestion API, so the record it stores already carries the verdict that
+produced it. Any existing `_verdict` on the envelope is overwritten, never
+merged, since each run reflects only its own fresh gate parameters. A
+consumer must treat `_verdict` exactly like the Rekor log coordinates next
+to it: informational and re-derivable, never a substitute for re-running
+`tenax-assay verify` with trusted gate parameters when the stakes actually
+require a fresh check.
 
 Policy gates:
 - `--min-rcs N` — fail if `release_confidence_score.value < N`.

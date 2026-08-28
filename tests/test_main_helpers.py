@@ -17,16 +17,20 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 
+from pathlib import Path
+
 from cli.main import (
     _detect_lockfile_dependencies,
     _emit_run_warnings,
     _ingest_sarif,
+    _maybe_annotate_verdict,
     _maybe_emit_slsa_provenance,
     _maybe_sign,
     _merge_sonar_metrics,
     derive_slsa_provenance_path,
 )
 from cli.parsers.github_rules import BranchGovernanceReport
+from cli.parsers.junit import TestTotals
 from cli.parsers.sarif import SarifSummaryReport, SarifToolSummary
 from cli.scorer import RCSResult
 
@@ -232,27 +236,133 @@ class MaybeSignTests(unittest.TestCase):
         from cli.main import derive_signed_path
 
         out_path = _write(self._tmp(), "out.json", "{}")
-        sign_total_ns, sign_sub_ns = _maybe_sign(self._args(), out_path)
+        sign_total_ns, sign_sub_ns, signed_path = _maybe_sign(self._args(), out_path)
         self.assertIsNone(sign_total_ns)
         self.assertEqual(sign_sub_ns, {})
+        self.assertIsNone(signed_path)
         self.assertFalse(os.path.exists(derive_signed_path(out_path)))
 
     def test_dry_run_sign_writes_signed_envelope(self):
         out_path = _write(self._tmp(), "out.json", json.dumps({"hello": "world"}))
         buf = io.StringIO()
         with redirect_stderr(buf):
-            sign_total_ns, sign_sub_ns = _maybe_sign(self._args(dry_run_sign=True), out_path)
+            sign_total_ns, sign_sub_ns, signed_path = _maybe_sign(self._args(dry_run_sign=True), out_path)
         self.assertIsInstance(sign_total_ns, int)
         self.assertEqual(sign_sub_ns, {"oidc_token_fetch_ns": 0, "fulcio_rekor_ns": 0})
         self.assertIn("signed envelope written to", buf.getvalue())
 
         from cli.main import derive_signed_path
 
-        signed_path = derive_signed_path(out_path)
+        self.assertEqual(str(signed_path), str(derive_signed_path(out_path)))
         self.assertTrue(os.path.exists(signed_path))
         with open(signed_path, "r", encoding="utf-8") as f:
             envelope = json.load(f)
         self.assertEqual(envelope["signatures"][0]["sig"], "DRY_RUN_UNSIGNED")
+
+
+class MaybeAnnotateVerdictTests(unittest.TestCase):
+    """Direct unit tests for _maybe_annotate_verdict, built off a real
+    signed envelope (cli.builder.build_statement + cli.oidc_signer.
+    sign_statement, dry-run) rather than driving cli.main.main() end to
+    end -- same rationale as MaybeSignTests/this module's own docstring:
+    no GitHub API mocking or git repo needed to exercise this helper
+    directly. See tests/test_main_verdict_integration.py for the one true
+    full-CLI-drive integration test this feature also gets."""
+
+    def _tmp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        return d
+
+    def _args(self, **overrides):
+        base = dict(min_rcs=0, dry_run_sign=True)
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def _signed_envelope_path(self, tmp_dir: str, rcs_value: int) -> str:
+        from cli.builder import build_statement
+        from cli.oidc_signer import sign_statement
+        from cli.parsers.coverage import CoverageReport
+        from cli.patch_coverage import PatchCoverageResult
+        from cli.scorer import RCSResult
+
+        bg = BranchGovernanceReport(
+            available=True, branch="main", pull_request_required=True, approvals_required=1,
+            direct_push_prevented=True, bypass_actors_count=0, admin_enforced=True,
+            warnings=[], reason="ok",
+        )
+        statement = build_statement(
+            subject_name="ghcr.io/x/y", subject_sha256="b" * 64, vcs_provider="github",
+            repository="acme/widgets", branch="main", commit_sha="c" * 40, base_commit_sha=None,
+            pr_number=None, pr_target_branch=None, pr_approvers=[], pr_required_approvals=0,
+            pr_review_state="not_applicable", branch_governance=bg, test_framework="junit",
+            test_report_sha256="d" * 64, test_report_uri="worm://x",
+            test_totals=TestTotals(tests=1, passed=1, failed=0, errored=0, skipped=0),
+            coverage_format="cobertura-xml", coverage_report_sha256="e" * 64, coverage_report_uri="worm://y",
+            coverage=CoverageReport(overall_line_rate=0.9, overall_branch_rate=0.8),
+            patch_coverage=PatchCoverageResult(
+                available=True, line_rate=0.9, lines_changed=10, lines_covered=9, reason="ok"
+            ),
+            patch_coverage_min=0.8, overall_coverage_min=0.6, total_assertions=5, total_test_functions=1,
+            empty_test_bodies=0, assertion_only_true=0,
+            rcs=RCSResult(
+                value=rcs_value, algorithm_version="rcs-v0.1", components={}, degraded=False, degraded_reasons=[]
+            ),
+        )
+        envelope = sign_statement(json.dumps(statement).encode("utf-8"), dry_run=True).to_dict()
+        path = os.path.join(tmp_dir, "attestation.dsse.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(envelope, f)
+        return path
+
+    def test_noop_when_signing_was_skipped(self):
+        stage_ns: dict = {}
+
+        word = _maybe_annotate_verdict(self._args(), None, stage_ns)
+
+        self.assertIsNone(word)
+        self.assertNotIn("verdict_annotation", stage_ns)
+
+    def test_writes_verdict_block_onto_signed_envelope(self):
+        path = self._signed_envelope_path(self._tmp(), rcs_value=90)
+        stage_ns: dict = {}
+
+        word = _maybe_annotate_verdict(self._args(min_rcs=0), Path(path), stage_ns)
+
+        self.assertIsNotNone(word)
+        with open(path, "r", encoding="utf-8") as f:
+            written = json.load(f)
+        self.assertIn("_verdict", written)
+        self.assertEqual(written["_verdict"]["word"], word)
+        self.assertEqual(written["_verdict"]["rcs_value"], 90)
+        self.assertIn("verdict_annotation", stage_ns)
+        # payload/signatures must survive completely untouched -- only an
+        # unsigned sibling field is ever added.
+        self.assertIn("payload", written)
+        self.assertIn("signatures", written)
+
+    def test_gate_violation_is_still_written_not_treated_as_an_error(self):
+        """A GATED/FAILED verdict is a normal, correctly-computed outcome
+        here -- not an error -- so it's still written, and the function
+        still returns the word rather than None (None is reserved for
+        "annotation itself couldn't happen")."""
+        path = self._signed_envelope_path(self._tmp(), rcs_value=10)
+
+        word = _maybe_annotate_verdict(self._args(min_rcs=80), Path(path), {})
+
+        self.assertEqual(word, "FAILED")
+        with open(path, "r", encoding="utf-8") as f:
+            written = json.load(f)
+        self.assertEqual(written["_verdict"]["word"], "FAILED")
+
+    def test_missing_envelope_file_warns_and_returns_none_without_raising(self):
+        buf = io.StringIO()
+
+        with redirect_stderr(buf):
+            word = _maybe_annotate_verdict(self._args(), Path("/nonexistent/env.dsse.json"), {})
+
+        self.assertIsNone(word)
+        self.assertIn("WARNING", buf.getvalue())
 
 
 class EmitRunWarningsTests(unittest.TestCase):

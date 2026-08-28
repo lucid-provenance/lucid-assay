@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .common import safe_resolve_path
 
@@ -68,6 +68,13 @@ class DSSEEnvelope:
     signatures: List[Dict[str, str]]  # [{"sig": <b64>, "certificate": <pem>}]
     rekor_log_index: Optional[int] = None
     rekor_log_id: Optional[str] = None
+    # Public, human-followable link to this entry on the production Rekor
+    # transparency log's search UI -- derived from rekor_log_index alone
+    # (Sigstore's public search endpoint resolves a log index directly, no
+    # separate per-entry UUID is needed). None whenever rekor_log_index is
+    # None (dry-run signing, or a signing failure that produced no tlog
+    # entry) -- never a fabricated link to an entry that doesn't exist.
+    rekor_log_url: Optional[str] = None
     # The complete, untouched Sigstore bundle (`Bundle.to_json()` output of
     # the DSSE-signed result) as parsed JSON, when one was actually minted.
     # Preserved verbatim -- including tlogEntries' kindVersion/inclusionProof/
@@ -85,6 +92,7 @@ class DSSEEnvelope:
             "_rekor": {
                 "logIndex": self.rekor_log_index,
                 "logId": self.rekor_log_id,
+                "logUrl": self.rekor_log_url,
             },
             "_sigstore_bundle": self.sigstore_bundle,
         }
@@ -152,6 +160,54 @@ def fetch_ambient_oidc_token(audience: str = "sigstore") -> str:
         "`permissions: id-token: write` is set. On GitLab CI configure "
         "`id_tokens:` with audience 'sigstore'."
     )
+
+
+def _extract_sig_and_cert(bundle_data: Dict[str, Any]) -> Tuple[str, str]:
+    """Extracts (signature_b64, certificate_pem) from a Sigstore bundle --
+    supports both the messageSignature and dsseEnvelope bundle shapes, and
+    both the certificate/x509CertificateChain verificationMaterial shapes
+    (Protobuf JSON spec vs. legacy). Split out of sign_statement() purely
+    to keep that function's cognitive complexity within budget (same
+    rationale as cli.verify's _format_vcs_lines/_format_pipeline_lines
+    split out of _format_run_identity_report)."""
+    sig_b64 = ""
+    if "messageSignature" in bundle_data:
+        sig_b64 = bundle_data["messageSignature"].get("signature", "")
+    elif "dsseEnvelope" in bundle_data:
+        sigs = bundle_data["dsseEnvelope"].get("signatures", [])
+        if sigs:
+            sig_b64 = sigs[0].get("sig", "")
+
+    verification_material = bundle_data.get("verificationMaterial", {})
+    raw_cert = None
+    if "certificate" in verification_material:
+        raw_cert = verification_material["certificate"].get("rawBytes", "")
+    elif "x509CertificateChain" in verification_material:
+        certs = verification_material["x509CertificateChain"].get("certificates", [])
+        if certs:
+            raw_cert = certs[0].get("rawBytes", "")
+
+    cert_pem = f"-----BEGIN CERTIFICATE-----\n{raw_cert}\n-----END CERTIFICATE-----" if raw_cert else ""
+    return sig_b64, cert_pem
+
+
+def _extract_rekor_metadata(bundle_data: Dict[str, Any]) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """Extracts (log_index, log_id, log_url) from a Sigstore bundle's
+    verificationMaterial.tlogEntries -- log_url is a direct
+    search.sigstore.dev link, constructible from log_index alone (see
+    sign_statement's own comment for why no separate per-entry UUID
+    lookup is needed). All three None when no tlog entry was minted.
+    Split out of sign_statement() for the same complexity-budget reason
+    as _extract_sig_and_cert above."""
+    verification_material = bundle_data.get("verificationMaterial", {})
+    tlog_entries = verification_material.get("tlogEntries", [])
+    log_index = None
+    log_id = None
+    if tlog_entries:
+        log_index = tlog_entries[0].get("logIndex")
+        log_id = tlog_entries[0].get("logId", {}).get("keyId")
+    log_url = f"https://search.sigstore.dev/?logIndex={log_index}" if log_index is not None else None
+    return log_index, log_id, log_url
 
 
 def sign_statement(
@@ -231,36 +287,12 @@ def sign_statement(
 
     bundle_data = json.loads(bundle.to_json())
 
-    # Extract signature and certificate from the standard Sigstore bundle format
-    # Supports both Protobuf JSON spec and legacy bundle schemas
-    sig_b64 = ""
-    cert_pem = ""
-    log_index = None
-    log_id = None
-
-    if "messageSignature" in bundle_data:
-        sig_b64 = bundle_data["messageSignature"].get("signature", "")
-    elif "dsseEnvelope" in bundle_data:
-        sigs = bundle_data["dsseEnvelope"].get("signatures", [])
-        if sigs:
-            sig_b64 = sigs[0].get("sig", "")
-
-    # Extract signing certificate (PEM or DER/Base64)
-    verification_material = bundle_data.get("verificationMaterial", {})
-    if "certificate" in verification_material:
-        raw_cert = verification_material["certificate"].get("rawBytes", "")
-        cert_pem = f"-----BEGIN CERTIFICATE-----\n{raw_cert}\n-----END CERTIFICATE-----"
-    elif "x509CertificateChain" in verification_material:
-        certs = verification_material["x509CertificateChain"].get("certificates", [])
-        if certs:
-            raw_cert = certs[0].get("rawBytes", "")
-            cert_pem = f"-----BEGIN CERTIFICATE-----\n{raw_cert}\n-----END CERTIFICATE-----"
-
-    # Extract Rekor transparency log metadata
-    tlog_entries = verification_material.get("tlogEntries", [])
-    if tlog_entries:
-        log_index = tlog_entries[0].get("logIndex")
-        log_id = tlog_entries[0].get("logId", {}).get("keyId")
+    # Extract signature/certificate and Rekor transparency-log metadata
+    # from the standard Sigstore bundle format -- supports both the
+    # Protobuf JSON spec and legacy bundle schemas (see each helper's own
+    # docstring).
+    sig_b64, cert_pem = _extract_sig_and_cert(bundle_data)
+    log_index, log_id, log_url = _extract_rekor_metadata(bundle_data)
 
     return DSSEEnvelope(
         payload_type="application/vnd.in-toto+json",
@@ -271,6 +303,7 @@ def sign_statement(
         }],
         rekor_log_index=log_index,
         rekor_log_id=log_id,
+        rekor_log_url=log_url,
         sigstore_bundle=bundle_data,
     )
 

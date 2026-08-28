@@ -44,6 +44,7 @@ import math
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -209,6 +210,17 @@ class VerificationResult:
     identity_status: str = "skipped"
     identity_detail: str = ""
     static_analysis_tools: List[Dict[str, Any]] = field(default_factory=list)
+    # predicate.s2c2f.controls, verbatim (cli/parsers/s2c2f.py) -- purely
+    # informational, same non-gating contract as static_analysis_tools.
+    # [] when this predicate predates S2C2F evaluation or the run skipped
+    # it, never fabricated as met/unmet.
+    s2c2f_controls: List[Dict[str, Any]] = field(default_factory=list)
+    # The signed envelope's own _rekor.logIndex/logUrl (cli/oidc_signer.py)
+    # -- not part of the signed predicate (see _extract_rekor_info's
+    # docstring for why). Both None on --dry-run-sign or an envelope
+    # predating this field.
+    rekor_log_index: Optional[int] = None
+    rekor_log_url: Optional[str] = None
     schema_validation_status: str = "skipped"
     slsa_level1: Optional[Dict[str, Any]] = None
     slsa_level2: Optional[Dict[str, Any]] = None
@@ -245,6 +257,16 @@ class VerificationResult:
     # nothing else was computed, since result.passed=False there always
     # implies FAILED regardless of source/build level.
     verdict_word: str = ""
+    # The highest SLSA Source/Build level each track cumulatively
+    # satisfies (see _highest_passing_level) -- computed once, alongside
+    # verdict/verdict_word, and stored here so a caller that wants them
+    # (e.g. _build_verdict_envelope_block, for `--write-verdict`) doesn't
+    # have to recompute _cumulative_track_status/_highest_passing_level
+    # from source_level1../slsa_level1.. a second time. 0 on the
+    # malformed-envelope early return, same as an all-failing track would
+    # cumulatively produce.
+    source_highest_level: int = 0
+    build_highest_level: int = 0
     # The exact admission-gate parameters this call was invoked with
     # (min_rcs, disallow_degraded, cert_identity, expected_repository, ...)
     # -- verbatim, not re-derived -- so a report can be read on its own and
@@ -269,6 +291,11 @@ class VerificationResult:
             "identity_status": self.identity_status,
             "identity_detail": self.identity_detail,
             "static_analysis_tools": self.static_analysis_tools,
+            "s2c2f_controls": self.s2c2f_controls,
+            "rekor_log_index": self.rekor_log_index,
+            "rekor_log_url": self.rekor_log_url,
+            "source_highest_level": self.source_highest_level,
+            "build_highest_level": self.build_highest_level,
             "schema_validation_status": self.schema_validation_status,
             "slsa_level1": self.slsa_level1,
             "slsa_level2": self.slsa_level2,
@@ -358,6 +385,42 @@ def _extract_static_analysis_tools(predicate: Dict[str, Any]) -> List[Dict[str, 
         return []
 
     return [t for t in tools if isinstance(t, dict)]
+
+
+def _extract_s2c2f_controls(predicate: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Defensively pulls predicate.s2c2f.controls (cli/parsers/s2c2f.py) out
+    of the predicate for display purposes only (never raises, never gates
+    `passed` -- purely informational, same contract as
+    _extract_static_analysis_tools). [] when the field is absent (an
+    attestation predating S2C2F evaluation, or a run that skipped it) or
+    malformed; individual malformed control entries are skipped rather
+    than discarding the whole list."""
+    s2c2f = predicate.get("s2c2f")
+    if not isinstance(s2c2f, dict):
+        return []
+    controls = s2c2f.get("controls")
+    if not isinstance(controls, list):
+        return []
+    return [c for c in controls if isinstance(c, dict)]
+
+
+def _extract_rekor_info(envelope: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
+    """Pulls (logIndex, logUrl) out of the DSSE envelope's own `_rekor`
+    block (cli/oidc_signer.py's DSSEEnvelope.to_dict() -- a sibling of
+    payload/signatures, not part of the signed predicate itself: Rekor
+    coordinates only exist *after* signing, so they could never be
+    embedded in the statement that got signed). Both None on a
+    --dry-run-sign envelope (no real transparency-log entry was minted),
+    an envelope predating this field, or a malformed `_rekor` block --
+    never fabricated."""
+    rekor = envelope.get("_rekor")
+    if not isinstance(rekor, dict):
+        return None, None
+    log_index = rekor.get("logIndex")
+    log_index = log_index if isinstance(log_index, int) and not isinstance(log_index, bool) else None
+    log_url = rekor.get("logUrl")
+    log_url = log_url if isinstance(log_url, str) and log_url.strip() else None
+    return log_index, log_url
 
 
 def _slsa_item(label: str, passed: bool, detail: str = "") -> Dict[str, Any]:
@@ -1022,6 +1085,72 @@ def _highest_passing_level(levels: List[Dict[str, Any]], cumulative_status: List
     return highest
 
 
+# Fixed-width closing rule shared by every plain-text report section
+# below (S2C2F, CD/Signing, SLSA Source/Build tracks, Run Identity) --
+# one constant rather than each section repeating the literal.
+_SECTION_DIVIDER = "====================================="
+
+_S2C2F_STATUS_MARK = {"met": "✓", "unmet": "✗", "not_yet_reported": "○"}
+
+
+def _format_s2c2f_report(controls: List[Dict[str, Any]]) -> List[str]:
+    """Renders predicate.s2c2f.controls (cli/parsers/s2c2f.py) as a
+    checklist grouped by S2C2F level: [✓]/[✗]/[○] per control (met/unmet/
+    not_yet_reported respectively -- a distinct third symbol, never folded
+    into ✗, since a control that couldn't be evaluated must never look
+    like one that was and failed). Purely informational, like the SARIF
+    static-analysis table below -- no PASSED/FAILED Status line, since
+    S2C2F controls aren't a cumulative leveling the way SLSA's Source/
+    Build tracks are; just a coverage summary. [] (no section at all) when
+    no controls were evaluated (an attestation predating S2C2F, or a run
+    that skipped it) -- matching every other optional section here."""
+    if not controls:
+        return []
+
+    met_count = sum(1 for c in controls if c.get("status") == "met")
+    lines = [f"=== S2C2F Compliance Matrix ({met_count}/{len(controls)} controls met) ==="]
+
+    by_level: Dict[int, List[Dict[str, Any]]] = {}
+    for c in controls:
+        by_level.setdefault(c.get("level") or 0, []).append(c)
+
+    for level in sorted(by_level):
+        lines.append(f"-- Level {level} --")
+        for c in by_level[level]:
+            mark = _S2C2F_STATUS_MARK.get(c.get("status"), "?")
+            line = f"[{mark}] {c.get('id', '?')} {c.get('label', '')}"
+            detail = c.get("detail")
+            if detail:
+                line += f" -- {detail}"
+            lines.append(line)
+    lines.append(_SECTION_DIVIDER)
+    return lines
+
+
+def _format_signing_report(result: "VerificationResult") -> List[str]:
+    """Renders the CD/signing summary: Sigstore identity verification
+    (result.identity_status/identity_detail, already computed by
+    _verify_sigstore_identity) and the Rekor transparency-log entry
+    (result.rekor_log_index/rekor_log_url -- the envelope's own _rekor
+    block, see _extract_rekor_info) as their own section shared by both
+    renderers. Identity status previously only ever reached
+    _print_verify_result_human's separate stderr "identity:" line -- never
+    $GITHUB_STEP_SUMMARY, since that line lived outside
+    _render_track_sections -- exactly the kind of drift that function's
+    own docstring warns about; this folds both back into the one shared
+    report."""
+    lines = ["=== CD / Signing ==="]
+    lines.append(f"Sigstore Identity: {result.identity_status} -- {result.identity_detail}")
+    if result.rekor_log_index is not None:
+        lines.append(f"Rekor Log Entry:   index {result.rekor_log_index}")
+        if result.rekor_log_url:
+            lines.append(f"Rekor Log URL:     {result.rekor_log_url}")
+    else:
+        lines.append("Rekor Log Entry:   none (--dry-run-sign, or this envelope predates Rekor log capture)")
+    lines.append(_SECTION_DIVIDER)
+    return lines
+
+
 def _format_track_report(levels: List[Dict[str, Any]]) -> Tuple[List[str], List[bool]]:
     """Renders an ordered list of cumulative level assessments (SLSA
     Source Levels 1-4, or SLSA Build Levels 1-3) as plain-text lines --
@@ -1035,7 +1164,7 @@ def _format_track_report(levels: List[Dict[str, Any]]) -> Tuple[List[str], List[
         if i > 0:
             lines.append("")
         lines.extend(_format_slsa_level_block(lvl, ok))
-    lines.append("=====================================")
+    lines.append(_SECTION_DIVIDER)
     return lines, cumulative_status
 
 
@@ -1123,7 +1252,7 @@ def _format_run_identity_report(result: "VerificationResult") -> List[str]:
     lines.extend(_format_pipeline_lines(identity["pipeline"]))
     lines.extend(_format_subject_lines(identity["subjects"]))
     lines.extend(_format_gate_params(result.gate_params))
-    lines.append("=====================================")
+    lines.append(_SECTION_DIVIDER)
     return lines
 
 
@@ -1513,6 +1642,8 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
         "verified": result.passed,
         "verdict": result.verdict,
         "verdict_word": result.verdict_word or "FAILED",
+        "source_highest_level": result.source_highest_level,
+        "build_highest_level": result.build_highest_level,
         "envelope": {
             "statement_type": statement.get("_type"),
             "predicate_type": statement.get("predicateType"),
@@ -1538,9 +1669,16 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
         "static_analysis": {
             "tools": _static_analysis_tools_by_name(result.static_analysis_tools),
         },
+        "s2c2f": {
+            "controls": result.s2c2f_controls,
+        },
         "identity": {
             "status": result.identity_status,
             "detail": result.identity_detail,
+        },
+        "signing": {
+            "rekor_log_index": result.rekor_log_index,
+            "rekor_log_url": result.rekor_log_url,
         },
         "violations": result.violations,
         "warnings": result.warnings,
@@ -2274,6 +2412,7 @@ def verify_dsse_attestation(
     subject_digests: List[str] = []
     metrics: Dict[str, Any] = {}
     static_analysis_tools: List[Dict[str, Any]] = []
+    s2c2f_controls: List[Dict[str, Any]] = []
     schema_validation_status = "skipped"
 
     if statement is not None:
@@ -2319,6 +2458,7 @@ def verify_dsse_attestation(
 
         metrics = _extract_metrics(predicate)
         static_analysis_tools = _extract_static_analysis_tools(predicate)
+        s2c2f_controls = _extract_s2c2f_controls(predicate)
 
         gate_violations, gate_warnings = _evaluate_policy_gates(
             rcs_value=rcs_value,
@@ -2332,6 +2472,10 @@ def verify_dsse_attestation(
         )
         violations.extend(gate_violations)
         warnings.extend(gate_warnings)
+
+    # Independent of statement decode success -- _rekor lives on the
+    # envelope itself, not the signed payload (see _extract_rekor_info).
+    rekor_log_index, rekor_log_url = _extract_rekor_info(envelope)
 
     identity_status, identity_detail = _verify_sigstore_identity(
         envelope,
@@ -2389,6 +2533,9 @@ def verify_dsse_attestation(
         identity_status=identity_status,
         identity_detail=identity_detail,
         static_analysis_tools=static_analysis_tools,
+        s2c2f_controls=s2c2f_controls,
+        rekor_log_index=rekor_log_index,
+        rekor_log_url=rekor_log_url,
         schema_validation_status=schema_validation_status,
         slsa_level1=slsa_level1,
         slsa_level2=slsa_level2,
@@ -2405,6 +2552,8 @@ def verify_dsse_attestation(
     build_levels = [slsa_level1, slsa_level2, slsa_level3]
     source_highest = _highest_passing_level(source_levels, _cumulative_track_status(source_levels))
     build_highest = _highest_passing_level(build_levels, _cumulative_track_status(build_levels))
+    result.source_highest_level = source_highest
+    result.build_highest_level = build_highest
     result.verdict_word = _verdict_word(result, source_highest, build_highest)
     result.verdict = _format_verdict_banner(result, source_highest, build_highest)[1]
 
@@ -2493,6 +2642,24 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         dest="json_output",
         help="deprecated: equivalent to --format json (kept for backwards compatibility)",
     )
+    p.add_argument(
+        "--write-verdict",
+        action="store_true",
+        dest="write_verdict",
+        help="persist this call's computed FAILED/GATED/PASSED verdict (plus rcs_value/degraded/SLSA "
+        "highest-level/gate_params -- see _build_verdict_envelope_block) as an unsigned '_verdict' "
+        "sibling field on the envelope -- same trust tier as the envelope's existing '_rekor'/"
+        "'_sigstore_bundle' fields, never part of the signed DSSE payload (a verdict is a function of "
+        "this call's own gate parameters, not an intrinsic fact about the artifact). Written to "
+        "--verdict-out, or in place over the input envelope when --verdict-out isn't given.",
+    )
+    p.add_argument(
+        "--verdict-out",
+        default=None,
+        dest="verdict_out",
+        help="output path for --write-verdict (default: overwrite the input envelope file in place, "
+        "so the same file can be re-uploaded to the ingestion API with its verdict attached)",
+    )
     return p.parse_args(argv)
 
 
@@ -2553,8 +2720,11 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
     etc. this call enforced), Static Analysis (the per-tool SARIF/SonarQube
     breakdown from _format_static_analysis_table, when any tools were
     ingested), SLSA Source Track (Levels 1-4), SLSA Build Track (Levels
-    1-3), Assay Health & Governance Metrics, and the synthesized FINAL
-    VERDICT banner -- as plain-text lines, shared by both the stderr human
+    1-3), the S2C2F Compliance Matrix (_format_s2c2f_report, when any
+    controls were evaluated), CD / Signing (_format_signing_report --
+    Sigstore identity + Rekor log entry), Assay Health & Governance
+    Metrics, and the synthesized FINAL VERDICT banner -- as plain-text
+    lines, shared by both the stderr human
     renderer and the $GITHUB_STEP_SUMMARY markdown writer (the same
     [✓]/[✗] plain-text rows read fine as GFM markdown verbatim, wrapped in
     a fenced code block -- see _render_step_summary_markdown). Static
@@ -2588,6 +2758,14 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
         lines.extend(track_lines)
     else:
         build_cumulative = []
+
+    s2c2f_lines = _format_s2c2f_report(result.s2c2f_controls)
+    if s2c2f_lines:
+        lines.append("")
+        lines.extend(s2c2f_lines)
+
+    lines.append("")
+    lines.extend(_format_signing_report(result))
 
     lines.append("")
     lines.extend(_format_assay_health_report(result))
@@ -2646,6 +2824,62 @@ def _render_step_summary_markdown(result: VerificationResult) -> str:
     if result.violations:
         parts.append("**Violations:**\n" + "\n".join(f"- {v}" for v in result.violations))
     return "\n\n".join(parts) + "\n"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _build_verdict_envelope_block(result: VerificationResult) -> Dict[str, Any]:
+    """Builds the `_verdict` block `--write-verdict` persists onto the
+    envelope (see _write_verdict_into_envelope) -- the FAILED/GATED/PASSED
+    verdict this exact `tenax-assay verify` invocation computed, plus
+    enough of its own inputs (rcs_value, degraded, SLSA highest levels,
+    gate_params) that a reader isn't left trusting a bare word with no way
+    to see what produced it.
+
+    Deliberately NOT part of the signed DSSE payload: a verdict is a
+    function of gate parameters (--min-rcs, --disallow-degraded,
+    --cert-identity, ...) chosen per verify call, not an intrinsic fact
+    about the artifact the way the RCS score or SLSA checklist inputs
+    are -- baking it into the predicate at build time would freeze in one
+    call's policy as if it were permanent. Instead this is an unsigned
+    sibling field on the envelope, exactly the same trust tier as
+    cli.oidc_signer's `_rekor`/`_sigstore_bundle`: informational,
+    re-derivable by re-running `tenax-assay verify` with the same gate
+    parameters, and never a substitute for doing so when the stakes
+    actually require a fresh, trusted check rather than reading a cached
+    one off the envelope."""
+    return {
+        "word": result.verdict_word or "FAILED",
+        "banner": result.verdict,
+        "passed": result.passed,
+        "rcs_value": result.rcs_value,
+        "degraded": result.degraded,
+        "source_level": result.source_highest_level,
+        "build_level": result.build_highest_level,
+        "gate_params": result.gate_params,
+        "computed_at": _now_iso(),
+    }
+
+
+def _write_verdict_into_envelope(envelope: Dict[str, Any], result: VerificationResult, out_path: str) -> Path:
+    """Merges `_build_verdict_envelope_block(result)` into `envelope` as a
+    top-level `_verdict` key and writes the result to `out_path` (resolved
+    via safe_resolve_path(), same convention as every other operator-
+    supplied output path in cli/). Overwrites whatever `_verdict` may
+    already be there -- each `--write-verdict` run reflects this call's
+    own fresh gate parameters, never accumulates stale ones. Returns the
+    resolved output Path. Raises on a write failure (OSError/
+    UnsafePathError) -- unlike $GITHUB_STEP_SUMMARY's best-effort append,
+    this is the one output --write-verdict callers explicitly asked for,
+    so a failure to produce it must be visible, not silently swallowed."""
+    envelope = dict(envelope)
+    envelope["_verdict"] = _build_verdict_envelope_block(result)
+    resolved_out = safe_resolve_path(out_path)
+    with open(resolved_out, "w", encoding="utf-8") as f:
+        json.dump(envelope, f, indent=2)
+    return resolved_out
 
 
 def _write_github_step_summary(result: VerificationResult) -> None:
@@ -2716,6 +2950,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         _print_verify_result_human(result)
     _write_github_step_summary(result)
+
+    if args.write_verdict:
+        verdict_out_path = args.verdict_out or args.envelope
+        try:
+            written_path = _write_verdict_into_envelope(envelope, result, verdict_out_path)
+        except (OSError, UnsafePathError) as e:
+            print(f"ERROR: could not write --write-verdict envelope to {verdict_out_path!r}: {e}", file=sys.stderr)
+            return EXIT_FILE_ERROR
+        print(f"verdict ({result.verdict_word or 'FAILED'}) written to {written_path}", file=sys.stderr)
 
     return EXIT_PASS if result.passed else EXIT_POLICY_VIOLATION
 

@@ -16,10 +16,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .builder import build_statement
-from .common import safe_resolve_path
+from .common import UnsafePathError, safe_resolve_path
 from .hashing import sha256_file, worm_uri
 from .parsers.ast import inspect_test_suite
 from .parsers.commit_author import CommitAuthorReport, inspect_commit_author
@@ -28,6 +29,7 @@ from .parsers.coverage_contexts import parse_coverage_contexts
 from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
 from .parsers.lockfiles import detect_and_parse_dependencies
+from .parsers.s2c2f import S2C2FReport, evaluate_s2c2f
 from .parsers.sarif import (
     SarifSummaryReport,
     aggregate_sarif_reports,
@@ -57,8 +59,10 @@ _STAGE_LABELS = [
     ("github_rules_api", "GitHub Ruleset API"),
     ("rcs_scoring", "RCS Scoring Engine"),
     ("lockfile_dependencies", "Lockfile Dependency Detection"),
+    ("s2c2f_evaluation", "S2C2F Control Evaluation"),
     ("predicate_assembly", "Predicate Serialization"),
     ("worm_upload", "WORM Upload Dispatch"),
+    ("verdict_annotation", "Verdict Annotation"),
 ]
 
 
@@ -291,10 +295,41 @@ def _compute_real_coverage_analysis(
         )
 
 
-def _maybe_sign(args: argparse.Namespace, out_path) -> Tuple[Optional[int], Dict[str, int]]:
+def _evaluate_s2c2f_controls(
+    args: argparse.Namespace,
+    *,
+    resolved_dependencies: List[Dict[str, Any]],
+    sarif_report: Optional[SarifSummaryReport],
+    branch_governance: BranchGovernanceReport,
+    stage_ns: Dict[str, int],
+) -> S2C2FReport:
+    """Step 6d: S2C2F control evaluation (see cli.parsers.s2c2f), fed by
+    data this pipeline already collected (resolved_dependencies, sarif_report,
+    branch_governance) plus a couple of cheap new signals of its own (a
+    GitHub API call, a local config-file check). Never raises -- every
+    network-backed control it evaluates independently degrades to
+    not_yet_reported on a missing token or API failure, same fail-closed
+    contract as branch governance/commit author above. Extracted (same
+    rationale as _ingest_sarif/_detect_lockfile_dependencies/
+    _compute_real_coverage_analysis above) so it's unit-testable directly."""
+    with _stage(stage_ns, "s2c2f_evaluation"):
+        return evaluate_s2c2f(
+            repo_dir=args.repo_dir,
+            repository=args.repository,
+            resolved_dependencies=resolved_dependencies,
+            sarif_report=sarif_report,
+            branch_governance=branch_governance,
+            token=args.github_token,
+        )
+
+
+def _maybe_sign(
+    args: argparse.Namespace, out_path
+) -> Tuple[Optional[int], Dict[str, int], Optional[Path]]:
     """Step 9: keyless Sigstore signing, gated on --sign/--dry-run-sign.
-    Returns (sign_total_ns, sign_sub_ns) for --debug's stage-profile
-    report; sign_total_ns is None when neither flag was passed.
+    Returns (sign_total_ns, sign_sub_ns, signed_path) for --debug's
+    stage-profile report and _maybe_annotate_verdict below; all three are
+    None/{}/None when neither flag was passed.
 
     Thin wrapper around cli.oidc_signer.sign_file_to_envelope (the same
     file-in/file-out entry point `tenax-assay sign` -- cli/sign.py -- uses
@@ -302,7 +337,7 @@ def _maybe_sign(args: argparse.Namespace, out_path) -> Tuple[Optional[int], Dict
     not this pipeline's in-process state); this call site just also times
     it for --debug's stage-profile report."""
     if not (args.sign or args.dry_run_sign):
-        return None, {}
+        return None, {}, None
 
     from .oidc_signer import sign_file_to_envelope
 
@@ -314,7 +349,69 @@ def _maybe_sign(args: argparse.Namespace, out_path) -> Tuple[Optional[int], Dict
     sign_total_ns = time.perf_counter_ns() - t0
     print(f"signed envelope written to {signed_path}", file=sys.stderr)
 
-    return sign_total_ns, sign_sub_ns
+    return sign_total_ns, sign_sub_ns, signed_path
+
+
+def _maybe_annotate_verdict(
+    args: argparse.Namespace, signed_path: Optional[Path], stage_ns: Dict[str, int]
+) -> Optional[str]:
+    """Step 9b: automatically persists this run's computed FAILED/GATED/
+    PASSED verdict onto the just-signed envelope (the equivalent of
+    `tenax-assay verify --write-verdict`, see cli/verify.py's
+    _build_verdict_envelope_block/_write_verdict_into_envelope), so a
+    downstream CI pipeline doesn't need a separate explicit `tenax-assay
+    verify --write-verdict` step before uploading the envelope to the
+    ingestion API. A no-op (returns None) when signing was skipped
+    (signed_path is None -- neither --sign nor --dry-run-sign was passed).
+
+    "Default gate parameters" here means exactly the one threshold this
+    pipeline already gates its own exit code on -- args.min_rcs, the same
+    value step 10 below checks -- not the fuller identity-pinning/
+    --disallow-degraded surface `tenax-assay verify` itself exposes, which
+    `tenax-assay run --sign` never collected flags for. A caller that
+    needs --cert-identity/--expected-*/--disallow-degraded enforced still
+    needs a real downstream `tenax-assay verify` call with those flags;
+    this annotation is best-effort convenience, not a substitute for it
+    (see _build_verdict_envelope_block's own docstring on why `_verdict`
+    is an unsigned, re-derivable sibling field, never a trust boundary).
+
+    Never fails the run and never changes its exit code: a GATED/FAILED
+    verdict is a completely normal, correctly-computed outcome, not an
+    error here -- it's still written to the envelope and reported to
+    stderr exactly like a PASSED one would be (step 10 below remains the
+    sole authority for *this run's own* pass/fail exit code, computed
+    independently of this annotation). Loading or re-writing the envelope
+    failing (a broken/oversized/unreadable file) degrades to a WARNING on
+    stderr rather than crashing `tenax-assay run` outright -- same
+    fail-open contract as WORM upload dispatch elsewhere in this
+    pipeline: signing itself already succeeded by the time this runs, and
+    this annotation step failing must never look like *that* failed.
+    Returns the computed verdict word (for --debug/tests), or None when
+    annotation didn't happen at all (skipped, or failed to load/write)."""
+    if signed_path is None:
+        return None
+
+    from .verify import EnvelopeTooLargeError, load_envelope, verify_dsse_attestation
+    from .verify import _write_verdict_into_envelope
+
+    with _stage(stage_ns, "verdict_annotation"):
+        try:
+            envelope = load_envelope(str(signed_path))
+        except (FileNotFoundError, EnvelopeTooLargeError, UnsafePathError, OSError, json.JSONDecodeError, RecursionError) as e:
+            print(f"WARNING: could not load signed envelope to annotate verdict: {e}", file=sys.stderr)
+            return None
+
+        result = verify_dsse_attestation(envelope, min_rcs=args.min_rcs, dry_run=args.dry_run_sign)
+
+        try:
+            _write_verdict_into_envelope(envelope, result, str(signed_path))
+        except (OSError, UnsafePathError) as e:
+            print(f"WARNING: could not write verdict onto {signed_path}: {e}", file=sys.stderr)
+            return None
+
+    word = result.verdict_word or "FAILED"
+    print(f"verdict ({word}) written to {signed_path}", file=sys.stderr)
+    return word
 
 
 def _emit_run_warnings(
@@ -586,6 +683,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 6c. Vanity-test-aware real coverage (see _compute_real_coverage_analysis)
     real_coverage = _compute_real_coverage_analysis(args, coverage, ast_metrics, stage_ns)
 
+    # 6d. S2C2F control evaluation (see _evaluate_s2c2f_controls)
+    s2c2f_report = _evaluate_s2c2f_controls(
+        args,
+        resolved_dependencies=resolved_dependencies,
+        sarif_report=sarif_report,
+        branch_governance=branch_governance,
+        stage_ns=stage_ns,
+    )
+
     # 7. Build unsigned in-toto Statement
     with _stage(stage_ns, "predicate_assembly"):
         statement = build_statement(
@@ -625,6 +731,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             ast_languages=ast_languages,
             resolved_dependencies=resolved_dependencies,
             real_coverage=real_coverage,
+            s2c2f=s2c2f_report,
         )
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
@@ -651,9 +758,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         upload_to_worm_async(args.coverage_report, coverage_report_sha)
 
     # 9. Keyless signing
-    sign_total_ns, sign_sub_ns = _maybe_sign(args, out_path)
+    sign_total_ns, sign_sub_ns, signed_path = _maybe_sign(args, out_path)
     if slsa_provenance_out_path is not None:
         _maybe_sign(args, slsa_provenance_out_path)
+
+    # 9b. Automatically persist this run's FAILED/GATED/PASSED verdict onto
+    # the just-signed envelope (see _maybe_annotate_verdict) -- best-effort,
+    # never affects this run's own exit code (step 10 below is still the
+    # sole authority for that). Only the primary RCS/assay envelope is
+    # annotated, not the separate --emit-slsa-provenance one (which isn't
+    # assay/v1-shaped and would always evaluate as a bare FAILED here).
+    _maybe_annotate_verdict(args, signed_path, stage_ns)
 
     if args.debug:
         wall_elapsed_ns = time.perf_counter_ns() - t_start_ns

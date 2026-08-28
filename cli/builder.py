@@ -19,6 +19,7 @@ from .parsers.commit_author import CommitAuthorReport
 from .parsers.coverage import CoverageReport
 from .parsers.github_rules import BranchGovernanceReport
 from .parsers.junit import TestTotals
+from .parsers.s2c2f import S2C2FReport
 from .parsers.sarif import SarifSummaryReport
 from .patch_coverage import PatchCoverageResult
 from .real_coverage import RealCoverageResult
@@ -113,6 +114,25 @@ def _build_real_coverage_block(real_coverage: Optional["RealCoverageResult"]) ->
     return real_coverage.as_dict()
 
 
+# predicate.s2c2f when the caller didn't pass an S2C2FReport at all (every
+# caller predating this field, and any pipeline invocation that skipped
+# S2C2F evaluation) -- an explicit empty-but-present block, matching every
+# other optional analysis in this predicate (_REAL_COVERAGE_TRACK_UNAVAILABLE
+# above, static_analysis's "not configured" fallback in build_statement()).
+_S2C2F_NOT_CONFIGURED: Dict[str, Any] = {
+    "framework": "S2C2F",
+    "framework_version": "v1",
+    "evaluated_controls": 0,
+    "controls": [],
+}
+
+
+def _build_s2c2f_block(s2c2f: Optional["S2C2FReport"]) -> Dict[str, Any]:
+    if s2c2f is None:
+        return dict(_S2C2F_NOT_CONFIGURED)
+    return s2c2f.as_dict()
+
+
 def build_statement(
     *,
     subject_name: str,
@@ -152,6 +172,7 @@ def build_statement(
     resolved_dependencies: Optional[List[Dict[str, Any]]] = None,
     valid_test_functions: int = 0,
     real_coverage: Optional[RealCoverageResult] = None,
+    s2c2f: Optional[S2C2FReport] = None,
 ) -> Dict[str, Any]:
     """Returns a dict matching the lifecycle/v0.1 predicate schema, wrapped
     in a standard in-toto Statement envelope."""
@@ -265,6 +286,11 @@ def build_statement(
             "warnings": branch_governance.warnings,
             "reason": branch_governance.reason,
             "reason_code": branch_governance.reason_code,
+            # Required-status-check contexts on the branch (e.g.
+            # "ci/tenax-assay-verify") -- [] on attestations predating this
+            # field, or whenever branch_governance.available is False. See
+            # cli/parsers/s2c2f.py's AUD-1 (Enforcing Provenance) check.
+            "required_status_check_contexts": branch_governance.required_status_check_contexts,
         },
         "artifact": {
             "subject": {
@@ -352,6 +378,15 @@ def build_statement(
         # found no recognized lockfile, or on attestations predating
         # this field.
         "resolved_dependencies": resolved_dependencies or [],
+        # S2C2F (Secure Supply Chain Consumption Framework) control
+        # evaluation (cli/parsers/s2c2f.py) -- only the subset of the
+        # published catalog this pipeline can honestly assess from real
+        # signals; every other control id is simply absent from
+        # controls[], not fabricated as met/unmet. "not_yet_reported" (per
+        # control) or an empty controls[] (this field predates the
+        # attestation, or S2C2F evaluation was skipped for this run) are
+        # both explicit, honest states -- never a guessed compliance claim.
+        "s2c2f": _build_s2c2f_block(s2c2f),
         "release_confidence_score": {
             "value": rcs.value,
             "algorithm_version": rcs.algorithm_version,

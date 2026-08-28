@@ -152,7 +152,7 @@
     "test_verification": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["framework", "report_format", "report_sha256", "totals", "duration_ms"],
+      "required": ["framework", "report_format", "report_sha256", "totals", "met", "duration_ms"],
       "properties": {
         "framework": { "type": "string", "examples": ["jest", "pytest", "junit5", "go-test"] },
         "report_format": { "type": "string", "enum": ["junit-xml", "jest-json", "tap"] },
@@ -169,6 +169,10 @@
             "errored": { "type": "integer", "minimum": 0 },
             "skipped": { "type": "integer", "minimum": 0 }
           }
+        },
+        "met": {
+          "type": "boolean",
+          "description": "Real, zero-tolerance gate: true only when tests > 0 and failed == 0 and errored == 0 and skipped == 0. Not derived from a configurable minimum -- any failure, error, or skip means false."
         },
         "flaky_retries": {
           "type": "integer",
@@ -480,12 +484,17 @@
     "scoreComponent": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["weight", "raw_score", "weighted_score", "reason"],
+      "required": ["weight", "raw_score", "weighted_score", "reason", "available"],
       "properties": {
         "weight": { "type": "number", "minimum": 0, "maximum": 1 },
         "raw_score": { "type": "number", "minimum": 0, "maximum": 100 },
         "weighted_score": { "type": "number", "minimum": 0, "maximum": 100 },
-        "reason": { "type": "string", "description": "Human/auditor-readable justification, e.g. 'zero tests executed', 'patch coverage unavailable, fell back to overall*0.7'." }
+        "reason": { "type": "string", "description": "Human/auditor-readable justification, e.g. 'zero tests executed', 'patch coverage unavailable, fell back to overall*0.7'." },
+        "available": {
+          "type": "boolean",
+          "default": true,
+          "description": "False when this control was never actually evaluated for this run (e.g. static_analysis with no --sarif configured) -- raw_score/weighted_score still carry the scoring policy's baseline (never penalizing an opt-in control that wasn't asked to run), but a consumer must not read that baseline number as a real measurement. True for every component that ran a real check, whether it passed or not."
+        }
       }
     },
     "realCoverageTrack": {

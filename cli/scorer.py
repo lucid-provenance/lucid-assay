@@ -80,6 +80,13 @@ class ScoreComponent:
     raw_score: float
     weighted_score: float
     reason: str
+    # False only when this control was never actually evaluated for this
+    # run (e.g. static_analysis with no --sarif configured at all) --
+    # raw_score/weighted_score still carry the scoring policy's baseline in
+    # that case (never penalizing an opt-in control nobody asked to run),
+    # but a consumer must not read that baseline as a real measurement.
+    # True for every component that ran a real check, pass or fail.
+    available: bool = True
 
     def as_dict(self) -> Dict:
         return {
@@ -87,6 +94,7 @@ class ScoreComponent:
             "raw_score": round(self.raw_score, 2),
             "weighted_score": round(self.weighted_score, 2),
             "reason": self.reason,
+            "available": self.available,
         }
 
 
@@ -254,19 +262,21 @@ def _score_sarif_findings(sarif_report: Optional[SarifSummaryReport]) -> ScoreCo
         # never asked to run. This is intentionally indistinguishable from
         # an explicit, genuinely clean SarifSummaryReport(available=True,
         # findings=[]) below.
-        return ScoreComponent(w, 100.0, 100.0 * w, "no --sarif reports configured for this run")
+        return ScoreComponent(w, 100.0, 100.0 * w, "no --sarif reports configured for this run", available=False)
 
     if not sarif_report.available:
         # Configured but the report came back broken (missing/corrupt
         # file(s)) -- fail closed, dock real points. score_pipeline flags
-        # the whole run degraded for this case (see below).
+        # the whole run degraded for this case (see below). Still no real
+        # findings were ever enumerated, so this is available=False too --
+        # distinct from a genuine clean scan, even though it's penalized.
         detail = "; ".join(sarif_report.reasons) or "SARIF report unavailable"
         raw = _clamp(100.0 - STATIC_ANALYSIS_UNAVAILABLE_PENALTY)
         reason = (
             f"static analysis (SARIF) unavailable: {detail}; "
             f"-{STATIC_ANALYSIS_UNAVAILABLE_PENALTY:.0f}pts unavailable-scan penalty"
         )
-        return ScoreComponent(w, raw, raw * w, reason)
+        return ScoreComponent(w, raw, raw * w, reason, available=False)
 
     patch_errors = sarif_report.patch_errors_count
     patch_warnings = sarif_report.patch_warnings_count

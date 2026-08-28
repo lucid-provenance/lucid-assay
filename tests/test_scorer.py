@@ -238,6 +238,29 @@ class DegradedReasonsTests(unittest.TestCase):
         ))
         self.assertEqual(result.degraded_reasons, [DEGRADED_REASON_SARIF_UNAVAILABLE])
 
+    def test_static_analysis_not_available_when_sarif_never_configured(self):
+        # sarif_report defaults to None in _base_kwargs -- no --sarif flags
+        # at all, distinct from "configured but broken" below. raw_score
+        # still carries the scoring policy's no-penalty baseline, but
+        # available=False so a consumer never reads that 100 as a real,
+        # clean scan result.
+        result = score_pipeline(**_base_kwargs())
+        component = result.components["static_analysis"]
+        self.assertFalse(component.available)
+        self.assertEqual(component.raw_score, 100.0)
+
+    def test_static_analysis_not_available_when_sarif_configured_but_broken(self):
+        result = score_pipeline(**_base_kwargs(
+            sarif_report=SarifSummaryReport(available=False, reasons=["SARIF file not found: x.json"]),
+        ))
+        self.assertFalse(result.components["static_analysis"].available)
+
+    def test_static_analysis_available_on_a_genuine_clean_scan(self):
+        result = score_pipeline(**_base_kwargs(
+            sarif_report=SarifSummaryReport(available=True, total_findings=0, tools_scanned=["semgrep"]),
+        ))
+        self.assertTrue(result.components["static_analysis"].available)
+
     def test_missing_branch_governance_reason(self):
         result = score_pipeline(**_base_kwargs(branch_governance=None))
         self.assertEqual(result.degraded_reasons, [DEGRADED_REASON_BRANCH_GOVERNANCE_UNVERIFIED])

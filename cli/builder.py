@@ -201,6 +201,20 @@ def build_statement(
     total_test_count = max(test_totals.tests, test_totals.skipped, 1)
     skipped_ratio = round(test_totals.skipped / total_test_count, 4)
 
+    # A real, unconditional gate -- unlike coverage's configurable minimums,
+    # this has no CLI knob: any failed, errored, or skipped test means the
+    # suite didn't fully pass, and zero executed tests is never a pass by
+    # default. Distinct from _score_test_health's continuous raw_score
+    # (which averages in a flaky-retry penalty and treats partial pass
+    # rates as a spectrum) -- this is the strict "did everything run and
+    # pass" boolean a consumer can safely color green/amber from.
+    test_health_met = (
+        test_totals.tests > 0
+        and test_totals.failed == 0
+        and test_totals.errored == 0
+        and test_totals.skipped == 0
+    )
+
     patch_met = False
     if patch_coverage.available and patch_coverage.line_rate is not None:
         patch_met = patch_coverage.line_rate >= patch_coverage_min
@@ -311,6 +325,11 @@ def build_statement(
                 "errored": test_totals.errored,
                 "skipped": test_totals.skipped,
             },
+            # Real, zero-tolerance gate -- true only when every test that
+            # ran passed and none were skipped/errored. Not derived from
+            # test_health's raw_score (a continuous, flaky-penalty-adjusted
+            # percentage); this is its own strict boolean.
+            "met": test_health_met,
             "flaky_retries": test_totals.flaky_retries,
             "duration_ms": test_totals.duration_ms,
         },

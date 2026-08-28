@@ -301,6 +301,33 @@ class BuilderStatementTests(unittest.TestCase):
         self.assertEqual(statement["predicate"]["test_verification"]["flaky_retries"], 2)
         self.assertEqual(statement["predicate"]["test_verification"]["duration_ms"], 555)
 
+    def test_test_verification_met_true_only_when_everything_ran_and_passed(self):
+        totals = TestTotals(tests=12, passed=12, failed=0, errored=0, skipped=0, duration_ms=555)
+        statement = build_statement(**_base_kwargs(test_totals=totals))
+        self.assertTrue(statement["predicate"]["test_verification"]["met"])
+
+    def test_test_verification_met_false_on_any_failure(self):
+        totals = TestTotals(tests=12, passed=11, failed=1, errored=0, skipped=0, duration_ms=555)
+        statement = build_statement(**_base_kwargs(test_totals=totals))
+        self.assertFalse(statement["predicate"]["test_verification"]["met"])
+
+    def test_test_verification_met_false_on_any_error(self):
+        totals = TestTotals(tests=12, passed=11, failed=0, errored=1, skipped=0, duration_ms=555)
+        statement = build_statement(**_base_kwargs(test_totals=totals))
+        self.assertFalse(statement["predicate"]["test_verification"]["met"])
+
+    def test_test_verification_met_false_on_any_skip_even_with_otherwise_perfect_pass_rate(self):
+        # A skipped test is still a "no-no" -- a 100% pass rate on only
+        # the tests that actually ran must not read as a clean gate.
+        totals = TestTotals(tests=12, passed=11, failed=0, errored=0, skipped=1, duration_ms=555)
+        statement = build_statement(**_base_kwargs(test_totals=totals))
+        self.assertFalse(statement["predicate"]["test_verification"]["met"])
+
+    def test_test_verification_met_false_when_zero_tests_executed(self):
+        totals = TestTotals(tests=0, passed=0, failed=0, errored=0, skipped=0, duration_ms=0)
+        statement = build_statement(**_base_kwargs(test_totals=totals))
+        self.assertFalse(statement["predicate"]["test_verification"]["met"])
+
     def test_sbom_defaults_to_none(self):
         statement = build_statement(**_base_kwargs())
         self.assertIsNone(statement["predicate"]["artifact"]["sbom"])

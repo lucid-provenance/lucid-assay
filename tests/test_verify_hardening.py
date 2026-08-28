@@ -190,6 +190,7 @@ class SchemaValidationGuardTests(_TempFileMixin, unittest.TestCase):
             "test_verification": {
                 "framework": "pytest", "report_format": "junit-xml", "report_sha256": "d" * 64,
                 "totals": {"tests": 4, "passed": 4, "failed": 0, "errored": 0, "skipped": 0},
+                "met": True,
                 "duration_ms": 100,
             },
             "coverage": {
@@ -206,7 +207,9 @@ class SchemaValidationGuardTests(_TempFileMixin, unittest.TestCase):
                 "value": 85, "algorithm_version": "rcs-v0.1", "degraded": False,
                 "computed_at": "2026-08-20T00:01:00Z",
                 "components": {
-                    name: {"weight": 0.2, "raw_score": 100.0, "weighted_score": 20.0, "reason": "ok"}
+                    name: {
+                        "weight": 0.2, "raw_score": 100.0, "weighted_score": 20.0, "reason": "ok", "available": True,
+                    }
                     for name in (
                         "test_health", "patch_coverage", "overall_coverage",
                         "assertion_integrity", "governance",

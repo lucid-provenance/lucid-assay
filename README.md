@@ -524,6 +524,25 @@ real Rekor entry was minted) — never a fabricated link. The full,
 untouched Sigstore bundle (`_sigstore_bundle`) is also preserved verbatim
 alongside it.
 
+**Automatic verdict annotation.** Whenever `--sign`/`--dry-run-sign` (or
+`tenax-assay run --sign`) produces a signed envelope, `cli/main.py`
+immediately runs `cli.verify.verify_dsse_attestation()` against it —
+using `--min-rcs`, the same threshold this pipeline already gates its own
+exit code on — and writes the resulting verdict into the envelope's
+`_verdict` field, the equivalent of a separate `tenax-assay verify
+--write-verdict` call (see "Verification (admission gate)" below for the
+field's exact shape and why it's an unsigned, re-derivable sibling field
+rather than baked into the signed predicate). This means a downstream CI
+pipeline no longer needs its own explicit verify step just to get a
+verdict onto the artifact before uploading it to the ingestion API — one
+still exists for callers that need `--cert-identity`/`--expected-*`/
+`--disallow-degraded` actually *enforced*, since `tenax-assay run --sign`
+never collects those flags itself. A GATED/FAILED verdict here is a
+normal outcome, not an error, and never changes this run's own exit code
+(still decided solely by step 10's `--min-rcs` check); only a genuine
+failure to load or re-write the envelope file degrades to a `WARNING` on
+stderr, since signing itself already succeeded by the time this runs.
+
 The library call is used deliberately over the `sigstore sign` CLI
 subcommand: `sigstore sign` always produces a hashedrekord/messageSignature
 bundle (an artifact signature), never a DSSE envelope, no matter what's

@@ -44,6 +44,7 @@ import math
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -256,6 +257,16 @@ class VerificationResult:
     # nothing else was computed, since result.passed=False there always
     # implies FAILED regardless of source/build level.
     verdict_word: str = ""
+    # The highest SLSA Source/Build level each track cumulatively
+    # satisfies (see _highest_passing_level) -- computed once, alongside
+    # verdict/verdict_word, and stored here so a caller that wants them
+    # (e.g. _build_verdict_envelope_block, for `--write-verdict`) doesn't
+    # have to recompute _cumulative_track_status/_highest_passing_level
+    # from source_level1../slsa_level1.. a second time. 0 on the
+    # malformed-envelope early return, same as an all-failing track would
+    # cumulatively produce.
+    source_highest_level: int = 0
+    build_highest_level: int = 0
     # The exact admission-gate parameters this call was invoked with
     # (min_rcs, disallow_degraded, cert_identity, expected_repository, ...)
     # -- verbatim, not re-derived -- so a report can be read on its own and
@@ -283,6 +294,8 @@ class VerificationResult:
             "s2c2f_controls": self.s2c2f_controls,
             "rekor_log_index": self.rekor_log_index,
             "rekor_log_url": self.rekor_log_url,
+            "source_highest_level": self.source_highest_level,
+            "build_highest_level": self.build_highest_level,
             "schema_validation_status": self.schema_validation_status,
             "slsa_level1": self.slsa_level1,
             "slsa_level2": self.slsa_level2,
@@ -1629,6 +1642,8 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
         "verified": result.passed,
         "verdict": result.verdict,
         "verdict_word": result.verdict_word or "FAILED",
+        "source_highest_level": result.source_highest_level,
+        "build_highest_level": result.build_highest_level,
         "envelope": {
             "statement_type": statement.get("_type"),
             "predicate_type": statement.get("predicateType"),
@@ -2537,6 +2552,8 @@ def verify_dsse_attestation(
     build_levels = [slsa_level1, slsa_level2, slsa_level3]
     source_highest = _highest_passing_level(source_levels, _cumulative_track_status(source_levels))
     build_highest = _highest_passing_level(build_levels, _cumulative_track_status(build_levels))
+    result.source_highest_level = source_highest
+    result.build_highest_level = build_highest
     result.verdict_word = _verdict_word(result, source_highest, build_highest)
     result.verdict = _format_verdict_banner(result, source_highest, build_highest)[1]
 
@@ -2624,6 +2641,24 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         dest="json_output",
         help="deprecated: equivalent to --format json (kept for backwards compatibility)",
+    )
+    p.add_argument(
+        "--write-verdict",
+        action="store_true",
+        dest="write_verdict",
+        help="persist this call's computed FAILED/GATED/PASSED verdict (plus rcs_value/degraded/SLSA "
+        "highest-level/gate_params -- see _build_verdict_envelope_block) as an unsigned '_verdict' "
+        "sibling field on the envelope -- same trust tier as the envelope's existing '_rekor'/"
+        "'_sigstore_bundle' fields, never part of the signed DSSE payload (a verdict is a function of "
+        "this call's own gate parameters, not an intrinsic fact about the artifact). Written to "
+        "--verdict-out, or in place over the input envelope when --verdict-out isn't given.",
+    )
+    p.add_argument(
+        "--verdict-out",
+        default=None,
+        dest="verdict_out",
+        help="output path for --write-verdict (default: overwrite the input envelope file in place, "
+        "so the same file can be re-uploaded to the ingestion API with its verdict attached)",
     )
     return p.parse_args(argv)
 
@@ -2791,6 +2826,62 @@ def _render_step_summary_markdown(result: VerificationResult) -> str:
     return "\n\n".join(parts) + "\n"
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _build_verdict_envelope_block(result: VerificationResult) -> Dict[str, Any]:
+    """Builds the `_verdict` block `--write-verdict` persists onto the
+    envelope (see _write_verdict_into_envelope) -- the FAILED/GATED/PASSED
+    verdict this exact `tenax-assay verify` invocation computed, plus
+    enough of its own inputs (rcs_value, degraded, SLSA highest levels,
+    gate_params) that a reader isn't left trusting a bare word with no way
+    to see what produced it.
+
+    Deliberately NOT part of the signed DSSE payload: a verdict is a
+    function of gate parameters (--min-rcs, --disallow-degraded,
+    --cert-identity, ...) chosen per verify call, not an intrinsic fact
+    about the artifact the way the RCS score or SLSA checklist inputs
+    are -- baking it into the predicate at build time would freeze in one
+    call's policy as if it were permanent. Instead this is an unsigned
+    sibling field on the envelope, exactly the same trust tier as
+    cli.oidc_signer's `_rekor`/`_sigstore_bundle`: informational,
+    re-derivable by re-running `tenax-assay verify` with the same gate
+    parameters, and never a substitute for doing so when the stakes
+    actually require a fresh, trusted check rather than reading a cached
+    one off the envelope."""
+    return {
+        "word": result.verdict_word or "FAILED",
+        "banner": result.verdict,
+        "passed": result.passed,
+        "rcs_value": result.rcs_value,
+        "degraded": result.degraded,
+        "source_level": result.source_highest_level,
+        "build_level": result.build_highest_level,
+        "gate_params": result.gate_params,
+        "computed_at": _now_iso(),
+    }
+
+
+def _write_verdict_into_envelope(envelope: Dict[str, Any], result: VerificationResult, out_path: str) -> Path:
+    """Merges `_build_verdict_envelope_block(result)` into `envelope` as a
+    top-level `_verdict` key and writes the result to `out_path` (resolved
+    via safe_resolve_path(), same convention as every other operator-
+    supplied output path in cli/). Overwrites whatever `_verdict` may
+    already be there -- each `--write-verdict` run reflects this call's
+    own fresh gate parameters, never accumulates stale ones. Returns the
+    resolved output Path. Raises on a write failure (OSError/
+    UnsafePathError) -- unlike $GITHUB_STEP_SUMMARY's best-effort append,
+    this is the one output --write-verdict callers explicitly asked for,
+    so a failure to produce it must be visible, not silently swallowed."""
+    envelope = dict(envelope)
+    envelope["_verdict"] = _build_verdict_envelope_block(result)
+    resolved_out = safe_resolve_path(out_path)
+    with open(resolved_out, "w", encoding="utf-8") as f:
+        json.dump(envelope, f, indent=2)
+    return resolved_out
+
+
 def _write_github_step_summary(result: VerificationResult) -> None:
     """Appends the markdown rendering of `result` to $GITHUB_STEP_SUMMARY
     when that env var is set (i.e. running inside a GitHub Actions job
@@ -2859,6 +2950,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         _print_verify_result_human(result)
     _write_github_step_summary(result)
+
+    if args.write_verdict:
+        verdict_out_path = args.verdict_out or args.envelope
+        try:
+            written_path = _write_verdict_into_envelope(envelope, result, verdict_out_path)
+        except (OSError, UnsafePathError) as e:
+            print(f"ERROR: could not write --write-verdict envelope to {verdict_out_path!r}: {e}", file=sys.stderr)
+            return EXIT_FILE_ERROR
+        print(f"verdict ({result.verdict_word or 'FAILED'}) written to {written_path}", file=sys.stderr)
 
     return EXIT_PASS if result.passed else EXIT_POLICY_VIOLATION
 

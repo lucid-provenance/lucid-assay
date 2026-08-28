@@ -28,6 +28,7 @@ from cli.verify import (
     _envelope_to_bundle_json,
     _evaluate_slsa_l1,
     _evaluate_slsa_l2,
+    _build_verdict_envelope_block,
     _extract_cert_ref,
     _extract_rekor_info,
     _extract_s2c2f_controls,
@@ -488,6 +489,98 @@ class VerifyCliMainTests(unittest.TestCase):
         payload = json.loads(captured_stdout.getvalue())
         self.assertTrue(payload["verified"])
         self.assertIn("deprecated", captured_stderr.getvalue())
+
+
+class BuildVerdictEnvelopeBlockTests(unittest.TestCase):
+    def test_block_carries_verdict_and_its_own_inputs(self):
+        envelope = _envelope(_statement(rcs_value=90))
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+        block = _build_verdict_envelope_block(result)
+
+        self.assertEqual(block["word"], result.verdict_word)
+        self.assertEqual(block["banner"], result.verdict)
+        self.assertEqual(block["passed"], result.passed)
+        self.assertEqual(block["rcs_value"], 90)
+        self.assertEqual(block["degraded"], False)
+        self.assertEqual(block["source_level"], result.source_highest_level)
+        self.assertEqual(block["build_level"], result.build_highest_level)
+        self.assertEqual(block["gate_params"], result.gate_params)
+        self.assertIn("computed_at", block)
+        json.dumps(block)  # must be JSON-serializable end to end
+
+    def test_malformed_envelope_still_produces_a_failed_block(self):
+        result = verify_dsse_attestation({"not": "a valid envelope shape"}, dry_run=True)
+
+        block = _build_verdict_envelope_block(result)
+
+        self.assertEqual(block["word"], "FAILED")
+        self.assertFalse(block["passed"])
+
+
+class WriteVerdictCliTests(unittest.TestCase):
+    def _write_envelope(self, envelope):
+        fd, path = tempfile.mkstemp(suffix=".dsse.json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(envelope, f)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_write_verdict_defaults_to_overwriting_the_input_envelope_in_place(self):
+        original_envelope = _envelope(_statement(rcs_value=90))
+        path = self._write_envelope(original_envelope)
+
+        rc = main([path, "--min-rcs", "80", "--dry-run", "--write-verdict"])
+
+        self.assertEqual(rc, EXIT_PASS)
+        with open(path) as f:
+            written = json.load(f)
+        self.assertIn("_verdict", written)
+        # RCS gate passed (90 >= 80), but this minimal test statement has
+        # no vcs/branch_governance/SLSA-shaped data at all, so the SLSA
+        # Source/Build tracks are incomplete -- GATED, not PASSED (see
+        # _verdict_word: PASSED additionally requires Source L4 + Build L3).
+        self.assertEqual(written["_verdict"]["word"], "GATED")
+        # The signed payload/signatures must survive completely untouched --
+        # --write-verdict only ever adds an unsigned sibling field.
+        self.assertEqual(written["payload"], original_envelope["payload"])
+        self.assertEqual(written["signatures"], original_envelope["signatures"])
+
+    def test_write_verdict_respects_explicit_verdict_out_path(self):
+        path = self._write_envelope(_envelope(_statement(rcs_value=50)))
+        out_fd, out_path = tempfile.mkstemp(suffix=".verdict.json")
+        os.close(out_fd)
+        self.addCleanup(os.remove, out_path)
+
+        rc = main([path, "--min-rcs", "80", "--dry-run", "--write-verdict", "--verdict-out", out_path])
+
+        self.assertEqual(rc, EXIT_POLICY_VIOLATION)
+        with open(path) as f:
+            original = json.load(f)
+        self.assertNotIn("_verdict", original)  # input envelope untouched
+        with open(out_path) as f:
+            written = json.load(f)
+        # RCS 50 < --min-rcs 80 is a hard gate violation -> FAILED, not
+        # GATED (see _verdict_word: FAILED is exactly "the hard admission
+        # gate itself rejected this run").
+        self.assertEqual(written["_verdict"]["word"], "FAILED")
+
+    def test_without_write_verdict_flag_envelope_is_never_mutated(self):
+        path = self._write_envelope(_envelope(_statement(rcs_value=90)))
+
+        rc = main([path, "--min-rcs", "80", "--dry-run"])
+
+        self.assertEqual(rc, EXIT_PASS)
+        with open(path) as f:
+            written = json.load(f)
+        self.assertNotIn("_verdict", written)
+
+    def test_write_verdict_to_unwritable_path_fails_closed(self):
+        path = self._write_envelope(_envelope(_statement(rcs_value=90)))
+
+        rc = main([path, "--min-rcs", "80", "--dry-run", "--write-verdict", "--verdict-out", "/nonexistent-dir/out.json"])
+
+        self.assertEqual(rc, EXIT_FILE_ERROR)
 
 
 class VerifyJsonPayloadTests(unittest.TestCase):

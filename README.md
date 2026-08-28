@@ -669,6 +669,44 @@ output carries the same underlying data reshaped into `static_analysis.tools`
   — it emits the same payload and prints a one-line deprecation notice to
   stderr (never stdout, so it can't corrupt a `--json` consumer's parsing).
 
+**`--write-verdict`** persists this call's computed FAILED/GATED/PASSED
+verdict onto the envelope itself, as an unsigned `_verdict` sibling field
+(`_build_verdict_envelope_block`) — the same trust tier as the envelope's
+existing `_rekor`/`_sigstore_bundle` fields (`cli/oidc_signer.py`), never
+part of the signed DSSE payload:
+
+```json
+"_verdict": {
+  "word": "GATED",
+  "banner": "FINAL VERDICT: GATED (Source L3 / Build L3) — SLSA Source L4 Incomplete",
+  "passed": true,
+  "rcs_value": 86,
+  "degraded": true,
+  "source_level": 3,
+  "build_level": 3,
+  "gate_params": {"min_rcs": 65, "disallow_degraded": false, "...": "..."},
+  "computed_at": "2026-08-28T16:53:56Z"
+}
+```
+
+Deliberately **not** baked into the signed predicate at build time: a
+verdict is a function of *this call's* gate parameters (`--min-rcs`,
+`--disallow-degraded`, `--cert-identity`, ...), not an intrinsic fact
+about the artifact the way the RCS score or SLSA checklist inputs are —
+freezing one call's policy into the predicate would make it look
+permanent when a different `--min-rcs` next month would legitimately
+produce a different verdict for the same artifact. Written to
+`--verdict-out` when given, or **in place over the input envelope**
+otherwise — the common flow is `tenax-assay verify env.dsse.json
+--write-verdict` immediately before uploading that same file to the
+ingestion API, so the record it stores already carries the verdict that
+produced it. Any existing `_verdict` on the envelope is overwritten, never
+merged, since each run reflects only its own fresh gate parameters. A
+consumer must treat `_verdict` exactly like the Rekor log coordinates next
+to it: informational and re-derivable, never a substitute for re-running
+`tenax-assay verify` with trusted gate parameters when the stakes actually
+require a fresh check.
+
 Policy gates:
 - `--min-rcs N` — fail if `release_confidence_score.value < N`.
 - `--require-digest sha256:<hex>` — fail unless that digest is among the

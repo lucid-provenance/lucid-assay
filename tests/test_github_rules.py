@@ -14,6 +14,7 @@ from cli.parsers.github_rules import (
     REASON_CODE_PLATFORM_UNSUPPORTED_TIER,
     bypass_permits_unreviewed_change,
     inspect_branch_governance,
+    _derive_required_status_check_contexts,
     _extract_http_error_detail,
     _github_api_get,
     _is_platform_tier_limitation,
@@ -673,6 +674,51 @@ class BypassPermitsUnreviewedChangeTests(unittest.TestCase):
 
     def test_admin_not_enforced_permits_bypass(self):
         self.assertTrue(bypass_permits_unreviewed_change(self._report(admin_enforced=False)))
+
+
+class DeriveRequiredStatusCheckContextsTests(unittest.TestCase):
+
+    def _required_status_checks_rule(self, contexts):
+        return {
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": c} for c in contexts]},
+        }
+
+    def test_no_matching_rule_type_returns_empty(self):
+        self.assertEqual(_derive_required_status_check_contexts([{"type": "pull_request"}]), [])
+
+    def test_extracts_contexts_from_matching_rule(self):
+        rule = self._required_status_checks_rule(["ci/lint", "ci/tenax-assay-verify"])
+        self.assertEqual(_derive_required_status_check_contexts([rule]), ["ci/lint", "ci/tenax-assay-verify"])
+
+    def test_flattens_multiple_rules(self):
+        rules = [self._required_status_checks_rule(["a"]), self._required_status_checks_rule(["b"])]
+        self.assertEqual(_derive_required_status_check_contexts(rules), ["a", "b"])
+
+    def test_skips_malformed_entries(self):
+        rule = {
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": ["not-a-dict", {"context": ""}, {"no_context": True}, {"context": "ok"}]},
+        }
+        self.assertEqual(_derive_required_status_check_contexts([rule]), ["ok"])
+
+    def test_inspect_branch_governance_populates_required_status_check_contexts(self):
+        with patch("cli.parsers.github_rules._github_api_get") as mock_get:
+            mock_get.side_effect = _api_get_router({
+                "/repos/acme/widgets/rules/branches/main": [
+                    _pull_request_rule(2),
+                    self._required_status_checks_rule(["ci/tenax-assay-verify"]),
+                ],
+                "/repos/acme/widgets/rulesets": [],
+            })
+            report = inspect_branch_governance("acme/widgets", "main", token="tok")
+
+        self.assertEqual(report.required_status_check_contexts, ["ci/tenax-assay-verify"])
+
+    def test_unavailable_report_has_empty_required_status_check_contexts(self):
+        report = inspect_branch_governance("acme/widgets", "main", token=None)
+        self.assertFalse(report.available)
+        self.assertEqual(report.required_status_check_contexts, [])
 
 
 class ScorerFailClosedIntegrationTests(unittest.TestCase):

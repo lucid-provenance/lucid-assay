@@ -29,9 +29,13 @@ from cli.verify import (
     _evaluate_slsa_l1,
     _evaluate_slsa_l2,
     _extract_cert_ref,
+    _extract_rekor_info,
+    _extract_s2c2f_controls,
     _format_assay_health_report,
     _format_coverage_line,
     _format_pct,
+    _format_s2c2f_report,
+    _format_signing_report,
     _format_real_coverage_summary,
     _format_real_coverage_threshold_warning,
     _format_real_coverage_track_line,
@@ -39,6 +43,8 @@ from cli.verify import (
     _format_test_coverage_summary,
     _format_test_validity_line,
     _format_track_report,
+    _render_step_summary_markdown,
+    _render_track_sections,
     _slsa_invocation_origin,
     _slsa_level_result,
     _static_analysis_tools_by_name,
@@ -68,6 +74,7 @@ def _statement(
     degraded_reasons=_DEGRADED_REASONS_OMITTED,
     omit_degraded_field=False,
     subject_sha256=SUBJECT_DIGEST,
+    s2c2f=None,
 ):
     rcs_block = {
         "value": rcs_value,
@@ -79,6 +86,16 @@ def _statement(
         rcs_block["degraded"] = degraded
     if degraded_reasons is not _DEGRADED_REASONS_OMITTED:
         rcs_block["degraded_reasons"] = degraded_reasons
+    predicate = {
+        "predicate_version": "0.1.0",
+        "release_confidence_score": rcs_block,
+        "test_verification": {
+            "totals": {"tests": 4, "passed": 4, "failed": 0, "errored": 0, "skipped": 0},
+        },
+        "coverage": {"overall": {"line_rate": 0.9, "branch_rate": 0.8}},
+    }
+    if s2c2f is not None:
+        predicate["s2c2f"] = s2c2f
     return {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [
@@ -88,18 +105,11 @@ def _statement(
             }
         ],
         "predicateType": "https://tenax.io/attestations/assay/v1",
-        "predicate": {
-            "predicate_version": "0.1.0",
-            "release_confidence_score": rcs_block,
-            "test_verification": {
-                "totals": {"tests": 4, "passed": 4, "failed": 0, "errored": 0, "skipped": 0},
-            },
-            "coverage": {"overall": {"line_rate": 0.9, "branch_rate": 0.8}},
-        },
+        "predicate": predicate,
     }
 
 
-def _envelope(statement, *, payload_type="application/vnd.in-toto+json", signatures=None):
+def _envelope(statement, *, payload_type="application/vnd.in-toto+json", signatures=None, rekor=None):
     payload_b64 = base64.b64encode(json.dumps(statement).encode("utf-8")).decode("ascii")
     if signatures is None:
         signatures = [{"sig": "DRY_RUN_UNSIGNED", "certificate": "DRY_RUN_NO_CERT"}]
@@ -107,7 +117,7 @@ def _envelope(statement, *, payload_type="application/vnd.in-toto+json", signatu
         "payloadType": payload_type,
         "payload": payload_b64,
         "signatures": signatures,
-        "_rekor": {"logIndex": None, "logId": None},
+        "_rekor": rekor if rekor is not None else {"logIndex": None, "logId": None},
     }
 
 
@@ -518,7 +528,9 @@ class VerifyJsonPayloadTests(unittest.TestCase):
             "slsa",
             "release_confidence_score",
             "static_analysis",
+            "s2c2f",
             "identity",
+            "signing",
             "violations",
             "warnings",
         ):
@@ -1729,6 +1741,151 @@ class FormatTestCoverageSummaryTests(unittest.TestCase):
         )
         lines = _format_test_coverage_summary(result)
         self.assertTrue(any("Real Total Coverage" in l for l in lines))
+
+
+def _s2c2f_control(id="ING-1", label="Package Managers", level=1, status="met", detail="ok"):
+    return {"id": id, "label": label, "level": level, "status": status, "detail": detail}
+
+
+class ExtractS2C2FControlsTests(unittest.TestCase):
+    def test_missing_s2c2f_block_returns_empty(self):
+        self.assertEqual(_extract_s2c2f_controls({}), [])
+
+    def test_non_dict_s2c2f_block_returns_empty(self):
+        self.assertEqual(_extract_s2c2f_controls({"s2c2f": "not-a-dict"}), [])
+
+    def test_non_list_controls_returns_empty(self):
+        self.assertEqual(_extract_s2c2f_controls({"s2c2f": {"controls": "nope"}}), [])
+
+    def test_malformed_entries_skipped_individually(self):
+        controls = [_s2c2f_control(), "not-a-dict", None]
+        self.assertEqual(_extract_s2c2f_controls({"s2c2f": {"controls": controls}}), [_s2c2f_control()])
+
+    def test_well_formed_controls_pass_through_verbatim(self):
+        controls = [_s2c2f_control(id="ING-1"), _s2c2f_control(id="SCA-1", status="unmet")]
+        self.assertEqual(_extract_s2c2f_controls({"s2c2f": {"controls": controls}}), controls)
+
+
+class ExtractRekorInfoTests(unittest.TestCase):
+    def test_missing_rekor_block_returns_none_none(self):
+        self.assertEqual(_extract_rekor_info({}), (None, None))
+
+    def test_non_dict_rekor_block_returns_none_none(self):
+        self.assertEqual(_extract_rekor_info({"_rekor": "nope"}), (None, None))
+
+    def test_null_log_index_and_url_returns_none_none(self):
+        self.assertEqual(_extract_rekor_info({"_rekor": {"logIndex": None, "logUrl": None}}), (None, None))
+
+    def test_well_formed_rekor_block_extracted(self):
+        env = {"_rekor": {"logIndex": 42, "logId": "abc", "logUrl": "https://search.sigstore.dev/?logIndex=42"}}
+        self.assertEqual(_extract_rekor_info(env), (42, "https://search.sigstore.dev/?logIndex=42"))
+
+    def test_boolean_log_index_rejected_as_not_an_int(self):
+        # bool is a subclass of int in Python -- must not be mistaken for a real log index.
+        self.assertEqual(_extract_rekor_info({"_rekor": {"logIndex": True}}), (None, None))
+
+    def test_blank_log_url_treated_as_absent(self):
+        self.assertEqual(_extract_rekor_info({"_rekor": {"logIndex": 1, "logUrl": "   "}}), (1, None))
+
+
+class FormatS2C2FReportTests(unittest.TestCase):
+    def test_empty_controls_renders_no_section_at_all(self):
+        self.assertEqual(_format_s2c2f_report([]), [])
+
+    def test_met_unmet_not_yet_reported_use_distinct_marks(self):
+        controls = [
+            _s2c2f_control(id="ING-1", status="met"),
+            _s2c2f_control(id="ING-2", status="unmet"),
+            _s2c2f_control(id="SCA-1", status="not_yet_reported"),
+        ]
+        text = "\n".join(_format_s2c2f_report(controls))
+        self.assertIn("[✓] ING-1", text)
+        self.assertIn("[✗] ING-2", text)
+        self.assertIn("[○] SCA-1", text)
+
+    def test_header_reports_met_count_out_of_total(self):
+        controls = [_s2c2f_control(status="met"), _s2c2f_control(id="ING-2", status="unmet")]
+        text = "\n".join(_format_s2c2f_report(controls))
+        self.assertIn("(1/2 controls met)", text)
+
+    def test_controls_grouped_under_their_own_level_heading(self):
+        controls = [
+            _s2c2f_control(id="ING-1", level=1),
+            _s2c2f_control(id="AUD-1", level=3),
+        ]
+        lines = _format_s2c2f_report(controls)
+        text = "\n".join(lines)
+        self.assertIn("-- Level 1 --", text)
+        self.assertIn("-- Level 3 --", text)
+        self.assertLess(lines.index("-- Level 1 --"), lines.index("-- Level 3 --"))
+
+
+class FormatSigningReportTests(unittest.TestCase):
+    def test_identity_line_always_present(self):
+        result = VerificationResult(passed=True, identity_status="verified", identity_detail="matched exactly")
+        text = "\n".join(_format_signing_report(result))
+        self.assertIn("Sigstore Identity: verified -- matched exactly", text)
+
+    def test_rekor_entry_present_when_log_index_set(self):
+        result = VerificationResult(
+            passed=True, identity_status="skipped", identity_detail="--dry-run",
+            rekor_log_index=42, rekor_log_url="https://search.sigstore.dev/?logIndex=42",
+        )
+        text = "\n".join(_format_signing_report(result))
+        self.assertIn("Rekor Log Entry:   index 42", text)
+        self.assertIn("Rekor Log URL:     https://search.sigstore.dev/?logIndex=42", text)
+
+    def test_rekor_entry_absent_reports_none_explicitly(self):
+        result = VerificationResult(passed=True, identity_status="skipped", identity_detail="--dry-run")
+        text = "\n".join(_format_signing_report(result))
+        self.assertIn("Rekor Log Entry:   none", text)
+        self.assertNotIn("Rekor Log URL:", text)
+
+
+class S2C2FAndSigningIntegrationTests(unittest.TestCase):
+    """End-to-end via verify_dsse_attestation(): confirms these sections
+    actually reach the shared _render_track_sections() report -- and
+    therefore both stderr human output and $GITHUB_STEP_SUMMARY, the same
+    way the SLSA checklists do (see _render_track_sections' docstring)."""
+
+    def test_step_summary_includes_s2c2f_and_signing_sections(self):
+        controls = [_s2c2f_control(id="ING-1", status="met"), _s2c2f_control(id="SCA-1", status="not_yet_reported")]
+        statement = _statement(s2c2f={"framework": "S2C2F", "controls": controls})
+        envelope = _envelope(
+            statement, rekor={"logIndex": 7, "logId": "abc", "logUrl": "https://search.sigstore.dev/?logIndex=7"}
+        )
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        summary = _render_step_summary_markdown(result)
+
+        self.assertIn("S2C2F Compliance Matrix", summary)
+        self.assertIn("[✓] ING-1", summary)
+        self.assertIn("[○] SCA-1", summary)
+        self.assertIn("CD / Signing", summary)
+        self.assertIn("Rekor Log Entry:   index 7", summary)
+        self.assertIn("https://search.sigstore.dev/?logIndex=7", summary)
+
+    def test_no_s2c2f_data_omits_the_section_entirely(self):
+        envelope = _envelope(_statement())
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+        summary = _render_step_summary_markdown(result)
+
+        self.assertNotIn("S2C2F Compliance Matrix", summary)
+        # CD / Signing must still render even with no S2C2F data at all.
+        self.assertIn("CD / Signing", summary)
+
+    def test_json_payload_carries_s2c2f_and_signing_sections(self):
+        controls = [_s2c2f_control(id="ING-1", status="met")]
+        statement = _statement(s2c2f={"framework": "S2C2F", "controls": controls})
+        envelope = _envelope(statement, rekor={"logIndex": 7, "logId": "abc", "logUrl": "https://x/?logIndex=7"})
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        payload = _build_verify_json_payload(result)
+
+        self.assertEqual(payload["s2c2f"]["controls"], controls)
+        self.assertEqual(payload["signing"], {"rekor_log_index": 7, "rekor_log_url": "https://x/?logIndex=7"})
+        json.dumps(payload)  # must remain JSON-serializable end to end
 
 
 class FormatAssayHealthReportTests(unittest.TestCase):

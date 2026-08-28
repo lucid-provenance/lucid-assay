@@ -28,6 +28,7 @@ cli/
   parsers/github_rules.py   # GitHub branch protection/ruleset inspection via REST API
   parsers/commit_author.py  # GitHub commit-author identity (verified account) via REST API
   parsers/lockfiles.py      # uv.lock/package-lock.json/go.sum/Gradle/Maven -> resolved_dependencies
+  parsers/s2c2f.py          # S2C2F control evaluation (subset with a real, checkable signal) -> predicate.s2c2f
   patch_coverage.py         # git diff base...head, intersected with coverage hit maps
   real_coverage.py           # vanity-test-aware coverage: which covered lines are only exercised by vanity tests
   hashing.py                 # SHA-256 content hashing + WORM key derivation
@@ -458,6 +459,38 @@ equivalent wired up for the other three languages' test runners
 vanity test simply never shows up in a coverage context — harmless, not a
 false negative this analysis claims to catch.
 
+## S2C2F control evaluation (`predicate.s2c2f`)
+
+`parsers/s2c2f.py` evaluates a subset of Microsoft's S2C2F (Secure Supply
+Chain Consumption Framework) control catalog against data this pipeline
+either already collected (`resolved_dependencies`, `static_analysis`,
+`branch_governance`) or can cheaply check for itself (a couple of GitHub
+API calls, a local config-file scan) — never the full published taxonomy.
+Every control this module doesn't implement is simply absent from
+`predicate.s2c2f.controls[]`; it is never guessed at as met or unmet. Each
+control that *is* evaluated reports one of three states:
+
+- `met` / `unmet` — the check ran and got a definitive answer.
+- `not_yet_reported` — the check couldn't run (no token, a rate limit or
+  auth failure, an invalid repository identifier) *or* no generic,
+  repo-observable signal exists for that control at all (e.g. UPD-1
+  "Manual Updates" describes a documented process, not an artifact).
+  Never conflated with `unmet`: a check that didn't run must never look
+  like one that ran and failed.
+
+Currently evaluated: `ING-1`/`ING-2` (lockfile presence / private package
+proxy config), `SCA-1`/`SCA-2` (SARIF tool-name matching against known
+SCA/license-scanning tools, or GitHub's vulnerability-alerts API), `INV-1`
+(resolved-dependency inventory), `UPD-1` (always `not_yet_reported` — see
+above), `SCA-3` (GitHub Dependabot alerts API reachability), `INV-2`
+(`SECURITY.md` via the GitHub community-profile API), `UPD-3`
+(a Dependabot/Renovate config file), `AUD-2`/`AUD-3` (resolved-dependency
+inventory / pkg: PURL + sha256/sha512 digest — the same hermeticity check
+`cli/verify.py`'s SLSA Build Level 3 checklist uses), `ENF-1` (branch
+requires a PR and blocks direct pushes), and `AUD-1` (a required status
+check on the branch names a provenance/attestation verification job —
+see `github_rules.BranchGovernanceReport.required_status_check_contexts`).
+
 ## Signing flow (keyless / Sigstore)
 
 `oidc_signer.py` implements the ambient-credential keyless model end to
@@ -482,6 +515,14 @@ delegate to internally:
    Rekor for an inclusion proof.
 4. Discard the ephemeral private key — no long-lived signing key exists
    to rotate or leak.
+
+The resulting envelope's `_rekor` block (`DSSEEnvelope.to_dict()`) carries
+`logIndex`/`logId` plus a `logUrl` — a direct `search.sigstore.dev` link
+to the public transparency-log entry, derived from `logIndex` alone (no
+separate per-entry UUID lookup needed). `null` on `--dry-run-sign` (no
+real Rekor entry was minted) — never a fabricated link. The full,
+untouched Sigstore bundle (`_sigstore_bundle`) is also preserved verbatim
+alongside it.
 
 The library call is used deliberately over the `sigstore sign` CLI
 subcommand: `sigstore sign` always produces a hashedrekord/messageSignature

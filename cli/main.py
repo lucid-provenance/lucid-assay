@@ -28,6 +28,7 @@ from .parsers.coverage_contexts import parse_coverage_contexts
 from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
 from .parsers.lockfiles import detect_and_parse_dependencies
+from .parsers.s2c2f import S2C2FReport, evaluate_s2c2f
 from .parsers.sarif import (
     SarifSummaryReport,
     aggregate_sarif_reports,
@@ -57,6 +58,7 @@ _STAGE_LABELS = [
     ("github_rules_api", "GitHub Ruleset API"),
     ("rcs_scoring", "RCS Scoring Engine"),
     ("lockfile_dependencies", "Lockfile Dependency Detection"),
+    ("s2c2f_evaluation", "S2C2F Control Evaluation"),
     ("predicate_assembly", "Predicate Serialization"),
     ("worm_upload", "WORM Upload Dispatch"),
 ]
@@ -288,6 +290,34 @@ def _compute_real_coverage_analysis(
             coverage=coverage,
             context_report=context_report,
             patch_modified_lines=patch_modified_lines,
+        )
+
+
+def _evaluate_s2c2f_controls(
+    args: argparse.Namespace,
+    *,
+    resolved_dependencies: List[Dict[str, Any]],
+    sarif_report: Optional[SarifSummaryReport],
+    branch_governance: BranchGovernanceReport,
+    stage_ns: Dict[str, int],
+) -> S2C2FReport:
+    """Step 6d: S2C2F control evaluation (see cli.parsers.s2c2f), fed by
+    data this pipeline already collected (resolved_dependencies, sarif_report,
+    branch_governance) plus a couple of cheap new signals of its own (a
+    GitHub API call, a local config-file check). Never raises -- every
+    network-backed control it evaluates independently degrades to
+    not_yet_reported on a missing token or API failure, same fail-closed
+    contract as branch governance/commit author above. Extracted (same
+    rationale as _ingest_sarif/_detect_lockfile_dependencies/
+    _compute_real_coverage_analysis above) so it's unit-testable directly."""
+    with _stage(stage_ns, "s2c2f_evaluation"):
+        return evaluate_s2c2f(
+            repo_dir=args.repo_dir,
+            repository=args.repository,
+            resolved_dependencies=resolved_dependencies,
+            sarif_report=sarif_report,
+            branch_governance=branch_governance,
+            token=args.github_token,
         )
 
 
@@ -586,6 +616,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 6c. Vanity-test-aware real coverage (see _compute_real_coverage_analysis)
     real_coverage = _compute_real_coverage_analysis(args, coverage, ast_metrics, stage_ns)
 
+    # 6d. S2C2F control evaluation (see _evaluate_s2c2f_controls)
+    s2c2f_report = _evaluate_s2c2f_controls(
+        args,
+        resolved_dependencies=resolved_dependencies,
+        sarif_report=sarif_report,
+        branch_governance=branch_governance,
+        stage_ns=stage_ns,
+    )
+
     # 7. Build unsigned in-toto Statement
     with _stage(stage_ns, "predicate_assembly"):
         statement = build_statement(
@@ -625,6 +664,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             ast_languages=ast_languages,
             resolved_dependencies=resolved_dependencies,
             real_coverage=real_coverage,
+            s2c2f=s2c2f_report,
         )
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0

@@ -57,7 +57,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 GITHUB_API_BASE = "https://api.github.com"
@@ -190,6 +190,16 @@ class BranchGovernanceReport:
     # ...): callers must not infer anything from an absent reason_code
     # beyond "not this specific, identified condition".
     reason_code: Optional[str] = None
+    # The `context` string of every "required_status_checks" rule entry
+    # applying to this branch (e.g. "ci/tenax-assay-verify") -- i.e. which
+    # named CI jobs must report success before a PR can merge. Always []
+    # rather than omitted when no such rule exists, or on an attestation
+    # predating this field; never populated at all when available=False.
+    # Consumed by cli.parsers.s2c2f's AUD-1 (Enforcing Provenance) check to
+    # tell whether *some* required check plausibly enforces provenance/
+    # attestation verification, without this module needing to know
+    # anything about S2C2F itself.
+    required_status_check_contexts: List[str] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -203,6 +213,7 @@ class BranchGovernanceReport:
             "warnings": self.warnings,
             "reason": self.reason,
             "reason_code": self.reason_code,
+            "required_status_check_contexts": self.required_status_check_contexts,
         }
 
 
@@ -491,6 +502,26 @@ def _derive_pr_requirements(rules: List[Any]) -> Tuple[bool, int, bool]:
     return pull_request_required, approvals_required, direct_push_prevented
 
 
+def _derive_required_status_check_contexts(rules: List[Any]) -> List[str]:
+    """Returns the `context` string of every entry under every
+    "required_status_checks" rule applying to this branch -- see
+    BranchGovernanceReport.required_status_check_contexts. A branch can
+    have more than one such rule (repo-level and org-level rulesets both
+    apply); this flattens all of them. Malformed/missing entries are
+    skipped individually rather than discarding the whole rule."""
+    contexts: List[str] = []
+    for rule in rules:
+        if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+            continue
+        params = rule.get("parameters") or {}
+        for check in params.get("required_status_checks") or []:
+            if isinstance(check, dict):
+                context = check.get("context")
+                if isinstance(context, str) and context.strip():
+                    contexts.append(context)
+    return contexts
+
+
 def _classify_bypass_actors(
     bypass_actors: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], bool]:
@@ -607,6 +638,7 @@ def inspect_branch_governance(
         return early_report
 
     pull_request_required, approvals_required, direct_push_prevented = _derive_pr_requirements(rules)
+    required_status_check_contexts = _derive_required_status_check_contexts(rules)
     always_bypass, pr_only_bypass, unknown_mode_bypass, admin_enforced = _classify_bypass_actors(bypass_actors)
     bypass_actors_count = len(bypass_actors)
 
@@ -636,4 +668,5 @@ def inspect_branch_governance(
         admin_enforced=admin_enforced,
         warnings=warnings,
         reason=reason,
+        required_status_check_contexts=required_status_check_contexts,
     )

@@ -209,6 +209,17 @@ class VerificationResult:
     identity_status: str = "skipped"
     identity_detail: str = ""
     static_analysis_tools: List[Dict[str, Any]] = field(default_factory=list)
+    # predicate.s2c2f.controls, verbatim (cli/parsers/s2c2f.py) -- purely
+    # informational, same non-gating contract as static_analysis_tools.
+    # [] when this predicate predates S2C2F evaluation or the run skipped
+    # it, never fabricated as met/unmet.
+    s2c2f_controls: List[Dict[str, Any]] = field(default_factory=list)
+    # The signed envelope's own _rekor.logIndex/logUrl (cli/oidc_signer.py)
+    # -- not part of the signed predicate (see _extract_rekor_info's
+    # docstring for why). Both None on --dry-run-sign or an envelope
+    # predating this field.
+    rekor_log_index: Optional[int] = None
+    rekor_log_url: Optional[str] = None
     schema_validation_status: str = "skipped"
     slsa_level1: Optional[Dict[str, Any]] = None
     slsa_level2: Optional[Dict[str, Any]] = None
@@ -269,6 +280,9 @@ class VerificationResult:
             "identity_status": self.identity_status,
             "identity_detail": self.identity_detail,
             "static_analysis_tools": self.static_analysis_tools,
+            "s2c2f_controls": self.s2c2f_controls,
+            "rekor_log_index": self.rekor_log_index,
+            "rekor_log_url": self.rekor_log_url,
             "schema_validation_status": self.schema_validation_status,
             "slsa_level1": self.slsa_level1,
             "slsa_level2": self.slsa_level2,
@@ -358,6 +372,42 @@ def _extract_static_analysis_tools(predicate: Dict[str, Any]) -> List[Dict[str, 
         return []
 
     return [t for t in tools if isinstance(t, dict)]
+
+
+def _extract_s2c2f_controls(predicate: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Defensively pulls predicate.s2c2f.controls (cli/parsers/s2c2f.py) out
+    of the predicate for display purposes only (never raises, never gates
+    `passed` -- purely informational, same contract as
+    _extract_static_analysis_tools). [] when the field is absent (an
+    attestation predating S2C2F evaluation, or a run that skipped it) or
+    malformed; individual malformed control entries are skipped rather
+    than discarding the whole list."""
+    s2c2f = predicate.get("s2c2f")
+    if not isinstance(s2c2f, dict):
+        return []
+    controls = s2c2f.get("controls")
+    if not isinstance(controls, list):
+        return []
+    return [c for c in controls if isinstance(c, dict)]
+
+
+def _extract_rekor_info(envelope: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
+    """Pulls (logIndex, logUrl) out of the DSSE envelope's own `_rekor`
+    block (cli/oidc_signer.py's DSSEEnvelope.to_dict() -- a sibling of
+    payload/signatures, not part of the signed predicate itself: Rekor
+    coordinates only exist *after* signing, so they could never be
+    embedded in the statement that got signed). Both None on a
+    --dry-run-sign envelope (no real transparency-log entry was minted),
+    an envelope predating this field, or a malformed `_rekor` block --
+    never fabricated."""
+    rekor = envelope.get("_rekor")
+    if not isinstance(rekor, dict):
+        return None, None
+    log_index = rekor.get("logIndex")
+    log_index = log_index if isinstance(log_index, int) and not isinstance(log_index, bool) else None
+    log_url = rekor.get("logUrl")
+    log_url = log_url if isinstance(log_url, str) and log_url.strip() else None
+    return log_index, log_url
 
 
 def _slsa_item(label: str, passed: bool, detail: str = "") -> Dict[str, Any]:
@@ -1022,6 +1072,67 @@ def _highest_passing_level(levels: List[Dict[str, Any]], cumulative_status: List
     return highest
 
 
+_S2C2F_STATUS_MARK = {"met": "✓", "unmet": "✗", "not_yet_reported": "○"}
+
+
+def _format_s2c2f_report(controls: List[Dict[str, Any]]) -> List[str]:
+    """Renders predicate.s2c2f.controls (cli/parsers/s2c2f.py) as a
+    checklist grouped by S2C2F level: [✓]/[✗]/[○] per control (met/unmet/
+    not_yet_reported respectively -- a distinct third symbol, never folded
+    into ✗, since a control that couldn't be evaluated must never look
+    like one that was and failed). Purely informational, like the SARIF
+    static-analysis table below -- no PASSED/FAILED Status line, since
+    S2C2F controls aren't a cumulative leveling the way SLSA's Source/
+    Build tracks are; just a coverage summary. [] (no section at all) when
+    no controls were evaluated (an attestation predating S2C2F, or a run
+    that skipped it) -- matching every other optional section here."""
+    if not controls:
+        return []
+
+    met_count = sum(1 for c in controls if c.get("status") == "met")
+    lines = [f"=== S2C2F Compliance Matrix ({met_count}/{len(controls)} controls met) ==="]
+
+    by_level: Dict[int, List[Dict[str, Any]]] = {}
+    for c in controls:
+        by_level.setdefault(c.get("level") or 0, []).append(c)
+
+    for level in sorted(by_level):
+        lines.append(f"-- Level {level} --")
+        for c in by_level[level]:
+            mark = _S2C2F_STATUS_MARK.get(c.get("status"), "?")
+            line = f"[{mark}] {c.get('id', '?')} {c.get('label', '')}"
+            detail = c.get("detail")
+            if detail:
+                line += f" -- {detail}"
+            lines.append(line)
+    lines.append("=====================================")
+    return lines
+
+
+def _format_signing_report(result: "VerificationResult") -> List[str]:
+    """Renders the CD/signing summary: Sigstore identity verification
+    (result.identity_status/identity_detail, already computed by
+    _verify_sigstore_identity) and the Rekor transparency-log entry
+    (result.rekor_log_index/rekor_log_url -- the envelope's own _rekor
+    block, see _extract_rekor_info) as their own section shared by both
+    renderers. Identity status previously only ever reached
+    _print_verify_result_human's separate stderr "identity:" line -- never
+    $GITHUB_STEP_SUMMARY, since that line lived outside
+    _render_track_sections -- exactly the kind of drift that function's
+    own docstring warns about; this folds both back into the one shared
+    report."""
+    lines = ["=== CD / Signing ==="]
+    lines.append(f"Sigstore Identity: {result.identity_status} -- {result.identity_detail}")
+    if result.rekor_log_index is not None:
+        lines.append(f"Rekor Log Entry:   index {result.rekor_log_index}")
+        if result.rekor_log_url:
+            lines.append(f"Rekor Log URL:     {result.rekor_log_url}")
+    else:
+        lines.append("Rekor Log Entry:   none (--dry-run-sign, or this envelope predates Rekor log capture)")
+    lines.append("=====================================")
+    return lines
+
+
 def _format_track_report(levels: List[Dict[str, Any]]) -> Tuple[List[str], List[bool]]:
     """Renders an ordered list of cumulative level assessments (SLSA
     Source Levels 1-4, or SLSA Build Levels 1-3) as plain-text lines --
@@ -1538,9 +1649,16 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
         "static_analysis": {
             "tools": _static_analysis_tools_by_name(result.static_analysis_tools),
         },
+        "s2c2f": {
+            "controls": result.s2c2f_controls,
+        },
         "identity": {
             "status": result.identity_status,
             "detail": result.identity_detail,
+        },
+        "signing": {
+            "rekor_log_index": result.rekor_log_index,
+            "rekor_log_url": result.rekor_log_url,
         },
         "violations": result.violations,
         "warnings": result.warnings,
@@ -2274,6 +2392,7 @@ def verify_dsse_attestation(
     subject_digests: List[str] = []
     metrics: Dict[str, Any] = {}
     static_analysis_tools: List[Dict[str, Any]] = []
+    s2c2f_controls: List[Dict[str, Any]] = []
     schema_validation_status = "skipped"
 
     if statement is not None:
@@ -2319,6 +2438,7 @@ def verify_dsse_attestation(
 
         metrics = _extract_metrics(predicate)
         static_analysis_tools = _extract_static_analysis_tools(predicate)
+        s2c2f_controls = _extract_s2c2f_controls(predicate)
 
         gate_violations, gate_warnings = _evaluate_policy_gates(
             rcs_value=rcs_value,
@@ -2332,6 +2452,10 @@ def verify_dsse_attestation(
         )
         violations.extend(gate_violations)
         warnings.extend(gate_warnings)
+
+    # Independent of statement decode success -- _rekor lives on the
+    # envelope itself, not the signed payload (see _extract_rekor_info).
+    rekor_log_index, rekor_log_url = _extract_rekor_info(envelope)
 
     identity_status, identity_detail = _verify_sigstore_identity(
         envelope,
@@ -2389,6 +2513,9 @@ def verify_dsse_attestation(
         identity_status=identity_status,
         identity_detail=identity_detail,
         static_analysis_tools=static_analysis_tools,
+        s2c2f_controls=s2c2f_controls,
+        rekor_log_index=rekor_log_index,
+        rekor_log_url=rekor_log_url,
         schema_validation_status=schema_validation_status,
         slsa_level1=slsa_level1,
         slsa_level2=slsa_level2,
@@ -2553,8 +2680,11 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
     etc. this call enforced), Static Analysis (the per-tool SARIF/SonarQube
     breakdown from _format_static_analysis_table, when any tools were
     ingested), SLSA Source Track (Levels 1-4), SLSA Build Track (Levels
-    1-3), Assay Health & Governance Metrics, and the synthesized FINAL
-    VERDICT banner -- as plain-text lines, shared by both the stderr human
+    1-3), the S2C2F Compliance Matrix (_format_s2c2f_report, when any
+    controls were evaluated), CD / Signing (_format_signing_report --
+    Sigstore identity + Rekor log entry), Assay Health & Governance
+    Metrics, and the synthesized FINAL VERDICT banner -- as plain-text
+    lines, shared by both the stderr human
     renderer and the $GITHUB_STEP_SUMMARY markdown writer (the same
     [✓]/[✗] plain-text rows read fine as GFM markdown verbatim, wrapped in
     a fenced code block -- see _render_step_summary_markdown). Static
@@ -2588,6 +2718,14 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
         lines.extend(track_lines)
     else:
         build_cumulative = []
+
+    s2c2f_lines = _format_s2c2f_report(result.s2c2f_controls)
+    if s2c2f_lines:
+        lines.append("")
+        lines.extend(s2c2f_lines)
+
+    lines.append("")
+    lines.extend(_format_signing_report(result))
 
     lines.append("")
     lines.extend(_format_assay_health_report(result))

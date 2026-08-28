@@ -68,6 +68,13 @@ class DSSEEnvelope:
     signatures: List[Dict[str, str]]  # [{"sig": <b64>, "certificate": <pem>}]
     rekor_log_index: Optional[int] = None
     rekor_log_id: Optional[str] = None
+    # Public, human-followable link to this entry on the production Rekor
+    # transparency log's search UI -- derived from rekor_log_index alone
+    # (Sigstore's public search endpoint resolves a log index directly, no
+    # separate per-entry UUID is needed). None whenever rekor_log_index is
+    # None (dry-run signing, or a signing failure that produced no tlog
+    # entry) -- never a fabricated link to an entry that doesn't exist.
+    rekor_log_url: Optional[str] = None
     # The complete, untouched Sigstore bundle (`Bundle.to_json()` output of
     # the DSSE-signed result) as parsed JSON, when one was actually minted.
     # Preserved verbatim -- including tlogEntries' kindVersion/inclusionProof/
@@ -85,6 +92,7 @@ class DSSEEnvelope:
             "_rekor": {
                 "logIndex": self.rekor_log_index,
                 "logId": self.rekor_log_id,
+                "logUrl": self.rekor_log_url,
             },
             "_sigstore_bundle": self.sigstore_bundle,
         }
@@ -262,6 +270,13 @@ def sign_statement(
         log_index = tlog_entries[0].get("logIndex")
         log_id = tlog_entries[0].get("logId", {}).get("keyId")
 
+    # search.sigstore.dev resolves a public Rekor log index directly -- no
+    # separate per-entry UUID lookup is needed -- so this link is always
+    # constructible whenever a real tlog entry was minted (log_index is not
+    # None), and never fabricated when one wasn't (dry-run, or a signing
+    # path that somehow produced no tlog entry).
+    log_url = f"https://search.sigstore.dev/?logIndex={log_index}" if log_index is not None else None
+
     return DSSEEnvelope(
         payload_type="application/vnd.in-toto+json",
         payload_b64=payload_b64,
@@ -271,6 +286,7 @@ def sign_statement(
         }],
         rekor_log_index=log_index,
         rekor_log_id=log_id,
+        rekor_log_url=log_url,
         sigstore_bundle=bundle_data,
     )
 

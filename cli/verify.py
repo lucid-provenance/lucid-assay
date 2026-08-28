@@ -2830,13 +2830,44 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _checklist_envelope_rows(levels: List[Optional[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Reshapes a track's `_slsa_level_result()` dicts (see that function's
+    own docstring for the real {track, level, name, items, passed,
+    origin} shape -- items is a list of real {label, passed, detail} rows,
+    see _slsa_item) into the list `_verdict.source_checklist`/
+    `build_checklist` persist. Verbatim, not re-derived: every dict here
+    already came out of _evaluate_source_l1..l4/_evaluate_slsa_l1..l3's
+    real evaluation against this statement -- this function only drops
+    the `None` entries a level can carry when its checklist genuinely
+    wasn't evaluated (e.g. no assay/SLSA statement classified at all),
+    never invents a row for one."""
+    return [level for level in levels if level is not None]
+
+
 def _build_verdict_envelope_block(result: VerificationResult) -> Dict[str, Any]:
     """Builds the `_verdict` block `--write-verdict` persists onto the
     envelope (see _write_verdict_into_envelope) -- the FAILED/GATED/PASSED
     verdict this exact `tenax-assay verify` invocation computed, plus
     enough of its own inputs (rcs_value, degraded, SLSA highest levels,
-    gate_params) that a reader isn't left trusting a bare word with no way
-    to see what produced it.
+    the itemized Source/Build checklists, gate_params) that a reader
+    isn't left trusting a bare word or a bare level number with no way to
+    see what produced it.
+
+    `source_checklist`/`build_checklist` are the same real, itemized
+    per-criterion results `tenax-assay verify`'s own human-readable
+    report and $GITHUB_STEP_SUMMARY output already show (see
+    _format_track_report/_render_step_summary_markdown) -- persisted
+    here for the first time so a downstream reader (tenax-dsse-collector,
+    tenax-console) doesn't have to re-run `tenax-assay verify` or dig
+    through a CI job's ephemeral step summary to see which specific
+    criteria passed or failed. Like the checklist inputs are largely
+    intrinsic facts about the artifact, but a handful of items
+    (_slsa_check_signature, _slsa_check_source_binding, ...) do depend on
+    this call's own --cert-identity/--expected-repository gate
+    parameters -- exactly the same "function of this call's parameters"
+    category `word`/`banner`/`source_level`/`build_level` already are, so
+    this lives in the same unsigned `_verdict` block rather than a
+    separate signed or unsigned field.
 
     Deliberately NOT part of the signed DSSE payload: a verdict is a
     function of gate parameters (--min-rcs, --disallow-degraded,
@@ -2858,6 +2889,10 @@ def _build_verdict_envelope_block(result: VerificationResult) -> Dict[str, Any]:
         "degraded": result.degraded,
         "source_level": result.source_highest_level,
         "build_level": result.build_highest_level,
+        "source_checklist": _checklist_envelope_rows(
+            [result.source_level1, result.source_level2, result.source_level3, result.source_level4]
+        ),
+        "build_checklist": _checklist_envelope_rows([result.slsa_level1, result.slsa_level2, result.slsa_level3]),
         "gate_params": result.gate_params,
         "computed_at": _now_iso(),
     }

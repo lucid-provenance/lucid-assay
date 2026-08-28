@@ -509,6 +509,32 @@ class BuildVerdictEnvelopeBlockTests(unittest.TestCase):
         self.assertIn("computed_at", block)
         json.dumps(block)  # must be JSON-serializable end to end
 
+    def test_block_carries_the_real_itemized_source_and_build_checklists(self):
+        envelope = _envelope(_statement(rcs_value=90))
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+        block = _build_verdict_envelope_block(result)
+
+        # Real per-level results the checklist evaluators actually computed
+        # against this statement -- not re-derived here, just reshaped into
+        # a list. Source always has 4 levels once evaluated at all.
+        self.assertEqual(len(block["source_checklist"]), 4)
+        self.assertEqual([lvl["level"] for lvl in block["source_checklist"]], [1, 2, 3, 4])
+        for lvl in block["source_checklist"]:
+            self.assertEqual(lvl["track"], "Source")
+            self.assertIsInstance(lvl["passed"], bool)
+            for item in lvl["items"]:
+                self.assertIn("label", item)
+                self.assertIn("passed", item)
+                self.assertIn("detail", item)
+
+        self.assertEqual(len(block["build_checklist"]), 3)
+        self.assertEqual([lvl["level"] for lvl in block["build_checklist"]], [1, 2, 3])
+        for lvl in block["build_checklist"]:
+            self.assertEqual(lvl["track"], "Build")
+
+        json.dumps(block)  # must stay JSON-serializable with the new keys too
+
     def test_malformed_envelope_still_produces_a_failed_block(self):
         result = verify_dsse_attestation({"not": "a valid envelope shape"}, dry_run=True)
 
@@ -516,6 +542,11 @@ class BuildVerdictEnvelopeBlockTests(unittest.TestCase):
 
         self.assertEqual(block["word"], "FAILED")
         self.assertFalse(block["passed"])
+        # Never crashes when a level's checklist genuinely wasn't
+        # evaluated -- an honest empty list, not a fabricated row.
+        self.assertIsInstance(block["source_checklist"], list)
+        self.assertIsInstance(block["build_checklist"], list)
+        json.dumps(block)
 
 
 class WriteVerdictCliTests(unittest.TestCase):

@@ -1072,6 +1072,11 @@ def _highest_passing_level(levels: List[Dict[str, Any]], cumulative_status: List
     return highest
 
 
+# Fixed-width closing rule shared by every plain-text report section
+# below (S2C2F, CD/Signing, SLSA Source/Build tracks, Run Identity) --
+# one constant rather than each section repeating the literal.
+_SECTION_DIVIDER = "====================================="
+
 _S2C2F_STATUS_MARK = {"met": "✓", "unmet": "✗", "not_yet_reported": "○"}
 
 
@@ -1105,7 +1110,7 @@ def _format_s2c2f_report(controls: List[Dict[str, Any]]) -> List[str]:
             if detail:
                 line += f" -- {detail}"
             lines.append(line)
-    lines.append("=====================================")
+    lines.append(_SECTION_DIVIDER)
     return lines
 
 
@@ -1129,7 +1134,7 @@ def _format_signing_report(result: "VerificationResult") -> List[str]:
             lines.append(f"Rekor Log URL:     {result.rekor_log_url}")
     else:
         lines.append("Rekor Log Entry:   none (--dry-run-sign, or this envelope predates Rekor log capture)")
-    lines.append("=====================================")
+    lines.append(_SECTION_DIVIDER)
     return lines
 
 
@@ -1146,7 +1151,7 @@ def _format_track_report(levels: List[Dict[str, Any]]) -> Tuple[List[str], List[
         if i > 0:
             lines.append("")
         lines.extend(_format_slsa_level_block(lvl, ok))
-    lines.append("=====================================")
+    lines.append(_SECTION_DIVIDER)
     return lines, cumulative_status
 
 
@@ -1234,7 +1239,7 @@ def _format_run_identity_report(result: "VerificationResult") -> List[str]:
     lines.extend(_format_pipeline_lines(identity["pipeline"]))
     lines.extend(_format_subject_lines(identity["subjects"]))
     lines.extend(_format_gate_params(result.gate_params))
-    lines.append("=====================================")
+    lines.append(_SECTION_DIVIDER)
     return lines
 
 

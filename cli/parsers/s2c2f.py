@@ -48,8 +48,9 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from ..common import UnsafePathError, safe_resolve_path
 from .github_rules import (
     DEFAULT_TIMEOUT,
     GITHUB_API_BASE,
@@ -92,7 +93,30 @@ class S2C2FReport:
         }
 
 
-def _control(id: str, label: str, level: int, status: str, detail: str = "") -> S2C2FControlResult:
+# Single source of truth for every control this module evaluates: its
+# published S2C2F label and level. Looked up by _control() below rather
+# than repeated as a literal at every met/unmet/not_yet_reported call site
+# in each _eval_* function -- multiple call sites in the same function
+# previously duplicated the same label literal 3-4 times over.
+_CONTROL_CATALOG: Dict[str, Tuple[str, int]] = {
+    "ING-1": ("Package Managers", 1),
+    "ING-2": ("Local Copies", 1),
+    "SCA-1": ("Vulnerability Scans", 1),
+    "SCA-2": ("License Checks", 1),
+    "INV-1": ("Inventory", 1),
+    "UPD-1": ("Manual Updates", 1),
+    "SCA-3": ("EOL Scans", 2),
+    "INV-2": ("Incident Plans", 2),
+    "UPD-3": ("PR Alerts", 2),
+    "AUD-2": ("Consumption Audits", 2),
+    "AUD-3": ("Integrity Validation", 2),
+    "ENF-1": ("Secure Source Config", 2),
+    "AUD-1": ("Enforcing Provenance", 3),
+}
+
+
+def _control(id: str, status: str, detail: str = "") -> S2C2FControlResult:
+    label, level = _CONTROL_CATALOG[id]
     return S2C2FControlResult(id=id, label=label, level=level, status=status, detail=detail)
 
 
@@ -149,6 +173,22 @@ def _resolve_github_context(repository: str, token: Optional[str]) -> Optional[s
 # Local, filesystem-only signals (no GitHub API / token required)
 # ---------------------------------------------------------------------------
 
+def _resolve_repo_dir(repo_dir: str) -> Optional[Path]:
+    """Resolves `repo_dir` via cli.common.safe_resolve_path() -- rejecting
+    null-byte-laced/unrepresentable path strings before any of this
+    module's local, filesystem-only checks join a (fixed, internal)
+    relative filename onto it -- and confirms it's actually a directory.
+    Returns None on either failure, same "can't be checked, not fabricated
+    absent" contract every other check in this module follows; every
+    caller below only ever joins one of its own hardcoded relative
+    filenames onto the resolved result, never a caller-supplied one."""
+    try:
+        resolved = safe_resolve_path(repo_dir)
+    except UnsafePathError:
+        return None
+    return resolved if resolved.is_dir() else None
+
+
 _UPDATE_AUTOMATION_CONFIG_PATHS = (
     ".github/dependabot.yml",
     ".github/dependabot.yaml",
@@ -161,12 +201,16 @@ _UPDATE_AUTOMATION_CONFIG_PATHS = (
 def _find_update_automation_config(repo_dir: str) -> Optional[str]:
     """Returns the first dependency-update-automation config file found
     under repo_dir (Dependabot or Renovate), or None if none of the
-    well-known paths exist. A Dependabot/Renovate config is what actually
-    produces the automated "a newer version is available" pull requests
-    S2C2F's UPD-3 (PR Alerts) describes."""
+    well-known paths exist (or repo_dir itself can't be resolved/isn't a
+    directory). A Dependabot/Renovate config is what actually produces the
+    automated "a newer version is available" pull requests S2C2F's UPD-3
+    (PR Alerts) describes."""
+    resolved_dir = _resolve_repo_dir(repo_dir)
+    if resolved_dir is None:
+        return None
     for rel_path in _UPDATE_AUTOMATION_CONFIG_PATHS:
         try:
-            if (Path(repo_dir) / rel_path).is_file():
+            if (resolved_dir / rel_path).is_file():
                 return rel_path
         except OSError:
             continue
@@ -175,6 +219,33 @@ def _find_update_automation_config(repo_dir: str) -> Optional[str]:
 
 _PACKAGE_PROXY_CONFIG_FILES = (".npmrc", ".yarnrc", ".yarnrc.yml", "pip.conf", "pip.ini")
 _PUBLIC_REGISTRY_HOSTS = ("registry.npmjs.org", "pypi.org", "files.pythonhosted.org")
+
+
+def _line_names_private_registry(line: str) -> bool:
+    """True if `line` is a non-comment `key=value` config line naming a
+    registry/index-url override whose value isn't one of the ecosystem's
+    default public registries. Split out of
+    _config_file_names_private_registry purely to keep cognitive
+    complexity within budget (same rationale as cli.verify's
+    _format_vcs_lines/_format_pipeline_lines split)."""
+    lowered = line.strip().lower()
+    if lowered.startswith("#") or "=" not in lowered:
+        return False
+    if "registry" not in lowered and "index-url" not in lowered:
+        return False
+    value = line.split("=", 1)[1].strip()
+    return bool(value) and not any(host in value for host in _PUBLIC_REGISTRY_HOSTS)
+
+
+def _config_file_names_private_registry(path: Path) -> bool:
+    """True if `path` is a readable text file with at least one line
+    matching _line_names_private_registry. Unreadable/non-UTF8 files
+    degrade to False (checked, not found), never raise."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return any(_line_names_private_registry(line) for line in text.splitlines())
 
 
 def _find_private_package_proxy_config(repo_dir: str) -> Optional[str]:
@@ -192,23 +263,13 @@ def _find_private_package_proxy_config(repo_dir: str) -> Optional[str]:
     runner's global ~/.npmrc) -- that case honestly reports "unmet"
     (checked, not found here), never a false "confirmed absent".
     """
+    resolved_dir = _resolve_repo_dir(repo_dir)
+    if resolved_dir is None:
+        return None
     for rel_path in _PACKAGE_PROXY_CONFIG_FILES:
-        candidate = Path(repo_dir) / rel_path
-        try:
-            if not candidate.is_file():
-                continue
-            text = candidate.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            lowered = line.strip().lower()
-            if lowered.startswith("#") or "=" not in lowered:
-                continue
-            if "registry" not in lowered and "index-url" not in lowered:
-                continue
-            value = line.split("=", 1)[1].strip()
-            if value and not any(host in value for host in _PUBLIC_REGISTRY_HOSTS):
-                return rel_path
+        candidate = resolved_dir / rel_path
+        if candidate.is_file() and _config_file_names_private_registry(candidate):
+            return rel_path
     return None
 
 
@@ -261,16 +322,16 @@ def _has_materialized_package_dependency(resolved_dependencies: List[Dict[str, A
 def _eval_ing1_package_managers(resolved_dependencies: List[Dict[str, Any]]) -> S2C2FControlResult:
     pkg_count = sum(1 for d in resolved_dependencies if isinstance(d, dict) and str(d.get("uri", "")).startswith("pkg:"))
     if pkg_count > 0:
-        return _control("ING-1", "Package Managers", 1, STATUS_MET, f"{pkg_count} package-manager-resolved dependenc{'y' if pkg_count == 1 else 'ies'} detected from a lockfile")
-    return _control("ING-1", "Package Managers", 1, STATUS_UNMET, "no lockfile with package-manager-resolved dependencies was found under the repo")
+        return _control("ING-1", STATUS_MET, f"{pkg_count} package-manager-resolved dependenc{'y' if pkg_count == 1 else 'ies'} detected from a lockfile")
+    return _control("ING-1", STATUS_UNMET, "no lockfile with package-manager-resolved dependencies was found under the repo")
 
 
 def _eval_ing2_local_copies(repo_dir: str) -> S2C2FControlResult:
     found = _find_private_package_proxy_config(repo_dir)
     if found:
-        return _control("ING-2", "Local Copies", 1, STATUS_MET, f"{found} configures a non-default registry/index-url, consistent with an internal package proxy/cache")
+        return _control("ING-2", STATUS_MET, f"{found} configures a non-default registry/index-url, consistent with an internal package proxy/cache")
     return _control(
-        "ING-2", "Local Copies", 1, STATUS_UNMET,
+        "ING-2", STATUS_UNMET,
         "no .npmrc/.yarnrc/pip.conf at the repo root names a private registry/index-url; "
         "an org-wide proxy configured outside the repo would not be visible here",
     )
@@ -279,26 +340,26 @@ def _eval_ing2_local_copies(repo_dir: str) -> S2C2FControlResult:
 def _eval_sca1_vulnerability_scans(sarif_tools_scanned: List[str], vuln_alerts_status: Optional[int]) -> S2C2FControlResult:
     tool_match = _sarif_tool_name_matches(sarif_tools_scanned, _SCA_TOOL_NAME_PATTERNS)
     if tool_match:
-        return _control("SCA-1", "Vulnerability Scans", 1, STATUS_MET, f"SARIF findings from a recognized SCA tool ({tool_match})")
+        return _control("SCA-1", STATUS_MET, f"SARIF findings from a recognized SCA tool ({tool_match})")
     if vuln_alerts_status == 204:
-        return _control("SCA-1", "Vulnerability Scans", 1, STATUS_MET, "GitHub Dependabot vulnerability alerts are enabled for this repository")
+        return _control("SCA-1", STATUS_MET, "GitHub Dependabot vulnerability alerts are enabled for this repository")
     if vuln_alerts_status == 404:
-        return _control("SCA-1", "Vulnerability Scans", 1, STATUS_UNMET, "GitHub Dependabot vulnerability alerts are not enabled, and no SARIF input came from a recognized SCA tool")
-    return _control("SCA-1", "Vulnerability Scans", 1, STATUS_NOT_YET_REPORTED, "no SARIF input from a recognized SCA tool, and the GitHub vulnerability-alerts API could not be reached (missing token or network failure)")
+        return _control("SCA-1", STATUS_UNMET, "GitHub Dependabot vulnerability alerts are not enabled, and no SARIF input came from a recognized SCA tool")
+    return _control("SCA-1", STATUS_NOT_YET_REPORTED, "no SARIF input from a recognized SCA tool, and the GitHub vulnerability-alerts API could not be reached (missing token or network failure)")
 
 
 def _eval_sca2_license_checks(sarif_tools_scanned: List[str]) -> S2C2FControlResult:
     tool_match = _sarif_tool_name_matches(sarif_tools_scanned, _LICENSE_TOOL_NAME_PATTERNS)
     if tool_match:
-        return _control("SCA-2", "License Checks", 1, STATUS_MET, f"SARIF findings from a recognized license-scanning tool ({tool_match})")
-    return _control("SCA-2", "License Checks", 1, STATUS_NOT_YET_REPORTED, "no --sarif input came from a recognized license-scanning tool; no other generic signal is available")
+        return _control("SCA-2", STATUS_MET, f"SARIF findings from a recognized license-scanning tool ({tool_match})")
+    return _control("SCA-2", STATUS_NOT_YET_REPORTED, "no --sarif input came from a recognized license-scanning tool; no other generic signal is available")
 
 
 def _eval_inv1_inventory(resolved_dependencies: List[Dict[str, Any]]) -> S2C2FControlResult:
     count = len(resolved_dependencies)
     if count > 0:
-        return _control("INV-1", "Inventory", 1, STATUS_MET, f"a live inventory of {count} resolved dependencies is recorded (predicate.resolved_dependencies)")
-    return _control("INV-1", "Inventory", 1, STATUS_UNMET, "predicate.resolved_dependencies is empty; no recognized lockfile was found")
+        return _control("INV-1", STATUS_MET, f"a live inventory of {count} resolved dependencies is recorded (predicate.resolved_dependencies)")
+    return _control("INV-1", STATUS_UNMET, "predicate.resolved_dependencies is empty; no recognized lockfile was found")
 
 
 def _eval_upd1_manual_updates() -> S2C2FControlResult:
@@ -307,7 +368,7 @@ def _eval_upd1_manual_updates() -> S2C2FControlResult:
     # a technical artifact this pipeline can observe in a repo checkout or
     # via the GitHub API. Always not_yet_reported, honestly, rather than
     # inferred from an unrelated proxy signal.
-    return _control("UPD-1", "Manual Updates", 1, STATUS_NOT_YET_REPORTED, "no generic, repo-observable signal exists for a documented manual-update process")
+    return _control("UPD-1", STATUS_NOT_YET_REPORTED, "no generic, repo-observable signal exists for a documented manual-update process")
 
 
 # ---------------------------------------------------------------------------
@@ -317,48 +378,48 @@ def _eval_upd1_manual_updates() -> S2C2FControlResult:
 
 def _eval_sca3_eol_scans(dependabot_alerts_status: Optional[int]) -> S2C2FControlResult:
     if dependabot_alerts_status == 200:
-        return _control("SCA-3", "EOL Scans", 2, STATUS_MET, "GitHub Dependabot alerts API is enabled and reachable for this repository (closest available signal for automated deprecated/EOL package flagging)")
+        return _control("SCA-3", STATUS_MET, "GitHub Dependabot alerts API is enabled and reachable for this repository (closest available signal for automated deprecated/EOL package flagging)")
     if dependabot_alerts_status == 404:
-        return _control("SCA-3", "EOL Scans", 2, STATUS_UNMET, "GitHub Dependabot alerts are not enabled for this repository")
+        return _control("SCA-3", STATUS_UNMET, "GitHub Dependabot alerts are not enabled for this repository")
     if dependabot_alerts_status == 403:
-        return _control("SCA-3", "EOL Scans", 2, STATUS_NOT_YET_REPORTED, "GitHub Dependabot alerts API returned 403; the token likely lacks 'Dependabot alerts: Read' permission")
-    return _control("SCA-3", "EOL Scans", 2, STATUS_NOT_YET_REPORTED, "GitHub Dependabot alerts API could not be reached (missing token or network failure)")
+        return _control("SCA-3", STATUS_NOT_YET_REPORTED, "GitHub Dependabot alerts API returned 403; the token likely lacks 'Dependabot alerts: Read' permission")
+    return _control("SCA-3", STATUS_NOT_YET_REPORTED, "GitHub Dependabot alerts API could not be reached (missing token or network failure)")
 
 
 def _eval_inv2_incident_plans(security_md_present: Optional[bool]) -> S2C2FControlResult:
     if security_md_present is True:
-        return _control("INV-2", "Incident Plans", 2, STATUS_MET, "a SECURITY.md is present (GitHub community profile)")
+        return _control("INV-2", STATUS_MET, "a SECURITY.md is present (GitHub community profile)")
     if security_md_present is False:
-        return _control("INV-2", "Incident Plans", 2, STATUS_UNMET, "no SECURITY.md was found via the GitHub community profile API")
-    return _control("INV-2", "Incident Plans", 2, STATUS_NOT_YET_REPORTED, "the GitHub community profile API could not be reached (missing token or network failure)")
+        return _control("INV-2", STATUS_UNMET, "no SECURITY.md was found via the GitHub community profile API")
+    return _control("INV-2", STATUS_NOT_YET_REPORTED, "the GitHub community profile API could not be reached (missing token or network failure)")
 
 
 def _eval_upd3_pr_alerts(repo_dir: str) -> S2C2FControlResult:
     found = _find_update_automation_config(repo_dir)
     if found:
-        return _control("UPD-3", "PR Alerts", 2, STATUS_MET, f"{found} configures automated dependency-update pull requests")
-    return _control("UPD-3", "PR Alerts", 2, STATUS_UNMET, "no Dependabot or Renovate configuration file was found under the repo")
+        return _control("UPD-3", STATUS_MET, f"{found} configures automated dependency-update pull requests")
+    return _control("UPD-3", STATUS_UNMET, "no Dependabot or Renovate configuration file was found under the repo")
 
 
 def _eval_aud2_consumption_audits(resolved_dependencies: List[Dict[str, Any]]) -> S2C2FControlResult:
     count = len(resolved_dependencies)
     if count > 0:
-        return _control("AUD-2", "Consumption Audits", 2, STATUS_MET, f"an auditable record of {count} consumed dependencies is recorded (predicate.resolved_dependencies)")
-    return _control("AUD-2", "Consumption Audits", 2, STATUS_UNMET, "predicate.resolved_dependencies is empty; no recognized lockfile was found")
+        return _control("AUD-2", STATUS_MET, f"an auditable record of {count} consumed dependencies is recorded (predicate.resolved_dependencies)")
+    return _control("AUD-2", STATUS_UNMET, "predicate.resolved_dependencies is empty; no recognized lockfile was found")
 
 
 def _eval_aud3_integrity_validation(resolved_dependencies: List[Dict[str, Any]]) -> S2C2FControlResult:
     if _has_materialized_package_dependency(resolved_dependencies):
-        return _control("AUD-3", "Integrity Validation", 2, STATUS_MET, "at least one resolved dependency carries a pkg: PURL with a sha256/sha512 digest")
-    return _control("AUD-3", "Integrity Validation", 2, STATUS_UNMET, "no resolved dependency carries both a pkg: PURL and a sha256/sha512 digest")
+        return _control("AUD-3", STATUS_MET, "at least one resolved dependency carries a pkg: PURL with a sha256/sha512 digest")
+    return _control("AUD-3", STATUS_UNMET, "no resolved dependency carries both a pkg: PURL and a sha256/sha512 digest")
 
 
 def _eval_enf1_secure_source_config(branch_governance: BranchGovernanceReport) -> S2C2FControlResult:
     if not branch_governance.available:
-        return _control("ENF-1", "Secure Source Config", 2, STATUS_NOT_YET_REPORTED, "branch governance could not be verified (see predicate.branch_governance.reason)")
+        return _control("ENF-1", STATUS_NOT_YET_REPORTED, "branch governance could not be verified (see predicate.branch_governance.reason)")
     if branch_governance.pull_request_required and branch_governance.direct_push_prevented:
-        return _control("ENF-1", "Secure Source Config", 2, STATUS_MET, "the branch requires a pull request and prevents direct pushes")
-    return _control("ENF-1", "Secure Source Config", 2, STATUS_UNMET, "the branch does not both require a pull request and prevent direct pushes")
+        return _control("ENF-1", STATUS_MET, "the branch requires a pull request and prevents direct pushes")
+    return _control("ENF-1", STATUS_UNMET, "the branch does not both require a pull request and prevent direct pushes")
 
 
 # ---------------------------------------------------------------------------
@@ -370,12 +431,12 @@ _PROVENANCE_STATUS_CHECK_PATTERNS = ("tenax", "assay", "attest", "provenance", "
 
 def _eval_aud1_enforcing_provenance(branch_governance: BranchGovernanceReport) -> S2C2FControlResult:
     if not branch_governance.available:
-        return _control("AUD-1", "Enforcing Provenance", 3, STATUS_NOT_YET_REPORTED, "branch governance could not be verified (see predicate.branch_governance.reason)")
+        return _control("AUD-1", STATUS_NOT_YET_REPORTED, "branch governance could not be verified (see predicate.branch_governance.reason)")
     contexts = branch_governance.required_status_check_contexts or []
     match = next((c for c in contexts if any(p in c.lower() for p in _PROVENANCE_STATUS_CHECK_PATTERNS)), None)
     if match:
-        return _control("AUD-1", "Enforcing Provenance", 3, STATUS_MET, f"required status check '{match}' enforces provenance/attestation verification before merge")
-    return _control("AUD-1", "Enforcing Provenance", 3, STATUS_UNMET, "no required status check on the branch names a provenance/attestation verification job")
+        return _control("AUD-1", STATUS_MET, f"required status check '{match}' enforces provenance/attestation verification before merge")
+    return _control("AUD-1", STATUS_UNMET, "no required status check on the branch names a provenance/attestation verification job")
 
 
 # ---------------------------------------------------------------------------

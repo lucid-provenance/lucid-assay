@@ -509,6 +509,30 @@ class BuildVerdictEnvelopeBlockTests(unittest.TestCase):
         self.assertIn("computed_at", block)
         json.dumps(block)  # must be JSON-serializable end to end
 
+    def test_rcs_met_true_when_the_real_score_clears_the_real_min_rcs(self):
+        envelope = _envelope(_statement(rcs_value=89))
+        result = verify_dsse_attestation(envelope, min_rcs=75, dry_run=True)
+
+        block = _build_verdict_envelope_block(result)
+
+        self.assertTrue(block["rcs_met"])
+
+    def test_rcs_met_false_when_the_real_score_falls_short_of_the_real_min_rcs(self):
+        envelope = _envelope(_statement(rcs_value=60))
+        result = verify_dsse_attestation(envelope, min_rcs=75, dry_run=True)
+
+        block = _build_verdict_envelope_block(result)
+
+        self.assertFalse(block["rcs_met"])
+
+    def test_rcs_met_is_none_not_fabricated_when_rcs_value_is_missing(self):
+        result = verify_dsse_attestation({"not": "a valid envelope shape"}, min_rcs=75, dry_run=True)
+
+        block = _build_verdict_envelope_block(result)
+
+        self.assertIsNone(result.rcs_value)
+        self.assertIsNone(block["rcs_met"])
+
     def test_block_carries_the_real_itemized_source_and_build_checklists(self):
         envelope = _envelope(_statement(rcs_value=90))
         result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)

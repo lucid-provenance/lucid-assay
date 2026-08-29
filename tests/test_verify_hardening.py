@@ -200,7 +200,7 @@ class SchemaValidationGuardTests(_TempFileMixin, unittest.TestCase):
                 "thresholds": {"overall_min": 0.6, "patch_min": 0.8, "overall_met": True, "patch_met": True},
             },
             "assertion_density": {
-                "total_assertions": 20, "total_test_functions": 10, "density_ratio": 2.0,
+                "total_assertions": 20, "total_test_functions": 10, "density_ratio": 2.0, "target": 1.5, "met": True,
                 "heuristics": {"empty_test_bodies": 0, "assertion_only_true": 0, "skipped_or_disabled_ratio": 0.0},
             },
             "release_confidence_score": {

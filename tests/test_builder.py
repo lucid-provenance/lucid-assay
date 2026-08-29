@@ -17,6 +17,7 @@ from cli.parsers.github_rules import BranchGovernanceReport
 from cli.parsers.junit import TestTotals
 from cli.patch_coverage import PatchCoverageResult, REASON_CODE_NO_COVERABLE_LINES
 from cli.real_coverage import CoverageTrackResult, RealCoverageResult
+from cli.parsers.sarif import SarifSummaryReport
 from cli.scorer import score_pipeline
 
 
@@ -327,6 +328,45 @@ class BuilderStatementTests(unittest.TestCase):
         totals = TestTotals(tests=0, passed=0, failed=0, errored=0, skipped=0, duration_ms=0)
         statement = build_statement(**_base_kwargs(test_totals=totals))
         self.assertFalse(statement["predicate"]["test_verification"]["met"])
+
+    def test_assertion_density_met_true_when_density_clears_the_real_target(self):
+        # default fixture: 200 assertions / 100 test functions = 2.0, above 1.5.
+        statement = build_statement(**_base_kwargs())
+        density = statement["predicate"]["assertion_density"]
+        self.assertEqual(density["target"], 1.5)
+        self.assertTrue(density["met"])
+
+    def test_assertion_density_met_false_when_density_falls_short_of_the_real_target(self):
+        statement = build_statement(**_base_kwargs(total_assertions=50, total_test_functions=100))
+        self.assertFalse(statement["predicate"]["assertion_density"]["met"])
+
+    def test_assertion_density_met_false_never_fabricated_true_when_there_are_no_test_functions(self):
+        statement = build_statement(**_base_kwargs(total_assertions=0, total_test_functions=0))
+        density = statement["predicate"]["assertion_density"]
+        self.assertIsNone(density["density_ratio"])
+        self.assertFalse(density["met"])
+
+    def test_static_analysis_configured_false_and_unavailable_when_no_sarif_was_given_at_all(self):
+        statement = build_statement(**_base_kwargs())
+        static_analysis = statement["predicate"]["static_analysis"]
+        self.assertFalse(static_analysis["configured"])
+        self.assertFalse(static_analysis["available"])
+        self.assertEqual(static_analysis["reasons"], ["no --sarif reports configured for this run"])
+
+    def test_static_analysis_configured_true_and_available_true_on_a_real_clean_scan(self):
+        sarif_report = SarifSummaryReport(available=True, total_findings=0, tools_scanned=["semgrep"])
+        statement = build_statement(**_base_kwargs(sarif_report=sarif_report))
+        static_analysis = statement["predicate"]["static_analysis"]
+        self.assertTrue(static_analysis["configured"])
+        self.assertTrue(static_analysis["available"])
+
+    def test_static_analysis_configured_true_but_unavailable_when_the_report_was_broken(self):
+        sarif_report = SarifSummaryReport(available=False, reasons=["SARIF file not found: x.json"])
+        statement = build_statement(**_base_kwargs(sarif_report=sarif_report))
+        static_analysis = statement["predicate"]["static_analysis"]
+        self.assertTrue(static_analysis["configured"])
+        self.assertFalse(static_analysis["available"])
+        self.assertEqual(static_analysis["reasons"], ["SARIF file not found: x.json"])
 
     def test_sbom_defaults_to_none(self):
         statement = build_statement(**_base_kwargs())

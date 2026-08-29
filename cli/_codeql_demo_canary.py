@@ -11,10 +11,14 @@ close the PR without merging at all.
 import hashlib
 
 
-def _canary_weak_hash(data: bytes) -> str:
-    # CWE-327 (Use of a Broken/Risky Cryptographic Algorithm): MD5 is
-    # cryptographically broken. CodeQL's default Python query suite flags
-    # this call site unconditionally (a syntactic pattern, no taint
-    # tracking required) -- exactly why it's the reliable trigger used
-    # here. Never called anywhere in the real codebase.
-    return hashlib.md5(data).hexdigest()
+def _canary_hash_password(password: str) -> str:
+    # CWE-327 (Use of a Broken/Risky Cryptographic Algorithm), specifically
+    # py/weak-sensitive-data-hashing: CodeQL's query here is taint-tracked,
+    # not purely syntactic -- it only fires when a value flowing into a
+    # broken hash (MD5/SHA1) is recognized as sensitive by its naming
+    # heuristic (password/secret/token/credential/...). A first attempt
+    # using a generically-named `data: bytes` parameter produced zero
+    # results for exactly this reason; naming it `password` is what
+    # actually triggers the query. Never called anywhere in the real
+    # codebase.
+    return hashlib.md5(password.encode()).hexdigest()

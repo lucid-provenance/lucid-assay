@@ -61,7 +61,7 @@ def _rcs_statement(*, vcs=None, branch_governance=None, rcs_value=85) -> Dict[st
     return {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [{"name": "registry.example.com/org/svc", "digest": {"sha256": SUBJECT_DIGEST}}],
-        "predicateType": "https://tenax.io/attestations/assay/v1",
+        "predicateType": "https://lucidprovenance.io/attestations/assay/v1",
         "predicate": predicate,
     }
 
@@ -253,7 +253,7 @@ class BuildLevel3ChecksTests(unittest.TestCase):
         over sha256 when an entry carries both -- meaning a real,
         genuinely hash-pinned npm lockfile almost always produces sha512
         entries here, never sha256. Confirmed via a real run
-        (tenax-io/tenax-console PR #1, 2026-08-27): this check failed
+        (lucid-provenance/lucid-console PR #1, 2026-08-27): this check failed
         against a fully-materialized ~569-package npm lockfile purely
         because every entry was sha512, before this test/fix existed."""
         predicate = {
@@ -324,7 +324,7 @@ class BuildLevel3ChecksTests(unittest.TestCase):
 
     def test_build_level3_fails_by_default_for_every_caller_today(self):
         """The whole point of the fail-closed requirement: a fully-populated,
-        real SLSA v1.0 statement (matching what tenax-assay's own build job
+        real SLSA v1.0 statement (matching what lucid-assay's own build job
         emits today) must still legitimately fail Build Level 3, since the
         architecture that would make it pass doesn't exist until Phase 2."""
         rcs_envelope = _envelope(_rcs_statement(vcs=_full_vcs(), branch_governance={"approvals_required": 2}))
@@ -466,13 +466,13 @@ class VerdictHeadingConsistencyTests(unittest.TestCase):
         self.assertIn("FINAL VERDICT: GATED", result.verdict)
 
         markdown = _render_step_summary_markdown(result)
-        self.assertIn("## tenax-assay verify: ⚠️ GATED", markdown)
+        self.assertIn("## lucid-assay verify: ⚠️ GATED", markdown)
         self.assertNotIn("PASS", markdown.split("\n")[0])
 
         buf = io.StringIO()
         with redirect_stderr(buf):
             _print_verify_result_human(result)
-        self.assertIn("tenax-assay verify: GATED", buf.getvalue())
+        self.assertIn("lucid-assay verify: GATED", buf.getvalue())
 
     def test_fully_compliant_result_shows_passed_in_heading(self):
         # Constructed directly (rather than driven through
@@ -486,19 +486,19 @@ class VerdictHeadingConsistencyTests(unittest.TestCase):
         result = VerificationResult(passed=True, verdict_word="PASSED")
 
         markdown = _render_step_summary_markdown(result)
-        self.assertIn("## tenax-assay verify: ✅ PASSED", markdown)
+        self.assertIn("## lucid-assay verify: ✅ PASSED", markdown)
 
         buf = io.StringIO()
         with redirect_stderr(buf):
             _print_verify_result_human(result)
-        self.assertIn("tenax-assay verify: PASSED", buf.getvalue())
+        self.assertIn("lucid-assay verify: PASSED", buf.getvalue())
 
     def test_malformed_envelope_reports_failed_not_blank(self):
         result = verify_dsse_attestation("not-a-dict", dry_run=True)  # type: ignore[arg-type]
 
         self.assertEqual(result.verdict_word, "FAILED")
         markdown = _render_step_summary_markdown(result)
-        self.assertIn("## tenax-assay verify: ❌ FAILED", markdown)
+        self.assertIn("## lucid-assay verify: ❌ FAILED", markdown)
 
 
 class StaticAnalysisInStepSummaryTests(unittest.TestCase):
@@ -557,7 +557,7 @@ class StepSummaryWriterTests(unittest.TestCase):
 
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
-            self.assertIn("tenax-assay verify:", content)
+            self.assertIn("lucid-assay verify:", content)
             self.assertIn("SLSA Source Track", content)
             self.assertIn("FINAL VERDICT", content)
         finally:
@@ -602,7 +602,7 @@ class StepSummaryWriterTests(unittest.TestCase):
 
         markdown = _render_step_summary_markdown(result)
 
-        self.assertIn("## tenax-assay verify:", markdown)
+        self.assertIn("## lucid-assay verify:", markdown)
         self.assertIn("```text", markdown)
 
 

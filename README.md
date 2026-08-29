@@ -1,4 +1,4 @@
-# Tenax Assay — Continuous Governance Control Plane (Foundation)
+# Lucid Assay — Continuous Governance Control Plane (Foundation)
 
 MVP foundation for bridging CI/CD execution to SOC 2 / FedRAMP / ISO 27001
 evidence: cryptographically signed in-toto attestations of test, coverage,
@@ -10,7 +10,7 @@ verifies those attestations before a deploy/merge is allowed to proceed.
 
 ```
 schema/
-  tenax-attestation-v1.schema.json    # in-toto predicate JSON Schema
+  lucid-attestation-v1.schema.json    # in-toto predicate JSON Schema
 cli/
   common.py                 # safe_resolve_path(): path-safety guard shared by every module below that opens an operator-supplied file
   parsers/junit.py          # streaming JUnit XML -> TestTotals (flaky-retry aware)
@@ -36,9 +36,9 @@ cli/
   builder.py                 # assembles the unsigned in-toto Statement
   slsa_provenance.py          # assembles a *separate*, real SLSA v1.0 provenance Statement (--emit-slsa-provenance)
   oidc_signer.py              # ambient OIDC -> Fulcio cert -> DSSE sign -> Rekor log
-  sign.py                      # `tenax-assay sign <file>`: standalone signing subcommand for an isolated attest job
+  sign.py                      # `lucid-assay sign <file>`: standalone signing subcommand for an isolated attest job
   verify.py                   # admission gatekeeper: DSSE decode + Sigstore identity + policy gates
-  main.py                     # CLI entrypoint wiring it all together (`tenax-assay verify` dispatches to verify.py)
+  main.py                     # CLI entrypoint wiring it all together (`lucid-assay verify` dispatches to verify.py)
 tests/
   test_scorer.py               # adversarial edge-case tests for the RCS algorithm
   test_patch_coverage.py        # git-diff/coverage intersection + reason_code tests (real git repo)
@@ -57,7 +57,7 @@ tests/
   test_common_path_safety.py            # safe_resolve_path() + its wiring into every open()/getsize() call site
   test_slsa_provenance.py               # SLSA v1.0 provenance builder: ground-truth/fail-closed tests, and proof
                                          # a genuine statement satisfies cli/verify.py's SLSA Level 1/2 checklist
-  test_sign.py                          # `tenax-assay sign` CLI + cli.oidc_signer.sign_file_to_envelope tests
+  test_sign.py                          # `lucid-assay sign` CLI + cli.oidc_signer.sign_file_to_envelope tests
   test_coverage_contexts.py             # `coverage json --show-contexts` export parsing tests
   test_real_coverage.py                 # vanity-test-aware coverage cross-reference tests
   fixtures/                             # sample cobertura.xml and a rendered statement
@@ -146,7 +146,7 @@ actually goes in a slow CI job (this is additive — output is identical to
 a normal run when `--debug` is omitted):
 
 ```text
-=== Tenax Assay Stage Profiling ===
+=== Lucid Assay Stage Profiling ===
 - Inputs & Parsing:                 0.2 ms
 - Diff & Patch Coverage:            0.0 ms
 - AST Assertion Walking:           36.6 ms
@@ -362,7 +362,7 @@ by name**: each keeps its own file's `report_hash`, since collapsing two
 same-named tools from two different files would leave no single honest
 hash to attach to the merged entry.
 
-`tenax-assay run` is an explicit alias for the pipeline above (it's also
+`lucid-assay run` is an explicit alias for the pipeline above (it's also
 what runs with no subcommand at all, so `run` is optional, not required —
 existing invocations with no subcommand keep working unchanged).
 
@@ -415,7 +415,7 @@ predicate data — it's never an RCS scoring input. **It's also unrelated to
 the SLSA v1.0 Build Level 2 checklist's "Materialized Resolved
 Dependencies" item below**, which reads a differently-shaped
 `buildDefinition.resolvedDependencies` on a SLSA-provenance predicate;
-tenax-assay's own predicate isn't SLSA-shaped (see the checklist section),
+lucid-assay's own predicate isn't SLSA-shaped (see the checklist section),
 so populating this field doesn't change that item's outcome.
 
 ### Vanity-test-aware "real" coverage (`--coverage-contexts`)
@@ -443,7 +443,7 @@ exact same denominator the existing `coverage.overall`/`coverage.patch`
 figures already use, so "measured" and "real" stay directly comparable.
 Embedded as `predicate.coverage.real.{overall,patch}` (each track:
 `available`, `measured_line_rate`, `real_line_rate`, `total_lines`,
-`measured_covered_lines`, `vanity_only_lines`) — `tenax-assay verify`
+`measured_covered_lines`, `vanity_only_lines`) — `lucid-assay verify`
 renders both as `Real Total/Patch Coverage: ...` lines, plus an explicit
 `⚠ ... is BELOW the ... threshold` warning whenever real coverage alone
 would fail a gate measured coverage currently passes (see "Verification
@@ -525,18 +525,18 @@ untouched Sigstore bundle (`_sigstore_bundle`) is also preserved verbatim
 alongside it.
 
 **Automatic verdict annotation.** Whenever `--sign`/`--dry-run-sign` (or
-`tenax-assay run --sign`) produces a signed envelope, `cli/main.py`
+`lucid-assay run --sign`) produces a signed envelope, `cli/main.py`
 immediately runs `cli.verify.verify_dsse_attestation()` against it —
 using `--min-rcs`, the same threshold this pipeline already gates its own
 exit code on — and writes the resulting verdict into the envelope's
-`_verdict` field, the equivalent of a separate `tenax-assay verify
+`_verdict` field, the equivalent of a separate `lucid-assay verify
 --write-verdict` call (see "Verification (admission gate)" below for the
 field's exact shape and why it's an unsigned, re-derivable sibling field
 rather than baked into the signed predicate). This means a downstream CI
 pipeline no longer needs its own explicit verify step just to get a
 verdict onto the artifact before uploading it to the ingestion API — one
 still exists for callers that need `--cert-identity`/`--expected-*`/
-`--disallow-degraded` actually *enforced*, since `tenax-assay run --sign`
+`--disallow-degraded` actually *enforced*, since `lucid-assay run --sign`
 never collects those flags itself. A GATED/FAILED verdict here is a
 normal outcome, not an error, and never changes this run's own exit code
 (still decided solely by step 10's `--min-rcs` check); only a genuine
@@ -572,7 +572,7 @@ a hard pipeline failure. `--dry-run-sign` produces an explicitly-marked
 ## Verification (admission gate)
 
 `cli/verify.py` (the largest module, ~740 lines) is the deploy/merge-time
-counterpart to signing: `tenax-assay verify <envelope.json> [flags]`
+counterpart to signing: `lucid-assay verify <envelope.json> [flags]`
 decodes a signed DSSE envelope, best-effort verifies the Sigstore signing
 identity, and enforces admission policy gates against the embedded RCS —
 never raising on malformed or hostile input; every problem surfaces as a
@@ -587,7 +587,7 @@ and exit code `1`, the same as any other file error.
 
 **Formal schema validation** (optional, diagnostic): when `jsonschema` is
 installed, the extracted predicate is validated against
-`schema/tenax-attestation-v1.schema.json` before policy/score evaluation,
+`schema/lucid-attestation-v1.schema.json` before policy/score evaluation,
 and surfaced as `schema_validation_status` (`"passed"` / `"failed"` /
 `"skipped"`). This is deliberately a `warnings` entry, **not** a blocking
 gate: the predicate schema evolves over time (`branch_governance`,
@@ -628,7 +628,7 @@ output carries the same underlying data reshaped into `static_analysis.tools`
     "verified": true,
     "envelope": {
       "statement_type": "https://in-toto.io/Statement/v1",
-      "predicate_type": "https://tenax.io/attestations/assay/v1",
+      "predicate_type": "https://lucidprovenance.io/attestations/assay/v1",
       "subject": [{"name": "registry.example.com/org/svc", "digest": {"sha256": "..."}}]
     },
     "verdict": "FINAL VERDICT: GATED (Source L2 / Build L1) — SLSA Build L2 Incomplete",
@@ -716,14 +716,14 @@ freezing one call's policy into the predicate would make it look
 permanent when a different `--min-rcs` next month would legitimately
 produce a different verdict for the same artifact. Written to
 `--verdict-out` when given, or **in place over the input envelope**
-otherwise — the common flow is `tenax-assay verify env.dsse.json
+otherwise — the common flow is `lucid-assay verify env.dsse.json
 --write-verdict` immediately before uploading that same file to the
 ingestion API, so the record it stores already carries the verdict that
 produced it. Any existing `_verdict` on the envelope is overwritten, never
 merged, since each run reflects only its own fresh gate parameters. A
 consumer must treat `_verdict` exactly like the Rekor log coordinates next
 to it: informational and re-derivable, never a substitute for re-running
-`tenax-assay verify` with trusted gate parameters when the stakes actually
+`lucid-assay verify` with trusted gate parameters when the stakes actually
 require a fresh check.
 
 Policy gates:
@@ -743,7 +743,7 @@ Policy gates:
   older attestation predating this field) — still blocks. `degraded`
   itself is schema-optional (defaults to `false` for *display* when a
   predicate omits it — that default is documented in
-  `schema/tenax-attestation-v1.schema.json`, not a guess) — but
+  `schema/lucid-attestation-v1.schema.json`, not a guess) — but
   `--disallow-degraded` never trusts that display default as a compliance
   signal: `degraded` missing or malformed entirely is its own fail-closed
   violation under this flag (`degraded_field_present == False`), same
@@ -791,7 +791,7 @@ carries the same data under `source.level_1`..`level_4` and
 **`--slsa-envelope PATH`** loads a *second* DSSE envelope alongside the
 primary one so both tracks can be evaluated together from the right
 source: the Source track reads `vcs`/`branch_governance` off whichever
-loaded statement is tenax-assay's own RCS predicate, and the Build track
+loaded statement is lucid-assay's own RCS predicate, and the Build track
 reads `buildDefinition`/`runDetails` off whichever is SLSA-provenance-
 shaped — regardless of which one is the primary positional argument.
 Without `--slsa-envelope` (unchanged from before it existed), both
@@ -936,7 +936,7 @@ cumulative, same rule as the Build track below):
 - **Level 3** — an *unforgeable* builder identity: `runDetails.builder.id`
   names the isolated control-plane signer workflow itself (a narrower
   allowlist than Level 2's, currently
-  `https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml`),
+  `https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml`),
   *and* the verified Sigstore signer identity (`--cert-identity`) is
   provably that same workflow — proving the entity that signed the
   envelope is the same one that claims to have built it, so an untrusted
@@ -947,7 +947,7 @@ cumulative, same rule as the Build track below):
   synthetic source-commit entry every statement already carries.
   **Fails closed for every caller today** — the architecture that would
   make the first two checks pass (provenance constructed inside
-  `tenax-attest`'s isolated signer job, not the untrusted build job — see
+  `lucid-attest`'s isolated signer job, not the untrusted build job — see
   "Isolating signing from the build" below) doesn't exist yet.
 
 **`--require-slsa-build-l3`** (off by default) folds the Build track's
@@ -974,7 +974,7 @@ raises) everywhere else, or if the file can't be written.
 ## SLSA v1.0 provenance attestation (`--emit-slsa-provenance`)
 
 `--emit-slsa-provenance` (`cli/slsa_provenance.py`) makes `cli.main` write a
-**second, separate** in-toto Statement alongside tenax-assay's own RCS
+**second, separate** in-toto Statement alongside lucid-assay's own RCS
 predicate — same subject artifact, but `predicateType`
 `https://slsa.dev/provenance/v1`, real SLSA-shaped `buildDefinition`/
 `runDetails`, and its own output file (`--slsa-provenance-out`, default
@@ -982,7 +982,7 @@ derived from `--out`, e.g. `attestation.slsa-provenance.unsigned.json`). If
 `--sign`/`--dry-run-sign` was also passed, this second statement is signed
 into its own DSSE envelope the same way the primary one is. The two
 predicates are kept apart rather than merged — see `parsers/lockfiles.py`'s
-note above and the SLSA checklist section for why tenax-assay's own
+note above and the SLSA checklist section for why lucid-assay's own
 predicate is deliberately not SLSA-shaped; this is the statement built
 specifically to *be* SLSA-shaped instead.
 
@@ -990,7 +990,7 @@ specifically to *be* SLSA-shaped instead.
 every `buildDefinition`/`runDetails` field is populated strictly from data
 that genuinely describes the run — ambient `GITHUB_REPOSITORY`/`_SHA`/
 `_RUN_ID`/`_RUN_ATTEMPT`/`_WORKFLOW_REF`/`RUNNER_ENVIRONMENT` env vars
-Actions itself sets, plus tenax-assay's own already-parsed lockfile
+Actions itself sets, plus lucid-assay's own already-parsed lockfile
 dependency list (`resolved_dependencies`, reshaped into SLSA's `{uri,
 digest}` form). Nothing is inferred or defaulted to a plausible-looking
 value:
@@ -1016,7 +1016,7 @@ test_satisfies_verify_py_slsa_build_level_1_and_2_checklists` asserts this
 directly against `_evaluate_slsa_l1`/`_evaluate_slsa_l2`. Note that
 `cli.verify`'s own `--min-rcs`/`--disallow-degraded`/`--require-digest`
 gates (and its unconditional `predicateType`/`release_confidence_score`
-checks) are specific to tenax-assay's RCS predicate and would always
+checks) are specific to lucid-assay's RCS predicate and would always
 report `passed: false` if evaluated against a lone SLSA statement outside
 `--slsa-envelope` — that's expected and unrelated to the SLSA checklist's
 outcome. `.github/workflows/assay.yml`'s own `verify` job evaluates both
@@ -1026,7 +1026,7 @@ that statement is constructed and signed in the first place). See
 `tests/fixtures/slsa_provenance_statement.output.json` for a minimal
 fully-populated example.
 
-## Isolating signing from the build (`tenax-assay sign`)
+## Isolating signing from the build (`lucid-assay sign`)
 
 A signed, checklist-passing statement is not by itself a defensible SLSA
 Build Level 2 claim. Level 2's actual requirement is that provenance is
@@ -1037,14 +1037,14 @@ same job, under the same script, as the code that runs a PR's tests and
 dependencies doesn't provide that: nothing stops that code from reaching
 the signing credential, in principle, since both share one trust boundary.
 
-`tenax-assay sign <statement.json> [--out PATH] [--dry-run-sign]`
+`lucid-assay sign <statement.json> [--out PATH] [--dry-run-sign]`
 (`cli/sign.py`) exists to make real isolation possible: it signs an
 already-built unsigned statement *file*, nothing else — no scoring,
 coverage, SARIF, or branch-governance re-execution, so a job invoking only
 this subcommand never needs read access to any of that. It's the same
 `cli.oidc_signer.sign_file_to_envelope()` either path uses; `cli.main`'s
 own `--sign`/`--dry-run-sign` flags still build-then-sign in one process
-for local/single-command use exactly as before — `tenax-assay sign` is
+for local/single-command use exactly as before — `lucid-assay sign` is
 additive, not a replacement.
 
 `.github/workflows/assay.yml` uses this to split into three jobs:
@@ -1057,8 +1057,8 @@ build (contents: read, security-events: write)
          |
          v  (artifacts only -- no shared runner/credentials)
 attest (id-token: write -- the ONLY job with it)
-  download-artifact -> `tenax-assay provenance` (constructs SLSA statement
-  from this job's own trusted context, not build's) -> `tenax-assay sign`
+  download-artifact -> `lucid-assay provenance` (constructs SLSA statement
+  from this job's own trusted context, not build's) -> `lucid-assay sign`
   (both statements, atomically) -> upload-artifact "signed-statements"
          |
          v
@@ -1069,17 +1069,17 @@ verify (contents: read)
 
 `build`'s test/dependency execution can never reach the Sigstore signing
 credential — `id-token: write` is granted to `attest` alone. `attest` is a
-`uses:` call to [`tenax-io/tenax-attest`](https://github.com/tenax-io/tenax-attest),
+`uses:` call to [`lucid-provenance/lucid-attest`](https://github.com/lucid-provenance/lucid-attest),
 a separate, branch-protected repository hosting the signing job as a
 `workflow_call` reusable workflow, checked out at a commit SHA hardcoded
 inside that repo's own `sign.yml` (`env.TRUSTED_SIGNER_SHA`) — deliberately
-*not* a value `tenax-assay`'s `attest` job (or any other caller) can supply
+*not* a value `lucid-assay`'s `attest` job (or any other caller) can supply
 (the same pattern [`slsa-framework/slsa-github-generator`](https://github.com/slsa-framework/slsa-github-generator)
 uses). That's the gap that matters: even a PR that fully rewrites
-`tenax-assay`'s own workflow file in the same PR can't also rewrite what
+`lucid-assay`'s own workflow file in the same PR can't also rewrite what
 the signer trusts, since that code isn't part of the PR's diff at all. The
-source for that repo's content lives in `contrib/tenax-attest-repo/` in
-this repo (not part of `tenax-assay`'s own CI — a header comment there
+source for that repo's content lives in `contrib/lucid-attest-repo/` in
+this repo (not part of `lucid-assay`'s own CI — a header comment there
 says so) along with setup instructions; `assay.yml`'s `attest` job comment
 cross-references it.
 
@@ -1093,8 +1093,8 @@ provenance-construction shift below: the code that builds and tests a PR
 cannot mint the identity that signs what gets said about it, **and**
 cannot forge the content of what gets signed either.
 
-**`tenax-assay provenance`** (`cli/provenance.py`) is what makes that
-second half real: `tenax-assay provenance --subject-name NAME
+**`lucid-assay provenance`** (`cli/provenance.py`) is what makes that
+second half real: `lucid-assay provenance --subject-name NAME
 --subject-digest sha256:HEX --repo-dir DIR --builder-id ID --out PATH`
 constructs a SLSA v1.0 provenance statement using nothing but *this
 process's own* ambient GitHub Actions context — the same
@@ -1111,12 +1111,12 @@ resolved dependencies) is derived from the trusted signer job's own
 environment and its own read-only checkout of the source commit (for
 lockfile scanning only — the checkout is never executed), not from
 anything the untrusted `build` job claims — then signs both statements
-atomically in the same job via `tenax-assay sign`.
+atomically in the same job via `lucid-assay sign`.
 
 ## Try it
 
 ```bash
-cd tenax-assay
+cd lucid-assay
 python3 -m unittest discover -s tests -v
 
 python3 -m cli.main \
@@ -1134,7 +1134,7 @@ python3 -m cli.main \
   --skip-perf-budget-check --debug \
   --emit-slsa-provenance --slsa-provenance-out /tmp/attestation.slsa-provenance.unsigned.json \
   --out /tmp/attestation.unsigned.json
-# `tenax-assay run --sarif ... --sonar-metrics ...` is an equivalent, explicit
+# `lucid-assay run --sarif ... --sonar-metrics ...` is an equivalent, explicit
 # spelling of the same pipeline invocation above. Omit --emit-slsa-provenance/
 # --slsa-provenance-out to skip the second, SLSA-shaped statement entirely.
 # --coverage-contexts is generated by:
@@ -1159,7 +1159,7 @@ python3 -m cli.main sign /tmp/attestation.unsigned.json --dry-run-sign
 ```
 
 `tests/fixtures/` currently ships `cobertura.xml` and a rendered
-`sample_statement.output.json` (tenax-assay's own RCS predicate) plus
+`sample_statement.output.json` (lucid-assay's own RCS predicate) plus
 `slsa_provenance_statement.output.json` (a minimal, fully-populated
 `--emit-slsa-provenance` statement); supply your own `junit.xml` (the
 schema is standard JUnit XML — pytest's `--junitxml=`, jest-junit, etc.
@@ -1184,7 +1184,7 @@ diagnostic schema validation, OIDC fetch retry bounding),
 edge cases against a mocked GitHub API), `test_slsa_provenance.py`
 (ground-truth/fail-closed tests for `--emit-slsa-provenance`, plus proof
 that a genuine statement satisfies `cli/verify.py`'s SLSA Level 1/2
-checklist), and `test_sign.py` (`tenax-assay sign`'s CLI surface and
+checklist), and `test_sign.py` (`lucid-assay sign`'s CLI surface and
 `cli.oidc_signer.sign_file_to_envelope`'s size-guard/fail-closed paths).
 
 Run the full suite in parallel:

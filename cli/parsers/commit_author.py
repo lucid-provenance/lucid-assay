@@ -176,7 +176,7 @@ def inspect_commit_author(
         "Authorization": f"Bearer {resolved_token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "tenax-assay",
+        "User-Agent": "lucid-assay",
     }
     body, error_report = _fetch_commit_body(repository, commit_sha, headers, timeout)
     if error_report is not None:

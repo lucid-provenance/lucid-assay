@@ -1,6 +1,6 @@
 ---
 name: assay-test
-description: Run Tenax Assay test suite and check adversarial AST coverage
+description: Run Lucid Assay test suite and check adversarial AST coverage
 ---
 
 Run the complete test suite using `python3 -m pytest -v tests/` and inspect any failing assertions or AST visitor boundary regressions.

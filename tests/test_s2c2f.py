@@ -238,7 +238,7 @@ class EvaluateS2C2FTests(unittest.TestCase):
         self.assertEqual(controls["AUD-1"].status, STATUS_NOT_YET_REPORTED)
 
     def test_aud1_met_when_a_required_status_check_names_provenance(self):
-        governance = _governance(required_status_check_contexts=["ci/build", "tenax-assay/verify"])
+        governance = _governance(required_status_check_contexts=["ci/build", "lucid-assay/verify"])
         report = evaluate_s2c2f(
             repo_dir=tempfile.mkdtemp(),
             repository="acme/widgets",
@@ -249,7 +249,7 @@ class EvaluateS2C2FTests(unittest.TestCase):
         )
         control = _controls_by_id(report)["AUD-1"]
         self.assertEqual(control.status, STATUS_MET)
-        self.assertIn("tenax-assay/verify", control.detail)
+        self.assertIn("lucid-assay/verify", control.detail)
 
     def test_aud1_unmet_when_no_required_status_check_names_provenance(self):
         governance = _governance(required_status_check_contexts=["ci/lint", "ci/unit-tests"])

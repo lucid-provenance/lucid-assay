@@ -7,7 +7,7 @@ from cli.verify import verify_dsse_attestation
 def create_envelope(payload_override=None, envelope_override=None):
     payload = {
         "_type": "https://in-toto.io/Statement/v1",
-        "predicateType": "https://tenax.io/attestations/assay/v1",
+        "predicateType": "https://lucidprovenance.io/attestations/assay/v1",
         "subject": [{"name": "foo", "digest": {"sha256": "abcdef"}}],
         "predicate": {
             "release_confidence_score": {

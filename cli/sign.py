@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tenax-assay sign: standalone keyless-signing subcommand for an already-built
+lucid-assay sign: standalone keyless-signing subcommand for an already-built
 unsigned in-toto Statement file (`cli.oidc_signer.sign_file_to_envelope`).
 
 Why this exists as its own subcommand, separate from `cli.main`'s `--sign`/
@@ -10,7 +10,7 @@ isolation between "the job that runs untrusted build/test code" and "the
 job that mints the Sigstore signing identity" needs to sign a statement it
 didn't just build itself -- a separate job downloaded it as an artifact from
 an upstream build job and has no access to, or trust in, anything about how
-that job produced it beyond the file's own bytes. `tenax-assay sign` is that
+that job produced it beyond the file's own bytes. `lucid-assay sign` is that
 narrow surface: it takes exactly one already-built unsigned statement file
 and signs it, nothing else -- it never re-runs scoring, coverage, SARIF
 ingestion, or branch governance, so a job invoking only this subcommand
@@ -43,7 +43,7 @@ EXIT_SIGNING_ERROR = 2
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="tenax-assay sign",
+        prog="lucid-assay sign",
         description="Keyless-sign an already-built unsigned in-toto Statement file into a DSSE envelope.",
     )
     p.add_argument("statement", help="path to the unsigned in-toto Statement JSON file")

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://tenax.io/attestations/assay/v1",
-  "title": "Tenax Assay Pipeline Lifecycle Attestation Predicate v1",
+  "$id": "https://lucidprovenance.io/attestations/assay/v1",
+  "title": "Lucid Assay Pipeline Lifecycle Attestation Predicate v1",
   "description": "In-toto predicate carried inside a DSSE-wrapped in-toto Statement (predicateType = this $id). Captures VCS provenance, supply-chain artifact identity, test verification, coverage, assertion-quality heuristics, and the derived Release Confidence Score (RCS) for a single CI pipeline run.",
   "type": "object",
   "additionalProperties": false,
@@ -110,7 +110,7 @@
         "required_status_check_contexts": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "The `context` of every required_status_checks rule entry applying to this branch (e.g. \"ci/tenax-assay-verify\"). Absent/empty on attestations predating this field, or whenever available=false."
+          "description": "The `context` of every required_status_checks rule entry applying to this branch (e.g. \"ci/lucid-assay-verify\"). Absent/empty on attestations predating this field, or whenever available=false."
         }
       }
     },
@@ -291,7 +291,7 @@
     "static_analysis": {
       "type": "object",
       "additionalProperties": false,
-      "description": "SARIF 2.1.0 static-analysis findings (see cli/parsers/sarif.py), differential-scored against the patch. configured=false means no --sarif input was given at all for this run (available is then always false too -- nothing was ever evaluated, so there's no real result to call available); configured=true, available=false means a --sarif input was given but couldn't be read/parsed (see reasons); configured=true, available=true is a real, completed scan (findings/tools populated, possibly empty). Absent entirely on attestations predating this feature; configured absent (available alone present) on an attestation predating the configured/available split (tenax-assay PR #47) -- available=true there is ambiguous between \"never configured\" and \"genuinely clean scan\", by that earlier schema's own now-corrected mistake.",
+      "description": "SARIF 2.1.0 static-analysis findings (see cli/parsers/sarif.py), differential-scored against the patch. configured=false means no --sarif input was given at all for this run (available is then always false too -- nothing was ever evaluated, so there's no real result to call available); configured=true, available=false means a --sarif input was given but couldn't be read/parsed (see reasons); configured=true, available=true is a real, completed scan (findings/tools populated, possibly empty). Absent entirely on attestations predating this feature; configured absent (available alone present) on an attestation predating the configured/available split (lucid-assay PR #47) -- available=true there is ambiguous between \"never configured\" and \"genuinely clean scan\", by that earlier schema's own now-corrected mistake.",
       "required": [
         "configured", "available", "format", "total_findings", "errors_count", "warnings_count",
         "notes_count", "patch_errors_count", "patch_warnings_count", "findings"

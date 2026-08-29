@@ -54,7 +54,7 @@ def _statement(*, predicate_overrides=None):
     return {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [{"name": "registry.example.com/org/svc", "digest": {"sha256": SUBJECT_DIGEST}}],
-        "predicateType": "https://tenax.io/attestations/assay/v1",
+        "predicateType": "https://lucidprovenance.io/attestations/assay/v1",
         "predicate": predicate,
     }
 
@@ -146,7 +146,7 @@ class EnvelopeSizeGuardTests(_TempFileMixin, unittest.TestCase):
 
 
 class SchemaValidationGuardTests(_TempFileMixin, unittest.TestCase):
-    """Formal jsonschema validation against schema/tenax-attestation-v1.schema.json.
+    """Formal jsonschema validation against schema/lucid-attestation-v1.schema.json.
 
     Deliberately diagnostic (a `warnings` entry), not a blocking gate: this
     predicate schema evolves over time (branch_governance/degraded_reasons/

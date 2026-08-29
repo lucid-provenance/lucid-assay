@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tenax-assay: single-binary CI attestation & governance engine.
+lucid-assay: single-binary CI attestation & governance engine.
 
 Hardened against:
   - Unsafe output filename collision during DSSE envelope output
@@ -101,7 +101,7 @@ def _emit_stage_profile(
     single blocking-overhead figure the 50ms budget check already covers;
     see cli/oidc_signer.py::sign_statement's `timing` param."""
     label_w = 28
-    print("=== Tenax Assay Stage Profiling ===", file=sys.stderr)
+    print("=== Lucid Assay Stage Profiling ===", file=sys.stderr)
     for key, label in _STAGE_LABELS:
         print(f"- {label + ':':<{label_w}}{_fmt_ms(stage_ns.get(key, 0)):>12}", file=sys.stderr)
     if sign_total_ns is not None:
@@ -332,7 +332,7 @@ def _maybe_sign(
     None/{}/None when neither flag was passed.
 
     Thin wrapper around cli.oidc_signer.sign_file_to_envelope (the same
-    file-in/file-out entry point `tenax-assay sign` -- cli/sign.py -- uses
+    file-in/file-out entry point `lucid-assay sign` -- cli/sign.py -- uses
     for an isolated signing job that only has an unsigned statement file,
     not this pipeline's in-process state); this call site just also times
     it for --debug's stage-profile report."""
@@ -357,9 +357,9 @@ def _maybe_annotate_verdict(
 ) -> Optional[str]:
     """Step 9b: automatically persists this run's computed FAILED/GATED/
     PASSED verdict onto the just-signed envelope (the equivalent of
-    `tenax-assay verify --write-verdict`, see cli/verify.py's
+    `lucid-assay verify --write-verdict`, see cli/verify.py's
     _build_verdict_envelope_block/_write_verdict_into_envelope), so a
-    downstream CI pipeline doesn't need a separate explicit `tenax-assay
+    downstream CI pipeline doesn't need a separate explicit `lucid-assay
     verify --write-verdict` step before uploading the envelope to the
     ingestion API. A no-op (returns None) when signing was skipped
     (signed_path is None -- neither --sign nor --dry-run-sign was passed).
@@ -367,10 +367,10 @@ def _maybe_annotate_verdict(
     "Default gate parameters" here means exactly the one threshold this
     pipeline already gates its own exit code on -- args.min_rcs, the same
     value step 10 below checks -- not the fuller identity-pinning/
-    --disallow-degraded surface `tenax-assay verify` itself exposes, which
-    `tenax-assay run --sign` never collected flags for. A caller that
+    --disallow-degraded surface `lucid-assay verify` itself exposes, which
+    `lucid-assay run --sign` never collected flags for. A caller that
     needs --cert-identity/--expected-*/--disallow-degraded enforced still
-    needs a real downstream `tenax-assay verify` call with those flags;
+    needs a real downstream `lucid-assay verify` call with those flags;
     this annotation is best-effort convenience, not a substitute for it
     (see _build_verdict_envelope_block's own docstring on why `_verdict`
     is an unsigned, re-derivable sibling field, never a trust boundary).
@@ -382,7 +382,7 @@ def _maybe_annotate_verdict(
     sole authority for *this run's own* pass/fail exit code, computed
     independently of this annotation). Loading or re-writing the envelope
     failing (a broken/oversized/unreadable file) degrades to a WARNING on
-    stderr rather than crashing `tenax-assay run` outright -- same
+    stderr rather than crashing `lucid-assay run` outright -- same
     fail-open contract as WORM upload dispatch elsewhere in this
     pipeline: signing itself already succeeded by the time this runs, and
     this annotation step failing must never look like *that* failed.
@@ -445,7 +445,7 @@ def _emit_run_warnings(
     # Unlike branch governance, an *unverified* author (verified_github_
     # account=False) is a legitimate, common outcome -- not a data-
     # collection failure -- and is already surfaced via SLSA Source Level
-    # 3 in `tenax-assay verify`'s output; only warn here when the check
+    # 3 in `lucid-assay verify`'s output; only warn here when the check
     # itself couldn't run at all (available=False).
     if commit_author is not None and not commit_author.available:
         print(
@@ -463,8 +463,8 @@ def _emit_run_warnings(
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="tenax-assay",
-        description="tenax-assay: single-binary CI attestation & governance engine.",
+        prog="lucid-assay",
+        description="lucid-assay: single-binary CI attestation & governance engine.",
     )
     p.add_argument("--junit-xml", required=True)
     p.add_argument("--coverage-format", choices=["cobertura", "lcov"], default="cobertura")
@@ -522,7 +522,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         dest="emit_slsa_provenance",
         help="additionally emit a second, separate in-toto Statement shaped as real SLSA v1.0 provenance "
-        "(predicateType https://slsa.dev/provenance/v1) alongside tenax-assay's own RCS predicate -- see "
+        "(predicateType https://slsa.dev/provenance/v1) alongside lucid-assay's own RCS predicate -- see "
         "cli/slsa_provenance.py. Populated only from real ambient GitHub Actions context (GITHUB_REPOSITORY/"
         "SHA/RUN_ID/WORKFLOW_REF, RUNNER_ENVIRONMENT); fields with no real value off-CI are simply omitted, "
         "never fabricated, so an off-CI run legitimately produces a less-complete statement.",
@@ -546,7 +546,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def _dispatch_standalone_subcommand(raw_argv: List[str]) -> Optional[int]:
-    """Dispatches `tenax-assay {verify,sign,provenance} ...` to their
+    """Dispatches `lucid-assay {verify,sign,provenance} ...` to their
     standalone subcommand entry points, each of which owns its own
     argument parsing entirely separately from parse_args()/the
     attestation-building pipeline below. Returns the subcommand's exit
@@ -559,14 +559,14 @@ def _dispatch_standalone_subcommand(raw_argv: List[str]) -> Optional[int]:
     if not raw_argv:
         return None
 
-    # `tenax`/`tenax-assay verify ...` dispatches to the standalone
+    # `lucid`/`lucid-assay verify ...` dispatches to the standalone
     # admission gatekeeper instead of the attestation-building pipeline below.
     if raw_argv[0] == "verify":
         from .verify import main as verify_main
 
         return verify_main(raw_argv[1:])
 
-    # `tenax-assay sign ...` dispatches to the standalone signing subcommand
+    # `lucid-assay sign ...` dispatches to the standalone signing subcommand
     # (cli/sign.py) -- signs an already-built unsigned statement *file*
     # directly, without re-running the pipeline above. See cli/sign.py's
     # module docstring for why this exists separately from --sign/
@@ -576,7 +576,7 @@ def _dispatch_standalone_subcommand(raw_argv: List[str]) -> Optional[int]:
 
         return sign_main(raw_argv[1:])
 
-    # `tenax-assay provenance ...` dispatches to the standalone SLSA v1.0
+    # `lucid-assay provenance ...` dispatches to the standalone SLSA v1.0
     # provenance-construction subcommand (cli/provenance.py) -- builds a
     # provenance statement from *this process's own* ambient GitHub
     # Actions context, intended to run inside an isolated, trusted signer
@@ -598,9 +598,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if subcommand_exit_code is not None:
         return subcommand_exit_code
 
-    # `tenax-assay run ...` is an explicit alias for the attestation
+    # `lucid-assay run ...` is an explicit alias for the attestation
     # pipeline below -- it's also what runs with no subcommand at all, so
-    # `run` is stripped rather than required, keeping `tenax-assay --sarif
+    # `run` is stripped rather than required, keeping `lucid-assay --sarif
     # ...` (no subcommand) working exactly as before.
     if raw_argv and raw_argv[0] == "run":
         raw_argv = raw_argv[1:]

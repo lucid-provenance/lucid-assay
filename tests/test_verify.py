@@ -105,7 +105,7 @@ def _statement(
                 "digest": {"sha256": subject_sha256},
             }
         ],
-        "predicateType": "https://tenax.io/attestations/assay/v1",
+        "predicateType": "https://lucidprovenance.io/attestations/assay/v1",
         "predicate": predicate,
     }
 
@@ -444,7 +444,7 @@ class VerifyCliMainTests(unittest.TestCase):
         self.assertIn("level_1", payload["slsa"])
         self.assertIn("level_2", payload["slsa"])
         self.assertEqual(
-            payload["envelope"]["predicate_type"], "https://tenax.io/attestations/assay/v1"
+            payload["envelope"]["predicate_type"], "https://lucidprovenance.io/attestations/assay/v1"
         )
 
     def test_format_json_reflects_nonzero_exit_on_policy_violation(self):
@@ -726,7 +726,7 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
             san_uri="https://github.com/acme/widgets/.github/workflows/assay.yml@refs/heads/main",
             issuer=GITHUB_ACTIONS_OIDC_ISSUER,
             repository="acme/widgets",
-            workflow_name="Tenax Assay",
+            workflow_name="Lucid Assay",
             ref="refs/heads/main",
         )
         defaults.update(overrides)
@@ -739,7 +739,7 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
             cert_oidc_issuer=None,
             expected_issuer=None,
             expected_repository="acme/widgets",
-            expected_workflow="Tenax Assay",
+            expected_workflow="Lucid Assay",
             expected_ref="refs/heads/main",
         )
         self.assertFalse(unsafe)
@@ -772,7 +772,7 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
         cert = self._cert(workflow_name="Some Other Workflow")
         policy, _, _ = _build_identity_policy(
             cert_identity=None, cert_oidc_issuer=None, expected_issuer=None,
-            expected_repository=None, expected_workflow="Tenax Assay", expected_ref=None,
+            expected_repository=None, expected_workflow="Lucid Assay", expected_ref=None,
         )
         from sigstore.errors import VerificationError
 
@@ -888,11 +888,11 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
         that ever acquired id-token: write must not be able to impersonate
         the quarantined signer."""
         cert = self._cert(
-            san_uri="https://github.com/tenax-io/tenax-assay/.github/workflows/assay.yml@refs/heads/main",
+            san_uri="https://github.com/lucid-provenance/lucid-assay/.github/workflows/assay.yml@refs/heads/main",
             issuer=GITHUB_ACTIONS_OIDC_ISSUER,
         )
         policy, unsafe, _ = _build_identity_policy(
-            cert_identity="https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml@11086bc4004f0e0e061a3c3e30223535f696e1f0",
+            cert_identity="https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml@11086bc4004f0e0e061a3c3e30223535f696e1f0",
             cert_oidc_issuer=GITHUB_ACTIONS_OIDC_ISSUER,
             expected_issuer=None, expected_repository=None, expected_workflow=None, expected_ref=None,
         )
@@ -910,7 +910,7 @@ class CertificateIdentityClaimsTests(unittest.TestCase):
         path that happens to share a prefix (e.g. a same-named workflow file
         one path segment deeper, or an extra trailing ref segment) must still
         be rejected."""
-        expected = "https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml@11086bc4004f0e0e061a3c3e30223535f696e1f0"
+        expected = "https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml@11086bc4004f0e0e061a3c3e30223535f696e1f0"
         cert = self._cert(
             san_uri=expected + "-evil",  # expected is a strict prefix of the actual SAN
             issuer=GITHUB_ACTIONS_OIDC_ISSUER,
@@ -1081,7 +1081,7 @@ class DescribeActualCertClaimsTests(unittest.TestCase):
             san_uri="https://github.com/acme/widgets/.github/workflows/assay.yml@refs/heads/main",
             issuer=GITHUB_ACTIONS_OIDC_ISSUER,
             repository="acme/widgets",
-            workflow_name="Tenax Assay",
+            workflow_name="Lucid Assay",
             ref="refs/heads/main",
         )
 
@@ -1089,7 +1089,7 @@ class DescribeActualCertClaimsTests(unittest.TestCase):
 
         self.assertIn("acme/widgets", summary)
         self.assertIn(GITHUB_ACTIONS_OIDC_ISSUER, summary)
-        self.assertIn("Tenax Assay", summary)
+        self.assertIn("Lucid Assay", summary)
         self.assertIn("refs/heads/main", summary)
         self.assertIn(
             "https://github.com/acme/widgets/.github/workflows/assay.yml@refs/heads/main", summary
@@ -1137,7 +1137,7 @@ class VerifySigstoreIdentityDiagnosticsTests(unittest.TestCase):
             san_uri="https://github.com/acme/widgets/.github/workflows/assay.yml@refs/heads/main",
             issuer=GITHUB_ACTIONS_OIDC_ISSUER,
             repository="acme/widgets",
-            workflow_name="Tenax Assay",
+            workflow_name="Lucid Assay",
             ref="refs/heads/main",
         )
         fake_bundle = mock.Mock()
@@ -1262,7 +1262,7 @@ class EvaluateSlsaL1Tests(unittest.TestCase):
         self.assertTrue(by_label["Subject Artifact Digest Verification"]["passed"])
 
     def test_wrong_predicate_type_fails(self):
-        statement = _slsa_provenance_statement(predicate_type="https://tenax.io/attestations/assay/v1")
+        statement = _slsa_provenance_statement(predicate_type="https://lucidprovenance.io/attestations/assay/v1")
 
         assessment = _evaluate_slsa_l1(statement)
 
@@ -1487,7 +1487,7 @@ class FormatSlsaReportTests(unittest.TestCase):
         # SLSA leveling is cumulative: Level 2 can't PASS on its own merits
         # if the statement doesn't even satisfy Level 1.
         statement = _slsa_provenance_statement(
-            predicate_type="https://tenax.io/attestations/assay/v1",  # breaks L1's predicateType check
+            predicate_type="https://lucidprovenance.io/attestations/assay/v1",  # breaks L1's predicateType check
             resolved_dependencies=DEFAULT_RESOLVED_DEPENDENCIES,
         )
         l1 = _evaluate_slsa_l1(statement)
@@ -1629,10 +1629,10 @@ class FormatSlsaLevelBlockOriginTests(unittest.TestCase):
 class VerifyDsseAttestationSlsaIntegrationTests(unittest.TestCase):
     """SLSA checklist wiring through verify_dsse_attestation(): purely
     informational, must never affect `passed`/violations regardless of
-    whether the statement happens to be tenax-assay's own RCS predicate
+    whether the statement happens to be lucid-assay's own RCS predicate
     (which is not SLSA-provenance-shaped) or a real SLSA provenance one."""
 
-    def test_tenax_predicate_gets_slsa_assessment_without_affecting_rcs_gate(self):
+    def test_lucid_predicate_gets_slsa_assessment_without_affecting_rcs_gate(self):
         envelope = _envelope(_statement(rcs_value=85, degraded=False))
 
         result = verify_dsse_attestation(envelope, min_rcs=70, dry_run=True)
@@ -1640,7 +1640,7 @@ class VerifyDsseAttestationSlsaIntegrationTests(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertIsNotNone(result.slsa_level1)
         self.assertIsNotNone(result.slsa_level2)
-        # tenax-assay's own predicate isn't SLSA-provenance-shaped, so most
+        # lucid-assay's own predicate isn't SLSA-provenance-shaped, so most
         # items legitimately fail -- but that must never leak into violations.
         self.assertFalse(result.slsa_level1["passed"])
         self.assertEqual(result.violations, [])

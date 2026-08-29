@@ -31,7 +31,7 @@ from cli.scorer import score_pipeline
 from cli.verify import verify_dsse_attestation
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SCHEMA_PATH = os.path.join(_REPO_ROOT, "schema", "tenax-attestation-v1.schema.json")
+_SCHEMA_PATH = os.path.join(_REPO_ROOT, "schema", "lucid-attestation-v1.schema.json")
 
 
 def _sarif_result(rule_id, level, uri, line, message="finding"):
@@ -436,7 +436,7 @@ class MalformedAndEmptySarifTests(_TempFileMixin, unittest.TestCase):
 class SchemaComplianceAndSignatureTests(unittest.TestCase):
     """Full pipeline: parsed SARIF (with tool extensions) -> scored ->
     assembled into the in-toto predicate -> validated against
-    schema/tenax-attestation-v1.schema.json -> signed (dry-run) -> verified,
+    schema/lucid-attestation-v1.schema.json -> signed (dry-run) -> verified,
     exercising the same DSSE/Sigstore path production signing uses."""
 
     def _build_sarif_report(self):

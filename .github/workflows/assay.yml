@@ -60,7 +60,7 @@ permissions:
 # `${{ env.SIGNER_WORKFLOW_SHA }}` to build --cert-identity, so the gate can
 # never drift from what `attest` actually invoked.
 env:
-  SIGNER_WORKFLOW_SHA: ddc340f1c442957c0d1801ff3db69cc820bbc307 # fix(pass-builder-id-explicitly) -- keep in sync with attest job's `uses:` pin
+  SIGNER_WORKFLOW_SHA: 094ef0f536398a5df33ff1dc2ae8e4fd12e9f047 # lucid-attest: rebrand Tenax -> Lucid (PR #6) -- keep in sync with attest job's `uses:` pin
 
 jobs:
   # Runs the PR's own code: tests, coverage, CodeQL, SonarQube, RCS scoring.
@@ -384,7 +384,7 @@ jobs:
     permissions:
       id-token: write # Required for Sigstore keyless OIDC minting
       contents: read
-    uses: lucid-provenance/lucid-attest/.github/workflows/sign.yml@ddc340f1c442957c0d1801ff3db69cc820bbc307 # keep in sync with env.SIGNER_WORKFLOW_SHA above
+    uses: lucid-provenance/lucid-attest/.github/workflows/sign.yml@094ef0f536398a5df33ff1dc2ae8e4fd12e9f047 # keep in sync with env.SIGNER_WORKFLOW_SHA above
     with:
       artifact-name: unsigned-statements
       statement-files: |

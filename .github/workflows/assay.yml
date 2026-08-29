@@ -1,4 +1,4 @@
-name: Tenax Assay
+name: Lucid Assay
 
 # Deliberately `pull_request`, NOT `pull_request_target`: this workflow
 # checks out and executes code from the PR head ref, so it must run in the
@@ -51,7 +51,7 @@ permissions:
   security-events: write # Required for github/codeql-action/analyze to upload SARIF to code scanning
 
 # SIGNER_WORKFLOW_SHA is the *single* source of truth for the pinned commit
-# tenax-io/tenax-attest/.github/workflows/sign.yml is trusted at -- it must
+# lucid-provenance/lucid-attest/.github/workflows/sign.yml is trusted at -- it must
 # be kept byte-for-byte identical to the SHA pinned on the `attest` job's
 # `uses:` line below (GitHub Actions reusable-workflow calls don't accept
 # expressions in `uses:`, so that line can't just reference this var
@@ -60,7 +60,7 @@ permissions:
 # `${{ env.SIGNER_WORKFLOW_SHA }}` to build --cert-identity, so the gate can
 # never drift from what `attest` actually invoked.
 env:
-  SIGNER_WORKFLOW_SHA: ddc340f1c442957c0d1801ff3db69cc820bbc307 # fix(pass-builder-id-explicitly) -- keep in sync with attest job's `uses:` pin
+  SIGNER_WORKFLOW_SHA: 094ef0f536398a5df33ff1dc2ae8e4fd12e9f047 # lucid-attest: rebrand Tenax -> Lucid (PR #6) -- keep in sync with attest job's `uses:` pin
 
 jobs:
   # Runs the PR's own code: tests, coverage, CodeQL, SonarQube, RCS scoring.
@@ -76,7 +76,7 @@ jobs:
       pull-requests: read # "Resolve PR Context for a Push-Triggered Run" below
     outputs:
       # Consumed by `attest` below as subject-name/subject-digest -- the
-      # only provenance-relevant values tenax-attest's isolated signer job
+      # only provenance-relevant values lucid-attest's isolated signer job
       # accepts from this (untrusted) job; everything else it needs to
       # construct real SLSA Build Level 3 provenance comes from its own
       # trusted context instead (see that job's `uses:` comment).
@@ -207,7 +207,7 @@ jobs:
           # Bearer support is newer and version-dependent.
           curl -sSf \
             -u "${SONAR_TOKEN}:" \
-            "https://sonarcloud.io/api/measures/component?component=tenax-io_tenax-assay&metricKeys=alert_status,sqale_index,cognitive_complexity" \
+            "https://sonarcloud.io/api/measures/component?component=lucid-provenance_lucid-assay&metricKeys=alert_status,sqale_index,cognitive_complexity" \
             -o build/sonar-measures.json
 
       # Mints a short-lived GitHub App installation token so branch-governance
@@ -256,10 +256,10 @@ jobs:
       #
       # No --emit-slsa-provenance here anymore: this job only mints the
       # assay/v1 RCS statement now. SLSA v1.0 provenance (Build Level 3)
-      # is constructed by `attest` below, inside tenax-attest's isolated
+      # is constructed by `attest` below, inside lucid-attest's isolated
       # signer job, from that job's own trusted context -- not by this
       # (untrusted) job -- see that job's `uses:` comment for why.
-      - name: Mint Unsigned Tenax Attestation
+      - name: Mint Unsigned Lucid Attestation
         id: mint
         env:
           GOVPLANE_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -341,59 +341,59 @@ jobs:
             --branch "${BRANCH_NAME}" \
             --github-token "$GOVPLANE_GITHUB_TOKEN" \
             --min-rcs 65 \
-            --out build/tenax-assay.unsigned.json \
+            --out build/lucid-assay.unsigned.json \
             "${EXTRA_ARGS[@]}"
 
       - name: Upload Unsigned Statements
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: unsigned-statements
-          path: build/tenax-assay.unsigned.json
+          path: build/lucid-assay.unsigned.json
           if-no-files-found: error
 
   # The *only* job with id-token: write -- signs the RCS statement `build`
   # uploaded, and -- via subject-name/subject-digest below -- additionally
   # CONSTRUCTS a SLSA v1.0 provenance statement (SLSA Build Level 3) from
   # its own trusted context and signs that too, atomically. The signing
-  # job's code lives entirely in tenax-io/tenax-attest (a separate,
-  # branch-protected repo -- see contrib/tenax-attest-repo/ in this repo
+  # job's code lives entirely in lucid-provenance/lucid-attest (a separate,
+  # branch-protected repo -- see contrib/lucid-attest-repo/ in this repo
   # for its content/rationale), checked out there at a commit SHA (`uses:`
   # below) pinned independently of whatever ref triggered this run -- so a
-  # PR that fully rewrites this workflow file, or tenax-assay's own
+  # PR that fully rewrites this workflow file, or lucid-assay's own
   # pipeline code, in the same PR cannot also change what the signer
   # trusts, since that code isn't part of this PR's diff at all.
   #
   # subject-name/subject-digest are the only provenance-relevant values
-  # tenax-attest's isolated signer job accepts from this (untrusted) job:
+  # lucid-attest's isolated signer job accepts from this (untrusted) job:
   # everything else that makes the statement SLSA-meaningful -- builder
   # identity, source binding, resolved dependencies -- comes from
-  # tenax-attest's own ambient context and its own read-only source
+  # lucid-attest's own ambient context and its own read-only source
   # checkout, never from anything this job computed.
   #
-  # This job has no way to choose which tenax-assay commit sign.yml checks
+  # This job has no way to choose which lucid-assay commit sign.yml checks
   # out for cli/sign.py/cli/oidc_signer.py/cli/provenance.py: that pin
-  # lives hardcoded inside tenax-attest's own sign.yml
+  # lives hardcoded inside lucid-attest's own sign.yml
   # (env.TRUSTED_SIGNER_SHA), not as a `workflow_call` input here -- a
   # caller-supplied `signer-ref` input was deliberately removed so the
   # privileged signing job can never be pointed at caller-chosen code.
-  # Bumping which tenax-assay commit the signer trusts is exclusively a
-  # tenax-attest-repo change, same discipline as bumping the `uses:` SHA
-  # below whenever tenax-attest's own sign.yml changes.
+  # Bumping which lucid-assay commit the signer trusts is exclusively a
+  # lucid-attest-repo change, same discipline as bumping the `uses:` SHA
+  # below whenever lucid-attest's own sign.yml changes.
   attest:
     needs: build
     permissions:
       id-token: write # Required for Sigstore keyless OIDC minting
       contents: read
-    uses: tenax-io/tenax-attest/.github/workflows/sign.yml@ddc340f1c442957c0d1801ff3db69cc820bbc307 # keep in sync with env.SIGNER_WORKFLOW_SHA above
+    uses: lucid-provenance/lucid-attest/.github/workflows/sign.yml@094ef0f536398a5df33ff1dc2ae8e4fd12e9f047 # keep in sync with env.SIGNER_WORKFLOW_SHA above
     with:
       artifact-name: unsigned-statements
       statement-files: |
-        tenax-assay.unsigned.json
+        lucid-assay.unsigned.json
       subject-name: ${{ needs.build.outputs.image-ref }}
       subject-digest: ${{ needs.build.outputs.image-digest }}
 
   # Downloads the signed envelopes `attest` produced and evaluates
-  # tenax-assay's own admission policy gates against them, plus both SLSA
+  # lucid-assay's own admission policy gates against them, plus both SLSA
   # tracks (Source, Build) in one unified report. No id-token permission
   # here either -- reading/verifying a signature doesn't require one,
   # only minting one does.
@@ -441,45 +441,45 @@ jobs:
           name: signed-statements
           path: build
 
-      # --write-verdict overwrites build/tenax-assay.dsse.json in place
+      # --write-verdict overwrites build/lucid-assay.dsse.json in place
       # with this exact call's FAILED/GATED/PASSED word/banner/rcs_value/
       # degraded/source_level/build_level/gate_params (plus the itemized
       # SLSA checklists) as an unsigned `_verdict` sibling field, then
       # "Upload In-Toto Attestation Artifact" below re-uploads that
-      # annotated file. Needed here for the same reason as tenax-console/
-      # tenax-dsse-collector's identical addition: this repo's own split
-      # mint(unsigned)/sign(isolated `attest` job, via tenax-attest's
+      # annotated file. Needed here for the same reason as lucid-console/
+      # lucid-dsse-collector's identical addition: this repo's own split
+      # mint(unsigned)/sign(isolated `attest` job, via lucid-attest's
       # reusable sign.yml) architecture never runs cli.main's own
       # run --sign/--dry-run-sign pipeline (the only place verdict
       # annotation happens automatically) -- `attest` only ever calls
       # `cli.main sign`, a different code path with no verdict step.
-      # Without this flag, tenax-assay's own dogfood attestations never
+      # Without this flag, lucid-assay's own dogfood attestations never
       # carry a verdict at all, on any branch (not specific to a PR vs.
       # main -- this job simply never wrote one).
-      - name: Verify Tenax Attestation Gate
+      - name: Verify Lucid Attestation Gate
         env:
           EXPECTED_REPOSITORY: ${{ github.repository }}
           EXPECTED_REF: ${{ github.ref }}
           # Pins the admission gate to the exact quarantined signer identity:
-          # not just "some workflow in tenax-io/tenax-attest", but that repo's
+          # not just "some workflow in lucid-provenance/lucid-attest", but that repo's
           # sign.yml specifically, at the same commit SHA `attest` invoked
           # (env.SIGNER_WORKFLOW_SHA, declared once at the top of this file).
           # --expected-repository/--expected-ref alone only constrain claims
           # about *this* repo's own ref -- they say nothing about which
           # workflow minted the OIDC token, so without --cert-identity any
-          # other job in tenax-assay that ever acquired id-token: write could
+          # other job in lucid-assay that ever acquired id-token: write could
           # sign an envelope this gate would still accept.
-          CERT_IDENTITY: https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml@${{ env.SIGNER_WORKFLOW_SHA }}
+          CERT_IDENTITY: https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml@${{ env.SIGNER_WORKFLOW_SHA }}
           CERT_OIDC_ISSUER: https://token.actions.githubusercontent.com
           # Binds admission to the *caller* side of the identity too: not
-          # just "signed by the quarantined tenax-attest signer" (that's
+          # just "signed by the quarantined lucid-attest signer" (that's
           # what --cert-identity above already pins), but "signed on behalf
           # of a run this workflow itself triggered" -- github.workflow is
-          # this workflow's own `name:` ("Tenax Assay"), which GitHub's OIDC
+          # this workflow's own `name:` ("Lucid Assay"), which GitHub's OIDC
           # token carries as the `workflow` claim for every job in this run,
           # including the reusable `attest` job. Without this, any other
-          # workflow in tenax-io/tenax-assay (present or future) that ever
-          # called the same tenax-attest signer would still pass this gate,
+          # workflow in lucid-provenance/lucid-assay (present or future) that ever
+          # called the same lucid-attest signer would still pass this gate,
           # since --expected-repository alone doesn't distinguish which
           # workflow file within the repo triggered the signing.
           EXPECTED_WORKFLOW: ${{ github.workflow }}
@@ -513,13 +513,13 @@ jobs:
             VERIFY_ARGS+=(--disallow-degraded)
           fi
 
-          uv run --no-sync python -m cli.verify build/tenax-assay.dsse.json "${VERIFY_ARGS[@]}"
+          uv run --no-sync python -m cli.verify build/lucid-assay.dsse.json "${VERIFY_ARGS[@]}"
 
       - name: Upload In-Toto Attestation Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: tenax-assay-attestation
+          name: lucid-assay-attestation
           path: |
-            build/tenax-assay.dsse.json
+            build/lucid-assay.dsse.json
             build/provenance.dsse.json
           if-no-files-found: error

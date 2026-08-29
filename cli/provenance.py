@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tenax-assay provenance: standalone SLSA v1.0 provenance-statement
+lucid-assay provenance: standalone SLSA v1.0 provenance-statement
 CONSTRUCTION subcommand (cli.slsa_provenance.build_slsa_provenance_statement).
 
 Why this exists as its own subcommand, separate from `cli.main`'s
@@ -10,8 +10,8 @@ requires provenance to be *constructed* by the same isolated, trusted
 build platform that signs it -- not merely signed there after being
 assembled by an untrusted build job (see cli/verify.py's
 `_slsa_check_isolated_provenance_generation` docstring for exactly why
-that distinction matters). `tenax-assay provenance` is the narrow surface
-that makes that possible: run it from inside `tenax-attest`'s isolated
+that distinction matters). `lucid-assay provenance` is the narrow surface
+that makes that possible: run it from inside `lucid-attest`'s isolated
 `sign` job (see that repo's `sign.yml`), and it builds the statement
 using *that job's own* ambient GitHub Actions context (GITHUB_REPOSITORY/
 _SHA/RUNNER_ENVIRONMENT, as seen by the trusted job, not whatever the
@@ -23,7 +23,7 @@ GITHUB_WORKFLOW_REF can't supply this when running inside a
 `workflow_call` job -- a real run proved it wrong, not a hypothetical).
 This subcommand performs zero pipeline logic beyond construction -- no
 scoring, coverage, or SARIF ingestion, and no signing (pair with
-`tenax-assay sign` for that) -- so a job invoking only this subcommand
+`lucid-assay sign` for that) -- so a job invoking only this subcommand
 never needs read access to any of it.
 
 Reuses cli.slsa_provenance.build_slsa_provenance_statement() and
@@ -77,15 +77,15 @@ def _control_plane_builder_id() -> Optional[str]:
     Disproven by a real run, do not re-derive this assumption: this does
     NOT reliably identify "the isolated signer workflow currently
     executing this job" when this subcommand runs inside a
-    `workflow_call` job (tenax-attest's sign.yml, invoked by some other
+    `workflow_call` job (lucid-attest's sign.yml, invoked by some other
     repo's caller workflow). GITHUB_WORKFLOW_REF is a *run-level* context
     value -- constant for every job in the run, always the ref of the
     top-level, *calling* workflow that GitHub's UI attributes the run to
     -- not a *job*-level one. A real run observed this directly: invoked
-    from tenax-dsse-collector's assay.yml, this returned
-    'https://github.com/tenax-io/tenax-dsse-collector/.github/workflows/
+    from lucid-dsse-collector's assay.yml, this returned
+    'https://github.com/lucid-provenance/lucid-dsse-collector/.github/workflows/
     assay.yml' -- the caller's own workflow, not
-    'https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml'
+    'https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml'
     -- so cli/verify.py's SLSA Build Level 2/3 checks correctly failed
     the resulting statement's builder-identity claim.
 
@@ -97,7 +97,7 @@ def _control_plane_builder_id() -> Optional[str]:
     two different GitHub Actions concepts that happen to look similar;
     this function's whole existence was conflating them.)
 
-    tenax-attest's sign.yml now always passes --builder-id explicitly
+    lucid-attest's sign.yml now always passes --builder-id explicitly
     (it's the one caller that authoritatively knows its own identity,
     hardcoded the same way TRUSTED_SIGNER_SHA is), so this fallback is
     only ever exercised by a direct, non-nested invocation -- where
@@ -116,10 +116,10 @@ def _control_plane_builder_id() -> Optional[str]:
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="tenax-assay provenance",
+        prog="lucid-assay provenance",
         description="Construct a SLSA v1.0 provenance in-toto Statement from this process's own ambient "
         "GitHub Actions context -- intended to run inside an isolated, trusted signer job (see "
-        "tenax-io/tenax-attest's sign.yml), not the untrusted job that built the subject artifact.",
+        "lucid-provenance/lucid-attest's sign.yml), not the untrusted job that built the subject artifact.",
     )
     p.add_argument("--subject-name", required=True, help="the attested artifact's name, e.g. an image ref")
     p.add_argument("--subject-digest", required=True, help="sha256:<hex> or bare hex")
@@ -134,7 +134,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--builder-id",
         default=None,
         dest="builder_id",
-        help="explicit runDetails.builder.id to assert, e.g. https://github.com/tenax-io/tenax-attest/"
+        help="explicit runDetails.builder.id to assert, e.g. https://github.com/lucid-provenance/lucid-attest/"
         ".github/workflows/sign.yml -- the caller's own known identity, not derived here. Required for "
         "correctness when running inside a workflow_call job (see _control_plane_builder_id's docstring "
         "for why ambient GITHUB_WORKFLOW_REF can't supply this in that case); falls back to a best-effort "

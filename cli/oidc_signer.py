@@ -258,7 +258,7 @@ def sign_statement(
     # `sigstore attest` *does* produce a DSSE envelope, but this sigstore
     # version's CLI restricts --predicate-type to the SLSA provenance enum
     # and derives the subject from a hash of the predicate file itself --
-    # neither fits a custom predicateType (tenax.io/attestations/assay/v1) over
+    # neither fits a custom predicateType (lucidprovenance.io/attestations/assay/v1) over
     # an already-fully-assembled Statement whose subject is a container
     # image digest, not a local file's hash. `Signer.sign_dsse()` is the
     # public library entry point both CLI subcommands themselves delegate
@@ -323,7 +323,7 @@ def sign_file_to_envelope(
     takes/returns in-memory bytes for cli.main's own single-process
     pipeline, right after it builds a statement) -- it exists for callers
     that sign a statement they didn't just build themselves, e.g. a
-    separate CI job (cli.sign's `tenax-assay sign` subcommand) that only
+    separate CI job (cli.sign's `lucid-assay sign` subcommand) that only
     received the unsigned file as an artifact from an upstream build job
     and has no access to -- or trust in -- however that job produced it
     beyond the file's own bytes. Both paths are resolved via

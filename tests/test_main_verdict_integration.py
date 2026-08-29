@@ -3,7 +3,7 @@ One true end-to-end integration test driving cli.main.main() with
 --dry-run-sign, confirming the signed envelope artifact the CLI produces
 automatically carries a valid `_verdict` sibling block (see
 cli/main.py's _maybe_annotate_verdict) -- without a separate,
-explicit `tenax-assay verify --write-verdict` step.
+explicit `lucid-assay verify --write-verdict` step.
 
 Deliberately kept to a single class/test, and separate from
 tests/test_main_helpers.py (whose own docstring explains why that file
@@ -90,7 +90,7 @@ class SignedEnvelopeCarriesVerdictIntegrationTest(unittest.TestCase):
                 envelope = json.load(f)
 
         # The envelope produced by the CLI's own --dry-run-sign path
-        # carries a real _verdict block -- no separate `tenax-assay
+        # carries a real _verdict block -- no separate `lucid-assay
         # verify --write-verdict` step was run.
         self.assertIn("_verdict", envelope)
         verdict = envelope["_verdict"]

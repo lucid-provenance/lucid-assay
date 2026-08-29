@@ -3,7 +3,7 @@ S2C2F (Secure Supply Chain Consumption Framework, Microsoft OSSF) control
 evaluation.
 
 This module deliberately does NOT attempt every control in the published
-S2C2F catalog (see tenax-console's `lib/s2c2f.ts` for the full Level 1-4
+S2C2F catalog (see lucid-console's `lib/s2c2f.ts` for the full Level 1-4
 taxonomy). It evaluates only the subset a CI-time tool can honestly assess
 from data this pipeline already has, or a cheap, well-defined new signal
 (a GitHub API call or a local config-file check) -- every other control
@@ -143,7 +143,7 @@ def _github_api_status(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) ->
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "tenax-assay",
+            "User-Agent": "lucid-assay",
         },
     )
     try:
@@ -426,7 +426,7 @@ def _eval_enf1_secure_source_config(branch_governance: BranchGovernanceReport) -
 # Level 3 controls (subset with a real, checkable signal)
 # ---------------------------------------------------------------------------
 
-_PROVENANCE_STATUS_CHECK_PATTERNS = ("tenax", "assay", "attest", "provenance", "slsa", "verify")
+_PROVENANCE_STATUS_CHECK_PATTERNS = ("lucid", "assay", "attest", "provenance", "slsa", "verify")
 
 
 def _eval_aud1_enforcing_provenance(branch_governance: BranchGovernanceReport) -> S2C2FControlResult:

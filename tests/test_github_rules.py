@@ -688,8 +688,8 @@ class DeriveRequiredStatusCheckContextsTests(unittest.TestCase):
         self.assertEqual(_derive_required_status_check_contexts([{"type": "pull_request"}]), [])
 
     def test_extracts_contexts_from_matching_rule(self):
-        rule = self._required_status_checks_rule(["ci/lint", "ci/tenax-assay-verify"])
-        self.assertEqual(_derive_required_status_check_contexts([rule]), ["ci/lint", "ci/tenax-assay-verify"])
+        rule = self._required_status_checks_rule(["ci/lint", "ci/lucid-assay-verify"])
+        self.assertEqual(_derive_required_status_check_contexts([rule]), ["ci/lint", "ci/lucid-assay-verify"])
 
     def test_flattens_multiple_rules(self):
         rules = [self._required_status_checks_rule(["a"]), self._required_status_checks_rule(["b"])]
@@ -707,13 +707,13 @@ class DeriveRequiredStatusCheckContextsTests(unittest.TestCase):
             mock_get.side_effect = _api_get_router({
                 "/repos/acme/widgets/rules/branches/main": [
                     _pull_request_rule(2),
-                    self._required_status_checks_rule(["ci/tenax-assay-verify"]),
+                    self._required_status_checks_rule(["ci/lucid-assay-verify"]),
                 ],
                 "/repos/acme/widgets/rulesets": [],
             })
             report = inspect_branch_governance("acme/widgets", "main", token="tok")
 
-        self.assertEqual(report.required_status_check_contexts, ["ci/tenax-assay-verify"])
+        self.assertEqual(report.required_status_check_contexts, ["ci/lucid-assay-verify"])
 
     def test_unavailable_report_has_empty_required_status_check_contexts(self):
         report = inspect_branch_governance("acme/widgets", "main", token=None)

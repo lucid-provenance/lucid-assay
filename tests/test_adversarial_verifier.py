@@ -1,4 +1,4 @@
-"""Adversarial tests for tenax-assay verifier boundaries.
+"""Adversarial tests for lucid-assay verifier boundaries.
 Covers:
 - Verification of non-Assay predicates (SLSA provenance)
 - GitHub API failures for commit author (Source Level 3)

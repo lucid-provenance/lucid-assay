@@ -1,5 +1,5 @@
 """
-CLI-level tests for `tenax-assay provenance` (cli/provenance.py) -- the
+CLI-level tests for `lucid-assay provenance` (cli/provenance.py) -- the
 standalone SLSA v1.0 provenance-CONSTRUCTION subcommand intended to run
 inside an isolated, trusted signer job (see that module's docstring for
 why it's separate from cli.main's --emit-slsa-provenance). Mirrors
@@ -74,14 +74,14 @@ class ProvenanceSubcommandTests(_TempDirTestCase):
         top-level *calling* workflow (e.g. a caller repo's assay.yml),
         never the reusable sign.yml job actually executing this
         subcommand. --builder-id must win over that ambient value, not
-        just supplement it -- this is exactly what tenax-attest's
+        just supplement it -- this is exactly what lucid-attest's
         sign.yml now always passes explicitly."""
         tmp = self._tmp()
         out_path = os.path.join(tmp, "provenance.unsigned.json")
         env = dict(_GITHUB_ENV)
         # Simulates the observed real-run value: the *caller's* workflow,
-        # not tenax-attest's own sign.yml.
-        env["GITHUB_WORKFLOW_REF"] = "tenax-io/tenax-dsse-collector/.github/workflows/assay.yml@refs/heads/main"
+        # not lucid-attest's own sign.yml.
+        env["GITHUB_WORKFLOW_REF"] = "lucid-provenance/lucid-dsse-collector/.github/workflows/assay.yml@refs/heads/main"
 
         with mock.patch.dict(os.environ, env, clear=False):
             provenance_main(
@@ -90,7 +90,7 @@ class ProvenanceSubcommandTests(_TempDirTestCase):
                     "--subject-digest", "sha256:" + "a" * 64,
                     "--repo-dir", tmp,
                     "--out", out_path,
-                    "--builder-id", "https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml",
+                    "--builder-id", "https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml",
                 ]
             )
 
@@ -98,7 +98,7 @@ class ProvenanceSubcommandTests(_TempDirTestCase):
             statement = json.load(f)
         self.assertEqual(
             statement["predicate"]["runDetails"]["builder"]["id"],
-            "https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml",
+            "https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml",
         )
 
     def test_bare_hex_digest_normalized_same_as_sha256_prefixed(self):

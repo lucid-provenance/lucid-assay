@@ -191,7 +191,7 @@ class BranchGovernanceReport:
     # beyond "not this specific, identified condition".
     reason_code: Optional[str] = None
     # The `context` string of every "required_status_checks" rule entry
-    # applying to this branch (e.g. "ci/tenax-assay-verify") -- i.e. which
+    # applying to this branch (e.g. "ci/lucid-assay-verify") -- i.e. which
     # named CI jobs must report success before a PR can merge. Always []
     # rather than omitted when no such rule exists, or on an attestation
     # predating this field; never populated at all when available=False.
@@ -334,7 +334,7 @@ def _github_api_get(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) -> An
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "tenax-assay",
+        "User-Agent": "lucid-assay",
     }
 
     url: Optional[str] = f"{GITHUB_API_BASE}{path}"

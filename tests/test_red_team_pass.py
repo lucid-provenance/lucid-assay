@@ -139,14 +139,14 @@ def test_dsse_envelope_corrupted_structure():
     # 1. Non-dict predicate
     statement_1 = {
         "_type": "https://in-toto.io/Statement/v1",
-        "predicateType": "https://tenax.io/attestations/assay/v1",
+        "predicateType": "https://lucidprovenance.io/attestations/assay/v1",
         "predicate": "not_a_dict"
     }
     
     # 2. Missing required blocks
     statement_2 = {
         "_type": "https://in-toto.io/Statement/v1",
-        "predicateType": "https://tenax.io/attestations/assay/v1",
+        "predicateType": "https://lucidprovenance.io/attestations/assay/v1",
         "predicate": {
         }
     }

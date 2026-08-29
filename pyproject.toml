@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tenax-assay"
+name = "lucid-assay"
 version = "0.1.0"
 description = "Deterministic quality scoring and in-toto attestation engine"
 readme = "README.md"
@@ -33,12 +33,12 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/tenax-io/tenax-assay"
-Repository = "https://github.com/tenax-io/tenax-assay"
+Homepage = "https://github.com/lucid-provenance/lucid-assay"
+Repository = "https://github.com/lucid-provenance/lucid-assay"
 
 [project.scripts]
-tenax = "cli.main:main"
-tenax-assay = "cli.main:main"
+lucid = "cli.main:main"
+lucid-assay = "cli.main:main"
 # Backwards-compatible aliases for the pre-rebrand Plinth Assay name.
 plinth = "cli.main:main"
 plinth-assay = "cli.main:main"

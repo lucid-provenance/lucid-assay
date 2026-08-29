@@ -1,5 +1,5 @@
 """
-CLI-level tests for `tenax-assay sign` (cli/sign.py) and its underlying
+CLI-level tests for `lucid-assay sign` (cli/sign.py) and its underlying
 cli.oidc_signer.sign_file_to_envelope -- the standalone signing subcommand
 used by an isolated CI job that only has an already-built unsigned
 statement file, not this pipeline's in-process state (see cli/sign.py's

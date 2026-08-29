@@ -1,8 +1,8 @@
 """
 Assembles a genuine SLSA v1.0 provenance Statement (predicateType =
 https://slsa.dev/provenance/v1) as a *second*, separate attestation
-alongside tenax-assay's own RCS predicate (cli/builder.py, predicateType
-https://tenax.io/attestations/assay/v1).
+alongside lucid-assay's own RCS predicate (cli/builder.py, predicateType
+https://lucidprovenance.io/attestations/assay/v1).
 
 The two are deliberately kept apart rather than merged into one predicate
 shape -- see README.md's "SLSA v1.0 provenance attestation" section and
@@ -16,7 +16,7 @@ Ground-truth-only (CLAUDE.md "Supply Chain Integrity & Attestation
 Invariants"): every field here is populated strictly from data that
 actually describes this run -- ambient GITHUB_* environment variables set
 by Actions itself, the caller-supplied subject/commit/repository, and
-tenax-assay's own already-parsed lockfile dependency list
+lucid-assay's own already-parsed lockfile dependency list
 (parsers/lockfiles.py). Nothing is inferred, guessed, or defaulted to a
 "probably true" value. A field whose real value isn't available is simply
 omitted rather than filled with a plausible fake -- an off-CI or
@@ -108,12 +108,12 @@ def _source_resolved_dependency() -> Optional[Dict[str, Any]]:
 
 
 def _lockfile_resolved_dependencies(resolved_dependencies: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    """Reshapes tenax-assay's own lockfile-derived dependency list
+    """Reshapes lucid-assay's own lockfile-derived dependency list
     (cli/parsers/lockfiles.py: pkg: PURL + digest per entry, already
     computed by _detect_lockfile_dependencies() in cli/main.py) into
     SLSA's {uri, digest} resolvedDependencies shape. Same underlying real
     data as the top-level predicate.resolved_dependencies field on
-    tenax-assay's own predicate -- reformatted here, never re-derived or
+    lucid-assay's own predicate -- reformatted here, never re-derived or
     fabricated. Entries missing a usable 'uri' are skipped individually
     rather than discarding the whole list."""
     out: List[Dict[str, Any]] = []
@@ -182,7 +182,7 @@ def build_slsa_provenance_statement(
     builder_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assembles a real, spec-shaped SLSA v1.0 provenance in-toto Statement
-    for the same subject artifact tenax-assay's own RCS predicate attests
+    for the same subject artifact lucid-assay's own RCS predicate attests
     to. Every buildDefinition/runDetails field is sourced from real ambient
     GitHub Actions context (see module docstring); fields whose real value
     isn't available are simply absent rather than guessed. `subject_sha256`

@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cli.builder import DEFAULT_PREDICATE_TYPE, build_statement
 
 _SCHEMA_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema", "tenax-attestation-v1.schema.json"
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema", "lucid-attestation-v1.schema.json"
 )
 from cli.parsers.coverage import CoverageReport
 from cli.parsers.github_rules import BranchGovernanceReport
@@ -113,14 +113,14 @@ def _base_kwargs(**overrides):
 
 class BuilderStatementTests(unittest.TestCase):
 
-    def test_predicate_type_matches_tenax_v1(self):
+    def test_predicate_type_matches_lucid_v1(self):
         statement = build_statement(**_base_kwargs())
-        self.assertEqual(statement["predicateType"], "https://tenax.io/attestations/assay/v1")
+        self.assertEqual(statement["predicateType"], "https://lucidprovenance.io/attestations/assay/v1")
 
     def test_predicate_type_uses_default_predicate_type_constant(self):
         statement = build_statement(**_base_kwargs())
         self.assertEqual(statement["predicateType"], DEFAULT_PREDICATE_TYPE)
-        self.assertEqual(DEFAULT_PREDICATE_TYPE, "https://tenax.io/attestations/assay/v1")
+        self.assertEqual(DEFAULT_PREDICATE_TYPE, "https://lucidprovenance.io/attestations/assay/v1")
 
     def test_statement_type_is_in_toto_v1(self):
         statement = build_statement(**_base_kwargs())
@@ -586,7 +586,7 @@ class PipelineBlockTests(unittest.TestCase):
     def test_ambient_github_actions_context_is_used_when_present(self):
         os.environ["GITHUB_RUN_ID"] = "123456789"
         os.environ["GITHUB_RUN_ATTEMPT"] = "2"
-        os.environ["GITHUB_WORKFLOW_REF"] = "tenax-io/tenax-assay/.github/workflows/assay.yml@refs/heads/main"
+        os.environ["GITHUB_WORKFLOW_REF"] = "lucid-provenance/lucid-assay/.github/workflows/assay.yml@refs/heads/main"
         os.environ["RUNNER_ENVIRONMENT"] = "github-hosted"
 
         statement = build_statement(**_base_kwargs())
@@ -595,7 +595,7 @@ class PipelineBlockTests(unittest.TestCase):
         self.assertEqual(pipeline["run_id"], "123456789")
         self.assertEqual(pipeline["run_attempt"], 2)
         self.assertEqual(
-            pipeline["workflow_ref"], "tenax-io/tenax-assay/.github/workflows/assay.yml@refs/heads/main"
+            pipeline["workflow_ref"], "lucid-provenance/lucid-assay/.github/workflows/assay.yml@refs/heads/main"
         )
         self.assertEqual(pipeline["runner_environment"], "github-hosted")
 
@@ -623,7 +623,7 @@ class PipelineBlockTests(unittest.TestCase):
     def test_pipeline_block_validates_against_schema_on_ci(self):
         os.environ["GITHUB_RUN_ID"] = "123456789"
         os.environ["GITHUB_RUN_ATTEMPT"] = "1"
-        os.environ["GITHUB_WORKFLOW_REF"] = "tenax-io/tenax-assay/.github/workflows/assay.yml@refs/heads/main"
+        os.environ["GITHUB_WORKFLOW_REF"] = "lucid-provenance/lucid-assay/.github/workflows/assay.yml@refs/heads/main"
         os.environ["RUNNER_ENVIRONMENT"] = "github-hosted"
 
         statement = build_statement(**_base_kwargs())

@@ -85,7 +85,7 @@ class EmitStageProfileTests(unittest.TestCase):
             )
         out = buf.getvalue()
 
-        self.assertIn("=== Tenax Assay Stage Profiling ===", out)
+        self.assertIn("=== Lucid Assay Stage Profiling ===", out)
         for label in (
             "Inputs & Parsing",
             "Diff & Patch Coverage",

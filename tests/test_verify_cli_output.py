@@ -62,8 +62,8 @@ class PrintVerifyResultHumanTests(unittest.TestCase):
         # word FINAL VERDICT does, not its own PASS/FAIL binary.
         result = VerificationResult(passed=True, verdict_word="GATED")
         out = self._render(result)
-        self.assertIn("tenax-assay verify: GATED", out)
-        self.assertNotIn("tenax-assay verify: PASS", out)
+        self.assertIn("lucid-assay verify: GATED", out)
+        self.assertNotIn("lucid-assay verify: PASS", out)
 
     def test_heading_falls_back_to_failed_when_verdict_word_unset(self):
         # e.g. a VerificationResult built directly by a test/caller without
@@ -71,7 +71,7 @@ class PrintVerifyResultHumanTests(unittest.TestCase):
         # heading.
         result = VerificationResult(passed=True)
         out = self._render(result)
-        self.assertIn("tenax-assay verify: FAILED", out)
+        self.assertIn("lucid-assay verify: FAILED", out)
 
 
 if __name__ == "__main__":

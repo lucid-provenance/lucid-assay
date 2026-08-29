@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-tenax-assay verify: admission gatekeeper for signed DSSE in-toto attestations.
+lucid-assay verify: admission gatekeeper for signed DSSE in-toto attestations.
 
 Decodes a DSSE envelope (`payloadType: application/vnd.in-toto+json`) produced
-by `tenax-assay` (see cli.oidc_signer / cli.builder), best-effort verifies the
+by `lucid-assay` (see cli.oidc_signer / cli.builder), best-effort verifies the
 Sigstore keyless signing identity, and enforces admission policy gates against
 the embedded Release Confidence Score (RCS) predicate.
 
@@ -64,15 +64,15 @@ except ImportError:
 
 EXPECTED_PAYLOAD_TYPE = "application/vnd.in-toto+json"
 EXPECTED_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
-EXPECTED_PREDICATE_TYPE = "https://tenax.io/attestations/assay/v1"
+EXPECTED_PREDICATE_TYPE = "https://lucidprovenance.io/attestations/assay/v1"
 
 # The generic SLSA v1.0 provenance predicateType (distinct from
-# EXPECTED_PREDICATE_TYPE above, which is tenax-assay's own RCS predicate).
+# EXPECTED_PREDICATE_TYPE above, which is lucid-assay's own RCS predicate).
 # The SLSA Build Level 1/2 checklist below (_evaluate_slsa_l1/_l2) is a
 # separate, purely informational assessment against the SLSA v1.0
 # provenance schema (https://slsa.dev/spec/v1.0/provenance) -- it never
 # gates `passed`/exit code, the same way static_analysis_tools doesn't --
-# so it applies whether the decoded statement is tenax-assay's own
+# so it applies whether the decoded statement is lucid-assay's own
 # predicate (which, not being SLSA provenance shaped, will legitimately
 # fail most of this checklist today) or a real SLSA provenance statement
 # handed to this same admission gate.
@@ -87,7 +87,7 @@ SLSA_PROVENANCE_PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
 # Sigstore's --cert-identity check (see
 # _slsa_check_isolated_provenance_generation), which does encode the ref.
 TRUSTED_CONTROL_PLANE_BUILDER_IDS = frozenset({
-    "https://github.com/tenax-io/tenax-attest/.github/workflows/sign.yml",
+    "https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml",
 })
 
 # Builder IDs trusted as SLSA Build Level 2 "hosted"/tamper-resistant
@@ -150,8 +150,8 @@ UNPARSEABLE_LITERAL = "<unparseable>"
 MAX_ENVELOPE_SIZE = 10 * 1024 * 1024  # 10MB
 
 # Packaged predicate JSON Schema, resolved relative to this module rather
-# than the process's CWD so `tenax-assay verify` works from any directory.
-_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schema" / "tenax-attestation-v1.schema.json"
+# than the process's CWD so `lucid-assay verify` works from any directory.
+_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schema" / "lucid-attestation-v1.schema.json"
 _schema_cache: Optional[Dict[str, Any]] = None
 
 
@@ -504,7 +504,7 @@ def _slsa_invocation_origin(predicate: Dict[str, Any]) -> Optional[str]:
     _format_run_identity_report's "CI Run:" line -- that's sourced from the
     RCS/assay statement's predicate.pipeline, which can legitimately be a
     *different* run than the one that constructed the SLSA statement (e.g.
-    the untrusted caller's build job vs. tenax-attest's isolated signer
+    the untrusted caller's build job vs. lucid-attest's isolated signer
     job). A failed Build Level checklist item needs a link to the run that
     actually produced *its own* predicate, so this is threaded through
     _slsa_level_result and rendered directly inside that level's block (see
@@ -761,7 +761,7 @@ def _slsa_check_isolated_provenance_generation(
 # stronger digest and virtually every real npm package ships only that one
 # -- so requiring sha256 specifically meant no JS/TS repo's lockfile could
 # ever satisfy this check, structurally, regardless of how well-pinned it
-# was. Confirmed via a real run (tenax-io/tenax-console PR #1, 2026-08-27):
+# was. Confirmed via a real run (lucid-provenance/lucid-console PR #1, 2026-08-27):
 # a genuine, fully hash-pinned package-lock.json still failed this check
 # with "no 'pkg:' PURL entries with a sha256 digest found" purely because
 # every one of its ~569 resolved entries carried sha512, never sha256.
@@ -817,7 +817,7 @@ def _evaluate_slsa_l3(
     own -- see --require-slsa-build-l3 for the opt-in exception). Fails
     closed and honestly for every caller today: the architecture that
     would make its first two items pass (provenance constructed inside
-    tenax-attest's isolated signer job, not the untrusted build job)
+    lucid-attest's isolated signer job, not the untrusted build job)
     doesn't exist yet."""
     predicate = statement.get("predicate")
     predicate = predicate if isinstance(predicate, dict) else {}
@@ -963,7 +963,7 @@ def _classify_statements(
     """Sorts up to two decoded in-toto Statements into (assay_statement,
     build_statement) by predicateType, regardless of which was passed as
     the primary envelope vs. the optional --slsa-envelope one -- so
-    `tenax-assay verify a.dsse.json --slsa-envelope b.dsse.json` and the
+    `lucid-assay verify a.dsse.json --slsa-envelope b.dsse.json` and the
     arguments reversed behave identically. Backward-compatible fallback:
     when a track's statement can't be identified by predicateType (most
     commonly: no --slsa-envelope was given at all), it falls back to
@@ -1538,7 +1538,7 @@ def _load_schema() -> Optional[Dict[str, Any]]:
 
 def _validate_against_schema(predicate: Dict[str, Any]) -> Tuple[str, List[str]]:
     """Best-effort structural validation of the predicate against the
-    packaged JSON Schema (schema/tenax-attestation-v1.schema.json).
+    packaged JSON Schema (schema/lucid-attestation-v1.schema.json).
 
     Returns (status, messages):
       - "passed": schema loaded, jsonschema ran, zero violations. messages=[].
@@ -2156,7 +2156,7 @@ def _validate_rcs_block(
     violations).
 
     `degraded` is always a concrete bool, never None: when the predicate
-    omits the field entirely (it's optional per schema/tenax-attestation-
+    omits the field entirely (it's optional per schema/lucid-attestation-
     v1.schema.json, which documents "default": false), `degraded` resolves
     to that schema-declared default -- a legitimate, versioned display
     interpretation, not a fabricated compliance claim. `degraded_field_present`
@@ -2165,7 +2165,7 @@ def _validate_rcs_block(
     (False) -- callers evaluating --disallow-degraded (see
     _evaluate_policy_gates) MUST fail closed on `degraded_field_present is
     False` rather than trusting the display default, since an absent field
-    on anything but a genuine tenax-assay-signed predicate is an unknown
+    on anything but a genuine lucid-assay-signed predicate is an unknown
     state, not a confirmed non-degraded one (CLAUDE.md "Fail-Closed
     Verification"). A malformed (non-bool) value both reports
     degraded_field_present=False *and* raises its own `violations` entry,
@@ -2239,7 +2239,7 @@ def _evaluate_policy_gates(
     if disallow_degraded and not degraded_field_present:
         # Fail-closed on an unknown state (CLAUDE.md "Fail-Closed
         # Verification"): the field is either absent (no genuine
-        # tenax-assay-signed predicate omits it -- scorer.py always sets
+        # lucid-assay-signed predicate omits it -- scorer.py always sets
         # it explicitly) or malformed (already its own violation above).
         # Either way, --disallow-degraded exists specifically to block
         # degraded runs, so it must never silently trust an unconfirmed
@@ -2353,7 +2353,7 @@ def verify_dsse_attestation(
 
     `slsa_statement` is the already-decoded payload of an optional *second*
     envelope (the CLI's --slsa-envelope) -- when given alongside a primary
-    envelope that's tenax-assay's own RCS predicate, the SLSA Source Track
+    envelope that's lucid-assay's own RCS predicate, the SLSA Source Track
     (sourced from the RCS predicate's vcs/branch_governance) and SLSA Build
     Track (sourced from this second, SLSA-shaped statement) are both fully
     evaluated together in one report (see _classify_statements). Omitted,
@@ -2562,8 +2562,8 @@ def verify_dsse_attestation(
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="tenax-assay verify",
-        description="Verify a tenax-assay DSSE in-toto attestation envelope against admission policy gates.",
+        prog="lucid-assay verify",
+        description="Verify a lucid-assay DSSE in-toto attestation envelope against admission policy gates.",
     )
     p.add_argument("envelope", help="path to the signed DSSE envelope JSON file")
     p.add_argument("--min-rcs", type=int, default=0, help="minimum acceptable RCS score (default: 0)")
@@ -2622,7 +2622,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         dest="require_slsa_build_l3",
         help="fail the gate if this run does not fully (cumulatively) satisfy SLSA Build Level 3 -- "
         "off by default, since no caller can satisfy it until provenance construction moves into "
-        "tenax-attest's isolated signer job (see cli/verify.py's SLSA Build Level 3 section)",
+        "lucid-attest's isolated signer job (see cli/verify.py's SLSA Build Level 3 section)",
     )
     p.add_argument(
         "--format",
@@ -2785,7 +2785,7 @@ def _print_verify_result_human(result: VerificationResult) -> None:
     result.verdict_word (FAILED/GATED/PASSED, see _verdict_word) rather
     than a separately-computed PASS/FAIL binary, so it always agrees with
     FINAL VERDICT below it."""
-    print(f"tenax-assay verify: {result.verdict_word or 'FAILED'}", file=sys.stderr)
+    print(f"lucid-assay verify: {result.verdict_word or 'FAILED'}", file=sys.stderr)
     if result.rcs_value is not None:
         print(f"  RCS={result.rcs_value} degraded={result.degraded}", file=sys.stderr)
         if result.degraded and result.degraded_reasons:
@@ -2816,7 +2816,7 @@ def _render_step_summary_markdown(result: VerificationResult) -> str:
     already fixed-width plain text, not meant to be reformatted as
     markdown headings/tables)."""
     word = result.verdict_word or "FAILED"
-    heading = f"## tenax-assay verify: {_VERDICT_EMOJI.get(word, '❌')} {word}"
+    heading = f"## lucid-assay verify: {_VERDICT_EMOJI.get(word, '❌')} {word}"
     body = "\n".join(_render_track_sections(result)).strip("\n")
     parts = [heading]
     if body:
@@ -2847,7 +2847,7 @@ def _checklist_envelope_rows(levels: List[Optional[Dict[str, Any]]]) -> List[Dic
 def _build_verdict_envelope_block(result: VerificationResult) -> Dict[str, Any]:
     """Builds the `_verdict` block `--write-verdict` persists onto the
     envelope (see _write_verdict_into_envelope) -- the FAILED/GATED/PASSED
-    verdict this exact `tenax-assay verify` invocation computed, plus
+    verdict this exact `lucid-assay verify` invocation computed, plus
     enough of its own inputs (rcs_value, rcs_met, degraded, SLSA highest
     levels, the itemized Source/Build checklists, gate_params) that a
     reader isn't left trusting a bare word or a bare level number with no
@@ -2863,11 +2863,11 @@ def _build_verdict_envelope_block(result: VerificationResult) -> Dict[str, Any]:
     bar".
 
     `source_checklist`/`build_checklist` are the same real, itemized
-    per-criterion results `tenax-assay verify`'s own human-readable
+    per-criterion results `lucid-assay verify`'s own human-readable
     report and $GITHUB_STEP_SUMMARY output already show (see
     _format_track_report/_render_step_summary_markdown) -- persisted
-    here for the first time so a downstream reader (tenax-dsse-collector,
-    tenax-console) doesn't have to re-run `tenax-assay verify` or dig
+    here for the first time so a downstream reader (lucid-dsse-collector,
+    lucid-console) doesn't have to re-run `lucid-assay verify` or dig
     through a CI job's ephemeral step summary to see which specific
     criteria passed or failed. Like the checklist inputs are largely
     intrinsic facts about the artifact, but a handful of items
@@ -2886,7 +2886,7 @@ def _build_verdict_envelope_block(result: VerificationResult) -> Dict[str, Any]:
     call's policy as if it were permanent. Instead this is an unsigned
     sibling field on the envelope, exactly the same trust tier as
     cli.oidc_signer's `_rekor`/`_sigstore_bundle`: informational,
-    re-derivable by re-running `tenax-assay verify` with the same gate
+    re-derivable by re-running `lucid-assay verify` with the same gate
     parameters, and never a substitute for doing so when the stakes
     actually require a fresh, trusted check rather than reading a cached
     one off the envelope."""
@@ -2943,7 +2943,7 @@ def _write_github_step_summary(result: VerificationResult) -> None:
     when that env var is set (i.e. running inside a GitHub Actions job
     step) -- a no-op everywhere else, and never raises: a broken/missing
     step-summary file must never fail the verification run itself.
-    Appends rather than overwrites so multiple `tenax-assay verify`
+    Appends rather than overwrites so multiple `lucid-assay verify`
     invocations within one job step accumulate rather than clobber each
     other's summary."""
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")

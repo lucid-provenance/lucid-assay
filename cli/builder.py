@@ -1,6 +1,6 @@
 """
 Assembles the unsigned in-toto Statement (predicateType =
-https://tenax.io/attestations/assay/v1) from parsed inputs.
+https://lucidprovenance.io/attestations/assay/v1) from parsed inputs.
 
 Hardened against:
   - TypeError on boolean evaluation of NoneType line rates
@@ -25,14 +25,14 @@ from .patch_coverage import PatchCoverageResult
 from .real_coverage import RealCoverageResult
 from .scorer import ASSERTION_DENSITY_TARGET, RCSResult
 
-DEFAULT_PREDICATE_TYPE = "https://tenax.io/attestations/assay/v1"
+DEFAULT_PREDICATE_TYPE = "https://lucidprovenance.io/attestations/assay/v1"
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# tenax-attestation-v1.schema.json requires pipeline.run_id/workflow_ref to
+# lucid-attestation-v1.schema.json requires pipeline.run_id/workflow_ref to
 # be non-empty strings -- unlike cli/slsa_provenance.py's SLSA statement,
 # which can omit an entire optional field when the ambient GitHub Actions
 # context isn't present, this predicate's pipeline block can't simply leave
@@ -315,7 +315,7 @@ def build_statement(
             "reason": branch_governance.reason,
             "reason_code": branch_governance.reason_code,
             # Required-status-check contexts on the branch (e.g.
-            # "ci/tenax-assay-verify") -- [] on attestations predating this
+            # "ci/lucid-assay-verify") -- [] on attestations predating this
             # field, or whenever branch_governance.available is False. See
             # cli/parsers/s2c2f.py's AUD-1 (Enforcing Provenance) check.
             "required_status_check_contexts": branch_governance.required_status_check_contexts,
@@ -410,7 +410,7 @@ def build_statement(
         # Pinned/resolved dependencies detected from lockfiles under the
         # repo (cli/parsers/lockfiles.py: uv.lock, package-lock.json,
         # go.sum, Gradle/Maven locks), deduplicated by uri. This is
-        # tenax-assay's own top-level predicate field, distinct from --
+        # lucid-assay's own top-level predicate field, distinct from --
         # and never a substitute for -- SLSA v1.0 provenance's
         # buildDefinition.resolvedDependencies, which cli/verify.py's
         # SLSA Level 2 checklist reads from a differently-shaped

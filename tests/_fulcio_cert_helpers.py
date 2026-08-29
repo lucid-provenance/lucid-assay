@@ -46,7 +46,7 @@ def _make_fulcio_style_cert(
     from cryptography.x509.oid import NameOID
 
     key = ed25519.Ed25519PrivateKey.generate()
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "tenax-assay-test")])
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "lucid-assay-test")])
     now = datetime.datetime.now(datetime.timezone.utc)
 
     builder = (

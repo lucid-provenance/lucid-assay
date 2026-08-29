@@ -441,6 +441,21 @@ jobs:
           name: signed-statements
           path: build
 
+      # --write-verdict overwrites build/tenax-assay.dsse.json in place
+      # with this exact call's FAILED/GATED/PASSED word/banner/rcs_value/
+      # degraded/source_level/build_level/gate_params (plus the itemized
+      # SLSA checklists) as an unsigned `_verdict` sibling field, then
+      # "Upload In-Toto Attestation Artifact" below re-uploads that
+      # annotated file. Needed here for the same reason as tenax-console/
+      # tenax-dsse-collector's identical addition: this repo's own split
+      # mint(unsigned)/sign(isolated `attest` job, via tenax-attest's
+      # reusable sign.yml) architecture never runs cli.main's own
+      # run --sign/--dry-run-sign pipeline (the only place verdict
+      # annotation happens automatically) -- `attest` only ever calls
+      # `cli.main sign`, a different code path with no verdict step.
+      # Without this flag, tenax-assay's own dogfood attestations never
+      # carry a verdict at all, on any branch (not specific to a PR vs.
+      # main -- this job simply never wrote one).
       - name: Verify Tenax Attestation Gate
         env:
           EXPECTED_REPOSITORY: ${{ github.repository }}
@@ -483,6 +498,7 @@ jobs:
             --cert-identity "$CERT_IDENTITY"
             --cert-oidc-issuer "$CERT_OIDC_ISSUER"
             --slsa-envelope build/provenance.dsse.json
+            --write-verdict
           )
           # pull_request (pre-merge) and push-to-main (post-merge/promotion,
           # now that "Resolve PR Context for a Push-Triggered Run" keeps it

@@ -243,11 +243,19 @@
     "assertion_density": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["total_assertions", "total_test_functions", "density_ratio", "heuristics"],
+      "required": ["total_assertions", "total_test_functions", "density_ratio", "target", "met", "heuristics"],
       "properties": {
         "total_assertions": { "type": "integer", "minimum": 0 },
         "total_test_functions": { "type": "integer", "minimum": 0 },
         "density_ratio": { "type": ["number", "null"], "minimum": 0, "description": "assertions / test_functions; null when total_test_functions is 0." },
+        "target": {
+          "type": "number", "minimum": 0,
+          "description": "cli/scorer.py's ASSERTION_DENSITY_TARGET, verbatim -- a fixed constant, not a per-run CLI flag. Absent on attestations predating this field."
+        },
+        "met": {
+          "type": "boolean",
+          "description": "True only when density_ratio is real and >= target -- a genuine, unconditional gate (no --min-assertion-density flag exists to make this configurable). False, never fabricated true, when density_ratio is null. Absent on attestations predating this field."
+        },
         "valid_test_functions": { "type": "integer", "minimum": 0, "description": "Non-skipped test functions with at least one real (non-tautological) assertion -- total_test_functions minus \"vanity\" tests (an empty body, or one whose only assertions are tautological, e.g. `assert True`). Absent on attestations predating this field." },
         "valid_test_ratio": { "type": ["number", "null"], "minimum": 0, "maximum": 1, "description": "valid_test_functions / total_test_functions; null when total_test_functions is 0. Absent on attestations predating this field." },
         "heuristics": {
@@ -283,12 +291,16 @@
     "static_analysis": {
       "type": "object",
       "additionalProperties": false,
-      "description": "SARIF 2.1.0 static-analysis findings (see cli/parsers/sarif.py), differential-scored against the patch. available=true with empty tools/findings when no --sarif input was configured for this run at all (a control that was never invoked isn't penalized) -- distinct from available=false, which means a --sarif input was configured but couldn't be read/parsed. Absent entirely on attestations predating this feature.",
+      "description": "SARIF 2.1.0 static-analysis findings (see cli/parsers/sarif.py), differential-scored against the patch. configured=false means no --sarif input was given at all for this run (available is then always false too -- nothing was ever evaluated, so there's no real result to call available); configured=true, available=false means a --sarif input was given but couldn't be read/parsed (see reasons); configured=true, available=true is a real, completed scan (findings/tools populated, possibly empty). Absent entirely on attestations predating this feature; configured absent (available alone present) on an attestation predating the configured/available split (tenax-assay PR #47) -- available=true there is ambiguous between \"never configured\" and \"genuinely clean scan\", by that earlier schema's own now-corrected mistake.",
       "required": [
-        "available", "format", "total_findings", "errors_count", "warnings_count",
+        "configured", "available", "format", "total_findings", "errors_count", "warnings_count",
         "notes_count", "patch_errors_count", "patch_warnings_count", "findings"
       ],
       "properties": {
+        "configured": {
+          "type": "boolean",
+          "description": "True iff --sarif was passed at least once for this run. False means static analysis was never invoked -- not skipped/bypassed after being requested, just never asked for."
+        },
         "available": { "type": "boolean" },
         "format": { "type": "string", "enum": ["sarif-2.1.0"] },
         "total_findings": { "type": "integer", "minimum": 0 },

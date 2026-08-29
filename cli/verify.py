@@ -2848,10 +2848,19 @@ def _build_verdict_envelope_block(result: VerificationResult) -> Dict[str, Any]:
     """Builds the `_verdict` block `--write-verdict` persists onto the
     envelope (see _write_verdict_into_envelope) -- the FAILED/GATED/PASSED
     verdict this exact `tenax-assay verify` invocation computed, plus
-    enough of its own inputs (rcs_value, degraded, SLSA highest levels,
-    the itemized Source/Build checklists, gate_params) that a reader
-    isn't left trusting a bare word or a bare level number with no way to
-    see what produced it.
+    enough of its own inputs (rcs_value, rcs_met, degraded, SLSA highest
+    levels, the itemized Source/Build checklists, gate_params) that a
+    reader isn't left trusting a bare word or a bare level number with no
+    way to see what produced it.
+
+    `rcs_met` is the real `rcs_value >= gate_params["min_rcs"]` comparison
+    _evaluate_policy_gates already makes internally to decide the
+    RCS-vs-threshold `violations` entry -- surfaced here so a downstream
+    reader can color the RCS score card without re-deriving that
+    comparison itself. `passed` above is a *different*, broader signal
+    (every gate this call evaluated, not just this one), so it must not
+    be reused as a stand-in for "did the score specifically clear its own
+    bar".
 
     `source_checklist`/`build_checklist` are the same real, itemized
     per-criterion results `tenax-assay verify`'s own human-readable
@@ -2881,11 +2890,23 @@ def _build_verdict_envelope_block(result: VerificationResult) -> Dict[str, Any]:
     parameters, and never a substitute for doing so when the stakes
     actually require a fresh, trusted check rather than reading a cached
     one off the envelope."""
+    min_rcs = result.gate_params.get("min_rcs")
     return {
         "word": result.verdict_word or "FAILED",
         "banner": result.verdict,
         "passed": result.passed,
         "rcs_value": result.rcs_value,
+        # True only when both the score and this call's own --min-rcs are
+        # real and the score clears it -- the exact same comparison
+        # _evaluate_policy_gates already makes to decide the RCS-vs-
+        # threshold `violations` entry, just also recorded here so a
+        # reader doesn't have to reconstruct "did 89 clear 75" from a
+        # free-text violation string. None (never fabricated true/false)
+        # when either side is missing. A function of this call's own
+        # gate parameter (--min-rcs), same category as word/banner/
+        # source_level/build_level, hence unsigned here rather than
+        # baked into the signed RCS predicate at build time.
+        "rcs_met": None if result.rcs_value is None or min_rcs is None else result.rcs_value >= min_rcs,
         "degraded": result.degraded,
         "source_level": result.source_highest_level,
         "build_level": result.build_highest_level,

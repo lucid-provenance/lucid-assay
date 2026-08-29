@@ -23,7 +23,7 @@ from .parsers.s2c2f import S2C2FReport
 from .parsers.sarif import SarifSummaryReport
 from .patch_coverage import PatchCoverageResult
 from .real_coverage import RealCoverageResult
-from .scorer import RCSResult
+from .scorer import ASSERTION_DENSITY_TARGET, RCSResult
 
 DEFAULT_PREDICATE_TYPE = "https://tenax.io/attestations/assay/v1"
 
@@ -225,6 +225,14 @@ def build_statement(
 
     if sarif_report is not None:
         static_analysis = {
+            # configured: --sarif was passed at least once for this run.
+            # available: the report(s) actually parsed and produced real
+            # results (sarif_report.available) -- distinct signals, so a
+            # reader can tell "asked for it, got real results" apart from
+            # "asked for it, but the report was missing/corrupt" (both
+            # configured=True) and from "never asked at all" below
+            # (configured=False, so available is never separately true).
+            "configured": True,
             "available": sarif_report.available,
             "format": "sarif-2.1.0",
             "tools_scanned": sarif_report.tools_scanned,
@@ -240,11 +248,17 @@ def build_statement(
             "reasons": sarif_report.reasons,
         }
     else:
-        # No --sarif flags were configured for this run at all -- an empty,
-        # available=True block (nothing scanned, nothing to report), not a
-        # failure state. Mirrors cli.scorer._score_sarif_findings(None).
+        # No --sarif flags were configured for this run at all --
+        # configured=False, available=False (nothing was ever actually
+        # evaluated, so there's no real result to call "available").
+        # Matches cli.scorer._score_sarif_findings(None)'s
+        # available=False; both used to independently say "true" here,
+        # which conflated "never configured" with "genuinely clean scan"
+        # -- exactly the ambiguity a reader needs available=False to see
+        # through.
         static_analysis = {
-            "available": True,
+            "configured": False,
+            "available": False,
             "format": "sarif-2.1.0",
             "tools_scanned": [],
             "total_findings": 0,
@@ -256,7 +270,7 @@ def build_statement(
             "patch_warnings_count": 0,
             "findings": [],
             "tools": [],
-            "reasons": [],
+            "reasons": ["no --sarif reports configured for this run"],
         }
 
     predicate = {
@@ -367,6 +381,15 @@ def build_statement(
             "total_assertions": total_assertions,
             "total_test_functions": total_test_functions,
             "density_ratio": density_ratio,
+            "target": ASSERTION_DENSITY_TARGET,
+            # True only when density_ratio is real and >= target -- a
+            # genuine, unconditional gate (no --min-assertion-density CLI
+            # flag exists; ASSERTION_DENSITY_TARGET is a fixed constant,
+            # so this needs no verify-time gate parameter the way
+            # RCS-vs-min_rcs does). False, never fabricated true, when
+            # density_ratio is null (zero test functions to compute a
+            # density from at all).
+            "met": density_ratio is not None and density_ratio >= ASSERTION_DENSITY_TARGET,
             # Non-skipped test functions with >=1 real (non-tautological)
             # assertion -- i.e. total_test_functions minus "vanity" tests
             # (an empty body, or one whose only assertions are

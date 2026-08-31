@@ -47,6 +47,17 @@ plinth-assay = "cli.main:main"
 where = ["."]
 include = ["cli*", "schema*"]
 
+[tool.setuptools.package-data]
+# Without this, a plain `pip install .` builds a wheel that never
+# contains the schema JSON at all -- setuptools only bundles *.py files
+# into a package by default, everything else needs an explicit
+# package-data declaration. cli.verify's schema-file resolution
+# (Path(__file__).resolve().parent.parent / "schema" / "*.json") expects
+# this file to land as a sibling to the installed cli/ package -- see
+# schema/__init__.py's own comment for the full story of why this was
+# missing and how it was found.
+schema = ["*.json"]
+
 [tool.pytest.ini_options]
 # tests/fixtures/ast_assertions/ holds source-text fixtures for the
 # multi-language AST assertion engine (tests/test_ast_assertions.py parses

@@ -45,20 +45,22 @@ COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY cli/ cli/
 COPY schema/ schema/
 
-# `uv sync`, not `pip install .` -- verified empirically before writing
-# this: a plain `pip install .` into a venv does NOT actually install
-# schema/ as package data (pyproject.toml's `[tool.setuptools.packages.find]
-# include = ["schema*"]` silently fails to pick it up -- schema/ has no
-# __init__.py), which breaks cli/verify.py's own schema-file resolution
-# (`Path(__file__).resolve().parent.parent / "schema" / "*.json"`) --
-# not a crash, but a silent degrade to schema_validation_status="skipped"
-# for every single run. `uv sync` installs the local project *editable*
-# by default, which keeps cli/ and schema/ as real sibling directories on
-# disk at this exact path (verified: the resulting _SCHEMA_PATH resolves
-# and exists) -- exactly like running from a normal checkout. This means
-# the runtime stage below MUST copy this whole directory to the identical
-# absolute path (/app), never rename it -- the editable install's own
-# path reference is an absolute path baked in at sync time, not relative.
+# `uv sync`, not `pip install .`. A plain `pip install .` used to silently
+# skip schema/ entirely (setuptools needs schema/__init__.py + an explicit
+# [tool.setuptools.package-data] declaration to bundle a non-.py data file
+# -- neither existed) -- that's fixed at the source now (see
+# schema/__init__.py and pyproject.toml), so either install method
+# resolves cli/verify.py's schema-file lookup correctly today. `uv sync`
+# is still the right choice here regardless: it resolves against the
+# hash-pinned uv.lock (deterministic), where `pip install .` alone would
+# re-resolve dependency versions fresh against pyproject.toml's loose
+# ranges -- the same reproducibility argument this whole image exists for.
+# It also happens to install the local project *editable*, which keeps
+# cli/ and schema/ as real sibling directories on disk at this exact path
+# rather than copied into site-packages -- meaning the runtime stage below
+# MUST copy this whole directory to the identical absolute path (/app),
+# never rename it, since the editable install's own path reference is an
+# absolute path baked in at sync time, not relative.
 RUN uv sync --frozen --no-dev
 
 # ---- Stage 2: runtime -- git is a real, new requirement here ----

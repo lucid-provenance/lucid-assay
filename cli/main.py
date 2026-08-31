@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .builder import build_statement
-from .common import UnsafePathError, safe_resolve_path
+from .common import JSON_SUFFIX, UnsafePathError, derive_signed_path, safe_resolve_path
 from .hashing import sha256_file, worm_uri
 from .parsers.ast import inspect_test_suite
 from .parsers.commit_author import CommitAuthorReport, inspect_commit_author
@@ -119,23 +119,6 @@ def _emit_stage_profile(
     )
     print(f"Total Wall-Clock Time:   {_fmt_s(wall_elapsed_ns):>13}", file=sys.stderr)
     print("====================================", file=sys.stderr)
-
-
-JSON_SUFFIX = ".json"
-
-
-def derive_signed_path(out_path: str) -> str:
-    """Derive the DSSE signed envelope path from --out, without
-    double-appending the .dsse.json suffix when --out already ends in
-    .dsse.json or .json (e.g. avoid *.dsse.dsse.json)."""
-    if out_path.endswith(".dsse.json"):
-        return out_path
-    if out_path.endswith(JSON_SUFFIX):
-        base_out = out_path[: -len(JSON_SUFFIX)]
-        if base_out.endswith(".unsigned"):
-            base_out = base_out[: -len(".unsigned")]
-        return f"{base_out}.dsse.json"
-    return f"{out_path}.dsse.json"
 
 
 def derive_slsa_provenance_path(out_path: str, explicit: Optional[str]) -> str:

@@ -1,0 +1,16 @@
+# Allowlist-by-default (denylist everything, then carve out what the
+# image build actually needs) -- same discipline as lucid-attest's own
+# .dockerignore for the signer image, applied here even though this image
+# carries no trust-boundary constraint: a smaller, deliberate build
+# context is still worth having on its own merits (faster builds, no
+# accidental inclusion of test fixtures/caches/git history).
+*
+
+!cli
+!cli/**
+!schema
+!schema/**
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE

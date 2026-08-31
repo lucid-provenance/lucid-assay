@@ -60,7 +60,7 @@ permissions:
 # `${{ env.SIGNER_WORKFLOW_SHA }}` to build --cert-identity, so the gate can
 # never drift from what `attest` actually invoked.
 env:
-  SIGNER_WORKFLOW_SHA: 0db779422687c8b1b772947a1548f5d357d7029a # lucid-attest: sign.yml now runs signing via the immutable, digest-pinned signer container (Milestone #18, PRs #7-#9) -- keep in sync with attest job's `uses:` pin
+  SIGNER_WORKFLOW_SHA: f69640d69a5ef2f213a952ea8907f6eb96a93920 # lucid-attest: signer container's HOME fixed to /tmp (PR #10) + re-pinned to the rebuilt, registry-verified image digest (PR #11) -- keep in sync with attest job's `uses:` pin
 
 jobs:
   # Runs the PR's own code: tests, coverage, CodeQL, SonarQube, RCS scoring.
@@ -384,7 +384,7 @@ jobs:
     permissions:
       id-token: write # Required for Sigstore keyless OIDC minting
       contents: read
-    uses: lucid-provenance/lucid-attest/.github/workflows/sign.yml@0db779422687c8b1b772947a1548f5d357d7029a # keep in sync with env.SIGNER_WORKFLOW_SHA above
+    uses: lucid-provenance/lucid-attest/.github/workflows/sign.yml@f69640d69a5ef2f213a952ea8907f6eb96a93920 # keep in sync with env.SIGNER_WORKFLOW_SHA above
     with:
       artifact-name: unsigned-statements
       statement-files: |

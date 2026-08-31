@@ -1113,6 +1113,63 @@ lockfile scanning only — the checkout is never executed), not from
 anything the untrusted `build` job claims — then signs both statements
 atomically in the same job via `lucid-assay sign`.
 
+## Container image
+
+`lucid-assay` publishes an immutable OCI image
+(`ghcr.io/lucid-provenance/lucid-assay`, public) alongside the CLI itself
+— Lucid roadmap Milestone #19. Unlike `lucid-attest`'s signer image
+(which packages only a narrow, hand-picked file list, since it runs with
+signing privilege), this image is the *entire* CLI, self-contained — no
+trust boundary to protect here.
+
+**What it closes**: the same source-pinned/runtime-not-pinned gap as any
+CI setup running this via `uv sync` on a fresh runner — RCS scoring's
+whole premise is determinism, but the execution environment (OS
+libraries, exact interpreter build, a live runtime dependency on PyPI's
+availability) is otherwise reassembled fresh on every run. The image
+freezes all of that.
+
+**Tags and pinning**: every push to `main` that touches `cli/`,
+`schema/`, `pyproject.toml`, `uv.lock`, or `Dockerfile` publishes a new
+image tagged by commit SHA (`:​<sha>`) and Sigstore-signed. There is
+**no `latest` tag, deliberately** — consistent with this project's own
+explicit-pinning stance everywhere else (`--min-rcs`, `TRUSTED_SIGNER_SHA`,
+...). Resolve a real digest before using this anywhere that matters:
+
+```bash
+docker buildx imagetools inspect ghcr.io/lucid-provenance/lucid-assay:<sha>
+```
+
+**Mount contract**: mount your repository checkout at `/workspace`
+(the image's `WORKDIR`, so `--repo-dir`'s default of `.` resolves
+correctly without passing it explicitly) — with **full git history**
+(`fetch-depth: 0` on your own checkout step), since patch coverage
+computes `git diff base...head` against it. Mount wherever your JUnit
+XML/coverage report/output path need to live too, if they're outside the
+repo checkout itself.
+
+```bash
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD:/workspace" \
+  ghcr.io/lucid-provenance/lucid-assay@sha256:<digest> \
+  --junit-xml junit.xml --coverage-report coverage.xml \
+  --image-ref ... --image-digest ... --head-sha ... \
+  --repository org/repo --branch main \
+  --skip-perf-budget-check --out attestation.unsigned.json
+```
+
+`--user "$(id -u):$(id -g)"` matters whenever the container needs to write
+into your mounted checkout (e.g. `--out`) — the image's built-in non-root
+user won't own your host directory. The `lucid-assay verify` admission
+gate works the same way, against a signed envelope instead:
+
+```bash
+docker run --rm -v "$PWD:/workspace" \
+  ghcr.io/lucid-provenance/lucid-assay@sha256:<digest> \
+  verify build/lucid-assay.dsse.json --min-rcs 65 --disallow-degraded
+```
+
 ## Try it
 
 ```bash

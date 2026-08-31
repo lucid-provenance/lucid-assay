@@ -27,6 +27,32 @@ class UnsafePathError(ValueError):
     input handle this the same way, without needing a new except clause."""
 
 
+JSON_SUFFIX = ".json"
+
+
+def derive_signed_path(out_path: str) -> str:
+    """Derive the DSSE signed envelope path from --out, without
+    double-appending the .dsse.json suffix when --out already ends in
+    .dsse.json or .json (e.g. avoid *.dsse.dsse.json).
+
+    Lives here, not in cli.main, specifically so cli.sign can depend on it
+    without importing cli.main -- cli.main's own top-level imports pull in
+    the entire scoring/parsing pipeline (cli.scorer, cli.parsers.*,
+    cli.builder), which a standalone signing process has no business
+    loading into its own address space. See Milestone #18's "narrow code
+    footprint" requirement in the Lucid roadmap for why this matters beyond
+    tidiness. cli.main still exposes this name (re-exported, not
+    redefined) for existing callers/tests that import it from there."""
+    if out_path.endswith(".dsse.json"):
+        return out_path
+    if out_path.endswith(JSON_SUFFIX):
+        base_out = out_path[: -len(JSON_SUFFIX)]
+        if base_out.endswith(".unsigned"):
+            base_out = base_out[: -len(".unsigned")]
+        return f"{base_out}.dsse.json"
+    return f"{out_path}.dsse.json"
+
+
 def safe_resolve_path(path_str: Union[str, "os.PathLike[str]"]) -> Path:
     """Resolves `path_str` to an absolute Path with `.`/`..` segments and
     symlinks normalized away, rejecting null bytes and non-string/empty

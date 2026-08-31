@@ -16,6 +16,14 @@ and signs it, nothing else -- it never re-runs scoring, coverage, SARIF
 ingestion, or branch governance, so a job invoking only this subcommand
 never needs read access to any of that.
 
+This module's own import graph is held to the same narrow standard as its
+read-access surface: it depends only on cli.common and cli.oidc_signer,
+deliberately never cli.main -- importing cli.main would pull in the entire
+scoring/parsing pipeline (cli.scorer, cli.parsers.*, cli.builder) at module
+load time regardless of which subcommand actually runs, which is exactly
+the code footprint lucid-attest's immutable signer container (Milestone
+#18) packages this module specifically to avoid carrying.
+
 Hardened against:
   - A missing/oversized/unreadable input file crashing instead of failing
     closed with a clear diagnostic (mirrors cli.verify's load_envelope
@@ -32,8 +40,7 @@ import argparse
 import sys
 from typing import List, Optional
 
-from .common import UnsafePathError
-from .main import derive_signed_path
+from .common import UnsafePathError, derive_signed_path
 from .oidc_signer import AmbientIdentityError, InputFileTooLargeError, sign_file_to_envelope
 
 EXIT_PASS = 0

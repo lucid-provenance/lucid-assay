@@ -11,7 +11,7 @@ counts.
 import os
 import unittest
 
-from cli.parsers.coverage import CoverageReport, FileCoverage, parse_cobertura, parse_lcov
+from cli.parsers.coverage import CoverageReport, FileCoverage, parse_cobertura, parse_jacoco, parse_lcov
 
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
@@ -217,6 +217,117 @@ class ParseLcovTests(unittest.TestCase):
         path = _write(self._tmp(), "lcov.info", lcov)
         report = parse_lcov(path)
         self.assertIn("abs/src/foo.py", report.files)
+
+
+class ParseJacocoTests(unittest.TestCase):
+    def _tmp(self):
+        import tempfile
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        return d
+
+    def test_real_shaped_report(self):
+        # Shape confirmed empirically against `mvn jacoco:report` output
+        # (google/gson, 2026-09-01) -- report-level aggregate counters,
+        # one package/sourcefile with per-line ci/mi instruction counts.
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<report name="demo">
+  <package name="com/google/gson">
+    <sourcefile name="Gson.java">
+      <line nr="1" mi="0" ci="5" mb="0" cb="0"/>
+      <line nr="2" mi="3" ci="0" mb="0" cb="0"/>
+      <line nr="3" mi="0" ci="2" mb="1" cb="1"/>
+      <counter type="INSTRUCTION" missed="3" covered="7"/>
+      <counter type="LINE" missed="1" covered="2"/>
+      <counter type="BRANCH" missed="1" covered="1"/>
+    </sourcefile>
+  </package>
+  <counter type="INSTRUCTION" missed="3" covered="7"/>
+  <counter type="LINE" missed="1" covered="2"/>
+  <counter type="BRANCH" missed="1" covered="1"/>
+</report>"""
+        path = _write(self._tmp(), "jacoco.xml", xml)
+        report = parse_jacoco(path)
+        self.assertIsInstance(report, CoverageReport)
+        self.assertAlmostEqual(report.overall_line_rate, 2 / 3)
+        self.assertAlmostEqual(report.overall_branch_rate, 0.5)
+        fc = report.files["com/google/gson/Gson.java"]
+        # ci>0 -> hit (1), regardless of the actual instruction count
+        self.assertEqual(fc.line_hits, {1: 1, 2: 0, 3: 1})
+
+    def test_missing_branch_counter_is_none_not_zero(self):
+        # JaCoCo omits BRANCH entirely when there's no conditional code --
+        # must read as "unknown", not "0% branch coverage".
+        xml = """<report name="demo">
+  <counter type="LINE" missed="0" covered="5"/>
+</report>"""
+        path = _write(self._tmp(), "jacoco.xml", xml)
+        report = parse_jacoco(path)
+        self.assertEqual(report.overall_line_rate, 1.0)
+        self.assertIsNone(report.overall_branch_rate)
+
+    def test_missing_line_counter_defaults_to_zero(self):
+        xml = "<report name=\"demo\"></report>"
+        path = _write(self._tmp(), "jacoco.xml", xml)
+        report = parse_jacoco(path)
+        self.assertEqual(report.overall_line_rate, 0.0)
+        self.assertEqual(report.files, {})
+
+    def test_unnamed_default_package(self):
+        # A source file at the default (unnamed) package has no <package
+        # name="..."> prefix to concatenate.
+        xml = """<report name="demo">
+  <package name="">
+    <sourcefile name="Main.java">
+      <line nr="1" mi="0" ci="1" mb="0" cb="0"/>
+    </sourcefile>
+  </package>
+  <counter type="LINE" missed="0" covered="1"/>
+</report>"""
+        path = _write(self._tmp(), "jacoco.xml", xml)
+        report = parse_jacoco(path)
+        self.assertIn("Main.java", report.files)
+
+    def test_multiple_packages_and_sourcefiles(self):
+        xml = """<report name="demo">
+  <package name="a">
+    <sourcefile name="A.java"><line nr="1" mi="0" ci="1" mb="0" cb="0"/></sourcefile>
+  </package>
+  <package name="b">
+    <sourcefile name="B.java"><line nr="1" mi="1" ci="0" mb="0" cb="0"/></sourcefile>
+  </package>
+  <counter type="LINE" missed="1" covered="1"/>
+</report>"""
+        path = _write(self._tmp(), "jacoco.xml", xml)
+        report = parse_jacoco(path)
+        self.assertEqual(set(report.files.keys()), {"a/A.java", "b/B.java"})
+        self.assertEqual(report.files["a/A.java"].line_hits, {1: 1})
+        self.assertEqual(report.files["b/B.java"].line_hits, {1: 0})
+
+    def test_malformed_counter_attributes_degrade_safely(self):
+        xml = """<report name="demo">
+  <counter type="LINE" missed="notanumber" covered="also-not"/>
+</report>"""
+        path = _write(self._tmp(), "jacoco.xml", xml)
+        report = parse_jacoco(path)
+        # A malformed LINE counter can't be parsed -> None -> defaults to
+        # 0.0 the same way a missing counter does, never raises.
+        self.assertEqual(report.overall_line_rate, 0.0)
+
+    def test_missing_line_nr_skipped(self):
+        xml = """<report name="demo">
+  <package name="p">
+    <sourcefile name="F.java">
+      <line mi="0" ci="1" mb="0" cb="0"/>
+      <line nr="2" mi="0" ci="1" mb="0" cb="0"/>
+    </sourcefile>
+  </package>
+  <counter type="LINE" missed="0" covered="2"/>
+</report>"""
+        path = _write(self._tmp(), "jacoco.xml", xml)
+        report = parse_jacoco(path)
+        self.assertEqual(report.files["p/F.java"].line_hits, {2: 1})
 
 
 if __name__ == "__main__":

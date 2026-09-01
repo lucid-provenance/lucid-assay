@@ -14,7 +14,7 @@ schema/
 cli/
   common.py                 # safe_resolve_path(): path-safety guard shared by every module below that opens an operator-supplied file
   parsers/junit.py          # streaming JUnit XML -> TestTotals (flaky-retry aware)
-  parsers/coverage.py       # Cobertura XML + LCOV -> CoverageReport (per-line hit maps)
+  parsers/coverage.py       # Cobertura XML + LCOV + JaCoCo XML -> CoverageReport (per-line hit maps)
   parsers/coverage_contexts.py # `coverage json --show-contexts` -> per-test line attribution
   parsers/ast_inspector.py  # backward-compat shim -> re-exports parsers/ast/
   parsers/ast/              # multi-language assertion integrity engine (registry/dispatcher)
@@ -232,11 +232,20 @@ keyed by `(classname, name)`; more than one recorded attempt with a
 passing final outcome is what "flaky" means here — only the final attempt
 counts toward pass/fail/error/skip totals.
 
-**`parsers/coverage.py`** parses Cobertura XML and LCOV into a common
-`CoverageReport`, normalizing file paths (stripping absolute prefixes and
-`./` tokens) so they can be matched against git-diff paths downstream. All
-rates are clamped to `[0.0, 1.0]`; malformed attributes degrade to `0`
-rather than raising.
+**`parsers/coverage.py`** parses Cobertura XML, LCOV, and JaCoCo XML
+(`--coverage-format jacoco`, e.g. `mvn jacoco:report` / Gradle's
+`jacocoTestReport`) into a common `CoverageReport`, normalizing file paths
+(stripping absolute prefixes and `./` tokens) so they can be matched
+against git-diff paths downstream. All rates are clamped to `[0.0, 1.0]`;
+malformed attributes degrade to `0` rather than raising. JaCoCo's own file
+identity is package-relative (`com/example/Foo.java`, no `src/main/java/`
+prefix — JaCoCo has no visibility into the build's source-root layout),
+so patch-coverage lookups against `git diff` paths may miss for Java
+projects; the report-level `overall_line_rate` is unaffected either way.
+`cobertura-maven-plugin` is effectively dead (depends on `tools.jar`,
+removed in JDK 9+) — JaCoCo is the real modern default for Java/JVM
+coverage, which is the reason this format exists as a first-class option
+rather than something you're expected to convert into Cobertura shape.
 
 **`patch_coverage.py`** runs `git diff --unified=0 base...head` and walks
 hunk headers to get exactly the added/modified line numbers per file, then

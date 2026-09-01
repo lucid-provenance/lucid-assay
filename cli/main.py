@@ -24,7 +24,7 @@ from .common import JSON_SUFFIX, UnsafePathError, derive_signed_path, safe_resol
 from .hashing import sha256_file, worm_uri
 from .parsers.ast import inspect_test_suite
 from .parsers.commit_author import CommitAuthorReport, inspect_commit_author
-from .parsers.coverage import parse_cobertura, parse_lcov
+from .parsers.coverage import parse_cobertura, parse_jacoco, parse_lcov
 from .parsers.coverage_contexts import parse_coverage_contexts
 from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
@@ -450,7 +450,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="lucid-assay: single-binary CI attestation & governance engine.",
     )
     p.add_argument("--junit-xml", required=True)
-    p.add_argument("--coverage-format", choices=["cobertura", "lcov"], default="cobertura")
+    p.add_argument("--coverage-format", choices=["cobertura", "lcov", "jacoco"], default="cobertura")
     p.add_argument("--coverage-report", required=True, dest="coverage_report")
     p.add_argument("--image-ref", required=True)
     p.add_argument("--image-digest", required=True, help="sha256:<hex> or bare hex")
@@ -601,6 +601,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 2. Parse coverage report
         if args.coverage_format == "cobertura":
             coverage = parse_cobertura(args.coverage_report)
+        elif args.coverage_format == "jacoco":
+            coverage = parse_jacoco(args.coverage_report)
         else:
             coverage = parse_lcov(args.coverage_report)
 
@@ -696,7 +698,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             test_report_sha256=test_report_sha,
             test_report_uri=worm_uri(test_report_sha),
             test_totals=test_totals,
-            coverage_format=f"{args.coverage_format}-xml" if args.coverage_format == "cobertura" else "lcov",
+            coverage_format={"cobertura": "cobertura-xml", "jacoco": "jacoco-xml"}.get(args.coverage_format, "lcov"),
             coverage_report_sha256=coverage_report_sha,
             coverage_report_uri=worm_uri(coverage_report_sha),
             coverage=coverage,

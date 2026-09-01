@@ -348,6 +348,78 @@ class ParseMavenPomDependenciesTests(TmpDirMixin, unittest.TestCase):
         path = self._write("pom.xml", xml)
         self.assertEqual(parse_maven_pom_dependencies(path), [])
 
+    def test_unresolved_group_or_artifact_id_placeholder_skipped(self):
+        xml = """<project><dependencies>
+          <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>${project.artifactId}</artifactId>
+            <version>1.0.0</version>
+          </dependency>
+        </dependencies></project>"""
+        path = self._write("pom.xml", xml)
+        self.assertEqual(parse_maven_pom_dependencies(path), [])
+
+    def test_plugin_configuration_dependency_element_not_a_real_dependency(self):
+        # Real shape from google/gson's pom.xml: japicmp-maven-plugin's
+        # <oldVersion><dependency> is a comparison-baseline coordinate
+        # pointer inside plugin <configuration>, not a project dependency
+        # -- must not be mistaken for one just because it reuses the tag
+        # name outside any real <dependencies> collection.
+        xml = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.foo</groupId>
+      <artifactId>real-dep</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>com.github.siom79.japicmp</groupId>
+        <artifactId>japicmp-maven-plugin</artifactId>
+        <configuration>
+          <oldVersion>
+            <dependency>
+              <groupId>${project.groupId}</groupId>
+              <artifactId>${project.artifactId}</artifactId>
+              <version>0.0.0-JAPICMP-OLD</version>
+            </dependency>
+          </oldVersion>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>"""
+        path = self._write("pom.xml", xml)
+        deps = parse_maven_pom_dependencies(path)
+        self.assertEqual([d.uri for d in deps], ["pkg:maven/org.foo/real-dep@1.0.0"])
+
+    def test_plugin_level_dependency_still_counted(self):
+        # A <plugin><dependencies><dependency> block is a real Maven
+        # construct (plugin-level extra classpath dependency) -- the
+        # <dependencies> scoping fix must not exclude it.
+        xml = """<project>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.foo</groupId>
+        <artifactId>some-plugin</artifactId>
+        <dependencies>
+          <dependency>
+            <groupId>org.foo</groupId>
+            <artifactId>plugin-dep</artifactId>
+            <version>2.0.0</version>
+          </dependency>
+        </dependencies>
+      </plugin>
+    </plugins>
+  </build>
+</project>"""
+        path = self._write("pom.xml", xml)
+        deps = parse_maven_pom_dependencies(path)
+        self.assertEqual([d.uri for d in deps], ["pkg:maven/org.foo/plugin-dep@2.0.0"])
+
     def test_malformed_xml_returns_empty(self):
         path = self._write("pom.xml", "<project><unclosed>")
         self.assertEqual(parse_maven_pom_dependencies(path), [])

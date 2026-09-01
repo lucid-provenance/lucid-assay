@@ -1161,8 +1161,34 @@ docker run --rm \
 
 `--user "$(id -u):$(id -g)"` matters whenever the container needs to write
 into your mounted checkout (e.g. `--out`) — the image's built-in non-root
-user won't own your host directory. The `lucid-assay verify` admission
-gate works the same way, against a signed envelope instead:
+user won't own your host directory.
+
+**Running this under `podman` instead of `docker`?** `--user "$(id -u):$(id -g)"`
+alone isn't enough — rootless podman remaps UIDs into a user namespace by
+default, so that flag no longer means what it means under `docker run`
+(which has no such remapping), and every write into the mount fails
+closed with `PermissionError: [Errno 13] Permission denied`, not a silent
+wrong-owner file. Add `--userns=keep-id` alongside it:
+
+```bash
+podman run --rm \
+  --userns=keep-id \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD:/workspace:Z" \
+  ghcr.io/lucid-provenance/lucid-assay@sha256:<digest> \
+  --junit-xml junit.xml --coverage-report coverage.xml \
+  --image-ref ... --image-digest ... --head-sha ... \
+  --repository org/repo --branch main \
+  --skip-perf-budget-check --out attestation.unsigned.json
+```
+
+(The `:Z` mount suffix above is for SELinux-enforcing hosts — e.g. Fedora/
+RHEL, where podman is the default runtime and this is most likely to come
+up — and is a no-op elsewhere.) Confirmed empirically 2026-09-01 running
+this image against an independent real-world Python repo on a Fedora host.
+
+The `lucid-assay verify` admission gate works the same way, against a
+signed envelope instead:
 
 ```bash
 docker run --rm -v "$PWD:/workspace" \

@@ -20,10 +20,17 @@ Hardened against:
     dependency, just one the signed predicate can't cryptographically
     pin.
   - A single malformed entry (bad hash, missing version, an unresolved
-    Maven property placeholder in place of a literal version) is skipped
-    individually rather than discarding the whole file's worth of
+    Maven property placeholder in any of groupId/artifactId/version) is
+    skipped individually rather than discarding the whole file's worth of
     dependencies -- one bad record in a 2,000-line go.sum must not blank
     out the other 1,999.
+  - A Maven `<dependency>`-named element that isn't inside a real
+    `<dependencies>` collection (e.g. a plugin configuration parameter
+    that happens to reuse the tag name, like japicmp-maven-plugin's
+    `<oldVersion><dependency>` baseline-version pointer) is never
+    mistaken for an actual project dependency -- see
+    parse_maven_pom_dependencies()'s own docstring for the confirmed
+    real-world case this guards against.
   - detect_and_parse_dependencies() walks repo_dir defensively, skipping
     vendored/build directory subtrees (node_modules, .git, vendor,
     build, dist, target, .venv) and tolerating unreadable directories, so
@@ -386,30 +393,55 @@ def _dependency_element_to_dependency(elem: ET.Element) -> Optional[ResolvedDepe
     version = _child_text(elem, "version")
     if not group_id or not artifact_id or not version:
         return None
-    if "${" in version:
-        return None  # an unresolved property placeholder, not a literal resolved version
+    if "${" in group_id or "${" in artifact_id or "${" in version:
+        return None  # an unresolved property placeholder, not a literal resolved coordinate
     return ResolvedDependency(uri=f"pkg:maven/{group_id}/{artifact_id}@{version}")
 
 
 def parse_maven_pom_dependencies(path: Union[str, Path]) -> List[ResolvedDependency]:
     """Parses `<dependency>` elements (groupId/artifactId/version, each
-    with a literal resolved version -- not a `${...}` property
-    placeholder or range) out of a pom.xml or a Maven
-    dependency-tree-style XML export, namespace-agnostically. Maven's own
-    file formats don't carry a digest, so every entry's `digest` is {}.
-    Returns [] on any missing/unreadable/malformed-XML input."""
+    with a literal resolved coordinate -- not a `${...}` property
+    placeholder or range in any of the three fields) out of a pom.xml or a
+    Maven dependency-tree-style XML export, namespace-agnostically.
+    Maven's own file formats don't carry a digest, so every entry's
+    `digest` is {}. Returns [] on any missing/unreadable/malformed-XML
+    input.
+
+    Only `<dependency>` elements whose immediate parent is a
+    `<dependencies>` collection are treated as real dependencies --
+    covers `<project><dependencies>`, `<dependencyManagement>
+    <dependencies>`, `<profile><dependencies>`, and plugin-level
+    `<plugin><dependencies>`, every real Maven dependency-declaration
+    shape. This deliberately excludes `<dependency>`-named elements that
+    appear elsewhere in a plugin's own `<configuration>` block for an
+    unrelated purpose -- e.g. japicmp-maven-plugin's
+    `<oldVersion><dependency>`, a comparison-baseline coordinate pointer,
+    not a project dependency -- which an earlier, unscoped
+    `tree.getroot().iter()` walk mistook for one, landing a synthesized-
+    looking placeholder coordinate (`${project.groupId}/${project.
+    artifactId}`) straight into a signed predicate's
+    `resolved_dependencies`. ElementTree has no parent pointers, so one is
+    built explicitly rather than reached for via an lxml-only API.
+    """
     try:
         resolved = safe_resolve_path(path)
         tree = ET.parse(resolved)
     except (UnsafePathError, OSError, ET.ParseError):
         return []
 
+    root = tree.getroot()
+    parent_of: Dict[ET.Element, ET.Element] = {child: parent for parent in root.iter() for child in parent}
+
     deps: List[ResolvedDependency] = []
-    for elem in tree.getroot().iter():
-        if _local_name(elem.tag) == "dependency":
-            dep = _dependency_element_to_dependency(elem)
-            if dep:
-                deps.append(dep)
+    for elem in root.iter():
+        if _local_name(elem.tag) != "dependency":
+            continue
+        parent = parent_of.get(elem)
+        if parent is None or _local_name(parent.tag) != "dependencies":
+            continue
+        dep = _dependency_element_to_dependency(elem)
+        if dep:
+            deps.append(dep)
     return deps
 
 

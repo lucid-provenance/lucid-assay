@@ -1,11 +1,14 @@
 """
-Coverage report parsing: Cobertura XML and LCOV.
+Coverage report parsing: Cobertura XML, LCOV, and JaCoCo XML.
 
 Hardened against:
   - Path normalization mismatches (stripping absolute prefixes and relative ./ tokens)
   - Missing/corrupted line number attributes
   - Unbounded rate bounds (clamped to [0.0, 1.0])
   - Non-standard LCOV negative hit counts
+  - Missing JaCoCo <counter> elements (JaCoCo omits a counter type entirely when
+    there's nothing of that kind to count, e.g. no BRANCH counter for a report
+    with no conditional code) -- degrades to 0.0/None rather than raising
 """
 from __future__ import annotations
 
@@ -168,3 +171,85 @@ def parse_lcov(path: str) -> CoverageReport:
     overall_line_rate = (state.covered_lines / state.total_lines) if state.total_lines > 0 else 0.0
     overall_line_rate = max(0.0, min(1.0, overall_line_rate))
     return CoverageReport(overall_line_rate, None, state.files)
+
+
+def _parse_jacoco_counter_rate(elem: ET.Element, counter_type: str) -> Optional[float]:
+    """Returns covered/(missed+covered) for one JaCoCo <counter type="...">
+    child of `elem` (report/package/sourcefile level all use the same
+    shape), or None if that counter type isn't present at all -- JaCoCo
+    omits a counter type entirely when there's nothing of that kind to
+    count (e.g. no BRANCH counter for a report with no conditional code),
+    which callers must treat as "unknown", not "0% covered"."""
+    for counter in elem.findall("counter"):
+        if counter.get("type") != counter_type:
+            continue
+        try:
+            missed = int(counter.get("missed", "0") or 0)
+            covered = int(counter.get("covered", "0") or 0)
+        except (ValueError, TypeError):
+            return None
+        total = missed + covered
+        return max(0.0, min(1.0, covered / total)) if total > 0 else 0.0
+    return None
+
+
+def _parse_jacoco_sourcefile_lines(sourcefile: ET.Element, fc: FileCoverage) -> None:
+    """Merges one <sourcefile>'s <line nr= ci= .../> entries into
+    `fc.line_hits`. JaCoCo records covered/missed *instructions* per line
+    (`ci`/`mi`), not an execution count the way Cobertura's `hits` does --
+    there's no real count to preserve, so a line is recorded as hit (1)
+    when any instruction on it was covered, 0 otherwise. Every consumer of
+    `line_hits` (patch coverage, RCS scoring) only cares whether a line
+    was exercised at all, so this coarser binary signal doesn't lose
+    anything those callers use."""
+    for line in sourcefile.findall("line"):
+        raw_num = line.get("nr")
+        if not raw_num:
+            continue
+        try:
+            num = int(raw_num)
+            covered_instructions = int(line.get("ci", "0") or 0)
+        except (ValueError, TypeError):
+            continue
+        hits = 1 if covered_instructions > 0 else 0
+        fc.line_hits[num] = max(fc.line_hits.get(num, 0), hits)
+
+
+def parse_jacoco(path: str) -> CoverageReport:
+    """JaCoCo XML report parser (`report.dtd`; produced by `mvn
+    jacoco:report` or Gradle's `jacocoTestReport`).
+
+    Schema differs structurally from Cobertura: JaCoCo aggregates coverage
+    as <counter type="LINE"|"BRANCH"|"INSTRUCTION" missed= covered=/>
+    elements at report/package/sourcefile/class level, rather than a
+    single line-rate attribute -- see _parse_jacoco_counter_rate.
+
+    File identity is JaCoCo's own package-relative path
+    (<package name="com/google/gson"> + <sourcefile name="Gson.java"> ->
+    "com/google/gson/Gson.java"), *not* a repo-root-relative path -- unlike
+    Cobertura/lcov output from every other ecosystem this pipeline parses,
+    this omits the source-root prefix (e.g. `src/main/java/`) entirely,
+    since JaCoCo has no visibility into the build's source-root layout.
+    Patch-coverage lookups against `git diff` paths may miss for Java
+    projects as a result -- a known, disclosed limitation, not a silent
+    one; overall_line_rate (the report-level aggregate this function also
+    returns) is unaffected either way.
+    """
+    tree = ET.parse(safe_resolve_path(path))
+    root = tree.getroot()
+
+    overall_line_rate = _parse_jacoco_counter_rate(root, "LINE") or 0.0
+    overall_branch_rate = _parse_jacoco_counter_rate(root, "BRANCH")
+
+    files: Dict[str, FileCoverage] = {}
+    for package in root.findall("package"):
+        pkg_name = package.get("name") or ""
+        for sourcefile in package.findall("sourcefile"):
+            sf_name = sourcefile.get("name")
+            if not sf_name:
+                continue
+            filename = _normalize_path(f"{pkg_name}/{sf_name}" if pkg_name else sf_name)
+            fc = files.setdefault(filename, FileCoverage())
+            _parse_jacoco_sourcefile_lines(sourcefile, fc)
+
+    return CoverageReport(overall_line_rate, overall_branch_rate, files)

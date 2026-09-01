@@ -14,7 +14,7 @@ schema/
 cli/
   common.py                 # safe_resolve_path(): path-safety guard shared by every module below that opens an operator-supplied file
   parsers/junit.py          # streaming JUnit XML -> TestTotals (flaky-retry aware)
-  parsers/coverage.py       # Cobertura XML + LCOV -> CoverageReport (per-line hit maps)
+  parsers/coverage.py       # Cobertura XML + LCOV + JaCoCo XML -> CoverageReport (per-line hit maps)
   parsers/coverage_contexts.py # `coverage json --show-contexts` -> per-test line attribution
   parsers/ast_inspector.py  # backward-compat shim -> re-exports parsers/ast/
   parsers/ast/              # multi-language assertion integrity engine (registry/dispatcher)
@@ -232,11 +232,20 @@ keyed by `(classname, name)`; more than one recorded attempt with a
 passing final outcome is what "flaky" means here — only the final attempt
 counts toward pass/fail/error/skip totals.
 
-**`parsers/coverage.py`** parses Cobertura XML and LCOV into a common
-`CoverageReport`, normalizing file paths (stripping absolute prefixes and
-`./` tokens) so they can be matched against git-diff paths downstream. All
-rates are clamped to `[0.0, 1.0]`; malformed attributes degrade to `0`
-rather than raising.
+**`parsers/coverage.py`** parses Cobertura XML, LCOV, and JaCoCo XML
+(`--coverage-format jacoco`, e.g. `mvn jacoco:report` / Gradle's
+`jacocoTestReport`) into a common `CoverageReport`, normalizing file paths
+(stripping absolute prefixes and `./` tokens) so they can be matched
+against git-diff paths downstream. All rates are clamped to `[0.0, 1.0]`;
+malformed attributes degrade to `0` rather than raising. JaCoCo's own file
+identity is package-relative (`com/example/Foo.java`, no `src/main/java/`
+prefix — JaCoCo has no visibility into the build's source-root layout),
+so patch-coverage lookups against `git diff` paths may miss for Java
+projects; the report-level `overall_line_rate` is unaffected either way.
+`cobertura-maven-plugin` is effectively dead (depends on `tools.jar`,
+removed in JDK 9+) — JaCoCo is the real modern default for Java/JVM
+coverage, which is the reason this format exists as a first-class option
+rather than something you're expected to convert into Cobertura shape.
 
 **`patch_coverage.py`** runs `git diff --unified=0 base...head` and walks
 hunk headers to get exactly the added/modified line numbers per file, then
@@ -1161,8 +1170,34 @@ docker run --rm \
 
 `--user "$(id -u):$(id -g)"` matters whenever the container needs to write
 into your mounted checkout (e.g. `--out`) — the image's built-in non-root
-user won't own your host directory. The `lucid-assay verify` admission
-gate works the same way, against a signed envelope instead:
+user won't own your host directory.
+
+**Running this under `podman` instead of `docker`?** `--user "$(id -u):$(id -g)"`
+alone isn't enough — rootless podman remaps UIDs into a user namespace by
+default, so that flag no longer means what it means under `docker run`
+(which has no such remapping), and every write into the mount fails
+closed with `PermissionError: [Errno 13] Permission denied`, not a silent
+wrong-owner file. Add `--userns=keep-id` alongside it:
+
+```bash
+podman run --rm \
+  --userns=keep-id \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD:/workspace:Z" \
+  ghcr.io/lucid-provenance/lucid-assay@sha256:<digest> \
+  --junit-xml junit.xml --coverage-report coverage.xml \
+  --image-ref ... --image-digest ... --head-sha ... \
+  --repository org/repo --branch main \
+  --skip-perf-budget-check --out attestation.unsigned.json
+```
+
+(The `:Z` mount suffix above is for SELinux-enforcing hosts — e.g. Fedora/
+RHEL, where podman is the default runtime and this is most likely to come
+up — and is a no-op elsewhere.) Confirmed empirically 2026-09-01 running
+this image against an independent real-world Python repo on a Fedora host.
+
+The `lucid-assay verify` admission gate works the same way, against a
+signed envelope instead:
 
 ```bash
 docker run --rm -v "$PWD:/workspace" \

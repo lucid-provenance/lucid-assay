@@ -626,5 +626,130 @@ class CliSurfaceTests(unittest.TestCase):
         self.assertEqual(vars(direct), vars(via_run))
 
 
+class SubjectFlagsTests(unittest.TestCase):
+    """--image-ref/--image-digest vs. --subject-name/--subject-digest --
+    two names for the same underlying subject pair (build_statement()'s
+    subject_name/subject_sha256 were always artifact-agnostic; only the
+    CLI flag names implied "must be a container image"). Neither pair is
+    individually required -- exactly one full pair (or a mix of the two)
+    must resolve, enforced in parse_args() itself since argparse can't
+    express "one of these two pairs" via required=True."""
+
+    def _argv_without_subject(self, extra=None):
+        argv = [
+            "--junit-xml", "j.xml", "--coverage-report", "c.xml",
+            "--head-sha", "b" * 40, "--repository", "o/r", "--branch", "main",
+        ]
+        return argv + (extra or [])
+
+    def test_image_ref_and_digest_alone_still_works(self):
+        """Backward compat: every existing caller (lucid-assay's own CI,
+        lucid-console, lucid-dsse-collector) passes only these two."""
+        from cli.main import parse_args
+
+        args = parse_args(self._argv_without_subject([
+            "--image-ref", "ghcr.io/org/svc", "--image-digest", "sha256:" + "a" * 64,
+        ]))
+        self.assertEqual(args.image_ref, "ghcr.io/org/svc")
+        self.assertEqual(args.image_digest, "sha256:" + "a" * 64)
+
+    def test_subject_name_and_digest_alone_resolves_onto_image_ref_fields(self):
+        """The new, generic pair -- for a caller with no container image
+        (e.g. a zip-based Lambda) -- resolves onto the exact same
+        args.image_ref/args.image_digest attributes every downstream
+        reader (build_statement(), _maybe_emit_slsa_provenance()) already
+        uses, so nothing downstream needs to know which pair was given."""
+        from cli.main import parse_args
+
+        args = parse_args(self._argv_without_subject([
+            "--subject-name", "lambda:my-function", "--subject-digest", "sha256:" + "b" * 64,
+        ]))
+        self.assertEqual(args.image_ref, "lambda:my-function")
+        self.assertEqual(args.image_digest, "sha256:" + "b" * 64)
+
+    def test_neither_pair_given_fails_closed_with_a_clear_diagnostic(self):
+        import io
+        from contextlib import redirect_stderr
+
+        from cli.main import parse_args
+
+        with self.assertRaises(SystemExit) as ctx:
+            with redirect_stderr(io.StringIO()) as captured:
+                parse_args(self._argv_without_subject())
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("--image-ref and --image-digest", captured.getvalue())
+        self.assertIn("--subject-name and --subject-digest", captured.getvalue())
+
+    def test_name_given_without_matching_digest_fails_closed(self):
+        """A caller who supplies --subject-name but forgets
+        --subject-digest (or vice versa) must not silently fall through
+        to an incomplete subject -- image_digest stays unresolved and the
+        same diagnostic fires."""
+        import io
+        from contextlib import redirect_stderr
+
+        from cli.main import parse_args
+
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()):
+                parse_args(self._argv_without_subject(["--subject-name", "lambda:my-function"]))
+
+    def test_mixing_across_pairs_is_permitted(self):
+        """Not an error case this platform needs to guard against --
+        these flags aren't adversarial/untrusted input (see this module's
+        own docstring on what actually needs hardening), just two names
+        for callers to pick from."""
+        from cli.main import parse_args
+
+        args = parse_args(self._argv_without_subject([
+            "--image-ref", "ghcr.io/org/svc", "--subject-digest", "sha256:" + "c" * 64,
+        ]))
+        self.assertEqual(args.image_ref, "ghcr.io/org/svc")
+        self.assertEqual(args.image_digest, "sha256:" + "c" * 64)
+
+    def test_end_to_end_pipeline_accepts_a_non_container_subject(self):
+        """Not just an argparse-level check: proves the whole pipeline
+        (build_statement() included) actually accepts and correctly
+        records a non-container subject end to end, dry-run-signed."""
+        import subprocess
+        import sys as _sys
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+
+        junit_path = os.path.join(tmp, "junit.xml")
+        with open(junit_path, "w", encoding="utf-8") as f:
+            f.write('<testsuite tests="1" failures="0" errors="0"><testcase name="t"/></testsuite>')
+        coverage_path = os.path.join(tmp, "coverage.xml")
+        with open(coverage_path, "w", encoding="utf-8") as f:
+            f.write('<coverage line-rate="1.0"><packages/></coverage>')
+        out_path = os.path.join(tmp, "attestation.unsigned.json")
+
+        result = subprocess.run(
+            [
+                _sys.executable, "-m", "cli.main",
+                "--junit-xml", junit_path,
+                "--coverage-report", coverage_path,
+                "--subject-name", "lambda:my-function",
+                "--subject-digest", "sha256:" + "d" * 64,
+                "--head-sha", "b" * 40,
+                "--repository", "o/r",
+                "--branch", "main",
+                "--skip-perf-budget-check",
+                "--out", out_path,
+            ],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        with open(out_path, "r", encoding="utf-8") as f:
+            statement = json.loads(f.read())
+        self.assertEqual(statement["subject"][0]["name"], "lambda:my-function")
+        self.assertEqual(statement["subject"][0]["digest"]["sha256"], "d" * 64)
+
+
 if __name__ == "__main__":
     unittest.main()

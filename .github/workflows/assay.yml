@@ -1,5 +1,14 @@
 name: Lucid Assay
 
+# run-name: overrides the Actions run-list headline, which otherwise
+# defaults to the triggering commit message -- indistinguishable at a
+# glance from Publish Assay Image's own run on the same commit (both
+# workflows can legitimately fire off one push when it touches cli/**).
+# Falls back through whichever triggering-event context actually exists:
+# push has head_commit.message, pull_request has pull_request.title,
+# workflow_dispatch has neither.
+run-name: "Score & attest: ${{ github.event.head_commit.message || github.event.pull_request.title || github.ref_name }}"
+
 # Deliberately `pull_request`, NOT `pull_request_target`: this workflow
 # checks out and executes code from the PR head ref, so it must run in the
 # restricted, no-secrets context `pull_request` provides for fork PRs.

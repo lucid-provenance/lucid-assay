@@ -2957,6 +2957,62 @@ def _write_github_step_summary(result: VerificationResult) -> None:
         print(f"warning: could not write $GITHUB_STEP_SUMMARY: {e}", file=sys.stderr)
 
 
+def _resolve_slsa_statement(args: argparse.Namespace) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+    """Loads and decodes --slsa-envelope on main()'s behalf, when given --
+    same (value, error_exit_code) sentinel convention as
+    _load_envelope_for_cli, so main() only ever has one shape of check to
+    make. Returns (None, None) when --slsa-envelope wasn't passed at all
+    (verify_dsse_attestation then falls back to the primary envelope for
+    both tracks, unchanged from before this flag existed). A decode
+    failure on the SLSA envelope itself is a warning, not a hard failure
+    -- the primary envelope's own Build Track fallback still applies."""
+    if not args.slsa_envelope:
+        return None, None
+
+    slsa_envelope, error_exit_code = _load_envelope_for_cli(args.slsa_envelope)
+    if error_exit_code is not None:
+        return None, error_exit_code
+
+    slsa_statement, decode_violations, _ = _decode_envelope_statement(slsa_envelope)
+    if decode_violations:
+        print(
+            f"warning: --slsa-envelope {args.slsa_envelope!r} could not be decoded: "
+            f"{'; '.join(decode_violations)}; SLSA Build Track will fall back to the primary envelope",
+            file=sys.stderr,
+        )
+    return slsa_statement, None
+
+
+def _resolve_output_format(args: argparse.Namespace) -> str:
+    """Resolves --format, honoring the deprecated --json alias when
+    --format was left at its default. The deprecation notice goes to
+    stderr, never stdout, so it can never corrupt a --json consumer's
+    "ONLY valid JSON on stdout" parsing."""
+    if args.json_output and args.format == "text":
+        print("warning: --json is deprecated; use --format json instead", file=sys.stderr)
+        return "json"
+    return args.format
+
+
+def _maybe_write_verdict(args: argparse.Namespace, envelope: Dict[str, Any], result: VerificationResult) -> Optional[int]:
+    """Handles --write-verdict on main()'s behalf: writes the envelope
+    (annotated with `_verdict`) if requested, returning an error exit
+    code on failure or None on success/no-op -- same sentinel convention
+    as _load_envelope_for_cli, so main() only ever has one shape of check
+    to make for this, too."""
+    if not args.write_verdict:
+        return None
+
+    verdict_out_path = args.verdict_out or args.envelope
+    try:
+        written_path = _write_verdict_into_envelope(envelope, result, verdict_out_path)
+    except (OSError, UnsafePathError) as e:
+        print(f"ERROR: could not write --write-verdict envelope to {verdict_out_path!r}: {e}", file=sys.stderr)
+        return EXIT_FILE_ERROR
+    print(f"verdict ({result.verdict_word or 'FAILED'}) written to {written_path}", file=sys.stderr)
+    return None
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
 
@@ -2964,18 +3020,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if error_exit_code is not None:
         return error_exit_code
 
-    slsa_statement: Optional[Dict[str, Any]] = None
-    if args.slsa_envelope:
-        slsa_envelope, error_exit_code = _load_envelope_for_cli(args.slsa_envelope)
-        if error_exit_code is not None:
-            return error_exit_code
-        slsa_statement, decode_violations, _ = _decode_envelope_statement(slsa_envelope)
-        if decode_violations:
-            print(
-                f"warning: --slsa-envelope {args.slsa_envelope!r} could not be decoded: "
-                f"{'; '.join(decode_violations)}; SLSA Build Track will fall back to the primary envelope",
-                file=sys.stderr,
-            )
+    slsa_statement, error_exit_code = _resolve_slsa_statement(args)
+    if error_exit_code is not None:
+        return error_exit_code
 
     result = verify_dsse_attestation(
         envelope,
@@ -2993,28 +3040,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         require_slsa_build_l3=args.require_slsa_build_l3,
     )
 
-    output_format = args.format
-    if args.json_output and output_format == "text":
-        # --json predates --format and is kept only as an alias; the
-        # deprecation notice goes to stderr, never stdout, so it can never
-        # corrupt a --json consumer's "ONLY valid JSON on stdout" parsing.
-        print("warning: --json is deprecated; use --format json instead", file=sys.stderr)
-        output_format = "json"
-
-    if output_format == "json":
+    if _resolve_output_format(args) == "json":
         print(json.dumps(_build_verify_json_payload(result), indent=2))
     else:
         _print_verify_result_human(result)
     _write_github_step_summary(result)
 
-    if args.write_verdict:
-        verdict_out_path = args.verdict_out or args.envelope
-        try:
-            written_path = _write_verdict_into_envelope(envelope, result, verdict_out_path)
-        except (OSError, UnsafePathError) as e:
-            print(f"ERROR: could not write --write-verdict envelope to {verdict_out_path!r}: {e}", file=sys.stderr)
-            return EXIT_FILE_ERROR
-        print(f"verdict ({result.verdict_word or 'FAILED'}) written to {written_path}", file=sys.stderr)
+    error_exit_code = _maybe_write_verdict(args, envelope, result)
+    if error_exit_code is not None:
+        return error_exit_code
 
     return EXIT_PASS if result.passed else EXIT_POLICY_VIOLATION
 

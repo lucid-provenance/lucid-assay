@@ -955,9 +955,12 @@ cumulative, same rule as the Build track below):
   `buildDefinition.resolvedDependencies` has at least one entry with a
   non-empty `uri`.
 - **Level 3** — an *unforgeable* builder identity: `runDetails.builder.id`
-  names the isolated control-plane signer workflow itself (a narrower
-  allowlist than Level 2's, currently
-  `https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml`),
+  names one of the isolated control-plane signer workflows themselves (a
+  narrower allowlist than Level 2's — currently two, individually
+  reviewed, entries:
+  `https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml`
+  and
+  `https://github.com/lucid-provenance/lucid-attest-service/.github/workflows/sign-client.yml`),
   *and* the verified Sigstore signer identity (`--cert-identity`) is
   provably that same workflow — proving the entity that signed the
   envelope is the same one that claims to have built it, so an untrusted
@@ -966,10 +969,12 @@ cumulative, same rule as the Build track below):
   locked dependencies: at least one `buildDefinition.resolvedDependencies`
   entry must be a real `pkg:` PURL with a `sha256` digest, not just the
   synthetic source-commit entry every statement already carries.
-  **Fails closed for every caller today** — the architecture that would
-  make the first two checks pass (provenance constructed inside
-  `lucid-attest`'s isolated signer job, not the untrusted build job — see
-  "Isolating signing from the build" below) doesn't exist yet.
+  **Fails closed for any caller whose provenance wasn't actually
+  constructed inside one of those two specific isolated signer jobs** —
+  provenance built by anything else (the untrusted build job itself, a
+  caller's own inlined workflow step, or simply no split-signer
+  architecture at all — see "Isolating signing from the build" below)
+  correctly can't reach this level, by design, not as a stub.
 
 **`--require-slsa-build-l3`** (off by default) folds the Build track's
 cumulative Level 3 outcome into `passed`/exit code — opt-in, so no

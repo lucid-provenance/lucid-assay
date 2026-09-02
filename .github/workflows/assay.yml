@@ -59,18 +59,6 @@ permissions:
   contents: read
   security-events: write # Required for github/codeql-action/analyze to upload SARIF to code scanning
 
-# SIGNER_WORKFLOW_SHA is the *single* source of truth for the pinned commit
-# lucid-provenance/lucid-attest/.github/workflows/sign.yml is trusted at -- it must
-# be kept byte-for-byte identical to the SHA pinned on the `attest` job's
-# `uses:` line below (GitHub Actions reusable-workflow calls don't accept
-# expressions in `uses:`, so that line can't just reference this var
-# directly; bump both together, in the same commit, whenever `attest`'s pin
-# moves). The `verify` job's admission gate reads it back out via
-# `${{ env.SIGNER_WORKFLOW_SHA }}` to build --cert-identity, so the gate can
-# never drift from what `attest` actually invoked.
-env:
-  SIGNER_WORKFLOW_SHA: f69640d69a5ef2f213a952ea8907f6eb96a93920 # lucid-attest: signer container's HOME fixed to /tmp (PR #10) + re-pinned to the rebuilt, registry-verified image digest (PR #11) -- keep in sync with attest job's `uses:` pin
-
 jobs:
   # Runs the PR's own code: tests, coverage, CodeQL, SonarQube, RCS scoring.
   # Produces one *unsigned* RCS statement file and nothing else that crosses
@@ -393,7 +381,15 @@ jobs:
     permissions:
       id-token: write # Required for Sigstore keyless OIDC minting
       contents: read
-    uses: lucid-provenance/lucid-attest/.github/workflows/sign.yml@f69640d69a5ef2f213a952ea8907f6eb96a93920 # keep in sync with env.SIGNER_WORKFLOW_SHA above
+    # This line is now the SOLE literal source of truth for the pinned
+    # signer commit -- `verify`'s own "Derive expected signer identity"
+    # step below parses it live to build --cert-identity, rather than
+    # trusting a separately hand-kept-in-sync copy (env.SIGNER_WORKFLOW_SHA
+    # existed for exactly that purpose until 2026-09-02; removed because a
+    # Dependabot bump PR only ever updates a `uses:` line, never a
+    # same-value literal duplicated elsewhere in the file -- see the
+    # comment in .github/dependabot.yml for the failure mode this closes).
+    uses: lucid-provenance/lucid-attest/.github/workflows/sign.yml@f69640d69a5ef2f213a952ea8907f6eb96a93920
     with:
       artifact-name: unsigned-statements
       statement-files: |
@@ -415,6 +411,24 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Single source of truth: parses the exact `uses:` line the `attest`
+      # job above already invokes, rather than trusting a separately
+      # hand-kept-in-sync literal (removed 2026-09-02 -- see that job's
+      # own `uses:` comment for why). Scoped to our own well-known
+      # `attest:` job shape, not a general YAML parser -- this file's
+      # shape is ours to keep stable, and no YAML-parsing dependency
+      # exists anywhere in this repo to lean on instead.
+      - name: "Derive expected signer identity from the attest job's own uses: pin"
+        id: signer
+        run: |
+          SIGNER_USES="$(awk '/^  attest:/{f=1} f && /^ *uses:/{print; exit}' \
+            .github/workflows/assay.yml | sed -E 's/^\s*uses:\s*([^ ]+).*/\1/')"
+          if [ -z "$SIGNER_USES" ]; then
+            echo "ERROR: could not parse the attest job's uses: line from .github/workflows/assay.yml -- did the job shape change?" >&2
+            exit 1
+          fi
+          echo "cert-identity=https://github.com/${SIGNER_USES}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -471,14 +485,17 @@ jobs:
           EXPECTED_REF: ${{ github.ref }}
           # Pins the admission gate to the exact quarantined signer identity:
           # not just "some workflow in lucid-provenance/lucid-attest", but that repo's
-          # sign.yml specifically, at the same commit SHA `attest` invoked
-          # (env.SIGNER_WORKFLOW_SHA, declared once at the top of this file).
+          # sign.yml specifically, at the same commit SHA `attest` invoked --
+          # derived live from that job's own `uses:` line by the
+          # "Derive expected signer identity" step above, not a separately
+          # hand-kept-in-sync literal, so this can never drift from what
+          # `attest` actually invoked even if only the `uses:` line changes.
           # --expected-repository/--expected-ref alone only constrain claims
           # about *this* repo's own ref -- they say nothing about which
           # workflow minted the OIDC token, so without --cert-identity any
           # other job in lucid-assay that ever acquired id-token: write could
           # sign an envelope this gate would still accept.
-          CERT_IDENTITY: https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml@${{ env.SIGNER_WORKFLOW_SHA }}
+          CERT_IDENTITY: ${{ steps.signer.outputs.cert-identity }}
           CERT_OIDC_ISSUER: https://token.actions.githubusercontent.com
           # Binds admission to the *caller* side of the identity too: not
           # just "signed by the quarantined lucid-attest signer" (that's

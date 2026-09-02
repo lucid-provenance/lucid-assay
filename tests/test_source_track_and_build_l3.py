@@ -201,6 +201,29 @@ class BuildLevel3ChecksTests(unittest.TestCase):
         predicate = {"runDetails": {"builder": {"id": TRUSTED_CONTROL_PLANE_ID}}}
         self.assertTrue(_slsa_check_control_plane_builder_identity(predicate)["passed"])
 
+    def test_control_plane_builder_identity_passes_for_every_known_trusted_entry(self):
+        """TRUSTED_CONTROL_PLANE_ID (above) only exercises whichever entry
+        frozenset iteration happens to yield first -- not guaranteed
+        stable across processes now that there are two. This explicitly
+        checks each one individually, so a future entry that's typo'd or
+        silently dropped can't hide behind that nondeterminism."""
+        for builder_id in TRUSTED_CONTROL_PLANE_BUILDER_IDS:
+            with self.subTest(builder_id=builder_id):
+                predicate = {"runDetails": {"builder": {"id": builder_id}}}
+                self.assertTrue(_slsa_check_control_plane_builder_identity(predicate)["passed"])
+
+    def test_control_plane_builder_identity_fails_for_an_unrecognized_workflow(self):
+        """A workflow that merely *looks* similar (same host, same
+        general shape) but isn't one of the specific, individually-
+        reviewed entries must still fail closed -- this allowlist is
+        deliberately not a prefix/pattern match (see its own comment)."""
+        predicate = {
+            "runDetails": {"builder": {"id": "https://github.com/some-other-org/some-repo/.github/workflows/sign.yml"}}
+        }
+        result = _slsa_check_control_plane_builder_identity(predicate)
+        self.assertFalse(result["passed"])
+        self.assertIn("isolated-control-plane allowlist", result["detail"])
+
     def test_control_plane_builder_identity_fails_for_generic_hosted_runner(self):
         predicate = {"runDetails": {"builder": {"id": "https://github.com/actions/runner"}}}
         result = _slsa_check_control_plane_builder_identity(predicate)

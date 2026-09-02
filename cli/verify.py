@@ -86,26 +86,51 @@ SLSA_PROVENANCE_PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
 # cryptographic pin to an exact trusted commit is separately enforced by
 # Sigstore's --cert-identity check (see
 # _slsa_check_isolated_provenance_generation), which does encode the ref.
+#
+# Two entries, deliberately: lucid-attest/sign.yml (constructs +
+# self-signs provenance via a pinned Docker image run locally in that
+# job) and lucid-attest-service/sign-client.yml (constructs provenance
+# the same way, but delegates the actual Sigstore operation to the
+# shared lucid-attest-service Lambda). Different signing mechanism,
+# same trust property: GitHub's OIDC job_workflow_ref claim (and hence
+# the Fulcio certificate identity Sigstore issues) reflects the reusable
+# workflow FILE's own path for a job that mints its own token inside a
+# workflow_call invocation, regardless of which repo's `uses:` line
+# invoked it -- confirmed against sign.yml's own real, working precedent
+# before adding this second entry, not assumed. That's what makes each
+# one, individually reviewed, sufficient to trust every future caller of
+# that file -- see the Lucid vault's "Serverless signer needs a
+# trustworthy provenance builder identity" note for the full reasoning
+# this resolves. Deliberately still an explicit, narrow allowlist rather
+# than a pattern/prefix match on either entry -- see
+# TRUSTED_HOSTED_BUILDER_IDS's own comment below for why a claim this
+# security-sensitive must fail closed on anything not individually
+# reviewed, not be widened into a broader match.
 TRUSTED_CONTROL_PLANE_BUILDER_IDS = frozenset({
     "https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml",
+    "https://github.com/lucid-provenance/lucid-attest-service/.github/workflows/sign-client.yml",
 })
 
 # Builder IDs trusted as SLSA Build Level 2 "hosted"/tamper-resistant
 # build platforms. Deliberately a narrow, explicit allowlist rather than
 # a prefix/pattern match: a hosted-builder claim is exactly the kind of
 # claim that must fail closed on anything not explicitly recognized.
-# Includes TRUSTED_CONTROL_PLANE_BUILDER_IDS deliberately (duplicated
-# literals, not a computed union -- see _ALLOWED_DEGRADED_REASONS's own
-# comment for why this module prefers that): SLSA's levels are cumulative,
-# so a builder identity specific and verifiable enough to satisfy Level
-# 3's stricter check must, a fortiori, also satisfy Level 2's weaker
-# "some trusted hosted platform" one -- otherwise Level 3 could never
-# actually be reached even once its own two checks pass, since Level 2
-# would independently block the cumulative Status line. Until the
-# caller's provenance is actually constructed inside that isolated job
-# (see the SLSA Build Level 3 section below), runDetails.builder.id will
-# still be the plain generic runner id, so Level 3 fails closed for every
-# caller today regardless -- by design, not as a stub.
+# Includes TRUSTED_CONTROL_PLANE_BUILDER_IDS via a live computed union
+# (unlike _ALLOWED_DEGRADED_REASONS's deliberately-duplicated literals --
+# that rationale is about avoiding a *cross-module* import into cli/scorer.py
+# et al.; both constants here are already defined in this same file, so a
+# computed union carries no drift risk at all, and every future addition
+# to TRUSTED_CONTROL_PLANE_BUILDER_IDS is automatically reflected here
+# too, with nothing to remember to keep in sync): SLSA's levels are
+# cumulative, so a builder identity specific and verifiable enough to
+# satisfy Level 3's stricter check must, a fortiori, also satisfy Level
+# 2's weaker "some trusted hosted platform" one -- otherwise Level 3
+# could never actually be reached even once its own two checks pass,
+# since Level 2 would independently block the cumulative Status line. A
+# caller whose provenance wasn't constructed inside one of
+# TRUSTED_CONTROL_PLANE_BUILDER_IDS's specific workflows still only
+# reaches this generic hosted-runner tier, so Level 3 correctly stays out
+# of reach for it regardless -- by design, not a stub.
 TRUSTED_HOSTED_BUILDER_IDS = frozenset({
     "https://github.com/actions/runner",
 } | TRUSTED_CONTROL_PLANE_BUILDER_IDS)
@@ -674,13 +699,13 @@ def _evaluate_slsa_l2(
 
 def _slsa_check_control_plane_builder_identity(predicate: Dict[str, Any]) -> Dict[str, Any]:
     """SLSA Build Level 3's "unforgeable builder identity" requirement:
-    runDetails.builder.id must name the isolated control-plane workflow
-    itself (TRUSTED_CONTROL_PLANE_BUILDER_IDS), not merely a generic
-    hosted runner (TRUSTED_HOSTED_BUILDER_IDS, sufficient for Level 2).
-    Until the provenance-construction architecture shift lands (see that
-    constant's own comment), builder.id stays the generic hosted-runner
-    id for every caller, so this fails closed honestly rather than as a
-    hardcoded stub."""
+    runDetails.builder.id must name one of the isolated control-plane
+    workflows themselves (TRUSTED_CONTROL_PLANE_BUILDER_IDS), not merely
+    a generic hosted runner (TRUSTED_HOSTED_BUILDER_IDS, sufficient for
+    Level 2). A caller whose provenance wasn't constructed inside one of
+    those specific, individually-reviewed workflows -- e.g. builder.id is
+    still the generic hosted-runner id, or names some other workflow
+    entirely -- fails closed honestly here, not as a hardcoded stub."""
     run_details = predicate.get("runDetails")
     run_details = run_details if isinstance(run_details, dict) else {}
     builder = run_details.get("builder")

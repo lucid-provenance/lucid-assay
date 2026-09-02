@@ -525,6 +525,18 @@ delegate to internally:
 4. Discard the ephemeral private key — no long-lived signing key exists
    to rotate or leak.
 
+**Caller-supplied identity token.** `sign_statement()`/`sign_file_to_envelope()`
+both accept an optional `identity_token` param that, when passed, is used
+as-is in place of step 1's ambient fetch — for a caller that isn't itself
+the CI runner holding the ambient OIDC environment (e.g. a signing service
+invoked *by* a GitHub Actions job: the job mints its own ambient token and
+forwards it in the request body, since `ACTIONS_ID_TOKEN_REQUEST_URL`/
+`_TOKEN` only ever exist in the runner's own process). Omitted (the
+default), behavior is unchanged — every existing caller (`cli.main`'s own
+pipeline, `lucid-assay sign`) still relies on ambient fetch. No CLI flag
+exposes this yet; it's a library-level entry point for a service fronting
+these functions on a caller's behalf.
+
 The resulting envelope's `_rekor` block (`DSSEEnvelope.to_dict()`) carries
 `logIndex`/`logId` plus a `logUrl` — a direct `search.sigstore.dev` link
 to the public transparency-log entry, derived from `logIndex` alone (no

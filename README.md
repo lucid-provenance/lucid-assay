@@ -1245,6 +1245,16 @@ python3 -m cli.main \
 #   pytest --cov=cli --cov-context=test --cov-report=xml:build/coverage.xml tests/
 #   coverage json --show-contexts -o build/coverage-contexts.json
 # Omit it to skip the vanity-test-aware "real" coverage analysis entirely.
+#
+# --image-ref/--image-digest above name a container image subject -- for
+# a pipeline whose actual output isn't one (a zip-based Lambda deploy, a
+# bare binary, anything without an OCI manifest), use --subject-name/
+# --subject-digest instead; they resolve onto the exact same underlying
+# subject fields (build_statement()'s subject was always artifact-
+# agnostic -- only these two flag names implied "must be a container").
+# Exactly one full pair (or a mix of the two, e.g. --image-ref with
+# --subject-digest) is required; omitting a name or digest entirely fails
+# closed with a diagnostic naming both valid pairs.
 
 # Admission gate against the unsigned statement's DSSE-shaped output
 # (only meaningful once --sign/--dry-run-sign has produced a real envelope):

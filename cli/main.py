@@ -452,8 +452,33 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--junit-xml", required=True)
     p.add_argument("--coverage-format", choices=["cobertura", "lcov", "jacoco"], default="cobertura")
     p.add_argument("--coverage-report", required=True, dest="coverage_report")
-    p.add_argument("--image-ref", required=True)
-    p.add_argument("--image-digest", required=True, help="sha256:<hex> or bare hex")
+    p.add_argument(
+        "--image-ref",
+        default=None,
+        help="container image reference this statement's subject describes. Exactly one "
+        "of {--image-ref, --subject-name} plus its matching digest flag is required -- "
+        "see --subject-name/--subject-digest for a non-container artifact.",
+    )
+    p.add_argument(
+        "--image-digest",
+        default=None,
+        help="sha256:<hex> or bare hex digest of the image named by --image-ref",
+    )
+    p.add_argument(
+        "--subject-name",
+        default=None,
+        help="generic subject name for an artifact that isn't a container image (e.g. a "
+        "Lambda function ARN, a build output's own identifier) -- use this instead of "
+        "--image-ref when the pipeline's actual output isn't one. The predicate's subject "
+        "is genuinely artifact-agnostic already (build_statement() just takes a name + "
+        "digest); --image-ref/--image-digest were simply the only names offered for it "
+        "until now, which wrongly implied every caller ships a container image.",
+    )
+    p.add_argument(
+        "--subject-digest",
+        default=None,
+        help="sha256:<hex> or bare hex digest of the artifact named by --subject-name",
+    )
     p.add_argument("--base-sha", default=None)
     p.add_argument("--head-sha", required=True)
     p.add_argument("--repo-dir", default=".")
@@ -525,7 +550,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "coverage, AST walk, GitHub ruleset API, scoring, predicate assembly, WORM "
         "dispatch, Sigstore signing) to stderr",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+
+    # Resolve --subject-name/--subject-digest onto the same args.image_ref/
+    # args.image_digest attributes --image-ref/--image-digest have always
+    # used, so every downstream reader (this function's own callers,
+    # build_statement(), _maybe_emit_slsa_provenance()) needs no changes at
+    # all -- this is purely two names for the same pair of fields. Neither
+    # pair is individually required anymore (argparse's own required=True
+    # can't express "one of these two pairs"), so that's enforced here
+    # instead, with the same p.error()-based diagnostic (usage line + clear
+    # message, exit code 2) argparse's own required-arg failures use.
+    args.image_ref = args.subject_name or args.image_ref
+    args.image_digest = args.subject_digest or args.image_digest
+    if not args.image_ref or not args.image_digest:
+        p.error(
+            "either --image-ref and --image-digest (for a container image subject), or "
+            "--subject-name and --subject-digest (for any other artifact), are required"
+        )
+    return args
 
 
 def _dispatch_standalone_subcommand(raw_argv: List[str]) -> Optional[int]:

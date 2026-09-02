@@ -214,19 +214,32 @@ def sign_statement(
     statement_json_bytes: bytes,
     dry_run: bool = False,
     timing: Optional[Dict[str, int]] = None,
+    identity_token: Optional[str] = None,
 ) -> DSSEEnvelope:
     """Keyless-sign an in-toto Statement into a DSSE envelope via Sigstore.
 
     `timing`, when passed a dict, is populated in place with high-resolution
     (`time.perf_counter_ns()`) sub-stage durations so a caller (cli.main's
     stage profiler) can break the "sigstore_signing" stage down further:
-      - "oidc_token_fetch_ns": ambient OIDC ID token acquisition.
+      - "oidc_token_fetch_ns": ambient OIDC ID token acquisition. Set to 0
+        (not measured) when `identity_token` is supplied directly, since no
+        fetch happens in that case.
       - "fulcio_rekor_ns": the Fulcio cert issuance + Rekor inclusion
         round-trip performed inside `signer.sign_dsse()`. Note this is
         *not* a `python3 -m sigstore sign` subprocess -- see the module
         docstring and the try/except block below for why this deliberately
         calls the `Signer.sign_dsse()` library API in-process instead.
     On dry_run, both keys are set to 0 (no network I/O occurs).
+
+    `identity_token`, when supplied, is used as-is instead of calling
+    `fetch_ambient_oidc_token()` -- for a caller that isn't itself the CI
+    runner holding the ambient OIDC environment (e.g. a signing service
+    invoked *by* a GitHub Actions job: the job mints its own ambient token
+    and forwards it in the request, since `ACTIONS_ID_TOKEN_REQUEST_URL`/
+    `_TOKEN` are only ever present in the runner's own process, never in a
+    downstream service's execution environment). Falls back to the existing
+    ambient-fetch behavior when omitted or empty, so every existing caller
+    (cli.main's own pipeline, `cli.sign`) is unaffected.
     """
     payload_b64 = base64.b64encode(statement_json_bytes).decode("ascii")
 
@@ -243,9 +256,9 @@ def sign_statement(
         )
 
     _t0 = time.perf_counter_ns()
-    oidc_token = fetch_ambient_oidc_token()
+    oidc_token = identity_token or fetch_ambient_oidc_token()
     if timing is not None:
-        timing["oidc_token_fetch_ns"] = time.perf_counter_ns() - _t0
+        timing["oidc_token_fetch_ns"] = 0 if identity_token else time.perf_counter_ns() - _t0
 
     # NOTE: this deliberately does NOT shell out to `sigstore sign` (as an
     # earlier version of this function did). `sigstore sign` always produces
@@ -314,6 +327,7 @@ def sign_file_to_envelope(
     *,
     dry_run: bool = False,
     timing: Optional[Dict[str, int]] = None,
+    identity_token: Optional[str] = None,
 ) -> Path:
     """Reads an already-built unsigned in-toto Statement from `input_path`,
     signs it via sign_statement(), and writes the resulting DSSE envelope
@@ -329,6 +343,12 @@ def sign_file_to_envelope(
     beyond the file's own bytes. Both paths are resolved via
     common.safe_resolve_path() first, the same convention every other
     operator-supplied path in cli/ follows.
+
+    `identity_token` is passed straight through to sign_statement() -- see
+    its docstring. Omitted by cli.sign's own CLI subcommand today (that
+    caller still runs on the CI runner itself and relies on ambient fetch);
+    a signing service fronting this function on a caller's behalf is the
+    intended user.
     """
     resolved_input = safe_resolve_path(input_path)
     size = os.path.getsize(resolved_input)  # raises FileNotFoundError/OSError, same as open() would
@@ -341,7 +361,9 @@ def sign_file_to_envelope(
     with open(resolved_input, "rb") as f:
         statement_json_bytes = f.read()
 
-    envelope = sign_statement(statement_json_bytes, dry_run=dry_run, timing=timing)
+    envelope = sign_statement(
+        statement_json_bytes, dry_run=dry_run, timing=timing, identity_token=identity_token
+    )
 
     resolved_output = safe_resolve_path(output_path)
     with open(resolved_output, "w", encoding="utf-8") as f:

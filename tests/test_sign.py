@@ -97,6 +97,106 @@ class SignFileToEnvelopeTests(_TempDirTestCase):
         sign_file_to_envelope(in_path, os.path.join(tmp, "out.json"), dry_run=True, timing=timing)
         self.assertEqual(timing, {"oidc_token_fetch_ns": 0, "fulcio_rekor_ns": 0})
 
+    def test_identity_token_forwarded_to_sign_statement(self):
+        """sign_file_to_envelope's identity_token param must reach
+        sign_statement() unmodified -- the whole point of threading it
+        through is a caller (e.g. a signing service) that has a
+        caller-supplied token but no in-process file path of its own."""
+        tmp = self._tmp()
+        in_path = _write(tmp, "statement.unsigned.json", _STATEMENT)
+        with mock.patch("cli.oidc_signer.sign_statement") as mock_sign:
+            from cli.oidc_signer import DSSEEnvelope
+            mock_sign.return_value = DSSEEnvelope(
+                payload_type="application/vnd.in-toto+json",
+                payload_b64="e30=",
+                signatures=[{"sig": "s", "certificate": "c"}],
+                rekor_log_index=None,
+                rekor_log_id=None,
+            )
+            sign_file_to_envelope(
+                in_path, os.path.join(tmp, "out.json"), identity_token="caller-supplied-token"
+            )
+        mock_sign.assert_called_once()
+        self.assertEqual(mock_sign.call_args.kwargs["identity_token"], "caller-supplied-token")
+
+
+class SignStatementIdentityTokenTests(_TempDirTestCase):
+    """sign_statement()'s identity_token param must bypass
+    fetch_ambient_oidc_token() entirely -- the point of adding it is
+    supporting a caller (a signing service invoked *by* a CI job) that
+    isn't itself the CI runner and has no ambient OIDC env vars to fetch
+    from at all. Ambient env vars are cleared around these tests so they
+    can't accidentally pass by falling back to a real ambient fetch."""
+
+    def setUp(self):
+        self._saved_env = {k: os.environ.get(k) for k in _AMBIENT_IDENTITY_ENV_KEYS}
+        for k in _AMBIENT_IDENTITY_ENV_KEYS:
+            os.environ.pop(k, None)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        for k, v in self._saved_env.items():
+            if v is not None:
+                os.environ[k] = v
+
+    def test_supplied_identity_token_skips_ambient_fetch(self):
+        with mock.patch("cli.oidc_signer.fetch_ambient_oidc_token") as mock_fetch, \
+             mock.patch("sigstore.sign.SigningContext") as mock_ctx_cls, \
+             mock.patch("sigstore.oidc.IdentityToken") as mock_identity_cls, \
+             mock.patch("sigstore.dsse.Statement"), \
+             mock.patch("sigstore.models.ClientTrustConfig"):
+            mock_fetch.side_effect = AssertionError("fetch_ambient_oidc_token must not be called")
+
+            mock_signer = mock.MagicMock()
+            mock_bundle = mock.MagicMock()
+            mock_bundle.to_json.return_value = json.dumps({
+                "messageSignature": {"signature": "c2ln", "messageDigest": {}},
+                "verificationMaterial": {"certificate": {"rawBytes": "Y2VydA=="}},
+            })
+            mock_signer.sign_dsse.return_value = mock_bundle
+            mock_ctx_cls.from_trust_config.return_value.signer.return_value.__enter__.return_value = mock_signer
+
+            from cli.oidc_signer import sign_statement
+
+            sign_statement(_STATEMENT.encode("utf-8"), identity_token="caller-supplied-token")
+
+            mock_fetch.assert_not_called()
+            mock_identity_cls.assert_called_once_with("caller-supplied-token")
+
+    def test_timing_records_zero_fetch_time_when_token_supplied(self):
+        with mock.patch("cli.oidc_signer.fetch_ambient_oidc_token") as mock_fetch, \
+             mock.patch("sigstore.sign.SigningContext") as mock_ctx_cls, \
+             mock.patch("sigstore.oidc.IdentityToken"), \
+             mock.patch("sigstore.dsse.Statement"), \
+             mock.patch("sigstore.models.ClientTrustConfig"):
+            mock_fetch.side_effect = AssertionError("fetch_ambient_oidc_token must not be called")
+
+            mock_signer = mock.MagicMock()
+            mock_bundle = mock.MagicMock()
+            mock_bundle.to_json.return_value = json.dumps({
+                "messageSignature": {"signature": "c2ln", "messageDigest": {}},
+                "verificationMaterial": {"certificate": {"rawBytes": "Y2VydA=="}},
+            })
+            mock_signer.sign_dsse.return_value = mock_bundle
+            mock_ctx_cls.from_trust_config.return_value.signer.return_value.__enter__.return_value = mock_signer
+
+            from cli.oidc_signer import sign_statement
+
+            timing: dict = {}
+            sign_statement(_STATEMENT.encode("utf-8"), timing=timing, identity_token="caller-supplied-token")
+
+            self.assertEqual(timing["oidc_token_fetch_ns"], 0)
+
+    def test_omitted_identity_token_still_uses_ambient_fetch(self):
+        """Backward-compat guardrail: existing callers (cli.main's own
+        pipeline, cli.sign with no injected token) must be completely
+        unaffected -- omitting identity_token still raises the existing
+        AmbientIdentityError when no ambient env vars are present."""
+        from cli.oidc_signer import AmbientIdentityError, sign_statement
+
+        with self.assertRaises(AmbientIdentityError):
+            sign_statement(_STATEMENT.encode("utf-8"))
+
 
 class SignCliTests(_TempDirTestCase):
     def test_explicit_out_path_is_honored(self):

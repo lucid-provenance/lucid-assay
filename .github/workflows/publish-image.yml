@@ -1,5 +1,12 @@
 name: Publish Assay Image
 
+# run-name: overrides the Actions run-list headline, which otherwise
+# defaults to the triggering commit message -- indistinguishable at a
+# glance from Lucid Assay's own run on the same commit (both workflows
+# can legitimately fire off one push that touches cli/**). Falls back to
+# github.ref_name on workflow_dispatch, where head_commit doesn't exist.
+run-name: "Publish image: ${{ github.event.head_commit.message || github.ref_name }}"
+
 # Builds, pushes, and Sigstore-signs the immutable lucid-assay CLI image
 # (Lucid roadmap Milestone #19). Triggered on every push to main that
 # touches the image's own actual inputs (cli/, pyproject.toml, uv.lock,

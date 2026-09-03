@@ -664,6 +664,20 @@ jobs:
           # already-double-quoted string, so `\"` had no quoting effect),
           # which made --expected-repository/--expected-ref never match the
           # real certificate claims and failed the gate on every run.
+          # --require-slsa-build-l3: enabled 2026-09-03. Both Build Level 3
+          # items (unforgeable control-plane builder identity, isolated
+          # provenance generation) have been genuinely passing for real on
+          # every current caller across the platform since the
+          # lucid-attest-service cutover -- confirmed against real CI runs
+          # on this repo and lucid-console/lucid-dsse-collector/
+          # lucid-attest-service the same day this flag was flipped, not
+          # assumed. Unconditional (unlike --disallow-degraded below,
+          # which is deliberately scoped away from an early feat/** WIP
+          # push with no PR context yet): Build Level 3 has nothing to do
+          # with PR context -- the isolated-signer identity chain is
+          # present identically on every run through this pipeline, so
+          # there's no legitimate "not yet" state for it the way there is
+          # for governance/degraded checks.
           VERIFY_ARGS=(
             --min-rcs 65
             --expected-repository "$EXPECTED_REPOSITORY"
@@ -672,6 +686,7 @@ jobs:
             --cert-identity "$CERT_IDENTITY"
             --cert-oidc-issuer "$CERT_OIDC_ISSUER"
             --slsa-envelope build/provenance.dsse.json
+            --require-slsa-build-l3
             --write-verdict
           )
           # pull_request (pre-merge) and push-to-main (post-merge/promotion,

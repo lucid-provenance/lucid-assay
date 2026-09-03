@@ -20,18 +20,24 @@ from contextlib import redirect_stderr
 from pathlib import Path
 
 from cli.main import (
+    _build_sbom_artifact_block,
     _detect_lockfile_dependencies,
     _emit_run_warnings,
     _ingest_sarif,
+    _ingest_sbom,
     _maybe_annotate_verdict,
+    _maybe_emit_sbom_statement,
     _maybe_emit_slsa_provenance,
     _maybe_sign,
+    _merge_sbom_into_sarif,
     _merge_sonar_metrics,
+    derive_sbom_statement_path,
     derive_slsa_provenance_path,
 )
 from cli.parsers.github_rules import BranchGovernanceReport
 from cli.parsers.junit import TestTotals
 from cli.parsers.sarif import SarifSummaryReport, SarifToolSummary
+from cli.parsers.sbom import SBOM_LICENSE_TOOL_NAME, SbomComponent, SbomReport
 from cli.scorer import RCSResult
 
 
@@ -51,6 +57,10 @@ def _sarif_doc(tool_name: str, results=None) -> dict:
 
 def _sonar_metrics_doc(alert_status="OK") -> dict:
     return {"component": {"measures": [{"metric": "alert_status", "value": alert_status}]}}
+
+
+def _cdx_doc(components) -> dict:
+    return {"bomFormat": "CycloneDX", "specVersion": "1.5", "components": components}
 
 
 def _governance(
@@ -219,6 +229,236 @@ wheels = [
             self._args(os.path.join(self._tmp(), "does-not-exist")), {}
         )
         self.assertEqual(result, [])
+
+    def test_falls_back_to_sbom_when_no_lockfile_found(self):
+        sbom_report = SbomReport(
+            available=True, format="cyclonedx",
+            components=[SbomComponent(name="flask", purl="pkg:pypi/flask@3.0.0", digest={"sha256": "aa"})],
+        )
+        result = _detect_lockfile_dependencies(self._args(self._tmp()), {}, sbom_report=sbom_report)
+        self.assertEqual(result, [{"uri": "pkg:pypi/flask@3.0.0", "digest": {"sha256": "aa"}}])
+
+    def test_lockfile_wins_over_sbom_when_both_present(self):
+        repo_dir = self._tmp()
+        toml = """
+[[package]]
+name = "pytest"
+version = "8.3.2"
+source = { registry = "https://pypi.org/simple" }
+"""
+        _write(repo_dir, "uv.lock", toml)
+        sbom_report = SbomReport(
+            available=True, components=[SbomComponent(name="other", purl="pkg:pypi/other@1.0")]
+        )
+        result = _detect_lockfile_dependencies(self._args(repo_dir), {}, sbom_report=sbom_report)
+        self.assertEqual(result, [{"uri": "pkg:pypi/pytest@8.3.2", "digest": {}}])
+
+    def test_unavailable_sbom_report_is_not_used_as_a_fallback(self):
+        sbom_report = SbomReport(available=False, reasons=["broken"])
+        result = _detect_lockfile_dependencies(self._args(self._tmp()), {}, sbom_report=sbom_report)
+        self.assertEqual(result, [])
+
+
+class IngestSbomTests(unittest.TestCase):
+    def _tmp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        return d
+
+    def _args(self, **overrides):
+        base = dict(sbom=None)
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_no_sbom_returns_none_silently(self):
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = _ingest_sbom(self._args(), {})
+        self.assertIsNone(result)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_valid_cyclonedx_sbom_is_parsed(self):
+        path = _write(self._tmp(), "bom.json", json.dumps(_cdx_doc(
+            [{"name": "flask", "version": "3.0.0", "purl": "pkg:pypi/flask@3.0.0",
+              "licenses": [{"license": {"id": "BSD-3-Clause"}}]}]
+        )))
+        stage_ns = {}
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = _ingest_sbom(self._args(sbom=path), stage_ns)
+        self.assertTrue(result.available)
+        self.assertEqual(result.format, "cyclonedx")
+        self.assertEqual(len(result.components), 1)
+        self.assertEqual(buf.getvalue(), "")
+        self.assertIn("parse_inputs", stage_ns)
+
+    def test_unreadable_sbom_path_warns_and_degrades(self):
+        missing = os.path.join(self._tmp(), "does-not-exist.json")
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = _ingest_sbom(self._args(sbom=missing), {})
+        self.assertFalse(result.available)
+        self.assertIn(f"SBOM '{missing}' could not be read/parsed", buf.getvalue())
+
+
+class MergeSbomIntoSarifTests(unittest.TestCase):
+    def test_no_sbom_report_returns_sarif_unchanged(self):
+        sarif_report = SarifSummaryReport(available=True, tools_scanned=["semgrep"])
+        result = _merge_sbom_into_sarif(sarif_report, None)
+        self.assertIs(result, sarif_report)
+
+    def test_unavailable_sbom_report_returns_sarif_unchanged(self):
+        sarif_report = SarifSummaryReport(available=True, tools_scanned=["semgrep"])
+        sbom_report = SbomReport(available=False, reasons=["broken"])
+        result = _merge_sbom_into_sarif(sarif_report, sbom_report)
+        self.assertIs(result, sarif_report)
+
+    def test_sbom_only_becomes_the_sarif_report_when_none_was_configured(self):
+        sbom_report = SbomReport(
+            available=True, components=[SbomComponent(name="bad", license_expression="AGPL-3.0")]
+        )
+        result = _merge_sbom_into_sarif(None, sbom_report)
+        self.assertTrue(result.available)
+        self.assertEqual(result.tools_scanned, [SBOM_LICENSE_TOOL_NAME])
+        self.assertEqual(result.errors_count, 1)
+
+    def test_sbom_findings_merge_alongside_a_real_sarif_report(self):
+        sarif_report = SarifSummaryReport(
+            available=True, tools_scanned=["semgrep"], tools=[SarifToolSummary(name="semgrep")]
+        )
+        sbom_report = SbomReport(
+            available=True, components=[SbomComponent(name="bad", license_expression="AGPL-3.0")]
+        )
+        result = _merge_sbom_into_sarif(sarif_report, sbom_report)
+        self.assertTrue(result.available)
+        self.assertEqual(set(result.tools_scanned), {"semgrep", SBOM_LICENSE_TOOL_NAME})
+        self.assertEqual(result.errors_count, 1)
+
+    def test_unavailable_real_sarif_report_taints_the_merge(self):
+        # Matches aggregate_sarif_reports' own fail-closed contract: one
+        # broken --sarif input taints the whole aggregate, even when the
+        # SBOM half is perfectly valid.
+        sarif_report = SarifSummaryReport(available=False, reasons=["corrupt"])
+        sbom_report = SbomReport(
+            available=True, components=[SbomComponent(name="bad", license_expression="AGPL-3.0")]
+        )
+        result = _merge_sbom_into_sarif(sarif_report, sbom_report)
+        self.assertFalse(result.available)
+
+    def test_sbom_report_sha_becomes_the_synthetic_tools_report_hash(self):
+        sbom_report = SbomReport(
+            available=True, components=[SbomComponent(name="bad", license_expression="AGPL-3.0")]
+        )
+        result = _merge_sbom_into_sarif(None, sbom_report, sbom_report_sha="d" * 64)
+        tool = next(t for t in result.tools if t.name == SBOM_LICENSE_TOOL_NAME)
+        self.assertEqual(tool.report_hash, {"algorithm": "sha256", "value": "d" * 64})
+
+    def test_no_sbom_report_sha_leaves_report_hash_none(self):
+        sbom_report = SbomReport(
+            available=True, components=[SbomComponent(name="bad", license_expression="AGPL-3.0")]
+        )
+        result = _merge_sbom_into_sarif(None, sbom_report)
+        tool = next(t for t in result.tools if t.name == SBOM_LICENSE_TOOL_NAME)
+        self.assertIsNone(tool.report_hash)
+
+
+class BuildSbomArtifactBlockTests(unittest.TestCase):
+    def test_none_when_no_sbom_report(self):
+        self.assertIsNone(_build_sbom_artifact_block(None, None))
+
+    def test_none_when_sbom_unavailable(self):
+        sbom_report = SbomReport(available=False, reasons=["broken"])
+        self.assertIsNone(_build_sbom_artifact_block(sbom_report, "a" * 64))
+
+    def test_none_when_no_hash_given(self):
+        sbom_report = SbomReport(available=True, format="cyclonedx", components=[])
+        self.assertIsNone(_build_sbom_artifact_block(sbom_report, None))
+
+    def test_cyclonedx_maps_to_cyclonedx_json(self):
+        sbom_report = SbomReport(
+            available=True, format="cyclonedx",
+            components=[SbomComponent(name="a"), SbomComponent(name="b")],
+        )
+        block = _build_sbom_artifact_block(sbom_report, "a" * 64)
+        self.assertEqual(block, {
+            "format": "cyclonedx-json", "sha256": "a" * 64,
+            "uri": "s3://evidence/sha256/" + "a" * 64, "component_count": 2,
+        })
+
+    def test_spdx2_and_spdx3_both_map_to_spdx_json(self):
+        for fmt in ("spdx2", "spdx3"):
+            sbom_report = SbomReport(available=True, format=fmt, components=[])
+            block = _build_sbom_artifact_block(sbom_report, "b" * 64)
+            self.assertEqual(block["format"], "spdx-json", fmt)
+
+    def test_unrecognized_format_is_none(self):
+        sbom_report = SbomReport(available=True, format="some-future-format", components=[])
+        self.assertIsNone(_build_sbom_artifact_block(sbom_report, "c" * 64))
+
+
+class DeriveSbomStatementPathTests(unittest.TestCase):
+    def test_explicit_path_wins(self):
+        self.assertEqual(derive_sbom_statement_path("build/attestation.unsigned.json", "custom.json"), "custom.json")
+
+    def test_derives_fixed_basename_sibling_in_same_directory(self):
+        self.assertEqual(
+            derive_sbom_statement_path("build/attestation.unsigned.json", None), "build/sbom.unsigned.json"
+        )
+
+    def test_out_basename_is_irrelevant_to_the_derived_name(self):
+        # Unlike derive_slsa_provenance_path's suffix scheme, this is a
+        # fixed basename regardless of --out's own filename.
+        self.assertEqual(
+            derive_sbom_statement_path("build/lucid-console.unsigned.json", None), "build/sbom.unsigned.json"
+        )
+
+    def test_no_directory_component(self):
+        self.assertEqual(derive_sbom_statement_path("attestation.unsigned.json", None), "sbom.unsigned.json")
+
+
+class MaybeEmitSbomStatementTests(unittest.TestCase):
+    def _tmp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        return d
+
+    def _args(self, out, **overrides):
+        base = dict(out=out, sbom_statement_out=None, image_ref="registry.example.com/org/svc")
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_no_sbom_report_is_a_noop(self):
+        out = os.path.join(self._tmp(), "attestation.unsigned.json")
+        result = _maybe_emit_sbom_statement(self._args(out), sbom_report=None, image_digest="a" * 64)
+        self.assertIsNone(result)
+
+    def test_unavailable_sbom_report_is_a_noop(self):
+        out = os.path.join(self._tmp(), "attestation.unsigned.json")
+        sbom_report = SbomReport(available=False, reasons=["broken"])
+        result = _maybe_emit_sbom_statement(self._args(out), sbom_report=sbom_report, image_digest="a" * 64)
+        self.assertIsNone(result)
+
+    def test_writes_a_real_sibling_statement_file(self):
+        d = self._tmp()
+        out = os.path.join(d, "attestation.unsigned.json")
+        raw_doc = {"bomFormat": "CycloneDX", "specVersion": "1.5", "components": []}
+        sbom_report = SbomReport(available=True, format="cyclonedx", components=[], raw_document=raw_doc)
+
+        result = _maybe_emit_sbom_statement(self._args(out), sbom_report=sbom_report, image_digest="a" * 64)
+
+        expected_path = os.path.join(d, "sbom.unsigned.json")
+        self.assertEqual(str(result), expected_path)
+        with open(expected_path) as f:
+            written = json.load(f)
+        self.assertEqual(written["predicateType"], "https://cyclonedx.org/bom")
+        self.assertEqual(written["predicate"], raw_doc)
+        self.assertEqual(written["subject"], [{"name": "registry.example.com/org/svc", "digest": {"sha256": "a" * 64}}])
+
+    def test_unmappable_format_is_a_noop(self):
+        out = os.path.join(self._tmp(), "attestation.unsigned.json")
+        sbom_report = SbomReport(available=True, format="unknown-format", components=[], raw_document={"x": 1})
+        result = _maybe_emit_sbom_statement(self._args(out), sbom_report=sbom_report, image_digest="a" * 64)
+        self.assertIsNone(result)
 
 
 class MaybeSignTests(unittest.TestCase):

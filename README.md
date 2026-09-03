@@ -29,12 +29,14 @@ cli/
   parsers/commit_author.py  # GitHub commit-author identity (verified account) via REST API
   parsers/lockfiles.py      # uv.lock/package-lock.json/go.sum/Gradle/Maven -> resolved_dependencies
   parsers/s2c2f.py          # S2C2F control evaluation (subset with a real, checkable signal) -> predicate.s2c2f
+  parsers/sbom.py            # CycloneDX/SPDX SBOM ingestion -> license-policy SARIF findings + resolved_dependencies
   patch_coverage.py         # git diff base...head, intersected with coverage hit maps
   real_coverage.py           # vanity-test-aware coverage: which covered lines are only exercised by vanity tests
   hashing.py                 # SHA-256 content hashing + WORM key derivation
   scorer.py                  # pure, deterministic Release Confidence Score (RCS)
   builder.py                 # assembles the unsigned in-toto Statement
   slsa_provenance.py          # assembles a *separate*, real SLSA v1.0 provenance Statement (--emit-slsa-provenance)
+  sbom_statement.py            # assembles a *separate* companion in-toto Statement wrapping --sbom's own raw document
   oidc_signer.py              # ambient OIDC -> Fulcio cert -> DSSE sign -> Rekor log
   sign.py                      # `lucid-assay sign <file>`: standalone signing subcommand for an isolated attest job
   verify.py                   # admission gatekeeper: DSSE decode + Sigstore identity + policy gates
@@ -57,6 +59,10 @@ tests/
   test_common_path_safety.py            # safe_resolve_path() + its wiring into every open()/getsize() call site
   test_slsa_provenance.py               # SLSA v1.0 provenance builder: ground-truth/fail-closed tests, and proof
                                          # a genuine statement satisfies cli/verify.py's SLSA Level 1/2 checklist
+  test_sbom.py                          # CycloneDX/SPDX parsing, license-expression classification, SARIF/
+                                         # resolved_dependencies projection tests (cli/parsers/sbom.py)
+  test_sbom_statement.py                # --sbom companion in-toto statement builder tests (cli/sbom_statement.py)
+  test_main_sbom_integration.py         # one true end-to-end --sbom + --dry-run-sign CLI-drive test
   test_sign.py                          # `lucid-assay sign` CLI + cli.oidc_signer.sign_file_to_envelope tests
   test_coverage_contexts.py             # `coverage json --show-contexts` export parsing tests
   test_real_coverage.py                 # vanity-test-aware coverage cross-reference tests
@@ -79,8 +85,8 @@ Every module is a pure function or a thin, swappable I/O boundary:
   it's the most defensively written module in the repo — see below.
 - `common.py::safe_resolve_path()` is the one path-safety choke point every
   module reads an operator-supplied file through (`--junit-xml`,
-  `--coverage-report`, `--sarif`, `--sonar-metrics`, `--out`, the `verify`
-  envelope argument, plus `hashing.py`'s evidence-artifact hashing and
+  `--coverage-report`, `--sarif`, `--sonar-metrics`, `--sbom`, `--out`, the
+  `verify` envelope argument, plus `hashing.py`'s evidence-artifact hashing and
   `patch_coverage.py`'s `--repo-dir` as `subprocess.run()`'s `cwd`):
   resolves to an absolute, symlink-normalized `Path`
   and rejects null bytes/malformed input before it ever reaches
@@ -371,6 +377,125 @@ by name**: each keeps its own file's `report_hash`, since collapsing two
 same-named tools from two different files would leave no single honest
 hash to attach to the merged entry.
 
+Alongside `level` (the SARIF spec's own coarse `error`/`warning`/`note`/
+`none` bucket), each finding also carries an optional `security_severity`
+band (`critical`/`high`/`medium`/`low`, or `null`) — derived from the
+rule's own `properties["security-severity"]`, the GitHub code-scanning
+SARIF convention several real scanners populate (Grype, CodeQL, Snyk, ...)
+with a CVSS-style numeric string, mapped to a band using the same score
+thresholds GitHub's own code-scanning UI uses (`>=9.0`/`>=7.0`/`>=4.0`/
+`>0.0`). This matters because `level` alone can't distinguish Critical from
+High for a tool like Grype, which maps both to `error` (confirmed against
+Grype's own SARIF presenter source) — `security_severity` is the only way
+to tell them apart. `None` when a tool doesn't populate the property —
+never guessed at from `level`. Rolled up as `critical_count`/`high_count`/
+`medium_count`/`low_count`, both per-tool (`static_analysis.tools[].
+summary`) and aggregated across the whole report (`static_analysis.
+critical_count` etc., top-level, alongside `errors_count`/`warnings_count`)
+— independent of, and computed the same way as, the existing per-level
+counts.
+
+**`parsers/sbom.py`** ingests a `--sbom <path>` (CycloneDX JSON 1.4–1.6, or
+SPDX JSON 2.3 — plus a best-effort subset of SPDX 3.0's JSON-LD form; see
+the module's own docstring for that format's documented scope limits)
+without requiring a tenant repo to run or maintain a separate license-
+scanning tool or conversion script. Each component's declared/concluded
+license (a single SPDX id, or an AND/OR/WITH expression) is evaluated
+against a policy — sensible defaults: `AGPL-*`/`GPL-*`/`SSPL-*`/`CC-BY-NC-*`
+forbidden, `MIT`/`Apache-*`/`BSD-*`/`ISC`/`0BSD`/etc. permissive, anything
+else (`LGPL-*`, `MPL-2.0`, a custom/proprietary name, a missing/
+`NOASSERTION`/`NONE` license) `unclassified` — never silently folded into
+either bucket. `classify_license_expression()` is a deliberately shallow,
+best-effort SPDX-expression evaluator (flattened AND/OR/WITH splitting, no
+operator-precedence/nesting awareness); see its own docstring for exactly
+what boolean structure it does and doesn't honor.
+
+The policy result is converted into the *same* `SarifFinding`/
+`SarifToolSummary`/`SarifSummaryReport` shapes `parse_sarif_file()`
+produces from a real SARIF file (`build_sbom_sarif_report()`) — a
+`"forbidden"` component becomes an `error`-level finding, `"unclassified"`
+becomes `warning`, and a `"permissive"` one produces no finding at all
+(same as a passing SARIF rule never emitting a `results[]` entry). `cli.
+main` folds this synthetic report into whatever real `--sarif` input it
+already has via `aggregate_sarif_reports()` *before* scoring, so a `--sbom`
+finding feeds the scorer's static-analysis component (`WEIGHTS
+["static_analysis"]`) and S2C2F's `SCA-2` ("License Checks") exactly like
+any other SARIF tool's — `cli.parsers.s2c2f._LICENSE_TOOL_NAME_PATTERNS`
+just recognizes `sbom.SBOM_LICENSE_TOOL_NAME`
+(`"lucid-assay-sbom-license-policy"`) as one more license-scanning tool
+name, no SBOM-specific branching anywhere in `s2c2f.py` itself. (This
+inherits `aggregate_sarif_reports()`'s existing fail-closed contract: an
+unavailable real `--sarif` input taints the merge even when the SBOM half
+parsed cleanly — deliberate, not an oversight, the same "no partial clean
+bill of health" principle that function already documents.)
+
+Each PURL-bearing component is also projected into
+`predicate.resolved_dependencies`
+(`sbom_components_to_resolved_dependencies()`, same `{"uri": "pkg:...",
+"digest": {...}}` shape `cli.parsers.lockfiles.ResolvedDependency`
+produces — digests are pulled from CycloneDX `hashes[]`/SPDX `checksums[]`
+when present) — but **only as a fallback when lockfile detection finds
+nothing on its own**: a real lockfile is always the more authoritative,
+pipeline-native source, never merged with or overridden by the SBOM's
+inventory. This is what closes S2C2F's `INV-1` ("Inventory")/`ING-1`
+("Package Managers") from a `--sbom` alone, with zero SBOM-specific code
+in `s2c2f.py` — those controls already just check `resolved_dependencies`
+non-empty, format-agnostically.
+
+A successfully-parsed `--sbom` also populates `predicate.artifact.sbom`
+(`format`/`sha256`/`uri`/`component_count`) — the same sha256 + WORM-
+content-addressed-uri pattern `test_verification.report_uri`/
+`coverage.report_uri` already use (`cli/hashing.py`'s own module docstring
+already names SBOMs as a third evidence-artifact kind this hashing scheme
+covers). `format` is `"cyclonedx-json"` or `"spdx-json"` (SPDX 2.x and 3.0
+both collapse to the one schema-declared value); a `--sbom` that failed to
+parse leaves the field at its schema-declared `null` default rather than
+claiming a validated artifact exists for a file this pipeline couldn't
+actually read.
+
+### `--sbom`'s companion in-toto statement
+
+A successfully-parsed `--sbom` also makes `cli.main` write a **second,
+separate** in-toto Statement (`cli/sbom_statement.py`) — same relationship
+to the primary RCS predicate as `--emit-slsa-provenance`'s own statement
+(see below): same subject artifact, but `predicateType`
+`https://cyclonedx.org/bom` (CycloneDX) or `https://spdx.dev/Document`
+(SPDX 2.x/3.0), and `predicate` set to the SBOM's own raw parsed document
+**verbatim** — never a re-derivation from `parsers/sbom.py`'s own
+`SbomComponent` extraction, which is a lossy, license-policy-oriented
+projection, not a faithful copy of the original. Written alongside `--out`
+as a fixed-basename sibling (`--sbom-statement-out` to override; default
+e.g. `build/attestation.unsigned.json` → `build/sbom.unsigned.json` —
+deliberately a fixed name, not a derived-suffix scheme like
+`--slsa-provenance-out`'s own, since a downstream CI workflow references
+it by that fixed, predictable name). If `--sign`/`--dry-run-sign` was also
+passed, this statement is signed into its own DSSE envelope the same way
+the primary one and the `--emit-slsa-provenance` one are.
+
+The three predicates are deliberately kept apart rather than merged into
+one — same "don't make lucid-assay own and track an external schema's
+evolution inside its own predicate" rationale as the SLSA provenance
+statement below, applied to a second external schema.
+
+The synthetic SBOM SARIF tool's own `report_hash` (`static_analysis.
+tools[].report_hash`, required by the schema for every tool entry) is set
+to this same `--sbom` file's sha256 — the honest equivalent of "the raw
+SARIF file this tool's results were parsed from" when there is no raw
+SARIF file, since a synthetic tool's findings are computed in-memory, not
+round-tripped through an actual SARIF document. It matches
+`predicate.artifact.sbom.sha256` exactly, since both are the same file
+hashed once (`cli.main`'s step 3d, ahead of scoring — see that function's
+own comment for why the ordering matters).
+
+Note: `cli/verify.py` needed **no changes** for any of this — it only ever
+renders `predicate.s2c2f.controls[]` verbatim (`_format_s2c2f_report`,
+`[✓]`/`[✗]`/`[○]` from each control's already-computed `met`/`unmet`/
+`not_yet_reported` status); the control's actual status is decided once,
+at mint time, in `cli.parsers.s2c2f.evaluate_s2c2f()`. Wiring a new signal
+into `verify.py` itself would break that separation — it operates purely
+on the already-signed, decoded predicate, never on this package's own
+parser dataclasses.
+
 `lucid-assay run` is an explicit alias for the pipeline above (it's also
 what runs with no subcommand at all, so `run` is optional, not required —
 existing invocations with no subcommand keep working unchanged).
@@ -488,8 +613,12 @@ control that *is* evaluated reports one of three states:
   like one that ran and failed.
 
 Currently evaluated: `ING-1`/`ING-2` (lockfile presence / private package
-proxy config), `SCA-1`/`SCA-2` (SARIF tool-name matching against known
-SCA/license-scanning tools, or GitHub's vulnerability-alerts API), `INV-1`
+proxy config — a `--sbom`'s PURL-bearing components count as a fallback
+source for `ING-1`/`INV-1` too, see `parsers/sbom.py` below), `SCA-1`/
+`SCA-2` (SARIF tool-name matching against known SCA/license-scanning
+tools — including `parsers/sbom.py`'s own synthetic
+`lucid-assay-sbom-license-policy` tool for `SCA-2` — or GitHub's
+vulnerability-alerts API), `INV-1`
 (resolved-dependency inventory), `UPD-1` (always `not_yet_reported` — see
 above), `SCA-3` (GitHub Dependabot alerts API reachability), `INV-2`
 (`SECURITY.md` via the GitHub community-profile API), `UPD-3`
@@ -499,6 +628,28 @@ inventory / pkg: PURL + sha256/sha512 digest — the same hermeticity check
 requires a PR and blocks direct pushes), and `AUD-1` (a required status
 check on the branch names a provenance/attestation verification job —
 see `github_rules.BranchGovernanceReport.required_status_check_contexts`).
+
+**`SCA-1` is a process-existence control, not an outcome gate**: a
+recognized SCA tool's SARIF findings credit `SCA-1` as `met` regardless of
+whether it found anything — a Grype run with real CVEs still has the
+vulnerability-scanning *control* in place, same precedent as `SCA-2` (a
+forbidden license doesn't flip that control to `unmet` either). The
+findings themselves are a separate signal, already surfaced in
+`predicate.static_analysis` (see the severity-band rollup above), not
+hidden by keeping `SCA-1` met.
+
+**`SCA-3` deliberately does *not* derive from Grype (or any SARIF input)**,
+despite Grype being a recognized `SCA-1` tool. Grype's own EOL-adjacent
+feature (`--enable-eol-distro-warnings`) is *distro*-level, not
+package-level, and — confirmed directly against Grype's own SARIF
+presenter source — that data (`Document.AlertsByPackage`) is a completely
+separate structure the SARIF presenter never reads; zero EOL/unmaintained
+signal reaches SARIF output at all, with or without the flag. Treating
+"Grype SARIF has zero findings" as "zero EOL violations" would credit a
+check that never actually ran — `SCA-3` stays scoped to the GitHub
+Dependabot alerts API, its only honest signal, and legitimately reports
+`not_yet_reported` off-GitHub or when the token lacks
+`Dependabot alerts: Read`.
 
 ## Signing flow (keyless / Sigstore)
 
@@ -1239,6 +1390,7 @@ python3 -m cli.main \
   --pr-number 42 --pr-approvers alice,bob --pr-required-approvals 2 --pr-review-state approved \
   --sarif path/to/semgrep.sarif.json --sarif path/to/sonarqube.sarif.json \
   --sonar-metrics path/to/sonar-measures.json \
+  --sbom path/to/cyclonedx-bom.json \
   --coverage-contexts build/coverage-contexts.json \
   --skip-perf-budget-check --debug \
   --emit-slsa-provenance --slsa-provenance-out /tmp/attestation.slsa-provenance.unsigned.json \

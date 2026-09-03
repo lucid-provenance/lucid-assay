@@ -142,7 +142,8 @@
           "properties": {
             "format": { "type": "string", "enum": ["spdx-json", "cyclonedx-json", "syft-json"] },
             "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-            "uri": { "type": "string", "format": "uri", "description": "Content-addressed WORM storage URI, e.g. s3://evidence/sha256/<hash>" }
+            "uri": { "type": "string", "format": "uri", "description": "Content-addressed WORM storage URI, e.g. s3://evidence/sha256/<hash>" },
+            "component_count": { "type": "integer", "minimum": 0, "description": "Number of components cli.parsers.sbom extracted from this SBOM" }
           },
           "required": ["format", "sha256", "uri"]
         }
@@ -313,6 +314,13 @@
           "description": "Findings at level=error whose file/line intersects the diff's changed lines -- weighed far more heavily by the scorer than a pre-existing baseline finding."
         },
         "patch_warnings_count": { "type": "integer", "minimum": 0 },
+        "critical_count": {
+          "type": "integer", "minimum": 0,
+          "description": "Findings whose rule carries a properties[\"security-severity\"] (the GitHub code-scanning SARIF convention several scanners populate, e.g. Grype/CodeQL/Snyk) mapping to a Critical CVSS band (>=9.0). Independent of errors_count/warnings_count/etc., which bucket by the SARIF spec's own coarser `level` -- a tool like Grype maps both Critical and High to level=error, so this is the only way to tell them apart."
+        },
+        "high_count": { "type": "integer", "minimum": 0 },
+        "medium_count": { "type": "integer", "minimum": 0 },
+        "low_count": { "type": "integer", "minimum": 0 },
         "tools_scanned": { "type": "array", "items": { "type": "string" } },
         "reasons": {
           "type": "array",
@@ -334,7 +342,11 @@
               "start_line": { "type": "integer", "minimum": 0 },
               "is_new_in_patch": { "type": "boolean" },
               "category": { "type": ["string", "null"] },
-              "tags": { "type": "array", "items": { "type": "string" } }
+              "tags": { "type": "array", "items": { "type": "string" } },
+              "security_severity": {
+                "type": ["string", "null"], "enum": ["critical", "high", "medium", "low", null],
+                "description": "See static_analysis.critical_count's own description."
+              }
             }
           }
         },
@@ -358,7 +370,11 @@
                   "warnings": { "type": "integer", "minimum": 0 },
                   "notes": { "type": "integer", "minimum": 0 },
                   "none": { "type": "integer", "minimum": 0 },
-                  "total_findings": { "type": "integer", "minimum": 0 }
+                  "total_findings": { "type": "integer", "minimum": 0 },
+                  "critical": { "type": "integer", "minimum": 0 },
+                  "high": { "type": "integer", "minimum": 0 },
+                  "medium": { "type": "integer", "minimum": 0 },
+                  "low": { "type": "integer", "minimum": 0 }
                 }
               },
               "rules": {
@@ -372,7 +388,8 @@
                     "rule_id": { "type": "string" },
                     "count": { "type": "integer", "minimum": 0 },
                     "category": { "type": ["string", "null"] },
-                    "tags": { "type": "array", "items": { "type": "string" } }
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "security_severity": { "type": ["string", "null"], "enum": ["critical", "high", "medium", "low", null] }
                   }
                 }
               },

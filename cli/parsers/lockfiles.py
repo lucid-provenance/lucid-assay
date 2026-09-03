@@ -1,8 +1,10 @@
 """
 Multi-ecosystem lockfile parsing: extracts pinned/resolved dependencies from
-Python (uv.lock, pip-compile-generated requirements.txt), JavaScript/TypeScript
-(package-lock.json, pnpm-lock.yaml), Go (go.sum), and Java (Gradle dependency
-locks, Maven pom.xml) lockfiles into normalized `pkg:` PURL identifiers with
+Python (uv.lock, poetry.lock, Pipfile.lock, pip-compile-generated
+requirements.txt), JavaScript/TypeScript (package-lock.json, pnpm-lock.yaml,
+yarn.lock -- both Classic v1 and Berry v2+), Go (go.sum), and Java (Gradle
+dependency locks, a build.gradle/build.gradle.kts fallback for repos without
+one, Maven pom.xml) lockfiles into normalized `pkg:` PURL identifiers with
 cryptographic digests -- shaped for a SLSA v1.0 provenance predicate's
 `resolvedDependencies` array
 (https://slsa.dev/spec/v1.0/provenance#resolveddependencies).
@@ -37,11 +39,17 @@ Hardened against:
     lines carrying at least one real `--hash=<algo>:<hex>` are treated as
     resolved, and the file as a whole is rejected (-> []) if it contains
     none at all -- see parse_pip_compile_requirements()'s own docstring.
-  - pnpm-lock.yaml is parsed with a minimal, purpose-built line scanner
-    (see parse_pnpm_lock()'s own docstring for why, not a general YAML
-    library) scoped exactly to the one block (`packages:`) this module
-    needs -- a malformed or truncated file degrades individual entries
-    the same way every other parser here does, never raises.
+  - pnpm-lock.yaml and yarn.lock (both generations) are parsed with a
+    minimal, purpose-built line scanner each (see parse_pnpm_lock()'s and
+    parse_yarn_lock()'s own docstrings for why, not a general YAML
+    library) scoped exactly to the block(s) this module needs -- a
+    malformed or truncated file degrades individual entries the same way
+    every other parser here does, never raises.
+  - A Gradle build script's dynamic version (`31.+`) or Ivy-style range
+    (`[1.0,2.0)`) is never mistaken for a pinned coordinate -- see
+    parse_gradle_build_file()'s own docstring, the same
+    fails-closed-per-field discipline pom.xml's `${...}` placeholder
+    check already applies.
   - detect_and_parse_dependencies() walks repo_dir defensively, skipping
     vendored/build directory subtrees (node_modules, .git, vendor,
     build, dist, target, .venv) and tolerating unreadable directories, so
@@ -180,6 +188,156 @@ def parse_uv_lock(path: Union[str, Path]) -> List[ResolvedDependency]:
             dep = _uv_package_to_dependency(pkg)
             if dep:
                 deps.append(dep)
+    return deps
+
+
+# --------------------------------------------------------------------------
+# Python: poetry.lock
+# --------------------------------------------------------------------------
+
+def _poetry_package_digest(pkg: Dict[str, Any]) -> Dict[str, str]:
+    """Picks one file's hash out of a poetry.lock [[package]] entry's own
+    `files = [{file = "...", hash = "sha256:..."}, ...]` array -- one
+    entry per distributed artifact (a wheel per platform, plus the
+    sdist), all real sha256 hashes of genuinely different files, the
+    same "digest: Dict[str, str] has no room for N hashes of one
+    algorithm" situation _pip_compile_entries() already documents.
+    Prefers a `.whl` file's hash over a `.tar.gz`/sdist's, mirroring
+    uv.lock's own wheel-before-sdist preference (_uv_package_digest) --
+    same rationale, a wheel is what actually gets installed on the
+    common path. Malformed entries (a non-dict, a hash without its own
+    'sha256:' prefix) are skipped individually; returns {} if no file
+    entry decodes cleanly."""
+    files = pkg.get("files")
+    if not isinstance(files, list):
+        return {}
+
+    def _entry_digest(entry: Any) -> Optional[Tuple[bool, Dict[str, str]]]:
+        if not isinstance(entry, dict):
+            return None
+        filename = entry.get("file")
+        raw_hash = entry.get("hash")
+        if not isinstance(raw_hash, str) or ":" not in raw_hash:
+            return None
+        algo, _, hex_value = raw_hash.partition(":")
+        algo, hex_value = algo.strip(), hex_value.strip()
+        if not algo or not hex_value:
+            return None
+        is_wheel = isinstance(filename, str) and filename.endswith(".whl")
+        return is_wheel, {algo: hex_value}
+
+    best: Optional[Tuple[bool, Dict[str, str]]] = None
+    for entry in files:
+        candidate = _entry_digest(entry)
+        if candidate and (best is None or (candidate[0] and not best[0])):
+            best = candidate
+    return best[1] if best else {}
+
+
+def _poetry_package_to_dependency(pkg: Dict[str, Any]) -> Optional[ResolvedDependency]:
+    name = pkg.get("name")
+    version = pkg.get("version")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if not isinstance(version, str) or not version.strip():
+        return None
+    return ResolvedDependency(
+        uri=f"pkg:pypi/{_normalize_pypi_name(name)}@{version.strip()}", digest=_poetry_package_digest(pkg)
+    )
+
+
+def parse_poetry_lock(path: Union[str, Path]) -> List[ResolvedDependency]:
+    """Parses a poetry.lock (Python) file's [[package]] entries into
+    ResolvedDependency, same TOML shape as uv.lock (a sibling Python
+    lockfile format, both parsed with the stdlib tomllib) but with real
+    per-file sha256 hashes under each entry's own `files` array rather
+    than a single wheels[0]/sdist.hash pair. Returns [] on any missing/
+    unreadable/malformed input."""
+    text = _read_text_safe(path)
+    if text is None:
+        return []
+
+    try:
+        doc = tomllib.loads(text)
+    except (tomllib.TOMLDecodeError, ValueError):
+        return []
+
+    packages = doc.get("package") if isinstance(doc, dict) else None
+    if not isinstance(packages, list):
+        return []
+
+    deps: List[ResolvedDependency] = []
+    for pkg in packages:
+        if isinstance(pkg, dict):
+            dep = _poetry_package_to_dependency(pkg)
+            if dep:
+                deps.append(dep)
+    return deps
+
+
+# --------------------------------------------------------------------------
+# Python: Pipfile.lock (Pipenv)
+# --------------------------------------------------------------------------
+
+def _pipfile_lock_entry_to_dependency(name: str, entry: Dict[str, Any]) -> Optional[ResolvedDependency]:
+    version = entry.get("version")
+    if not isinstance(version, str) or not version.strip():
+        return None
+    # Pipfile.lock's own version strings carry a PEP 440 operator prefix
+    # ("==1.3.1", always "==" in practice -- Pipenv only ever locks to an
+    # exact pin) that a purl version has no business including.
+    version = version.strip().lstrip("=").strip()
+    if not version:
+        return None
+
+    digest: Dict[str, str] = {}
+    hashes = entry.get("hashes")
+    if isinstance(hashes, list):
+        for raw_hash in hashes:
+            if isinstance(raw_hash, str) and ":" in raw_hash:
+                algo, _, hex_value = raw_hash.partition(":")
+                algo, hex_value = algo.strip(), hex_value.strip()
+                if algo and hex_value:
+                    digest[algo] = hex_value
+                    break  # first well-formed hash wins -- see poetry's own digest picker for why "one of several real per-file hashes" is an inherent digest: Dict[str, str] limitation, not special-cased differently here
+
+    return ResolvedDependency(uri=f"pkg:pypi/{_normalize_pypi_name(name)}@{version}", digest=digest)
+
+
+def parse_pipfile_lock(path: Union[str, Path]) -> List[ResolvedDependency]:
+    """Parses a Pipfile.lock (Pipenv) file's `default` and `develop`
+    dependency maps into ResolvedDependency, decoding each entry's own
+    `hashes` array (real sha256 hashes, one per distributed file --
+    picks the first well-formed one; see _pipfile_lock_entry_to_dependency).
+    Both sections are included -- Pipenv's own distinction between
+    "runtime" and "dev" dependencies doesn't map onto anything this
+    module's callers use resolved_dependencies for, and every other
+    ecosystem parser here includes dev/test dependencies too (uv.lock's
+    [[package]] array has no runtime/dev split at all to even exclude
+    from). Returns [] on any missing/unreadable/malformed input, or a
+    file with neither section present."""
+    text = _read_text_safe(path)
+    if text is None:
+        return []
+
+    try:
+        doc = json.loads(text)
+    except (json.JSONDecodeError, RecursionError):
+        return []
+
+    if not isinstance(doc, dict):
+        return []
+
+    deps: List[ResolvedDependency] = []
+    for section in ("default", "develop"):
+        entries = doc.get(section)
+        if not isinstance(entries, dict):
+            continue
+        for name, entry in entries.items():
+            if isinstance(name, str) and isinstance(entry, dict):
+                dep = _pipfile_lock_entry_to_dependency(name, entry)
+                if dep:
+                    deps.append(dep)
     return deps
 
 
@@ -529,6 +687,182 @@ def parse_pnpm_lock(path: Union[str, Path]) -> List[ResolvedDependency]:
 
 
 # --------------------------------------------------------------------------
+# JavaScript/TypeScript: yarn.lock (Classic v1 and Berry v2+)
+# --------------------------------------------------------------------------
+
+_YARN_CLASSIC_VERSION_LINE = re.compile(r'^\s+version\s+"([^"]+)"\s*$')
+# Deliberately unquoted in real Yarn Classic output (unlike npm's own SRI
+# string, which is always JSON-quoted) -- see parse_yarn_lock()'s own
+# docstring; the payload itself is the identical SRI shape either way.
+_YARN_CLASSIC_INTEGRITY_LINE = re.compile(r"^\s+integrity\s+(\S+)\s*$")
+
+# Yarn Berry's own block-header line -- single or comma-separated
+# "name@npm:range" specifiers, quoted, e.g.
+# '"@babel/code-frame@npm:^7.0.0":' -- needs no dedicated regex of its
+# own: structurally it's the same "non-indented line" shape Classic's
+# header is, so both generations' scanners detect one identically
+# (`not line[0].isspace()`) and hand it to the same
+# _yarn_first_specifier_name() either way.
+_YARN_BERRY_VERSION_LINE = re.compile(r"^\s+version:\s*(\S+)\s*$")
+_YARN_BERRY_CHECKSUM_LINE = re.compile(r"^\s+checksum:\s*(\S+)\s*$")
+
+
+def _yarn_first_specifier_name(key_line: str) -> Optional[str]:
+    """Extracts just the package name out of a yarn.lock block-header
+    line's *first* specifier -- 'foo@^1.0.0, foo@^1.1.0:' and
+    '\"@scope/foo@npm:^1.0.0\":' both -> the name before the range. Every
+    comma-separated specifier on one block names the same package (that's
+    the whole reason yarn merged them into one block), so only the first
+    is needed. Reuses the same "second '@' for a scoped name, first '@'
+    otherwise" rule pnpm's own key-splitting uses (_pnpm_split_key) --
+    same underlying npm package-naming convention."""
+    first = key_line.split(",", 1)[0].strip().rstrip(":").strip()
+    if first.startswith('"') and first.endswith('"'):
+        first = first[1:-1]
+    if not first:
+        return None
+    at_index = first.find("@", 1) if first.startswith("@") else first.find("@")
+    if at_index <= 0:
+        return None
+    return first[:at_index]
+
+
+def _is_yarn_berry(text: str) -> bool:
+    """Yarn Berry (v2+) lockfiles always open with a top-level
+    `__metadata:` block; Classic (v1) ones never have one -- the same
+    real, documented signal Yarn's own tooling uses to reject a Classic
+    lockfile as unreadable by Berry and vice versa (see e.g.
+    yarnpkg/berry#6042, "'__metadata' key not found in yarn.lock, must be
+    a Yarn classic lockfile"). Checked as an unindented line match, not a
+    bare substring search, so a dependency literally named
+    "__metadata" (were that ever legal) couldn't false-positive this."""
+    return any(line.rstrip("\n") == "__metadata:" for line in text.splitlines())
+
+
+def _parse_yarn_classic(text: str) -> List[ResolvedDependency]:
+    deps: List[ResolvedDependency] = []
+    name: Optional[str] = None
+    version: Optional[str] = None
+    integrity: Optional[str] = None
+
+    def _flush() -> None:
+        if name and version:
+            digest = _decode_sri_integrity(integrity) if integrity else {}
+            deps.append(ResolvedDependency(uri=f"{_npm_purl(name)}@{version}", digest=digest))
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip("\n")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+
+        if not line[0].isspace():
+            _flush()
+            name = _yarn_first_specifier_name(line)
+            version = None
+            integrity = None
+            continue
+
+        if name is None:
+            continue  # a stray indented line before any real block header
+
+        version_match = _YARN_CLASSIC_VERSION_LINE.match(line)
+        if version_match:
+            version = version_match.group(1)
+            continue
+        integrity_match = _YARN_CLASSIC_INTEGRITY_LINE.match(line)
+        if integrity_match:
+            integrity = integrity_match.group(1)
+
+    _flush()
+    return deps
+
+
+def _parse_yarn_berry(text: str) -> List[ResolvedDependency]:
+    deps: List[ResolvedDependency] = []
+    name: Optional[str] = None
+    version: Optional[str] = None
+    checksum: Optional[str] = None
+
+    def _flush() -> None:
+        if name and version:
+            deps.append(ResolvedDependency(uri=f"{_npm_purl(name)}@{version}", digest=_decode_yarn_berry_checksum(checksum)))
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip("\n")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+
+        if not line[0].isspace():
+            if line != "__metadata:":
+                _flush()
+                name = _yarn_first_specifier_name(line)
+                version = None
+                checksum = None
+            else:
+                _flush()
+                name = None
+            continue
+
+        if name is None:
+            continue
+
+        version_match = _YARN_BERRY_VERSION_LINE.match(line)
+        if version_match:
+            version = version_match.group(1).strip('"')
+            continue
+        checksum_match = _YARN_BERRY_CHECKSUM_LINE.match(line)
+        if checksum_match:
+            checksum = checksum_match.group(1)
+
+    _flush()
+    return deps
+
+
+def _decode_yarn_berry_checksum(checksum: Optional[str]) -> Dict[str, str]:
+    """Decodes a Yarn Berry `checksum:` field -- '<cache-key-version>/
+    <hex>', e.g. '10/6eebd12a5cd...9d6c0a' -- to {algo: hex}. The hex
+    portion is consistently 128 characters in every real lockfile
+    confirmed while writing this (github.com/yarnpkg/berry's own
+    yarn.lock), which is exactly a raw (unencoded) SHA-512 digest's
+    length -- Berry's own checksum is documented as a SHA-512 of the
+    package archive, prefixed with a cache-format version for
+    invalidation, not SRI or base64 like every other digest this module
+    decodes. A checksum that doesn't split into exactly two '/'-separated
+    parts, or whose hex portion isn't 128 hex characters, degrades to {}
+    rather than guessed at -- a future Berry cache-format bump changing
+    the hash algorithm would show up here as a length mismatch, not a
+    silently wrong algorithm label."""
+    if not checksum or "/" not in checksum:
+        return {}
+    _, _, hex_value = checksum.rpartition("/")
+    hex_value = hex_value.strip()
+    if len(hex_value) == 128 and re.fullmatch(r"[0-9a-fA-F]+", hex_value):
+        return {"sha512": hex_value.lower()}
+    return {}
+
+
+def parse_yarn_lock(path: Union[str, Path]) -> List[ResolvedDependency]:
+    """Parses a yarn.lock (Yarn Classic v1, or Yarn Berry v2+) file into
+    ResolvedDependency, dispatching on which generation it is
+    (_is_yarn_berry) since the two are structurally different formats
+    that happen to share a filename -- Classic is a bespoke text format
+    (unquoted `integrity <sri-string>`), Berry is real YAML-shaped
+    (`checksum: <n>/<hex>`, no SRI at all). Both are parsed with the same
+    minimal line-scanner approach pnpm-lock.yaml's parser uses, for the
+    same reason (see parse_pnpm_lock()'s own docstring) -- Berry's format
+    happens to be YAML, but this module has no YAML dependency to lean on
+    for it either. Confirmed against real, current lockfiles for both
+    generations (github.com/yarnpkg/yarn and github.com/yarnpkg/berry's
+    own yarn.lock files) before writing this, not assumed from memory.
+    Returns [] on any missing/unreadable input, or a file with no
+    resolvable package blocks at all."""
+    text = _read_text_safe(path)
+    if text is None:
+        return []
+    return _parse_yarn_berry(text) if _is_yarn_berry(text) else _parse_yarn_classic(text)
+
+
+# --------------------------------------------------------------------------
 # Go: go.sum
 # --------------------------------------------------------------------------
 
@@ -620,6 +954,90 @@ def parse_gradle_lockfile(path: Union[str, Path]) -> List[ResolvedDependency]:
 
 
 # --------------------------------------------------------------------------
+# Java: Gradle build script fallback (build.gradle / build.gradle.kts)
+# --------------------------------------------------------------------------
+
+# A dependency-configuration call carrying a literal "group:artifact:version"
+# GAV string, in either DSL: Groovy's `implementation 'g:a:v'` (parens
+# optional) or Kotlin's `implementation("g:a:v")` (parens required, but
+# this doesn't need to tell the two apart -- both use identical
+# configuration-name and quoted-GAV-string shapes). Deliberately not
+# anchored to end-of-line: a real declaration is often followed by a
+# `{ exclude ... }` configuration block or a trailing comment, which this
+# has no need to parse, only to stop before.
+_GRADLE_BUILD_DEPENDENCY = re.compile(
+    r"""^\s*(?:implementation|api|compile|testImplementation|testCompile|compileOnly|
+        testCompileOnly|runtimeOnly|testRuntimeOnly|annotationProcessor|
+        testAnnotationProcessor|kapt|testKapt|providedCompile|feature)
+        \s*\(?\s*['"]([^:'"]+):([^:'"]+):([^:'"]+)['"]""",
+    re.VERBOSE,
+)
+
+
+def _is_pinned_gradle_version(version: str) -> bool:
+    """A literal GAV string's version segment is only treated as
+    "resolved" the same way this module treats every other ecosystem's
+    pin -- excludes Gradle's own dynamic-version syntax (`31.+`, `+`) and
+    Ivy-style version ranges (`[1.0,2.0)`, `(,2.0]`) exactly the way
+    parse_maven_pom_dependencies() already excludes an unresolved
+    `${...}` property placeholder: a range or a floating "whatever's
+    newest" marker isn't a pinned coordinate, even though it's a literal
+    string sitting right there in the build file."""
+    version = version.strip()
+    return bool(version) and not any(c in version for c in "+[](),$")
+
+
+def _gradle_build_line_to_dependency(match: "re.Match[str]") -> Optional[ResolvedDependency]:
+    group, artifact, version = (s.strip() for s in match.groups())
+    if not group or not artifact or not _is_pinned_gradle_version(version):
+        return None
+    return ResolvedDependency(uri=f"pkg:maven/{group}/{artifact}@{version}")
+
+
+def parse_gradle_build_file(path: Union[str, Path]) -> List[ResolvedDependency]:
+    """Fallback for a Gradle project with no gradle.lockfile at all --
+    the common case, since `dependencyLocking` is opt-in and most real
+    Gradle projects never enable it (unlike Maven, where
+    parse_maven_pom_dependencies() reads pom.xml's always-present
+    declared dependencies directly, with no separate lock-file
+    requirement -- this closes that same asymmetry for Gradle). Regex-
+    matches literal `<configuration> 'group:artifact:version'` /
+    `<configuration>(\"group:artifact:version\")` declarations across
+    both Gradle DSLs (build.gradle / build.gradle.kts) -- deliberately
+    does NOT attempt map-notation (`group: 'x', name: 'y', version: 'z'`),
+    version-catalog references (`libs.guava`), or variable interpolation
+    (`\"$group:$artifact:$version\"`); a build script is a real
+    programming language (Groovy/Kotlin), and matching the common,
+    literal-string-coordinate case is the realistic scope for a regex
+    scanner, the same tradeoff parse_gradle_lockfile's own regex already
+    makes for its simpler, fully-structured input. A dynamic-version
+    coordinate (`31.+`) or an Ivy-style range (`[1.0,2.0)`) is excluded
+    the same way an unresolved `${...}` Maven property is -- see
+    _is_pinned_gradle_version. Digests are always {} (a build script
+    carries no hash, same as gradle.lockfile itself). When a real
+    gradle.lockfile also exists in the same repo, this fallback still
+    runs -- harmless: both sources produce the same `pkg:maven/...` URI
+    for a genuinely matching coordinate, deduplicated downstream by
+    detect_and_parse_dependencies() the same way any two lockfiles
+    naming the same dependency already are. Returns [] on any missing/
+    unreadable input."""
+    text = _read_text_safe(path)
+    if text is None:
+        return []
+
+    deps: List[ResolvedDependency] = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("//"):
+            continue
+        match = _GRADLE_BUILD_DEPENDENCY.match(line)
+        if match:
+            dep = _gradle_build_line_to_dependency(match)
+            if dep:
+                deps.append(dep)
+    return deps
+
+
+# --------------------------------------------------------------------------
 # Java: Maven (pom.xml / dependency-tree XML export)
 # --------------------------------------------------------------------------
 
@@ -701,11 +1119,16 @@ def parse_maven_pom_dependencies(path: Union[str, Path]) -> List[ResolvedDepende
 
 _LOCKFILE_PARSERS: Dict[str, Callable[[Union[str, Path]], List[ResolvedDependency]]] = {
     "uv.lock": parse_uv_lock,
+    "poetry.lock": parse_poetry_lock,
+    "Pipfile.lock": parse_pipfile_lock,
     "requirements.txt": parse_pip_compile_requirements,
     "package-lock.json": parse_package_lock_json,
     "pnpm-lock.yaml": parse_pnpm_lock,
+    "yarn.lock": parse_yarn_lock,
     "go.sum": parse_go_sum,
     "gradle.lockfile": parse_gradle_lockfile,
+    "build.gradle": parse_gradle_build_file,
+    "build.gradle.kts": parse_gradle_build_file,
     "pom.xml": parse_maven_pom_dependencies,
 }
 
@@ -733,20 +1156,26 @@ def _iter_lockfiles(repo_dir: Path) -> Iterator[Tuple[str, Path]]:
 
 
 def detect_and_parse_dependencies(repo_dir: Union[str, Path]) -> List[Dict[str, Any]]:
-    """Auto-detects lockfiles under repo_dir (uv.lock, requirements.txt,
-    package-lock.json, pnpm-lock.yaml, go.sum, gradle.lockfile, pom.xml --
-    any number/combination, at any depth outside vendored/build
-    directories), parses each with its matching ecosystem parser, and
-    aggregates the results into a flat
+    """Auto-detects lockfiles under repo_dir (uv.lock, poetry.lock,
+    Pipfile.lock, requirements.txt, package-lock.json, pnpm-lock.yaml,
+    yarn.lock, go.sum, gradle.lockfile, build.gradle/build.gradle.kts,
+    pom.xml -- any number/combination, at any depth outside vendored/
+    build directories), parses each with its matching ecosystem parser,
+    and aggregates the results into a flat
     list of ResolvedDependency dicts (see `ResolvedDependency.to_dict`),
-    deduplicated by `uri` (first lockfile to produce a given URI wins).
-    A `requirements.txt` that turns out not to be real pip-compile output
-    (no `--hash=` lines at all) contributes nothing here, same as if it
-    didn't exist -- see parse_pip_compile_requirements()'s own docstring;
-    filename-based auto-detection alone can't tell it apart from a
-    hand-written one, so the parser itself is what fails closed. Returns
-    [] if repo_dir doesn't exist/isn't a readable directory, or no known
-    lockfiles are found under it -- never raises."""
+    deduplicated by `uri` (first lockfile to produce a given URI wins --
+    when both a real gradle.lockfile and a build.gradle fallback are
+    present and name the same coordinate, which one's entry survives
+    depends on directory-walk order; harmless, since neither carries a
+    digest to lose over the other -- see parse_gradle_build_file()'s own
+    docstring). A `requirements.txt` that turns out not to be real
+    pip-compile output (no `--hash=` lines at all) contributes nothing
+    here, same as if it didn't exist -- see
+    parse_pip_compile_requirements()'s own docstring; filename-based
+    auto-detection alone can't tell it apart from a hand-written one, so
+    the parser itself is what fails closed. Returns [] if repo_dir
+    doesn't exist/isn't a readable directory, or no known lockfiles are
+    found under it -- never raises."""
     try:
         resolved_dir = safe_resolve_path(repo_dir)
     except UnsafePathError:

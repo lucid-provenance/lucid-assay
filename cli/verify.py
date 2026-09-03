@@ -87,27 +87,30 @@ SLSA_PROVENANCE_PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
 # Sigstore's --cert-identity check (see
 # _slsa_check_isolated_provenance_generation), which does encode the ref.
 #
-# Two entries, deliberately: lucid-attest/sign.yml (constructs +
-# self-signs provenance via a pinned Docker image run locally in that
-# job) and lucid-attest-service/sign-client.yml (constructs provenance
-# the same way, but delegates the actual Sigstore operation to the
-# shared lucid-attest-service Lambda). Different signing mechanism,
-# same trust property: GitHub's OIDC job_workflow_ref claim (and hence
-# the Fulcio certificate identity Sigstore issues) reflects the reusable
-# workflow FILE's own path for a job that mints its own token inside a
-# workflow_call invocation, regardless of which repo's `uses:` line
-# invoked it -- confirmed against sign.yml's own real, working precedent
-# before adding this second entry, not assumed. That's what makes each
-# one, individually reviewed, sufficient to trust every future caller of
-# that file -- see the Lucid vault's "Serverless signer needs a
-# trustworthy provenance builder identity" note for the full reasoning
-# this resolves. Deliberately still an explicit, narrow allowlist rather
-# than a pattern/prefix match on either entry -- see
+# One entry: lucid-attest-service/sign-client.yml (constructs SLSA
+# provenance from its own isolated context, then delegates the actual
+# Sigstore operation to the shared lucid-attest-service Lambda).
+# GitHub's OIDC job_workflow_ref claim (and hence the Fulcio certificate
+# identity Sigstore issues) reflects the reusable workflow FILE's own
+# path for a job that mints its own token inside a workflow_call
+# invocation, regardless of which repo's `uses:` line invoked it --
+# that's what makes this one, individually reviewed, sufficient to trust
+# every future caller of that file -- see the Lucid vault's "Serverless
+# signer needs a trustworthy provenance builder identity" note for the
+# full reasoning this resolves. Deliberately still an explicit, narrow
+# allowlist rather than a pattern/prefix match -- see
 # TRUSTED_HOSTED_BUILDER_IDS's own comment below for why a claim this
 # security-sensitive must fail closed on anything not individually
 # reviewed, not be widened into a broader match.
+#
+# lucid-attest/sign.yml -- the original entry, same trust property via
+# a pinned Docker image run locally in that job rather than delegating
+# to a Lambda -- was removed 2026-09-03. lucid-attest is archived on
+# GitHub; every real caller had already cut over to sign-client.yml
+# before the archival, and an archived repo's workflow identity has no
+# business staying in an active trust allowlist once nothing legitimate
+# can still present it.
 TRUSTED_CONTROL_PLANE_BUILDER_IDS = frozenset({
-    "https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml",
     "https://github.com/lucid-provenance/lucid-attest-service/.github/workflows/sign-client.yml",
 })
 
@@ -638,8 +641,8 @@ def _slsa_invocation_origin(predicate: Dict[str, Any]) -> Optional[str]:
     _format_run_identity_report's "CI Run:" line -- that's sourced from the
     RCS/assay statement's predicate.pipeline, which can legitimately be a
     *different* run than the one that constructed the SLSA statement (e.g.
-    the untrusted caller's build job vs. lucid-attest's isolated signer
-    job). A failed Build Level checklist item needs a link to the run that
+    the untrusted caller's build job vs. lucid-attest-service's isolated
+    signer job). A failed Build Level checklist item needs a link to the run that
     actually produced *its own* predicate, so this is threaded through
     _slsa_level_result and rendered directly inside that level's block (see
     _format_slsa_level_block) instead. Returns None, not "", when absent --
@@ -904,10 +907,17 @@ def _evaluate_slsa_l3(
     signer and the builder are provably the same entity) -- against a
     decoded in-toto Statement dict. Purely informational, same contract as
     _evaluate_slsa_l1/_l2 (never raises, never gates `passed` on its
-    own -- see --require-slsa-build-l3 for the opt-in exception). Fails
-    closed and honestly for every caller today: the architecture that
-    would make its two items pass (provenance constructed inside the
-    isolated signer job, not the untrusted build job) doesn't exist yet.
+    own -- see --require-slsa-build-l3 for the opt-in exception). Both
+    items genuinely pass today, confirmed against real CI runs across
+    every current caller (lucid-assay, lucid-console, lucid-dsse-collector,
+    lucid-attest-service, 2026-09-03) -- lucid-attest-service's
+    sign-client.yml constructs provenance from its own isolated context
+    when a caller supplies --subject-name/--subject-digest, and its
+    --builder-id matches TRUSTED_CONTROL_PLANE_BUILDER_IDS' sole entry.
+    Not fail-closed-by-architecture-absence anymore; --require-slsa-build-l3
+    stays opt-in because provenance construction is still conditional on a
+    caller providing those two flags, not because the underlying mechanism
+    doesn't exist.
 
     Materialized (locked) dependency evidence used to be a third item
     here; moved into its own section for the same reason described on
@@ -2764,8 +2774,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         dest="require_slsa_build_l3",
         help="fail the gate if this run does not fully (cumulatively) satisfy SLSA Build Level 3 -- "
-        "off by default, since no caller can satisfy it until provenance construction moves into "
-        "lucid-attest's isolated signer job (see cli/verify.py's SLSA Build Level 3 section)",
+        "off by default: it genuinely passes today when a caller supplies --subject-name/"
+        "--subject-digest (confirmed against real CI runs, 2026-09-03), but that's still an opt-in "
+        "caller choice, not universal (see cli/verify.py's SLSA Build Level 3 section)",
     )
     p.add_argument(
         "--format",

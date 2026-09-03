@@ -133,6 +133,63 @@ jobs:
         run: |
           uv sync --frozen --extra dev
 
+      # Generates a canonical CycloneDX SBOM of this repo via Syft, fed to
+      # this repo's own mint step below via --sbom -- closes S2C2F SCA-2
+      # ("License Checks") and backs INV-1/ING-1 from a real, native SBOM.
+      # Same recipe already proven in lucid-console/lucid-dsse-collector/
+      # lucid-attest-service's own dogfood pipelines -- this repo (the one
+      # that actually built --sbom ingestion) was the one dogfood workflow
+      # that never got it wired in, found while auditing the platform for
+      # other supported-language enhancements, not a fresh design. Run
+      # after `uv sync` (deliberately, same as the other three repos'
+      # post-install placement) so the real installed dependency closure
+      # (.venv/) is what gets cataloged, not just pyproject.toml's own
+      # declared ranges -- and before "Execute Tests with Telemetry"
+      # creates build/, so there's no stray build output for Syft to see.
+      # Unlike the other three repos' copy of this step, no --exclude is
+      # needed: lucid-assay's own build job never vendors a second, nested
+      # checkout of itself the way their `_assay/` does.
+      #
+      # --user matches the runner's own UID so Syft's container (whose own
+      # default user isn't the runner's) doesn't write a root-owned
+      # build/sbom.cdx.json into this bind-mounted workspace -- a later
+      # step reading it as the runner user would otherwise fail on
+      # permissions. Same digest-verification discipline as every other
+      # pinned image in this platform: confirmed directly against GHCR's
+      # own API, not copied from an unverified source.
+      - name: Generate CycloneDX SBOM (Syft)
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            ghcr.io/anchore/syft@sha256:95fe0835e5bebc6f8b1f8acef68d47d63d594ef4c0f25c097ff853b23cbac74c \
+            dir:. -o cyclonedx-json=build/sbom.cdx.json
+          test -s build/sbom.cdx.json || { echo "ERROR: Syft did not produce build/sbom.cdx.json" >&2; exit 1; }
+
+      # Platform-agnostic vulnerability scan via Grype, pointed at the SBOM
+      # Syft just generated -- same recipe as the other three repos' own
+      # copy of this step, including its two real fixes: GRYPE_DB_CACHE_DIR
+      # and TMPDIR both redirected (the non-root --user override above has
+      # no writable $HOME for either the vulnerability-DB cache or Grype's
+      # own DB-update-check temp file -- see lucid-console's own comment
+      # for the exact failure this closes, confirmed via a real run
+      # there). Named accurately, not "vulnerability and EOL scan": Grype
+      # does not detect EOL/unmaintained packages.
+      - name: Scan for vulnerabilities (Grype)
+        run: |
+          mkdir -p build/.grype-db-cache build/.grype-tmp
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e GRYPE_DB_CACHE_DIR=/workspace/build/.grype-db-cache \
+            -e TMPDIR=/workspace/build/.grype-tmp \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            ghcr.io/anchore/grype@sha256:8a93fc48da96bd6ec5981279d099b69de11541dc68fdf222fb9161f8ff284af7 \
+            sbom:build/sbom.cdx.json \
+            -o sarif=build/grype.sarif
+          test -s build/grype.sarif || { echo "ERROR: Grype did not produce build/grype.sarif" >&2; exit 1; }
+
       # `uv run --no-sync`: execute inside the environment `uv sync` just
       # populated without uv re-checking/re-syncing it first (already
       # synced explicitly above, so that would just be redundant work) --
@@ -365,6 +422,14 @@ jobs:
           if [ -f build/sonar-measures.json ]; then
             EXTRA_ARGS+=(--sonar-metrics build/sonar-measures.json)
           fi
+          # --sarif is repeatable -- aggregated alongside CodeQL's, not a
+          # replacement for it. Unconditional (not existence-guarded like
+          # CodeQL's own, above): the "Generate CycloneDX SBOM (Syft)" /
+          # "Scan for vulnerabilities (Grype)" steps already hard-fail the
+          # job if they didn't produce their output file, so by the time
+          # this runs both are guaranteed present -- same convention the
+          # other three repos' own copy of this wiring already uses.
+          EXTRA_ARGS+=(--sbom build/sbom.cdx.json --sarif build/grype.sarif)
           # Same existence-guarded pattern: the "Execute Tests with
           # Telemetry" step above always produces this file, but degrading
           # to "real coverage analysis unavailable" (cli.main treats a
@@ -396,11 +461,22 @@ jobs:
             --out build/lucid-assay.unsigned.json \
             "${EXTRA_ARGS[@]}"
 
+          # --sbom above also makes cli.main write a *second*, separate
+          # in-toto statement wrapping the SBOM's own raw document --
+          # fixed-basename-sibling-of-out convention, same check the other
+          # three repos' own copy of this wiring already makes.
+          test -s build/sbom.unsigned.json || {
+            echo "ERROR: --sbom was passed but build/sbom.unsigned.json was not produced (see the mint step's own stderr WARNING above for why)" >&2
+            exit 1
+          }
+
       - name: Upload Unsigned Statements
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: unsigned-statements
-          path: build/lucid-assay.unsigned.json
+          path: |
+            build/lucid-assay.unsigned.json
+            build/sbom.unsigned.json
           if-no-files-found: error
 
   # The *only* job with id-token: write -- signs the RCS statement `build`
@@ -464,6 +540,7 @@ jobs:
       artifact-name: unsigned-statements
       statement-files: |
         lucid-assay.unsigned.json
+        sbom.unsigned.json
       subject-name: ${{ needs.build.outputs.image-ref }}
       subject-digest: ${{ needs.build.outputs.image-digest }}
 

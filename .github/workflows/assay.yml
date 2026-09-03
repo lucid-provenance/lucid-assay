@@ -279,7 +279,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          pulls_json="$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls")"
+          # Right after a merge, GitHub's own "list PRs associated with
+          # commit" API can return an empty response body while its
+          # backend indexing catches up -- confirmed for real (2026-09-03,
+          # lucid-dsse-collector, immediately after merging a real PR): jq
+          # then fails with "unexpected end of JSON input" on the empty
+          # string, a transient race, not a persistent state. Bounded
+          # retry (5 attempts, 3s apart -- provably bounded, never an
+          # unbounded/tight loop, same discipline cli/oidc_signer.py's own
+          # ambient-token-fetch retry already uses) rather than a single
+          # unguarded call.
+          pulls_json=""
+          for attempt in 1 2 3 4 5; do
+            pulls_json="$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls")"
+            echo "$pulls_json" | jq -e . >/dev/null 2>&1 && break
+            echo "WARNING: attempt $attempt/5: commits/.../pulls returned non-JSON (likely a GitHub indexing race right after a merge) -- retrying in 3s" >&2
+            sleep 3
+          done
+          echo "$pulls_json" | jq -e . >/dev/null 2>&1 || { echo "ERROR: commits/.../pulls never returned valid JSON after 5 attempts" >&2; exit 1; }
           echo "base-sha=$(echo "$pulls_json" | jq -r '.[0].base.sha // empty')" >> "$GITHUB_OUTPUT"
           echo "number=$(echo "$pulls_json" | jq -r '.[0].number // empty')" >> "$GITHUB_OUTPUT"
 

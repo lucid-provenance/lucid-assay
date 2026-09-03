@@ -186,6 +186,11 @@ class SchemaValidationGuardTests(_TempFileMixin, unittest.TestCase):
                 "approvals_required": 2, "direct_push_prevented": True, "bypass_actors_count": 0,
                 "admin_enforced": True, "warnings": [], "reason": "clean",
             },
+            "repository_governance": {
+                "available": True, "linear_history_required": True,
+                "force_pushes_blocked": True, "deletions_blocked": True,
+                "commit_signature": {"available": True, "verified": True, "reason": "valid", "signature_type": "gpg"},
+            },
             "artifact": {"subject": {"name": "registry.example.com/org/svc", "digest": {"sha256": SUBJECT_DIGEST}}},
             "test_verification": {
                 "framework": "pytest", "report_format": "junit-xml", "report_sha256": "d" * 64,

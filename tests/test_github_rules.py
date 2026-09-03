@@ -14,9 +14,11 @@ from cli.parsers.github_rules import (
     REASON_CODE_PLATFORM_UNSUPPORTED_TIER,
     bypass_permits_unreviewed_change,
     inspect_branch_governance,
+    _derive_branch_hygiene,
     _derive_required_status_check_contexts,
     _extract_http_error_detail,
     _github_api_get,
+    _has_rule_type,
     _is_platform_tier_limitation,
     _quote_ref,
 )
@@ -719,6 +721,68 @@ class DeriveRequiredStatusCheckContextsTests(unittest.TestCase):
         report = inspect_branch_governance("acme/widgets", "main", token=None)
         self.assertFalse(report.available)
         self.assertEqual(report.required_status_check_contexts, [])
+
+
+class DeriveBranchHygieneTests(unittest.TestCase):
+    def test_has_rule_type_true_when_present(self):
+        self.assertTrue(_has_rule_type([{"type": "deletion"}], "deletion"))
+
+    def test_has_rule_type_false_when_absent(self):
+        self.assertFalse(_has_rule_type([{"type": "pull_request"}], "deletion"))
+
+    def test_has_rule_type_false_on_empty_rules(self):
+        self.assertFalse(_has_rule_type([], "deletion"))
+
+    def test_has_rule_type_skips_non_dict_entries(self):
+        self.assertFalse(_has_rule_type(["not-a-dict", None], "deletion"))
+
+    def test_all_three_hygiene_rules_active(self):
+        rules = [{"type": "required_linear_history"}, {"type": "non_fast_forward"}, {"type": "deletion"}]
+        self.assertEqual(_derive_branch_hygiene(rules), (True, True, True))
+
+    def test_none_active(self):
+        rules = [{"type": "pull_request"}]
+        self.assertEqual(_derive_branch_hygiene(rules), (False, False, False))
+
+    def test_partial_mix(self):
+        rules = [{"type": "deletion"}]
+        self.assertEqual(_derive_branch_hygiene(rules), (False, False, True))
+
+    def test_inspect_branch_governance_populates_hygiene_fields(self):
+        with patch("cli.parsers.github_rules._github_api_get") as mock_get:
+            mock_get.side_effect = _api_get_router({
+                "/repos/acme/widgets/rules/branches/main": [
+                    _pull_request_rule(2),
+                    {"type": "required_linear_history"},
+                    {"type": "non_fast_forward"},
+                    {"type": "deletion"},
+                ],
+                "/repos/acme/widgets/rulesets": [],
+            })
+            report = inspect_branch_governance("acme/widgets", "main", token="tok")
+
+        self.assertTrue(report.linear_history_required)
+        self.assertTrue(report.force_pushes_blocked)
+        self.assertTrue(report.deletions_blocked)
+
+    def test_unavailable_report_has_false_hygiene_fields(self):
+        report = inspect_branch_governance("acme/widgets", "main", token=None)
+        self.assertFalse(report.available)
+        self.assertFalse(report.linear_history_required)
+        self.assertFalse(report.force_pushes_blocked)
+        self.assertFalse(report.deletions_blocked)
+
+    def test_as_dict_includes_hygiene_fields(self):
+        with patch("cli.parsers.github_rules._github_api_get") as mock_get:
+            mock_get.side_effect = _api_get_router({
+                "/repos/acme/widgets/rules/branches/main": [_pull_request_rule(1), {"type": "deletion"}],
+                "/repos/acme/widgets/rulesets": [],
+            })
+            report = inspect_branch_governance("acme/widgets", "main", token="tok")
+        d = report.as_dict()
+        self.assertEqual(d["linear_history_required"], False)
+        self.assertEqual(d["force_pushes_blocked"], False)
+        self.assertEqual(d["deletions_blocked"], True)
 
 
 class ScorerFailClosedIntegrationTests(unittest.TestCase):

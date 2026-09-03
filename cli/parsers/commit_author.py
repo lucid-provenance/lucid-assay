@@ -22,6 +22,24 @@ and it does not require cryptographic commit signing (GPG/SSH-signed
 commits would be a stronger binding still, but cli.verify's Source
 Level 3 check doesn't demand it -- see that module's docstring).
 
+The *same response* also carries `commit.verification` (GitHub's own
+cryptographic-signature check: `verified`, `reason`, and the raw
+`signature` blob when one exists) -- extracted here too
+(commit_signature_verified/_reason/_type) since it's the same API call
+already being made, not a second fetch. Deliberately not folded into
+`verified_github_account`/Source Level 3 above: this is a genuinely
+different, stronger claim (cryptographic proof the commit content
+itself wasn't altered after signing, vs. GitHub's email-matching
+account link), consumed instead by cli.verify's separate Repository &
+Workstation Governance section -- see that module's own docstring for
+why the two are kept apart rather than combined into one signal.
+`commit_signature_type` ("gpg"/"ssh") is inferred from the raw
+signature blob's own PEM-style header when `verification.signature` is
+present -- GitHub's API doesn't expose a parsed key ID/fingerprint
+directly, and parsing one out of the raw OpenPGP/SSH signature packet
+format is deliberately out of scope here; only genuinely-available data
+is reported, nothing synthesized to look more complete than it is.
+
 Hardened against (mirrors cli.parsers.github_rules -- see that
 module's docstring for the shared rationale, reused here directly
 rather than re-implemented):
@@ -64,6 +82,17 @@ class CommitAuthorReport:
     github_login: Optional[str] = None
     verified_github_account: bool = False
     reason: str = ""
+    # commit.verification's own fields -- see this module's docstring for
+    # why these are separate from verified_github_account/reason above.
+    # None (not False/"") for both commit_signature_verified and
+    # commit_signature_type when unavailable/not captured -- distinct
+    # from a confirmed-unsigned commit (verified=False, a real, checked
+    # answer), same "None means not asked, False means asked and no"
+    # discipline this module already applies to verified_github_account
+    # via `available`.
+    commit_signature_verified: Optional[bool] = None
+    commit_signature_reason: Optional[str] = None
+    commit_signature_type: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -74,6 +103,9 @@ class CommitAuthorReport:
             "github_login": self.github_login,
             "verified_github_account": self.verified_github_account,
             "reason": self.reason,
+            "commit_signature_verified": self.commit_signature_verified,
+            "commit_signature_reason": self.commit_signature_reason,
+            "commit_signature_type": self.commit_signature_type,
         }
 
 
@@ -114,6 +146,21 @@ def _fetch_commit_body(
         return None, _unavailable(commit_sha, f"GitHub API request failed: {e}")
 
 
+def _signature_type_from_blob(signature: Any) -> Optional[str]:
+    """Infers "gpg" or "ssh" from the raw signature blob's own PEM-style
+    header -- the only place this distinction is actually observable in
+    GitHub's response (no separate, parsed "algorithm" field exists).
+    None for a malformed/absent/unrecognized blob -- never guessed."""
+    if not isinstance(signature, str):
+        return None
+    text = signature.lstrip()
+    if text.startswith("-----BEGIN SSH SIGNATURE-----"):
+        return "ssh"
+    if text.startswith("-----BEGIN PGP SIGNATURE-----"):
+        return "gpg"
+    return None
+
+
 def _report_from_commit_body(body: Any, commit_sha: str) -> CommitAuthorReport:
     if not isinstance(body, dict):
         return _unavailable(commit_sha, "unexpected response shape from GitHub commits API")
@@ -130,6 +177,13 @@ def _report_from_commit_body(body: Any, commit_sha: str) -> CommitAuthorReport:
     login = _as_dict(body.get("author")).get("login")
     login = login if isinstance(login, str) and login else None
 
+    verification = _as_dict(commit_obj.get("verification"))
+    signature_verified = verification.get("verified")
+    signature_verified = signature_verified if isinstance(signature_verified, bool) else None
+    signature_reason = verification.get("reason")
+    signature_reason = signature_reason if isinstance(signature_reason, str) and signature_reason else None
+    signature_type = _signature_type_from_blob(verification.get("signature"))
+
     return CommitAuthorReport(
         available=True,
         commit_sha=commit_sha,
@@ -142,6 +196,9 @@ def _report_from_commit_body(body: Any, commit_sha: str) -> CommitAuthorReport:
             if login
             else "commit author email does not resolve to a linked, verified GitHub account"
         ),
+        commit_signature_verified=signature_verified,
+        commit_signature_reason=signature_reason,
+        commit_signature_type=signature_type,
     )
 
 

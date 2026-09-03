@@ -2,7 +2,7 @@
 Covers:
 - Verification of non-Assay predicates (SLSA provenance)
 - GitHub API failures for commit author (Source Level 3)
-- Malformed PURLs/Hashes in resolved dependencies (Build Level 3)
+- Malformed PURLs/Hashes in resolved dependencies (Dependency Materialization Evidence)
 - Size limits and malformed envelope handling
 """
 from __future__ import annotations
@@ -79,30 +79,25 @@ def test_commit_author_unlinked_account_failure():
     )
     assert report.verified_github_account is False
 
-def test_build_l3_malformed_dependencies(monkeypatch):
-    """Build Level 3 should fail if resolvedDependencies are missing hashes or PURLs."""
-    monkeypatch.setattr("cli.verify._verify_sigstore_identity", lambda *a, **k: ("skipped", "mock"))
-    
-    # Predicate with bad resolvedDependencies
-    predicate = {
-        "buildDefinition": {
-            "resolvedDependencies": [
-                {"uri": "not-a-purl"}, # No pkg: prefix
-                {"uri": "pkg:maven/foo", "digest": {}} # Missing sha256
-            ]
-        }
-    }
-    statement = {
-        "_type": "https://in-toto.io/Statement/v1",
-        "predicateType": EXPECTED_PREDICATE_TYPE,
-        "predicate": predicate
-    }
-    
-    from cli.verify import _evaluate_slsa_l3
-    l3_result = _evaluate_slsa_l3(statement, identity_status="skipped", cert_identity=None)
-    
-    # The "Materialized Locked Dependencies" check should fail
-    dep_check = next(i for i in l3_result["items"] if "Materialized Locked Dependencies" in i["label"])
+def test_dependency_governance_malformed_dependencies():
+    """The Dependency Materialization Evidence section's locked-dependency
+    check should fail if resolved_dependencies are missing hashes or
+    PURLs. Used to be Build Level 3's own "Materialized Locked
+    Dependencies" item (buildDefinition.resolvedDependencies) -- moved out
+    of the SLSA Build Track entirely (it doesn't define a dependency-
+    materialization level) into its own section, reading lucid-assay's
+    own predicate.resolved_dependencies instead. See cli/verify.py's
+    _dependency_check_locked / _format_dependency_governance_report."""
+    from cli.verify import _dependency_check_locked
+
+    # lucid-assay's own resolved_dependencies -- not SLSA provenance's
+    # buildDefinition.resolvedDependencies.
+    resolved_dependencies = [
+        {"uri": "not-a-purl"},  # No pkg: prefix
+        {"uri": "pkg:maven/foo", "digest": {}},  # Missing sha256
+    ]
+
+    dep_check = _dependency_check_locked(resolved_dependencies)
     assert dep_check["passed"] is False
     assert "no 'pkg:' PURL entries with a sha256 or sha512 digest found" in dep_check["detail"]
 

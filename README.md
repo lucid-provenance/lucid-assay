@@ -546,11 +546,13 @@ algorithm→hex-digest map, empty when the lockfile format itself carries no
 digest, e.g. Gradle/Maven), deduplicated by `uri`, `[]` when no recognized
 lockfile is found. Like `static_analysis`, this is purely additive
 predicate data — it's never an RCS scoring input. **It's also unrelated to
-the SLSA v1.0 Build Level 2 checklist's "Materialized Resolved
-Dependencies" item below**, which reads a differently-shaped
-`buildDefinition.resolvedDependencies` on a SLSA-provenance predicate;
-lucid-assay's own predicate isn't SLSA-shaped (see the checklist section),
-so populating this field doesn't change that item's outcome.
+SLSA v1.0 provenance's `buildDefinition.resolvedDependencies`** on a
+SLSA-provenance predicate — a differently-shaped field on a differently-
+shaped predicate; lucid-assay's own predicate isn't SLSA-shaped. This is
+the field `cli/verify.py`'s Dependency Materialization Evidence section
+reads (see "Verification (admission gate)" below) — deliberately **not**
+part of the SLSA Build Track checklist, since SLSA v1.0's ratified Build
+Track doesn't define a dependency-materialization level.
 
 ### Vanity-test-aware "real" coverage (`--coverage-contexts`)
 
@@ -624,7 +626,8 @@ above), `SCA-3` (GitHub Dependabot alerts API reachability), `INV-2`
 (`SECURITY.md` via the GitHub community-profile API), `UPD-3`
 (a Dependabot/Renovate config file), `AUD-2`/`AUD-3` (resolved-dependency
 inventory / pkg: PURL + sha256/sha512 digest — the same hermeticity check
-`cli/verify.py`'s SLSA Build Level 3 checklist uses), `ENF-1` (branch
+`cli/verify.py`'s Dependency Materialization Evidence section's
+"Materialized Locked Dependencies" item uses), `ENF-1` (branch
 requires a PR and blocks direct pushes), and `AUD-1` (a required status
 check on the branch names a provenance/attestation verification job —
 see `github_rules.BranchGovernanceReport.required_status_check_contexts`).
@@ -805,10 +808,10 @@ output carries the same underlying data reshaped into `static_analysis.tools`
     },
     "verdict": "FINAL VERDICT: GATED (Source L2 / Build L1) — SLSA Build L2 Incomplete",
     "source": {
-      "level_1": {"level": 1, "track": "Source", "name": "Source Level 1: Version Controlled Source", "passed": true, "items": ["..."]},
-      "level_2": {"level": 2, "track": "Source", "name": "Source Level 2: Verified History & Explicit Lineage", "passed": true, "items": ["..."]},
-      "level_3": {"level": 3, "track": "Source", "name": "Source Level 3: Retained History & Author Identity", "passed": false, "items": ["..."]},
-      "level_4": {"level": 4, "track": "Source", "name": "Source Level 4: Two-Party Code Review & Branch Governance", "passed": false, "items": ["..."]}
+      "level_1": {"level": 1, "track": "Source", "name": "Source Policy Level 1: Version Controlled Source", "passed": true, "items": ["..."]},
+      "level_2": {"level": 2, "track": "Source", "name": "Source Policy Level 2: Verified History & Explicit Lineage", "passed": true, "items": ["..."]},
+      "level_3": {"level": 3, "track": "Source", "name": "Source Policy Level 3: Retained History & Author Identity", "passed": false, "items": ["..."]},
+      "level_4": {"level": 4, "track": "Source", "name": "Source Policy Level 4: Two-Party Code Review & Branch Governance", "passed": false, "items": ["..."]}
     },
     "slsa": {
       "level_1": {
@@ -831,11 +834,17 @@ output carries the same underlying data reshaped into `static_analysis.tools`
         "items": [
           {"label": "Hosted Builder Identity", "passed": false, "detail": "missing runDetails.builder.id"},
           {"label": "Cryptographic Envelope Signature (Sigstore Keyless OIDC)", "passed": true, "detail": ""},
-          {"label": "Authenticated Source Repository Binding", "passed": true, "detail": ""},
-          {"label": "Materialized Resolved Dependencies", "passed": false, "detail": "buildDefinition.resolvedDependencies is missing or empty"}
+          {"label": "Authenticated Source Repository Binding", "passed": true, "detail": ""}
         ]
       },
       "level_3": {"level": 3, "track": "Build", "name": "SLSA Build Level 3", "passed": false, "items": ["..."]}
+    },
+    "dependency_governance": {
+      "items": [
+        {"label": "Materialized Resolved Dependencies (142 packages recorded)", "passed": true, "detail": ""},
+        {"label": "Materialized Locked Dependencies (140 packages locked to hash, 2 floating (no sha256/sha512 digest))", "passed": true, "detail": ""},
+        {"label": "Canonical SBOM Attached", "passed": false, "detail": "predicate.artifact.sbom is absent -- no --sbom was ingested for this run"}
+      ]
     },
     "release_confidence_score": {"score": 89, "degraded": false, "degraded_field_present": true, "degraded_reasons": [], "components": {"...": "..."}},
     "static_analysis": {"tools": {"codeql": {"errors": 0, "warnings": 0}, "sonarcloud": {"quality_gate": "PASSED"}}},
@@ -846,15 +855,20 @@ output carries the same underlying data reshaped into `static_analysis.tools`
   ```
   `source.level_1`..`level_4` and `slsa.level_1`..`level_3` are exactly
   `result.source_level1`..`source_level4`/`slsa_level1`..`slsa_level3` —
-  the same SLSA Source Track and Build Track checklists the text
+  the same Source Track and SLSA Build Track checklists the text
   formatter renders to stderr via `_format_track_report` (see "SLSA
   Source & Build Track checklists" below for what each item means and
   how each level builds on the one below it), reshaped as JSON here
   rather than recomputed, so `--format json` and the default text output
-  can never disagree about SLSA compliance for the same run. `verdict` is
-  the same synthesized `FINAL VERDICT: ...` headline the text banner
-  prints (see below) — the highest level each track cumulatively
-  satisfies, plus the actual hard-gate outcome.
+  can never disagree about SLSA compliance for the same run.
+  `dependency_governance.items` is `result.dependency_governance_items` —
+  lucid-assay's own dependency/SBOM evidence (`predicate.
+  resolved_dependencies` + `predicate.artifact.sbom`), deliberately
+  **not** part of `slsa.level_2`/`level_3` (see the Dependency
+  Materialization Evidence section below for why). `verdict` is the same
+  synthesized `FINAL VERDICT: ...` headline the text banner prints (see
+  below) — the highest level each track cumulatively satisfies, plus the
+  actual hard-gate outcome.
 
   `--json` (no `-f`) is kept as a **deprecated alias** for `--format json`
   — it emits the same payload and prints a one-line deprecation notice to
@@ -869,7 +883,7 @@ part of the signed DSSE payload:
 ```json
 "_verdict": {
   "word": "GATED",
-  "banner": "FINAL VERDICT: GATED (Source L3 / Build L3) — SLSA Source L4 Incomplete",
+  "banner": "FINAL VERDICT: GATED (Source L3 / Build L3) — Source Policy L4 Incomplete",
   "passed": true,
   "rcs_value": 86,
   "degraded": true,
@@ -960,6 +974,33 @@ statement(s) against both halves of the SLSA v1.0 framework — the
 carries the same data under `source.level_1`..`level_4` and
 `slsa.level_1`..`level_3`; the deprecated `--json` alias does too).
 
+The Build Track is a ratified SLSA v1.0 standard; the Source Track is
+still a draft specification, so its report header and each level's
+`Status:` line say **"Source Policy Level N"**, not "SLSA Source Level
+N" — this project's own policy assessment against that draft, not implied
+compliance with a finalized SLSA standard. Both distinctions are cosmetic
+only: the underlying checks, cumulative leveling, and non-gating contract
+are unchanged.
+
+Dependency-materialization evidence (a `pkg:` PURL + digest count, and
+whether an SBOM is attached) used to be folded into the Build Level 2/3
+Assessment blocks as "Materialized Resolved/Locked Dependencies" items.
+It's been pulled out into its own **Dependency Materialization Evidence**
+section instead: SLSA v1.0's *ratified* Build Track doesn't define a
+dependency-materialization level — that's dependency governance
+([OpenSSF S2C2F](https://github.com/ossf/s2c2f) `ING-1`/`ING-2`
+territory), not a Build Level claim. This section reads lucid-assay's own
+`predicate.resolved_dependencies` + `predicate.artifact.sbom` (see
+`parsers/lockfiles.py` and "SBOM ingestion" above) — never SLSA
+provenance's `buildDefinition.resolvedDependencies` on a differently-
+shaped predicate. It's purely informational like the S2C2F Compliance
+Matrix below it (no cumulative `Status:` line — nothing here gates
+admission), and it is a *different* evaluation from that matrix's own
+`ING-1`/`ING-2` control rows (`parsers/s2c2f.py`'s separate met/unmet
+logic) — the two can legitimately disagree for the same run; this
+section's header names those control IDs only as context for what the
+evidence *informs*, not as a claim that it computes them.
+
 **`--slsa-envelope PATH`** loads a *second* DSSE envelope alongside the
 primary one so both tracks can be evaluated together from the right
 source: the Source track reads `vcs`/`branch_governance` off whichever
@@ -973,22 +1014,22 @@ separate "unavailable" state — the same fail-closed contract this
 checklist has always had.
 
 ```text
-SLSA Source Track
-=== Source Level 1: Version Controlled Source Assessment ===
+Source Track (SLSA Source — Draft Specification)
+=== Source Policy Level 1: Version Controlled Source Assessment ===
 [✓] Version Controlled Source (VCS provider & branch binding)
-Status: PASSED (SLSA Source Level 1)
+Status: PASSED (Source Policy Level 1)
 
-=== Source Level 2: Verified History & Explicit Lineage Assessment ===
+=== Source Policy Level 2: Verified History & Explicit Lineage Assessment ===
 [✓] Verified History & Explicit Lineage (commit SHA, base SHA, PR lineage)
-Status: PASSED (SLSA Source Level 2)
+Status: PASSED (Source Policy Level 2)
 
-=== Source Level 3: Retained History & Author Identity Assessment ===
+=== Source Policy Level 3: Retained History & Author Identity Assessment ===
 [✓] Retained History & Author Identity (commit author resolves to a verified GitHub account) (author: @octocat)
-Status: PASSED (SLSA Source Level 3)
+Status: PASSED (Source Policy Level 3)
 
-=== Source Level 4: Two-Party Code Review & Branch Governance Assessment ===
+=== Source Policy Level 4: Two-Party Code Review & Branch Governance Assessment ===
 [✓] Two-Party Code Review & Branch Governance (branch_governance.approvals_required >= 1) (2 approval(s) required)
-Status: PASSED (SLSA Source Level 4)
+Status: PASSED (Source Policy Level 4)
 =====================================
 
 SLSA Build Track
@@ -1003,14 +1044,18 @@ Status: PASSED (SLSA Build Level 1)
 [✓] Hosted Builder Identity (https://github.com/actions/runner)
 [✓] Cryptographic Envelope Signature (Sigstore Keyless OIDC)
 [✓] Authenticated Source Repository Binding
-[✓] Materialized Resolved Dependencies (142 packages recorded)
 Status: PASSED (SLSA Build Level 2)
 
 === SLSA Build Level 3 Assessment ===
 [✗] Unforgeable Control-Plane Builder Identity (https://github.com/actions/runner) -- builder id is not in the trusted isolated-control-plane allowlist [...]
 [✗] Isolated Provenance Generation (signer identity matches builder identity) -- ...
-[✓] Materialized Locked Dependencies (142 packages recorded)
 Status: FAILED (SLSA Build Level 3)
+=====================================
+
+=== Dependency Materialization Evidence (2/3 present; informs S2C2F ING-1/ING-2) ===
+[✓] Materialized Resolved Dependencies (142 packages recorded)
+[✓] Materialized Locked Dependencies (140 packages locked to hash, 2 floating (no sha256/sha512 digest))
+[✗] Canonical SBOM Attached -- predicate.artifact.sbom is absent -- no --sbom was ingested for this run
 =====================================
 
 === Assay Health & Governance Metrics ===

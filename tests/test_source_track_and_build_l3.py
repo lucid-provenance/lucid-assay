@@ -35,9 +35,9 @@ from cli.verify import (
     _format_verdict_banner,
     _print_verify_result_human,
     _render_step_summary_markdown,
+    _dependency_check_locked,
     _slsa_check_control_plane_builder_identity,
     _slsa_check_isolated_provenance_generation,
-    _slsa_check_materialized_dependencies,
     _verdict_word,
 )
 
@@ -251,24 +251,30 @@ class BuildLevel3ChecksTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertIn("does not match", result["detail"])
 
+    # These five cases used to exercise _slsa_check_materialized_dependencies
+    # (SLSA Build Level 3's own "materialized locked dependencies" item,
+    # reading buildDefinition.resolvedDependencies). That item moved out of
+    # the Build Track entirely -- SLSA v1.0's ratified Build Track doesn't
+    # define a dependency-materialization level -- into
+    # _dependency_check_locked, which reads lucid-assay's own
+    # predicate.resolved_dependencies (flat list, no buildDefinition
+    # wrapper, no synthetic source-commit entry). Same digest-algorithm
+    # rigor, new input shape and home; see cli/verify.py's
+    # _format_dependency_governance_report.
     def test_materialized_dependencies_requires_pkg_purl_with_sha256(self):
-        predicate = {"buildDefinition": {"resolvedDependencies": [{"uri": "git+https://github.com/acme/widgets", "digest": {"gitCommit": "e" * 40}}]}}
-        result = _slsa_check_materialized_dependencies(predicate)
+        resolved = [{"uri": "git+https://github.com/acme/widgets", "digest": {"gitCommit": "e" * 40}}]
+        result = _dependency_check_locked(resolved)
         self.assertFalse(result["passed"])
         self.assertIn("no 'pkg:' PURL entries", result["detail"])
 
     def test_materialized_dependencies_passes_with_package_entry(self):
-        predicate = {
-            "buildDefinition": {
-                "resolvedDependencies": [
-                    {"uri": "git+https://github.com/acme/widgets", "digest": {"gitCommit": "e" * 40}},
-                    {"uri": "pkg:pypi/requests@2.31.0", "digest": {"sha256": "f" * 64}},
-                ]
-            }
-        }
-        result = _slsa_check_materialized_dependencies(predicate)
+        resolved = [
+            {"uri": "git+https://github.com/acme/widgets", "digest": {"gitCommit": "e" * 40}},
+            {"uri": "pkg:pypi/requests@2.31.0", "digest": {"sha256": "f" * 64}},
+        ]
+        result = _dependency_check_locked(resolved)
         self.assertTrue(result["passed"])
-        self.assertIn("1 packages recorded", result["items"][0]["label"] if "items" in result else result["label"])
+        self.assertIn("1 packages locked to hash", result["label"])
 
     def test_materialized_dependencies_passes_with_sha512_digest(self):
         """npm's package-lock.json v2/v3 `integrity` field is SRI, and
@@ -279,31 +285,23 @@ class BuildLevel3ChecksTests(unittest.TestCase):
         (lucid-provenance/lucid-console PR #1, 2026-08-27): this check failed
         against a fully-materialized ~569-package npm lockfile purely
         because every entry was sha512, before this test/fix existed."""
-        predicate = {
-            "buildDefinition": {
-                "resolvedDependencies": [
-                    {"uri": "git+https://github.com/acme/widgets", "digest": {"gitCommit": "e" * 40}},
-                    {"uri": "pkg:npm/left-pad@1.3.0", "digest": {"sha512": "a" * 128}},
-                ]
-            }
-        }
-        result = _slsa_check_materialized_dependencies(predicate)
+        resolved = [
+            {"uri": "git+https://github.com/acme/widgets", "digest": {"gitCommit": "e" * 40}},
+            {"uri": "pkg:npm/left-pad@1.3.0", "digest": {"sha512": "a" * 128}},
+        ]
+        result = _dependency_check_locked(resolved)
         self.assertTrue(result["passed"])
-        self.assertIn("1 packages recorded", result["items"][0]["label"] if "items" in result else result["label"])
+        self.assertIn("1 packages locked to hash", result["label"])
 
     def test_materialized_dependencies_rejects_weak_digest_algorithms(self):
         """sha1/md5 are deliberately NOT accepted alongside sha256/sha512
         -- this isn't "accept whatever key is present", it's specifically
         the two algorithms strong enough to back a hermeticity claim."""
-        predicate = {
-            "buildDefinition": {
-                "resolvedDependencies": [
-                    {"uri": "pkg:npm/ancient-package@0.0.1", "digest": {"sha1": "b" * 40}},
-                    {"uri": "pkg:npm/other-package@0.0.1", "digest": {"md5": "c" * 32}},
-                ]
-            }
-        }
-        result = _slsa_check_materialized_dependencies(predicate)
+        resolved = [
+            {"uri": "pkg:npm/ancient-package@0.0.1", "digest": {"sha1": "b" * 40}},
+            {"uri": "pkg:npm/other-package@0.0.1", "digest": {"md5": "c" * 32}},
+        ]
+        result = _dependency_check_locked(resolved)
         self.assertFalse(result["passed"])
         self.assertIn("no 'pkg:' PURL entries", result["detail"])
 
@@ -313,15 +311,11 @@ class BuildLevel3ChecksTests(unittest.TestCase):
         the `isinstance(digest, dict)` guard this exercises is new code
         added alongside sha512 acceptance, not covered by any existing
         case above."""
-        predicate = {
-            "buildDefinition": {
-                "resolvedDependencies": [
-                    {"uri": "pkg:npm/no-digest-field@1.0.0"},
-                    {"uri": "pkg:npm/malformed-digest@1.0.0", "digest": "sha256:" + "d" * 64},
-                ]
-            }
-        }
-        result = _slsa_check_materialized_dependencies(predicate)
+        resolved = [
+            {"uri": "pkg:npm/no-digest-field@1.0.0"},
+            {"uri": "pkg:npm/malformed-digest@1.0.0", "digest": "sha256:" + "d" * 64},
+        ]
+        result = _dependency_check_locked(resolved)
         self.assertFalse(result["passed"])
         self.assertIn("no 'pkg:' PURL entries", result["detail"])
 
@@ -581,7 +575,7 @@ class StepSummaryWriterTests(unittest.TestCase):
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
             self.assertIn("lucid-assay verify:", content)
-            self.assertIn("SLSA Source Track", content)
+            self.assertIn("Source Track (SLSA Source", content)
             self.assertIn("FINAL VERDICT", content)
         finally:
             os.remove(path)

@@ -240,6 +240,16 @@ class VerificationResult:
     # [] when this predicate predates S2C2F evaluation or the run skipped
     # it, never fabricated as met/unmet.
     s2c2f_controls: List[Dict[str, Any]] = field(default_factory=list)
+    # predicate.resolved_dependencies + predicate.artifact.sbom, evaluated
+    # into a checklist (see _extract_dependency_evidence) -- lucid-assay's
+    # own dependency evidence, deliberately never SLSA v1.0 provenance's
+    # buildDefinition.resolvedDependencies (see CLAUDE.md's warning against
+    # confusing the two). Used to have equivalent checks living inside
+    # slsa_level2/slsa_level3 above; moved out into their own section since
+    # SLSA v1.0's ratified Build Track doesn't define a dependency-
+    # materialization level -- see _format_dependency_governance_report.
+    # Purely informational, same non-gating contract as s2c2f_controls.
+    dependency_governance_items: List[Dict[str, Any]] = field(default_factory=list)
     # The signed envelope's own _rekor.logIndex/logUrl (cli/oidc_signer.py)
     # -- not part of the signed predicate (see _extract_rekor_info's
     # docstring for why). Both None on --dry-run-sign or an envelope
@@ -317,6 +327,7 @@ class VerificationResult:
             "identity_detail": self.identity_detail,
             "static_analysis_tools": self.static_analysis_tools,
             "s2c2f_controls": self.s2c2f_controls,
+            "dependency_governance_items": self.dependency_governance_items,
             "rekor_log_index": self.rekor_log_index,
             "rekor_log_url": self.rekor_log_url,
             "source_highest_level": self.source_highest_level,
@@ -427,6 +438,104 @@ def _extract_s2c2f_controls(predicate: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(controls, list):
         return []
     return [c for c in controls if isinstance(c, dict)]
+
+
+def _extract_dependency_evidence(predicate: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Builds the Dependency Materialization Evidence checklist (see
+    _format_dependency_governance_report) from lucid-assay's own
+    predicate.resolved_dependencies (cli/parsers/lockfiles.py-derived) and
+    predicate.artifact.sbom -- deliberately never SLSA v1.0 provenance's
+    buildDefinition.resolvedDependencies (see CLAUDE.md's warning against
+    confusing the two; that field is a different predicate's, evaluated
+    nowhere in this checklist). Purely informational, same never-raises/
+    never-gates contract as _extract_s2c2f_controls. [] when
+    resolved_dependencies is empty/absent AND no sbom is attached -- an
+    attestation that never ran dependency detection at all, matching
+    every other optional section's "nothing to show" convention here."""
+    resolved = predicate.get("resolved_dependencies")
+    resolved = [d for d in resolved if isinstance(d, dict)] if isinstance(resolved, list) else []
+
+    artifact = predicate.get("artifact")
+    artifact = artifact if isinstance(artifact, dict) else {}
+    sbom = artifact.get("sbom")
+    sbom = sbom if isinstance(sbom, dict) else None
+
+    if not resolved and not sbom:
+        return []
+
+    items = [_dependency_check_resolved(resolved)]
+    if resolved:
+        items.append(_dependency_check_locked(resolved))
+    items.append(_dependency_check_sbom(sbom))
+    return items
+
+
+def _dependency_check_resolved(resolved: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The lockfile-parsed dependency count, no rigor requirement beyond
+    "has a non-empty uri" -- the same bar SLSA Build Level 2's dependency
+    item used to apply (see _evaluate_slsa_l2's docstring)."""
+    label = "Materialized Resolved Dependencies"
+    valid = [d for d in resolved if isinstance(d.get("uri"), str) and d.get("uri").strip()]
+    if not valid:
+        return _slsa_item(
+            label, False,
+            "predicate.resolved_dependencies is missing or empty -- no lockfile was detected/parsed for this run",
+        )
+    return _slsa_item(f"{label} ({len(valid)} packages recorded)", True)
+
+
+def _dependency_check_locked(resolved: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Stricter subset of _dependency_check_resolved: counts only entries
+    hash-pinned to a real `pkg:` PURL with a sha256/sha512 digest (see
+    _MATERIALIZED_DIGEST_ALGORITHMS) -- the same bar SLSA Build Level 3's
+    dependency item used to apply. Any entry that doesn't clear it
+    (Gradle/Maven lockfiles carry no digest at all -- see
+    cli/parsers/lockfiles.py's parse_gradle_lockfile/parse_maven_pom_dependencies)
+    is counted as floating and named in the passing label, so a real delta
+    between the resolved and locked counts is never left unexplained."""
+    label = "Materialized Locked Dependencies"
+
+    def _is_locked(d: Dict[str, Any]) -> bool:
+        uri = d.get("uri")
+        if not isinstance(uri, str) or not uri.startswith("pkg:"):
+            return False
+        digest = d.get("digest")
+        if not isinstance(digest, dict):
+            return False
+        return any(isinstance(digest.get(algo), str) and bool(digest.get(algo).strip()) for algo in _MATERIALIZED_DIGEST_ALGORITHMS)
+
+    valid = [d for d in resolved if isinstance(d.get("uri"), str) and d.get("uri").strip()]
+    locked = [d for d in valid if _is_locked(d)]
+    floating = len(valid) - len(locked)
+
+    if not locked:
+        return _slsa_item(
+            label, False,
+            "no 'pkg:' PURL entries with a sha256 or sha512 digest found -- dependencies aren't hash-pinned "
+            "to a lockfile",
+        )
+    detail_suffix = f", {floating} floating (no sha256/sha512 digest)" if floating else ""
+    return _slsa_item(f"{label} ({len(locked)} packages locked to hash{detail_suffix})", True)
+
+
+def _dependency_check_sbom(sbom: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """predicate.artifact.sbom (cli/main.py's _build_sbom_artifact_block)
+    -- format is the schema's own enum value ("cyclonedx-json"/
+    "spdx-json"), never a prettified display name, so this never claims a
+    format lucid-assay didn't actually detect."""
+    label = "Canonical SBOM Attached"
+    if not sbom:
+        return _slsa_item(label, False, "predicate.artifact.sbom is absent -- no --sbom was ingested for this run")
+    sha256 = sbom.get("sha256")
+    if not isinstance(sha256, str) or not sha256.strip():
+        return _slsa_item(label, False, "predicate.artifact.sbom is present but missing a sha256 digest")
+
+    fmt = sbom.get("format")
+    detail = f"{fmt}, SHA-256 anchored" if isinstance(fmt, str) and fmt.strip() else "SHA-256 anchored"
+    component_count = sbom.get("component_count")
+    if isinstance(component_count, int) and not isinstance(component_count, bool):
+        detail += f", {component_count} components"
+    return _slsa_item(f"{label} ({detail})", True)
 
 
 def _extract_rekor_info(envelope: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
@@ -653,24 +762,6 @@ def _slsa_check_source_binding(predicate: Dict[str, Any], expected_repository: O
     return _slsa_item(label, True)
 
 
-def _slsa_check_resolved_dependencies(predicate: Dict[str, Any]) -> Dict[str, Any]:
-    build_definition = predicate.get("buildDefinition")
-    build_definition = build_definition if isinstance(build_definition, dict) else {}
-    resolved = build_definition.get("resolvedDependencies")
-    label = "Materialized Resolved Dependencies"
-
-    if not isinstance(resolved, list) or not resolved:
-        return _slsa_item(label, False, "buildDefinition.resolvedDependencies is missing or empty")
-
-    valid_count = sum(
-        1 for d in resolved if isinstance(d, dict) and isinstance(d.get("uri"), str) and d.get("uri").strip()
-    )
-    if valid_count == 0:
-        return _slsa_item(label, False, "no entries with a valid non-empty 'uri' found")
-
-    return _slsa_item(f"{label} ({valid_count} packages recorded)", True)
-
-
 def _evaluate_slsa_l2(
     statement: Dict[str, Any],
     *,
@@ -679,20 +770,26 @@ def _evaluate_slsa_l2(
     expected_repository: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Evaluates the SLSA v1.0 Build Level 2 checklist -- a trusted hosted
-    builder identity, a verified Sigstore keyless signature, authenticated
-    source-repository binding, and materialized resolvedDependencies --
-    against a decoded in-toto Statement dict. Purely informational, same
-    contract as _evaluate_slsa_l1 (never raises, never gates `passed`).
-    Each item is evaluated independently here; see _format_slsa_report for
-    where "Level 2 builds on Level 1" (SLSA's leveling is cumulative) is
-    actually enforced in the combined Status line."""
+    builder identity, a verified Sigstore keyless signature, and
+    authenticated source-repository binding -- against a decoded in-toto
+    Statement dict. Purely informational, same contract as
+    _evaluate_slsa_l1 (never raises, never gates `passed`). Each item is
+    evaluated independently here; see _format_slsa_report for where
+    "Level 2 builds on Level 1" (SLSA's leveling is cumulative) is
+    actually enforced in the combined Status line.
+
+    Dependency-materialization evidence (buildDefinition.resolvedDependencies)
+    used to be a fourth item here, but SLSA v1.0's ratified Build Track
+    doesn't define a dependency-materialization level -- that's dependency
+    governance (OpenSSF S2C2F ING-1/ING-2 territory), not a Build Level
+    claim, so it now lives in its own section: see
+    _extract_dependency_evidence/_format_dependency_governance_report."""
     predicate = statement.get("predicate")
     predicate = predicate if isinstance(predicate, dict) else {}
     items = [
         _slsa_check_hosted_builder(predicate),
         _slsa_check_signature(identity_status, identity_detail),
         _slsa_check_source_binding(predicate, expected_repository),
-        _slsa_check_resolved_dependencies(predicate),
     ]
     return _slsa_level_result("Build", 2, "SLSA Build Level 2", items, origin=_slsa_invocation_origin(predicate))
 
@@ -790,66 +887,37 @@ def _slsa_check_isolated_provenance_generation(
 # a genuine, fully hash-pinned package-lock.json still failed this check
 # with "no 'pkg:' PURL entries with a sha256 digest found" purely because
 # every one of its ~569 resolved entries carried sha512, never sha256.
+# Originally gated SLSA Build Level 3's hermeticity claim
+# (_slsa_check_materialized_dependencies); now backs the Dependency
+# Materialization Evidence section's locked-dependency check instead (see
+# _dependency_check_locked) -- SLSA v1.0's ratified Build Track doesn't
+# define a dependency-materialization level, so this stopped being a
+# Build Level 3 item, not a stopped-mattering one.
 _MATERIALIZED_DIGEST_ALGORITHMS = ("sha256", "sha512")
-
-
-def _slsa_check_materialized_dependencies(predicate: Dict[str, Any]) -> Dict[str, Any]:
-    """Stricter sibling of _slsa_check_resolved_dependencies (Level 2's
-    "some non-empty resolvedDependencies list"): Level 3's hermeticity
-    claim requires at least one *package-level* entry -- a real `pkg:`
-    PURL with a sha256 or sha512 digest (see _MATERIALIZED_DIGEST_ALGORITHMS
-    above for why both) -- not just the synthetic source-commit entry every
-    provenance statement already carries (see cli/slsa_provenance.py's
-    _source_resolved_dependency)."""
-    build_definition = predicate.get("buildDefinition")
-    build_definition = build_definition if isinstance(build_definition, dict) else {}
-    resolved = build_definition.get("resolvedDependencies")
-    label = "Materialized Locked Dependencies"
-
-    if not isinstance(resolved, list) or not resolved:
-        return _slsa_item(label, False, "buildDefinition.resolvedDependencies is missing or empty")
-
-    def _is_materialized_package_entry(d: Any) -> bool:
-        if not isinstance(d, dict):
-            return False
-        uri = d.get("uri")
-        if not isinstance(uri, str) or not uri.startswith("pkg:"):
-            return False
-        digest = d.get("digest")
-        if not isinstance(digest, dict):
-            return False
-        return any(isinstance(digest.get(algo), str) and bool(digest.get(algo).strip()) for algo in _MATERIALIZED_DIGEST_ALGORITHMS)
-
-    valid_count = sum(1 for d in resolved if _is_materialized_package_entry(d))
-    if valid_count == 0:
-        return _slsa_item(
-            label, False,
-            "no 'pkg:' PURL entries with a sha256 or sha512 digest found (only the source-commit "
-            "entry is present, or dependencies aren't hash-pinned to a lockfile)",
-        )
-    return _slsa_item(f"{label} ({valid_count} packages recorded)", True)
 
 
 def _evaluate_slsa_l3(
     statement: Dict[str, Any], *, identity_status: str, cert_identity: Optional[str]
 ) -> Dict[str, Any]:
     """Evaluates the SLSA v1.0 Build Level 3 checklist -- an unforgeable
-    control-plane builder identity, isolated provenance generation (the
-    signer and the builder are provably the same entity), and
-    materialized locked dependencies -- against a decoded in-toto
-    Statement dict. Purely informational, same contract as
+    control-plane builder identity and isolated provenance generation (the
+    signer and the builder are provably the same entity) -- against a
+    decoded in-toto Statement dict. Purely informational, same contract as
     _evaluate_slsa_l1/_l2 (never raises, never gates `passed` on its
     own -- see --require-slsa-build-l3 for the opt-in exception). Fails
     closed and honestly for every caller today: the architecture that
-    would make its first two items pass (provenance constructed inside
-    lucid-attest's isolated signer job, not the untrusted build job)
-    doesn't exist yet."""
+    would make its two items pass (provenance constructed inside the
+    isolated signer job, not the untrusted build job) doesn't exist yet.
+
+    Materialized (locked) dependency evidence used to be a third item
+    here; moved into its own section for the same reason described on
+    _evaluate_slsa_l2 -- see _extract_dependency_evidence/
+    _format_dependency_governance_report."""
     predicate = statement.get("predicate")
     predicate = predicate if isinstance(predicate, dict) else {}
     items = [
         _slsa_check_control_plane_builder_identity(predicate),
         _slsa_check_isolated_provenance_generation(predicate, identity_status=identity_status, cert_identity=cert_identity),
-        _slsa_check_materialized_dependencies(predicate),
     ]
     return _slsa_level_result("Build", 3, "SLSA Build Level 3", items, origin=_slsa_invocation_origin(predicate))
 
@@ -961,24 +1029,27 @@ def _source_check_two_party_review(branch_governance: Optional[Dict[str, Any]]) 
 
 
 def _evaluate_source_l1(vcs: Dict[str, Any]) -> Dict[str, Any]:
-    return _slsa_level_result("Source", 1, "Source Level 1: Version Controlled Source", [_source_check_version_controlled(vcs)])
+    return _slsa_level_result(
+        "Source", 1, "Source Policy Level 1: Version Controlled Source", [_source_check_version_controlled(vcs)]
+    )
 
 
 def _evaluate_source_l2(vcs: Dict[str, Any]) -> Dict[str, Any]:
     return _slsa_level_result(
-        "Source", 2, "Source Level 2: Verified History & Explicit Lineage", [_source_check_verified_history(vcs)]
+        "Source", 2, "Source Policy Level 2: Verified History & Explicit Lineage", [_source_check_verified_history(vcs)]
     )
 
 
 def _evaluate_source_l3(vcs: Dict[str, Any]) -> Dict[str, Any]:
     return _slsa_level_result(
-        "Source", 3, "Source Level 3: Retained History & Author Identity", [_source_check_retained_history(vcs)]
+        "Source", 3, "Source Policy Level 3: Retained History & Author Identity", [_source_check_retained_history(vcs)]
     )
 
 
 def _evaluate_source_l4(branch_governance: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return _slsa_level_result(
-        "Source", 4, "Source Level 4: Two-Party Code Review & Branch Governance", [_source_check_two_party_review(branch_governance)]
+        "Source", 4, "Source Policy Level 4: Two-Party Code Review & Branch Governance",
+        [_source_check_two_party_review(branch_governance)],
     )
 
 
@@ -1079,7 +1150,15 @@ def _format_slsa_level_block(assessment: Dict[str, Any], overall_passed: bool) -
     if not overall_passed and assessment.get("origin"):
         lines.append(f"Origin CI Run:  {assessment['origin']}")
     status = "PASSED" if overall_passed else "FAILED"
-    lines.append(f"Status: {status} (SLSA {assessment['track']} Level {assessment['level']})")
+    # Source Track status is framed as "Source Policy Level N", not
+    # "SLSA Source Level N" -- SLSA's Source Track is a draft
+    # specification, unlike the ratified Build Track, so its levels are
+    # reported as this project's own policy assessment against that draft
+    # rather than implied compliance with a finalized SLSA standard.
+    if assessment["track"] == "Source":
+        lines.append(f"Status: {status} (Source Policy Level {assessment['level']})")
+    else:
+        lines.append(f"Status: {status} (SLSA {assessment['track']} Level {assessment['level']})")
     return lines
 
 
@@ -1148,6 +1227,39 @@ def _format_s2c2f_report(controls: List[Dict[str, Any]]) -> List[str]:
             if detail:
                 line += f" -- {detail}"
             lines.append(line)
+    lines.append(_SECTION_DIVIDER)
+    return lines
+
+
+def _format_dependency_governance_report(items: List[Dict[str, Any]]) -> List[str]:
+    """Renders the Dependency Materialization Evidence checklist (see
+    _extract_dependency_evidence) -- lucid-assay's own predicate.
+    resolved_dependencies and predicate.artifact.sbom, deliberately never
+    SLSA v1.0 provenance's buildDefinition.resolvedDependencies. This used
+    to be two items folded into the SLSA Build Level 2/3 Assessment blocks
+    (see _evaluate_slsa_l2/_evaluate_slsa_l3's docstrings); it moved here
+    because SLSA v1.0's ratified Build Track doesn't define a dependency-
+    materialization level -- dependency completeness/pinning is OpenSSF
+    S2C2F territory (ING-1 "use a package manager", ING-2 "retain a local
+    copy"), which this section's header names for context. It is *not*
+    the same evaluation as the S2C2F Compliance Matrix's own ING-1/ING-2
+    control rows (_format_s2c2f_report, driven by cli/parsers/s2c2f.py's
+    separate met/unmet logic) -- the two sections can legitimately show
+    different verdicts for the same run. Purely informational like
+    _format_s2c2f_report: no PASSED/FAILED Status line, since nothing here
+    is a cumulative SLSA-style leveling and nothing gates on it. []
+    (no section at all) when _extract_dependency_evidence found nothing,
+    matching every other optional section here."""
+    if not items:
+        return []
+    present_count = sum(1 for i in items if i["passed"])
+    lines = [f"=== Dependency Materialization Evidence ({present_count}/{len(items)} present; informs S2C2F ING-1/ING-2) ==="]
+    for item in items:
+        mark = "✓" if item["passed"] else "✗"
+        line = f"[{mark}] {item['label']}"
+        if not item["passed"] and item["detail"]:
+            line += f" -- {item['detail']}"
+        lines.append(line)
     lines.append(_SECTION_DIVIDER)
     return lines
 
@@ -1534,7 +1646,7 @@ def _format_verdict_banner(result: "VerificationResult", source_highest: int, bu
         if build_highest < 3:
             incomplete = f"SLSA Build L{build_highest + 1} Incomplete"
         else:
-            incomplete = f"SLSA Source L{source_highest + 1} Incomplete"
+            incomplete = f"Source Policy L{source_highest + 1} Incomplete"
 
     headline = f"FINAL VERDICT: {verdict_word} (Source L{source_highest} / Build L{build_highest})"
     if incomplete:
@@ -1696,6 +1808,9 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
         },
         "s2c2f": {
             "controls": result.s2c2f_controls,
+        },
+        "dependency_governance": {
+            "items": result.dependency_governance_items,
         },
         "identity": {
             "status": result.identity_status,
@@ -2438,6 +2553,7 @@ def verify_dsse_attestation(
     metrics: Dict[str, Any] = {}
     static_analysis_tools: List[Dict[str, Any]] = []
     s2c2f_controls: List[Dict[str, Any]] = []
+    dependency_governance_items: List[Dict[str, Any]] = []
     schema_validation_status = "skipped"
 
     if statement is not None:
@@ -2484,6 +2600,7 @@ def verify_dsse_attestation(
         metrics = _extract_metrics(predicate)
         static_analysis_tools = _extract_static_analysis_tools(predicate)
         s2c2f_controls = _extract_s2c2f_controls(predicate)
+        dependency_governance_items = _extract_dependency_evidence(predicate)
 
         gate_violations, gate_warnings = _evaluate_policy_gates(
             rcs_value=rcs_value,
@@ -2559,6 +2676,7 @@ def verify_dsse_attestation(
         identity_detail=identity_detail,
         static_analysis_tools=static_analysis_tools,
         s2c2f_controls=s2c2f_controls,
+        dependency_governance_items=dependency_governance_items,
         rekor_log_index=rekor_log_index,
         rekor_log_url=rekor_log_url,
         schema_validation_status=schema_validation_status,
@@ -2744,8 +2862,10 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
     predicate traces back to, and the exact --min-rcs/--disallow-degraded/
     etc. this call enforced), Static Analysis (the per-tool SARIF/SonarQube
     breakdown from _format_static_analysis_table, when any tools were
-    ingested), SLSA Source Track (Levels 1-4), SLSA Build Track (Levels
-    1-3), the S2C2F Compliance Matrix (_format_s2c2f_report, when any
+    ingested), Source Track (SLSA Source, Levels 1-4), SLSA Build Track
+    (Levels 1-3), Dependency Materialization Evidence
+    (_format_dependency_governance_report, when any evidence was found),
+    the S2C2F Compliance Matrix (_format_s2c2f_report, when any
     controls were evaluated), CD / Signing (_format_signing_report --
     Sigstore identity + Rekor log entry), Assay Health & Governance
     Metrics, and the synthesized FINAL VERDICT banner -- as plain-text
@@ -2770,7 +2890,7 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
 
     if all(lvl is not None for lvl in source_levels):
         lines.append("")
-        lines.append("SLSA Source Track")
+        lines.append("Source Track (SLSA Source — Draft Specification)")
         track_lines, source_cumulative = _format_track_report(source_levels)
         lines.extend(track_lines)
     else:
@@ -2783,6 +2903,11 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
         lines.extend(track_lines)
     else:
         build_cumulative = []
+
+    dependency_lines = _format_dependency_governance_report(result.dependency_governance_items)
+    if dependency_lines:
+        lines.append("")
+        lines.extend(dependency_lines)
 
     s2c2f_lines = _format_s2c2f_report(result.s2c2f_controls)
     if s2c2f_lines:

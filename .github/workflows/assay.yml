@@ -82,10 +82,10 @@ jobs:
       pull-requests: read # "Resolve PR Context for a Push-Triggered Run" below
     outputs:
       # Consumed by `attest` below as subject-name/subject-digest -- the
-      # only provenance-relevant values lucid-attest's isolated signer job
-      # accepts from this (untrusted) job; everything else it needs to
-      # construct real SLSA Build Level 3 provenance comes from its own
-      # trusted context instead (see that job's `uses:` comment).
+      # only provenance-relevant values the isolated signer job accepts
+      # from this (untrusted) job; everything else it needs to construct
+      # real SLSA Build Level 3 provenance comes from its own trusted
+      # context instead (see that job's `uses:` comment).
       image-ref: ${{ steps.mint.outputs.image-ref }}
       image-digest: ${{ steps.mint.outputs.image-digest }}
 
@@ -291,9 +291,9 @@ jobs:
       #
       # No --emit-slsa-provenance here anymore: this job only mints the
       # assay/v1 RCS statement now. SLSA v1.0 provenance (Build Level 3)
-      # is constructed by `attest` below, inside lucid-attest's isolated
-      # signer job, from that job's own trusted context -- not by this
-      # (untrusted) job -- see that job's `uses:` comment for why.
+      # is constructed by `attest` below, inside the isolated signer job,
+      # from that job's own trusted context -- not by this (untrusted)
+      # job -- see that job's `uses:` comment for why.
       - name: Mint Unsigned Lucid Attestation
         id: mint
         env:
@@ -390,30 +390,32 @@ jobs:
   # uploaded, and -- via subject-name/subject-digest below -- additionally
   # CONSTRUCTS a SLSA v1.0 provenance statement (SLSA Build Level 3) from
   # its own trusted context and signs that too, atomically. The signing
-  # job's code lives entirely in lucid-provenance/lucid-attest (a separate,
-  # branch-protected repo -- see contrib/lucid-attest-repo/ in this repo
-  # for its content/rationale), checked out there at a commit SHA (`uses:`
-  # below) pinned independently of whatever ref triggered this run -- so a
-  # PR that fully rewrites this workflow file, or lucid-assay's own
-  # pipeline code, in the same PR cannot also change what the signer
-  # trusts, since that code isn't part of this PR's diff at all.
+  # job's code lives entirely in lucid-provenance/lucid-attest-service (a
+  # separate, deployed Lambda-backed service), invoked here as a reusable
+  # workflow pinned to a commit SHA (`uses:` below) independently of
+  # whatever ref triggered this run -- so a PR that fully rewrites this
+  # workflow file, or lucid-assay's own pipeline code, in the same PR
+  # cannot also change what the signer trusts, since that code isn't part
+  # of this PR's diff at all.
   #
   # subject-name/subject-digest are the only provenance-relevant values
-  # lucid-attest's isolated signer job accepts from this (untrusted) job:
-  # everything else that makes the statement SLSA-meaningful -- builder
-  # identity, source binding, resolved dependencies -- comes from
-  # lucid-attest's own ambient context and its own read-only source
-  # checkout, never from anything this job computed.
+  # the isolated signer job accepts from this (untrusted) job: everything
+  # else that makes the statement SLSA-meaningful -- builder identity,
+  # source binding, resolved dependencies -- comes from the signer's own
+  # ambient context and its own read-only source checkout, never from
+  # anything this job computed.
   #
-  # This job has no way to choose which lucid-assay commit sign.yml checks
-  # out for cli/sign.py/cli/oidc_signer.py/cli/provenance.py: that pin
-  # lives hardcoded inside lucid-attest's own sign.yml
-  # (env.TRUSTED_SIGNER_SHA), not as a `workflow_call` input here -- a
-  # caller-supplied `signer-ref` input was deliberately removed so the
-  # privileged signing job can never be pointed at caller-chosen code.
-  # Bumping which lucid-assay commit the signer trusts is exclusively a
-  # lucid-attest-repo change, same discipline as bumping the `uses:` SHA
-  # below whenever lucid-attest's own sign.yml changes.
+  # This job has no way to choose which lucid-assay commit sign-client.yml
+  # checks out for cli/oidc_signer.py/cli/provenance.py: that pin lives
+  # hardcoded inside lucid-attest-service's own sign-client.yml
+  # (env.PROVENANCE_SOURCE_SHA) and its ci.yml/deploy.yml
+  # (env.SIGNER_SOURCE_SHA), not as a `workflow_call` input here -- a
+  # caller-supplied ref input would let the privileged signing job be
+  # pointed at caller-chosen code, defeating the isolation this whole
+  # mechanism exists for. Bumping which lucid-assay commit the signer
+  # trusts is exclusively a lucid-attest-service-repo change, same
+  # discipline as bumping the `uses:` SHA below whenever
+  # lucid-attest-service's own sign-client.yml changes.
   attest:
     needs: build
     permissions:
@@ -427,7 +429,20 @@ jobs:
     # Dependabot bump PR only ever updates a `uses:` line, never a
     # same-value literal duplicated elsewhere in the file -- see the
     # comment in .github/dependabot.yml for the failure mode this closes).
-    uses: lucid-provenance/lucid-attest/.github/workflows/sign.yml@f69640d69a5ef2f213a952ea8907f6eb96a93920
+    #
+    # CUT OVER 2026-09-03 from lucid-attest's sign.yml (a pinned Docker
+    # signer container, since retired) to lucid-attest-service's
+    # sign-client.yml (a Lambda-backed reusable workflow, same isolated-
+    # builder-identity property -- see the Lucid vault's "Serverless
+    # signer needs a trustworthy provenance builder identity" note for the
+    # full trust-model reasoning). Overdue, not routine: lucid-console and
+    # lucid-dsse-collector, this repo's own downstream consumers, both cut
+    # over 2026-09-02 -- this repo's own dogfood workflow was missed in
+    # that same pass and found still pointed at the retired lucid-attest
+    # repo entirely, while auditing every repo's own independent signer/
+    # source pin for silent drift -- see the vault's "Signer SHA pinning
+    # pain" note.
+    uses: lucid-provenance/lucid-attest-service/.github/workflows/sign-client.yml@231039b08b91b78788dba732a10355aafcaeaa11
     with:
       artifact-name: unsigned-statements
       statement-files: |
@@ -509,8 +524,9 @@ jobs:
       # "Upload In-Toto Attestation Artifact" below re-uploads that
       # annotated file. Needed here for the same reason as lucid-console/
       # lucid-dsse-collector's identical addition: this repo's own split
-      # mint(unsigned)/sign(isolated `attest` job, via lucid-attest's
-      # reusable sign.yml) architecture never runs cli.main's own
+      # mint(unsigned)/sign(isolated `attest` job, via lucid-attest-
+      # service's reusable sign-client.yml) architecture never runs
+      # cli.main's own
       # run --sign/--dry-run-sign pipeline (the only place verdict
       # annotation happens automatically) -- `attest` only ever calls
       # `cli.main sign`, a different code path with no verdict step.
@@ -522,8 +538,8 @@ jobs:
           EXPECTED_REPOSITORY: ${{ github.repository }}
           EXPECTED_REF: ${{ github.ref }}
           # Pins the admission gate to the exact quarantined signer identity:
-          # not just "some workflow in lucid-provenance/lucid-attest", but that repo's
-          # sign.yml specifically, at the same commit SHA `attest` invoked --
+          # not just "some workflow in lucid-provenance/lucid-attest-service",
+          # but that repo's sign-client.yml specifically, at the same commit SHA `attest` invoked --
           # derived live from that job's own `uses:` line by the
           # "Derive expected signer identity" step above, not a separately
           # hand-kept-in-sync literal, so this can never drift from what
@@ -536,14 +552,14 @@ jobs:
           CERT_IDENTITY: ${{ steps.signer.outputs.cert-identity }}
           CERT_OIDC_ISSUER: https://token.actions.githubusercontent.com
           # Binds admission to the *caller* side of the identity too: not
-          # just "signed by the quarantined lucid-attest signer" (that's
-          # what --cert-identity above already pins), but "signed on behalf
-          # of a run this workflow itself triggered" -- github.workflow is
+          # just "signed by the quarantined lucid-attest-service signer"
+          # (that's what --cert-identity above already pins), but "signed on
+          # behalf of a run this workflow itself triggered" -- github.workflow is
           # this workflow's own `name:` ("Lucid Assay"), which GitHub's OIDC
           # token carries as the `workflow` claim for every job in this run,
           # including the reusable `attest` job. Without this, any other
           # workflow in lucid-provenance/lucid-assay (present or future) that ever
-          # called the same lucid-attest signer would still pass this gate,
+          # called the same lucid-attest-service signer would still pass this gate,
           # since --expected-repository alone doesn't distinguish which
           # workflow file within the repo triggered the signing.
           EXPECTED_WORKFLOW: ${{ github.workflow }}

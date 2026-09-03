@@ -4,22 +4,29 @@
 # now that lucid-attest tags real releases (v1.0.0+). Opens a PR here
 # proposing the bump, never merges automatically.
 #
-# IMPORTANT, review this by hand every time: Dependabot only understands
-# the standard `uses: owner/repo@sha` syntax -- it updates the `attest`
-# job's `uses:` line, but has no way to know assay.yml also duplicates
-# that same SHA as a literal in env.SIGNER_WORKFLOW_SHA above it (the
-# "reusable-workflow calls don't accept expressions in uses:" constraint
-# documented at that env block). A merged Dependabot PR that only
-# touches the `uses:` line leaves env.SIGNER_WORKFLOW_SHA stale, which
-# then makes CERT_IDENTITY (which does read it live) assert the WRONG
-# signer identity -- fails closed as an identity-verification failure in
-# `verify`, not a silent hole, but still a real CI break. Manually update
-# env.SIGNER_WORKFLOW_SHA to match before merging any bump PR that
-# touches the `attest` job's `uses:` line -- exactly the same
-# "keep in sync" step a hand-authored bump already required.
+# The duplicate-pin danger this comment used to warn about (a bump PR
+# only touching the `attest` job's `uses:` line, leaving a separately-
+# maintained env var stale) is now closed structurally, not just by
+# manual review discipline: `verify`'s own "Derive expected signer
+# identity" step parses that `uses:` line live at runtime, so there's
+# nothing left to duplicate or drift. A bump PR touching only the
+# `uses:` line is fully self-consistent now.
+#
+# `groups` below is load-bearing, not cosmetic -- confirmed by a real
+# failure, 2026-09-02: github/codeql-action/init and .../analyze must
+# stay on matching versions (the config init writes is version-specific;
+# a mismatch fails the job with "Loaded a configuration file for version
+# 'X', but running version 'Y'"), but Dependabot opens one PR per `uses:`
+# reference by default -- two separate PRs each bumped only one half of
+# the pair, so each was individually broken until manually merged
+# together. Grouping them forces one PR with both bumped atomically.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action/*"

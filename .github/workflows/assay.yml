@@ -234,6 +234,19 @@ jobs:
       # cli.parsers.github_rules degrade branch-governance data to
       # unavailable rather than raising (see cli/parsers/github_rules.py's
       # module docstring).
+      #
+      # permission-contents: read -- also mints this, for cli.parsers.
+      # commit_author's GET /repos/{repo}/commits/{sha} call (SLSA Source
+      # Level 3's commit-author verification). This repo being public
+      # masked the gap until now: a public repo's commits endpoint is
+      # readable by a token with basically any valid grant, but a private
+      # repo's requires this permission explicitly -- confirmed by a real
+      # divergence, 2026-09-02 (this check passing here, failing
+      # identically in lucid-console/lucid-dsse-collector with "HTTP 403:
+      # Resource not accessible by integration"). Requesting it here too,
+      # even though masked, rather than relying on this repo staying
+      # public -- the same "don't gate policy on repo visibility" caveat
+      # branch governance's own note already makes.
       - name: Generate GitHub App Token
         id: app-token
         if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
@@ -242,6 +255,7 @@ jobs:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           permission-administration: read
+          permission-contents: read
 
       # push carries no PR context of its own -- see the `on:` block's
       # comment for the full rationale. Looks up whichever PR GitHub

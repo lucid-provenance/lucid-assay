@@ -12,14 +12,19 @@
 # nothing left to duplicate or drift. A bump PR touching only the
 # `uses:` line is fully self-consistent now.
 #
-# `groups` below is load-bearing, not cosmetic -- confirmed by a real
-# failure, 2026-09-02: github/codeql-action/init and .../analyze must
-# stay on matching versions (the config init writes is version-specific;
-# a mismatch fails the job with "Loaded a configuration file for version
-# 'X', but running version 'Y'"), but Dependabot opens one PR per `uses:`
-# reference by default -- two separate PRs each bumped only one half of
-# the pair, so each was individually broken until manually merged
-# together. Grouping them forces one PR with both bumped atomically.
+# `groups` bundles every github-actions bump into one PR per week
+# instead of one PR per action -- confirmed necessary two ways, real
+# evidence both times, 2026-09-02: (1) github/codeql-action/init and
+# .../analyze must stay on matching versions (the config init writes is
+# version-specific; a mismatch fails the job with "Loaded a
+# configuration file for version 'X', but running version 'Y'"), and
+# Dependabot's one-PR-per-`uses:`-reference default bumped only one half
+# of that pair per PR; (2) five repos' first real week under Dependabot
+# opened 19 separate single-action PRs total -- real, but unmanageably
+# noisy for what's almost always a same-day batch of trivial version
+# bumps. One wildcard pattern groups the whole github-actions ecosystem
+# for this repo into a single PR; the codeql-action pairing is now just
+# a side effect of that, not a special case.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
@@ -27,6 +32,6 @@ updates:
     schedule:
       interval: "weekly"
     groups:
-      codeql-action:
+      github-actions:
         patterns:
-          - "github/codeql-action/*"
+          - "*"

@@ -1,9 +1,10 @@
 """
 Multi-ecosystem lockfile parsing: extracts pinned/resolved dependencies from
-Python (uv.lock), JavaScript/TypeScript (package-lock.json), Go (go.sum),
-and Java (Gradle dependency locks, Maven pom.xml) lockfiles into normalized
-`pkg:` PURL identifiers with cryptographic digests -- shaped for a SLSA v1.0
-provenance predicate's `resolvedDependencies` array
+Python (uv.lock, pip-compile-generated requirements.txt), JavaScript/TypeScript
+(package-lock.json, pnpm-lock.yaml), Go (go.sum), and Java (Gradle dependency
+locks, Maven pom.xml) lockfiles into normalized `pkg:` PURL identifiers with
+cryptographic digests -- shaped for a SLSA v1.0 provenance predicate's
+`resolvedDependencies` array
 (https://slsa.dev/spec/v1.0/provenance#resolveddependencies).
 
 Hardened against:
@@ -31,6 +32,16 @@ Hardened against:
     mistaken for an actual project dependency -- see
     parse_maven_pom_dependencies()'s own docstring for the confirmed
     real-world case this guards against.
+  - A plain, hand-written requirements.txt (unhashed version pins, or no
+    pins at all) is never mistaken for a real pip-compile lockfile: only
+    lines carrying at least one real `--hash=<algo>:<hex>` are treated as
+    resolved, and the file as a whole is rejected (-> []) if it contains
+    none at all -- see parse_pip_compile_requirements()'s own docstring.
+  - pnpm-lock.yaml is parsed with a minimal, purpose-built line scanner
+    (see parse_pnpm_lock()'s own docstring for why, not a general YAML
+    library) scoped exactly to the one block (`packages:`) this module
+    needs -- a malformed or truncated file degrades individual entries
+    the same way every other parser here does, never raises.
   - detect_and_parse_dependencies() walks repo_dir defensively, skipping
     vendored/build directory subtrees (node_modules, .git, vendor,
     build, dist, target, .venv) and tolerating unreadable directories, so
@@ -173,6 +184,113 @@ def parse_uv_lock(path: Union[str, Path]) -> List[ResolvedDependency]:
 
 
 # --------------------------------------------------------------------------
+# Python: pip-compile-generated requirements.txt
+# --------------------------------------------------------------------------
+
+# A top-level pinned requirement line: "name==version", optionally followed
+# by a line-continuation backslash if --hash lines follow. Deliberately
+# anchored to "==" (an exact pin) -- pip-compile always emits exact pins,
+# and this is also what excludes a hand-written "name>=1.0" range pin from
+# ever being mistaken for one.
+_PIP_COMPILE_REQUIREMENT_LINE = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9._!+-]*)\s*(?:\\\s*)?$"
+)
+# A --hash continuation line (pip's own --require-hashes format), e.g.
+#     --hash=sha256:1f28b4522cdc2fb4256ac1a020c78acf9cba2c6b461ccd2c126f3aa8e8335d1
+# possibly followed by a line-continuation backslash if more --hash lines
+# follow for the same requirement.
+_PIP_COMPILE_HASH_LINE = re.compile(r"^--hash=([A-Za-z0-9]+):([A-Za-z0-9]+)\s*(?:\\\s*)?$")
+
+
+def _pip_compile_entries(lines: List[str]) -> List[ResolvedDependency]:
+    """Groups a pip-compile-style requirements.txt's lines into one
+    ResolvedDependency per top-level `name==version` line, folding in
+    every `--hash=algo:hex` continuation line that follows it (each on
+    its own line, indented, per pip's own --require-hashes output --
+    never inline on the requirement line itself) until the next
+    non-continuation line. A `# via ...` trace-comment line or a blank
+    line ends the current requirement's hash block without starting a
+    new one. Requirements with zero --hash lines are skipped entirely --
+    see parse_pip_compile_requirements()'s own docstring for why.
+
+    A real pip-compile entry commonly carries several --hash lines for
+    the *same* algorithm (sha256) -- one per platform-specific wheel plus
+    the sdist, all genuinely different files' hashes, not the
+    same-file-multiple-algorithms case package-lock.json's SRI decoding
+    handles. digest: Dict[str, str] has no room to represent "N hashes
+    for the same algorithm" any more than any other parser in this module
+    does, so the last --hash=sha256:... line for a given algorithm simply
+    wins over earlier ones -- an arbitrary but deterministic choice, not a
+    claim that the discarded hashes matter less."""
+    deps: List[ResolvedDependency] = []
+    name: Optional[str] = None
+    version: Optional[str] = None
+    digest: Dict[str, str] = {}
+
+    def _flush() -> None:
+        if name and digest:
+            deps.append(ResolvedDependency(uri=f"pkg:pypi/{_normalize_pypi_name(name)}@{version}", digest=dict(digest)))
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        req_match = _PIP_COMPILE_REQUIREMENT_LINE.match(line)
+        if req_match:
+            _flush()
+            name, version = req_match.groups()
+            digest = {}
+            continue
+
+        hash_match = _PIP_COMPILE_HASH_LINE.match(line) if name else None
+        if hash_match:
+            algo, hex_value = hash_match.groups()
+            digest[algo] = hex_value
+            continue
+
+        if not line.startswith("--hash="):
+            # Anything else (a blank line, a "# via ..." trace comment, a
+            # header comment) ends the current requirement's hash block --
+            # the next --hash= line, if any, belongs to a different
+            # requirement and must not be folded into this one.
+            _flush()
+            name = version = None
+            digest = {}
+
+    _flush()
+    return deps
+
+
+def parse_pip_compile_requirements(path: Union[str, Path]) -> List[ResolvedDependency]:
+    """Parses a pip-compile-generated (pip-tools, `--generate-hashes`)
+    requirements.txt into ResolvedDependency, one per `name==version`
+    entry with at least one real `--hash=<algo>:<hex>` line folded in as
+    its digest.
+
+    Deliberately rejects a plain, hand-written requirements.txt rather
+    than treat an unhashed version pin as "resolved": a requirement line
+    with no --hash= lines following it is skipped individually (same
+    per-entry fail-closed contract as every other parser here), and if
+    the file contains *no* real --hash= lines at all, this returns []
+    for the whole file -- a bare `name==1.0.0`/`name>=1.0` pin is a
+    version constraint, not a cryptographically pinned dependency, and
+    this module's whole point is the latter. This is also what tells a
+    genuine pip-compile lockfile apart from a hand-edited requirements.txt
+    that happens to share the same filename -- there's no other reliable
+    signal to detect by (pip-compile's own header comment is conventional,
+    not guaranteed present after manual edits).
+
+    Returns [] on any missing/unreadable input."""
+    text = _read_text_safe(path)
+    if text is None:
+        return []
+
+    # _pip_compile_entries() only ever appends an entry once it has at
+    # least one real digest, so an all-unhashed file naturally comes back
+    # as [] here too -- no separate "did we find anything real" check
+    # needed.
+    return _pip_compile_entries(text.splitlines())
+
+
+# --------------------------------------------------------------------------
 # JavaScript/TypeScript: package-lock.json (npm v2/v3)
 # --------------------------------------------------------------------------
 
@@ -275,6 +393,138 @@ def parse_package_lock_json(path: Union[str, Path]) -> List[ResolvedDependency]:
             dep = _npm_entry_to_dependency(pkg_path, entry)
             if dep:
                 deps.append(dep)
+    return deps
+
+
+# --------------------------------------------------------------------------
+# JavaScript/TypeScript: pnpm-lock.yaml
+# --------------------------------------------------------------------------
+
+# A "packages:" block's own package-key line: 2-space indented, single
+# quoted or bare key, nothing else on the line (the entry's own fields
+# follow on more-indented lines below it). Real pnpm output always quotes
+# these (the key contains "@", and a scoped name embeds "/" too), but the
+# quotes aren't load-bearing for us either way.
+_PNPM_PACKAGE_KEY_LINE = re.compile(r"^  ['\"]?([^'\"]+?)['\"]?:\s*$")
+# The resolution line nested under a package key, e.g.
+#     resolution: {integrity: sha512-BcYH1CVJ...==}
+# Deliberately reuses the flow-mapping shape wholesale rather than a real
+# YAML flow-mapping parse -- pnpm always emits `integrity` as the first
+# key inside `resolution: {...}`, and this is the only field this module
+# needs out of it.
+_PNPM_RESOLUTION_LINE = re.compile(r"^\s+resolution:\s*\{.*?integrity:\s*([^\s,}]+)")
+
+
+def _pnpm_split_key(key: str) -> Optional[Tuple[str, str]]:
+    """Splits one pnpm `packages:` block key into (name, version).
+    Handles both the current (lockfileVersion 9.0+) bare key shape,
+    'name@version' / '@scope/name@version', and the older (pre-9,
+    e.g. 6.0) registry-relative shape, '/name@version' -- pnpm's own
+    lockfile spec calls the latter a "dependency path"
+    (https://github.com/pnpm/spec/blob/master/lockfile/6.0.md); the
+    leading '/' is stripped before applying the same split either way.
+    A scoped name's own '/' is not the separator -- the version starts
+    at the *second* '@' when the key begins with '@', the first
+    otherwise. Any trailing peer-dependency suffix in parens (only ever
+    seen directly in a *snapshots:*-style key, never confirmed inside a
+    real packages: one, but stripped defensively all the same, since a
+    purl version has no business carrying one) is dropped. Returns None
+    if the key doesn't contain an '@' to split on at all."""
+    key = key.strip()
+    if key.startswith("/"):
+        key = key[1:]
+
+    at_index = key.find("@", 1) if key.startswith("@") else key.find("@")
+    if at_index <= 0:
+        return None
+
+    name, version = key[:at_index], key[at_index + 1:]
+    version = version.split("(", 1)[0].strip()
+    return (name, version) if name and version else None
+
+
+def _pnpm_package_lines_to_dependency(key: str, entry_lines: List[str]) -> Optional[ResolvedDependency]:
+    split = _pnpm_split_key(key)
+    if split is None:
+        return None
+    name, version = split
+
+    digest: Dict[str, str] = {}
+    for line in entry_lines:
+        match = _PNPM_RESOLUTION_LINE.match(line)
+        if match:
+            digest = _decode_sri_integrity(match.group(1))
+            break
+
+    return ResolvedDependency(uri=f"{_npm_purl(name)}@{version}", digest=digest)
+
+
+def parse_pnpm_lock(path: Union[str, Path]) -> List[ResolvedDependency]:
+    """Parses a pnpm-lock.yaml's `packages:` block into ResolvedDependency,
+    decoding each entry's `resolution.integrity` SRI string the same way
+    parse_package_lock_json() does (pnpm uses the identical SRI format npm
+    does). Covers both the current split `packages:`/`snapshots:` schema
+    (lockfileVersion 9.0+, where `packages:` carries the immutable
+    resolution/integrity metadata and `snapshots:` carries the
+    peer-resolved dependency graph -- only the former has what this module
+    needs) and the older, unsplit `packages:`-only schema (lockfileVersion
+    6.0 and earlier) transparently, since both shapes carry the same
+    `resolution: {integrity: ...}` field per entry.
+
+    Deliberately a minimal, purpose-built line scanner rather than a real
+    YAML parse: this project has no YAML dependency today (every other
+    parser in this module is stdlib-only -- tomllib/json/xml.etree), and
+    pulling one in just for this single, narrow, always-machine-generated
+    block would cut against that. Confirmed against a real, current
+    lockfileVersion 9.0 file (github.com/pnpm/logger's own pnpm-lock.yaml)
+    before writing this, not assumed from memory. Scoped exactly to what's
+    needed: find the top-level `packages:` block, split it into per-entry
+    line groups by the 2-space-indented key line, and pull `resolution.
+    integrity` out of each. A key this scanner can't split (see
+    _pnpm_split_key) or an entry with no resolution/integrity line at all
+    degrades to being skipped (unparseable key) or an empty digest
+    (missing integrity) individually -- never raises, never drops the
+    whole file. Returns [] on any missing/unreadable input, or when the
+    file has no top-level `packages:` block at all."""
+    text = _read_text_safe(path)
+    if text is None:
+        return []
+
+    in_packages = False
+    current_key: Optional[str] = None
+    current_lines: List[str] = []
+    deps: List[ResolvedDependency] = []
+
+    def _flush() -> None:
+        if current_key is not None:
+            dep = _pnpm_package_lines_to_dependency(current_key, current_lines)
+            if dep:
+                deps.append(dep)
+
+    for line in text.splitlines():
+        if line.rstrip("\n") == "packages:":
+            in_packages = True
+            continue
+        if not in_packages:
+            continue
+        if line and not line[0].isspace():
+            # An unindented line (snapshots:, importers:, overrides:, ...,
+            # or a later env-lockfile document's own top-level key) ends
+            # the packages: block.
+            _flush()
+            current_key = None
+            in_packages = False
+            continue
+
+        key_match = _PNPM_PACKAGE_KEY_LINE.match(line)
+        if key_match:
+            _flush()
+            current_key = key_match.group(1)
+            current_lines = []
+        elif current_key is not None:
+            current_lines.append(line)
+
+    _flush()
     return deps
 
 
@@ -451,7 +701,9 @@ def parse_maven_pom_dependencies(path: Union[str, Path]) -> List[ResolvedDepende
 
 _LOCKFILE_PARSERS: Dict[str, Callable[[Union[str, Path]], List[ResolvedDependency]]] = {
     "uv.lock": parse_uv_lock,
+    "requirements.txt": parse_pip_compile_requirements,
     "package-lock.json": parse_package_lock_json,
+    "pnpm-lock.yaml": parse_pnpm_lock,
     "go.sum": parse_go_sum,
     "gradle.lockfile": parse_gradle_lockfile,
     "pom.xml": parse_maven_pom_dependencies,
@@ -481,14 +733,20 @@ def _iter_lockfiles(repo_dir: Path) -> Iterator[Tuple[str, Path]]:
 
 
 def detect_and_parse_dependencies(repo_dir: Union[str, Path]) -> List[Dict[str, Any]]:
-    """Auto-detects lockfiles under repo_dir (uv.lock, package-lock.json,
-    go.sum, gradle.lockfile, pom.xml -- any number/combination, at any
-    depth outside vendored/build directories), parses each with its
-    matching ecosystem parser, and aggregates the results into a flat
+    """Auto-detects lockfiles under repo_dir (uv.lock, requirements.txt,
+    package-lock.json, pnpm-lock.yaml, go.sum, gradle.lockfile, pom.xml --
+    any number/combination, at any depth outside vendored/build
+    directories), parses each with its matching ecosystem parser, and
+    aggregates the results into a flat
     list of ResolvedDependency dicts (see `ResolvedDependency.to_dict`),
     deduplicated by `uri` (first lockfile to produce a given URI wins).
-    Returns [] if repo_dir doesn't exist/isn't a readable directory, or
-    no known lockfiles are found under it -- never raises."""
+    A `requirements.txt` that turns out not to be real pip-compile output
+    (no `--hash=` lines at all) contributes nothing here, same as if it
+    didn't exist -- see parse_pip_compile_requirements()'s own docstring;
+    filename-based auto-detection alone can't tell it apart from a
+    hand-written one, so the parser itself is what fails closed. Returns
+    [] if repo_dir doesn't exist/isn't a readable directory, or no known
+    lockfiles are found under it -- never raises."""
     try:
         resolved_dir = safe_resolve_path(repo_dir)
     except UnsafePathError:

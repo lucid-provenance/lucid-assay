@@ -166,6 +166,16 @@ jobs:
       # restricted `pull_request` context a fork PR runs under -- guarded
       # the same way, so an external contributor's PR degrades (no
       # SonarQube enrichment) instead of failing outright.
+      #
+      # Also unavailable, confirmed by a real failure (2026-09-02, PR #63 --
+      # Dependabot's own first bump PR against this repo): GitHub applies
+      # the identical secrets/permissions restriction to any `pull_request`
+      # run whose actor is `dependabot[bot]`, EVEN when head.repo equals
+      # this repo -- a same-repo PR the fork-only check above doesn't
+      # catch. Without this, SonarQube fails outright with "Not authorized
+      # or project not found" on every Dependabot PR, not just external
+      # contributors' -- a self-inflicted regression from adopting
+      # Dependabot itself, not a broken/expired token.
       # Project metadata (organization, projectKey, sources, coverage/xunit
       # paths) lives in sonar-project.properties at the repo root -- the
       # action reads it automatically, so it's the single source of truth
@@ -174,7 +184,7 @@ jobs:
       # sonar.sources briefly pointed at a nonexistent src/ directory
       # instead of cli/).
       - name: SonarQube Cloud Scan
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
         uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -193,7 +203,7 @@ jobs:
       # degrades to a warning (not a failure) when --sonar-metrics can't
       # be read, so a transient API hiccup here must never fail the job.
       - name: Fetch SonarQube Cloud Measures
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
         continue-on-error: true
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -215,13 +225,18 @@ jobs:
       # comment there). Skipped for fork PRs: `secrets.APP_PRIVATE_KEY` is
       # unavailable in the restricted `pull_request` context those run
       # under (see the top-of-file comment), so this step would otherwise
-      # fail every external contributor's PR outright. When skipped, the
-      # token output is empty and cli.main / cli.parsers.github_rules
-      # degrade branch-governance data to unavailable rather than raising
-      # (see cli/parsers/github_rules.py's module docstring).
+      # fail every external contributor's PR outright. Also skipped for
+      # Dependabot PRs, for the identical reason (confirmed by the same
+      # real SonarQube failure that motivated this -- see that step's own
+      # comment): GitHub withholds secrets from a `pull_request` run
+      # whose actor is `dependabot[bot]` even when head.repo matches this
+      # repo. When skipped, the token output is empty and cli.main /
+      # cli.parsers.github_rules degrade branch-governance data to
+      # unavailable rather than raising (see cli/parsers/github_rules.py's
+      # module docstring).
       - name: Generate GitHub App Token
         id: app-token
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}

@@ -29,11 +29,17 @@ from cli.verify import (
     _evaluate_slsa_l1,
     _evaluate_slsa_l2,
     _build_verdict_envelope_block,
+    _dependency_check_locked,
+    _dependency_check_resolved,
+    _dependency_check_sbom,
+    _evaluate_slsa_l3,
     _extract_cert_ref,
+    _extract_dependency_evidence,
     _extract_rekor_info,
     _extract_s2c2f_controls,
     _format_assay_health_report,
     _format_coverage_line,
+    _format_dependency_governance_report,
     _format_pct,
     _format_s2c2f_report,
     _format_signing_report,
@@ -76,6 +82,8 @@ def _statement(
     omit_degraded_field=False,
     subject_sha256=SUBJECT_DIGEST,
     s2c2f=None,
+    resolved_dependencies=None,
+    sbom=None,
 ):
     rcs_block = {
         "value": rcs_value,
@@ -97,6 +105,10 @@ def _statement(
     }
     if s2c2f is not None:
         predicate["s2c2f"] = s2c2f
+    if resolved_dependencies is not None:
+        predicate["resolved_dependencies"] = resolved_dependencies
+    if sbom is not None:
+        predicate["artifact"] = {"sbom": sbom}
     return {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [
@@ -677,6 +689,7 @@ class VerifyJsonPayloadTests(unittest.TestCase):
             "release_confidence_score",
             "static_analysis",
             "s2c2f",
+            "dependency_governance",
             "identity",
             "signing",
             "violations",
@@ -1338,16 +1351,21 @@ class EvaluateSlsaL2Tests(unittest.TestCase):
         )
 
     def test_fully_compliant_statement_passes_all_items(self):
+        # resolved_dependencies is still passed here to keep the fixture a
+        # fully-shaped SLSA statement, but _evaluate_slsa_l2 no longer
+        # reads buildDefinition.resolvedDependencies at all -- that moved
+        # to _dependency_check_resolved/_dependency_check_locked, reading
+        # lucid-assay's own predicate.resolved_dependencies instead (see
+        # DependencyGovernanceTests below).
         statement = _slsa_provenance_statement(resolved_dependencies=DEFAULT_RESOLVED_DEPENDENCIES)
 
         assessment = self._l2(statement, expected_repository="acme/widgets")
 
         self.assertEqual(assessment["level"], 2)
         self.assertTrue(assessment["passed"])
-        self.assertEqual(len(assessment["items"]), 4)
+        self.assertEqual(len(assessment["items"]), 3)
         by_label = {i["label"]: i for i in assessment["items"]}
         self.assertIn("Hosted Builder Identity (https://github.com/actions/runner)", by_label)
-        self.assertIn("Materialized Resolved Dependencies (142 packages recorded)", by_label)
 
     def test_untrusted_builder_id_fails(self):
         statement = _slsa_provenance_statement(builder_id="https://evil.example.com/self-hosted")
@@ -1416,35 +1434,6 @@ class EvaluateSlsaL2Tests(unittest.TestCase):
         by_label = {i["label"]: i for i in assessment["items"]}
         self.assertTrue(by_label["Authenticated Source Repository Binding"]["passed"])
 
-    def test_missing_resolved_dependencies_fails(self):
-        statement = _slsa_provenance_statement(resolved_dependencies=None)
-        # buildDefinition.resolvedDependencies was never set at all in this case.
-
-        assessment = self._l2(statement)
-
-        by_label = {i["label"]: i for i in assessment["items"]}
-        self.assertFalse(by_label["Materialized Resolved Dependencies"]["passed"])
-
-    def test_empty_resolved_dependencies_list_fails(self):
-        statement = _slsa_provenance_statement(resolved_dependencies=[])
-
-        assessment = self._l2(statement)
-
-        by_label = {i["label"]: i for i in assessment["items"]}
-        self.assertFalse(by_label["Materialized Resolved Dependencies"]["passed"])
-
-    def test_resolved_dependencies_with_missing_uris_are_not_counted(self):
-        statement = _slsa_provenance_statement(
-            resolved_dependencies=[{"uri": "pkg:pypi/good@1.0"}, {"digest": {"sha256": "a" * 64}}, {"uri": ""}]
-        )
-
-        assessment = self._l2(statement)
-
-        by_label = {i["label"]: i for i in assessment["items"]}
-        # Only the one entry with a non-empty 'uri' should be counted.
-        self.assertIn("Materialized Resolved Dependencies (1 packages recorded)", by_label)
-        self.assertTrue(by_label["Materialized Resolved Dependencies (1 packages recorded)"]["passed"])
-
     def test_non_dict_predicate_fails_closed_without_raising(self):
         statement = {"predicate": ["not", "a", "dict"]}
 
@@ -1469,7 +1458,6 @@ class FormatSlsaReportTests(unittest.TestCase):
         self.assertIn("Status: PASSED (SLSA Build Level 1)", text)
         self.assertIn("Status: PASSED (SLSA Build Level 2)", text)
         self.assertIn("[✓] in-toto v1 Statement Envelope", text)
-        self.assertIn("[✓] Materialized Resolved Dependencies (142 packages recorded)", text)
         self.assertTrue(text.rstrip("\n").endswith("====================================="))
 
     def test_failing_item_renders_cross_mark_and_detail(self):
@@ -1519,6 +1507,185 @@ class FormatSlsaReportTests(unittest.TestCase):
         self.assertIn("[✗] Hosted Builder Identity -- missing runDetails.builder.id", text)
         self.assertIn("[✓] Cryptographic Envelope Signature (Sigstore Keyless OIDC)", text)
         self.assertIn("Status: FAILED (SLSA Build Level 2)", text)
+
+
+class SlsaBuildLevelsExcludeDependencyItemsTests(unittest.TestCase):
+    """Regression guard: SLSA v1.0's ratified Build Track doesn't define a
+    dependency-materialization level, so Build Level 2/3 must never carry
+    a dependency-evidence item again -- that lives in its own Dependency
+    Materialization Evidence section instead (see
+    DependencyGovernanceTests below)."""
+
+    def test_build_level2_has_no_dependency_item(self):
+        statement = _slsa_provenance_statement(resolved_dependencies=DEFAULT_RESOLVED_DEPENDENCIES)
+        assessment = _evaluate_slsa_l2(statement, identity_status="verified", identity_detail="ok")
+        self.assertEqual(len(assessment["items"]), 3)
+        self.assertFalse(any("Materialized" in i["label"] for i in assessment["items"]))
+
+    def test_build_level3_has_no_dependency_item(self):
+        statement = {
+            "predicate": {
+                "buildDefinition": {"resolvedDependencies": [{"uri": "pkg:pypi/x@1", "digest": {"sha256": "a" * 64}}]},
+                "runDetails": {"builder": {"id": "https://github.com/actions/runner"}},
+            }
+        }
+        assessment = _evaluate_slsa_l3(statement, identity_status="skipped", cert_identity=None)
+        self.assertEqual(len(assessment["items"]), 2)
+        self.assertFalse(any("Materialized" in i["label"] for i in assessment["items"]))
+
+
+def _dep(uri, digest=None):
+    entry = {"uri": uri}
+    if digest is not None:
+        entry["digest"] = digest
+    return entry
+
+
+class ExtractDependencyEvidenceTests(unittest.TestCase):
+    """_extract_dependency_evidence pulls lucid-assay's own
+    predicate.resolved_dependencies + predicate.artifact.sbom -- never
+    SLSA v1.0 provenance's buildDefinition.resolvedDependencies -- into
+    the Dependency Materialization Evidence checklist."""
+
+    def test_no_resolved_dependencies_and_no_sbom_returns_empty(self):
+        self.assertEqual(_extract_dependency_evidence({}), [])
+
+    def test_non_list_resolved_dependencies_treated_as_absent(self):
+        self.assertEqual(_extract_dependency_evidence({"resolved_dependencies": "nope"}), [])
+
+    def test_resolved_only_yields_resolved_and_locked_items(self):
+        predicate = {"resolved_dependencies": [_dep("pkg:pypi/requests@2.31.0", {"sha256": "a" * 64})]}
+        items = _extract_dependency_evidence(predicate)
+        labels = [i["label"] for i in items]
+        self.assertTrue(any(l.startswith("Materialized Resolved Dependencies") for l in labels))
+        self.assertTrue(any(l.startswith("Materialized Locked Dependencies") for l in labels))
+        # No sbom was given -- the sbom item still renders, failing closed.
+        self.assertIn("Canonical SBOM Attached", labels)
+
+    def test_sbom_only_yields_failing_resolved_item_and_sbom_item_no_locked_item(self):
+        predicate = {"artifact": {"sbom": {"format": "cyclonedx-json", "sha256": "b" * 64, "component_count": 3}}}
+        items = _extract_dependency_evidence(predicate)
+        labels = [i["label"] for i in items]
+        self.assertEqual(len(items), 2)  # resolved (failing) + sbom -- no locked item without any resolved deps
+        self.assertIn("Materialized Resolved Dependencies", labels)
+        by_label = {i["label"]: i for i in items}
+        self.assertFalse(by_label["Materialized Resolved Dependencies"]["passed"])
+
+    def test_malformed_resolved_entries_skipped_individually(self):
+        predicate = {"resolved_dependencies": [_dep("pkg:pypi/good@1.0", {"sha256": "c" * 64}), "not-a-dict", None]}
+        items = _extract_dependency_evidence(predicate)
+        by_prefix = {i["label"].split(" (")[0]: i for i in items}
+        self.assertTrue(by_prefix["Materialized Resolved Dependencies"]["passed"])
+
+
+class DependencyCheckResolvedTests(unittest.TestCase):
+    def test_missing_uris_are_not_counted(self):
+        result = _dependency_check_resolved([_dep("pkg:pypi/good@1.0"), _dep(""), {"digest": {"sha256": "a" * 64}}])
+        self.assertIn("Materialized Resolved Dependencies (1 packages recorded)", result["label"])
+        self.assertTrue(result["passed"])
+
+    def test_empty_list_fails(self):
+        result = _dependency_check_resolved([])
+        self.assertFalse(result["passed"])
+        self.assertIn("no lockfile was detected/parsed", result["detail"])
+
+
+class DependencyCheckLockedTests(unittest.TestCase):
+    def test_delta_between_resolved_and_locked_is_explained(self):
+        resolved = [
+            _dep("pkg:pypi/locked-one@1.0", {"sha256": "a" * 64}),
+            _dep("pkg:maven/no-digest@1.0", {}),  # Gradle/Maven: no digest at all -- floating
+        ]
+        result = _dependency_check_locked(resolved)
+        self.assertTrue(result["passed"])
+        self.assertIn("1 packages locked to hash, 1 floating (no sha256/sha512 digest)", result["label"])
+
+    def test_no_floating_omits_the_delta_clause(self):
+        resolved = [_dep("pkg:pypi/locked-one@1.0", {"sha256": "a" * 64})]
+        result = _dependency_check_locked(resolved)
+        self.assertIn("1 packages locked to hash)", result["label"])
+        self.assertNotIn("floating", result["label"])
+
+
+class DependencyCheckSbomTests(unittest.TestCase):
+    def test_absent_sbom_fails(self):
+        result = _dependency_check_sbom(None)
+        self.assertFalse(result["passed"])
+        self.assertIn("no --sbom was ingested", result["detail"])
+
+    def test_missing_sha256_fails(self):
+        result = _dependency_check_sbom({"format": "cyclonedx-json"})
+        self.assertFalse(result["passed"])
+        self.assertIn("missing a sha256 digest", result["detail"])
+
+    def test_well_formed_sbom_passes_with_format_and_component_count(self):
+        result = _dependency_check_sbom({"format": "cyclonedx-json", "sha256": "a" * 64, "component_count": 42})
+        self.assertTrue(result["passed"])
+        self.assertIn("cyclonedx-json, SHA-256 anchored, 42 components", result["label"])
+
+
+class FormatDependencyGovernanceReportTests(unittest.TestCase):
+    def test_empty_items_renders_no_section_at_all(self):
+        self.assertEqual(_format_dependency_governance_report([]), [])
+
+    def test_header_reports_present_count_and_names_s2c2f(self):
+        items = [_dependency_check_resolved([_dep("pkg:pypi/x@1", {"sha256": "a" * 64})]), _dependency_check_sbom(None)]
+        text = "\n".join(_format_dependency_governance_report(items))
+        self.assertIn("=== Dependency Materialization Evidence (1/2 present; informs S2C2F ING-1/ING-2) ===", text)
+
+    def test_no_status_line_rendered(self):
+        # Unlike the SLSA tracks, this section is purely informational --
+        # no cumulative PASSED/FAILED Status line.
+        items = [_dependency_check_resolved([_dep("pkg:pypi/x@1", {"sha256": "a" * 64})])]
+        text = "\n".join(_format_dependency_governance_report(items))
+        self.assertNotIn("Status:", text)
+        self.assertTrue(text.rstrip("\n").endswith("====================================="))
+
+    def test_failing_item_renders_cross_mark_and_detail(self):
+        items = [_dependency_check_sbom(None)]
+        text = "\n".join(_format_dependency_governance_report(items))
+        self.assertIn("[✗] Canonical SBOM Attached -- predicate.artifact.sbom is absent -- no --sbom was ingested", text)
+
+
+class DependencyGovernanceIntegrationTests(unittest.TestCase):
+    """End-to-end via verify_dsse_attestation(): confirms the Dependency
+    Materialization Evidence section actually reaches the shared
+    _render_track_sections() report and the --format json payload, the
+    same way S2C2FAndSigningIntegrationTests confirms for S2C2F/signing."""
+
+    def test_step_summary_includes_dependency_governance_section(self):
+        statement = _statement(
+            resolved_dependencies=[_dep("pkg:pypi/requests@2.31.0", {"sha256": "a" * 64})],
+            sbom={"format": "cyclonedx-json", "sha256": "b" * 64, "component_count": 1},
+        )
+        envelope = _envelope(statement)
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        summary = _render_step_summary_markdown(result)
+
+        self.assertIn("Dependency Materialization Evidence", summary)
+        self.assertIn("[✓] Materialized Resolved Dependencies (1 packages recorded)", summary)
+        self.assertIn("[✓] Canonical SBOM Attached", summary)
+
+    def test_no_dependency_data_omits_the_section_entirely(self):
+        envelope = _envelope(_statement())
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+        summary = _render_step_summary_markdown(result)
+
+        self.assertNotIn("Dependency Materialization Evidence", summary)
+
+    def test_json_payload_carries_dependency_governance_items(self):
+        statement = _statement(resolved_dependencies=[_dep("pkg:pypi/requests@2.31.0", {"sha256": "a" * 64})])
+        envelope = _envelope(statement)
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        payload = _build_verify_json_payload(result)
+
+        # resolved + locked + a failing sbom item (none was given, but the
+        # item still renders so a reader sees the gap explicitly).
+        self.assertEqual(len(payload["dependency_governance"]["items"]), 3)
+        json.dumps(payload)  # must remain JSON-serializable end to end
 
 
 class SlsaInvocationOriginTests(unittest.TestCase):

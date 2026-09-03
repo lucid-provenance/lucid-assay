@@ -550,7 +550,23 @@ jobs:
           # minting without PR context is expected and shouldn't block --
           # that branch's own eventual PR (or its post-merge push to main)
           # is what actually gets gated.
-          if [ "${{ github.event_name }}" = "pull_request" ] || [ "$EXPECTED_REF" = "refs/heads/main" ]; then
+          #
+          # Also exempted: Dependabot-actor pull_request runs. Real failure,
+          # 2026-09-02: "Generate GitHub App Token" is deliberately skipped
+          # for these (GitHub withholds secrets from a pull_request run
+          # whose actor is dependabot[bot], even same-repo -- see that
+          # step's own comment), which makes branch governance come back
+          # branch_governance_unverified -- a real, distinct degraded reason
+          # from branch_governance:platform_unsupported_tier, and NOT in
+          # cli.verify's _ALLOWED_DEGRADED_REASONS. Without this exemption,
+          # every Dependabot PR fails this gate unconditionally, forever,
+          # regardless of how trivial or correct the actual bump is (a
+          # clean actions/checkout version bump, PR #71, is what surfaced
+          # this). The bump itself is still fully built, signed, and
+          # verified otherwise -- only the strict admission gate is
+          # structurally unreachable for this actor, the same reasoning
+          # that already exempts it from the App-token/SonarQube steps.
+          if { [ "${{ github.event_name }}" = "pull_request" ] || [ "$EXPECTED_REF" = "refs/heads/main" ]; } && [ "${{ github.actor }}" != "dependabot[bot]" ]; then
             VERIFY_ARGS+=(--disallow-degraded)
           fi
 

@@ -127,9 +127,14 @@ class ClassifyLicenseExpressionTests(unittest.TestCase):
                 self.assertEqual(matched, [expr])
 
     def test_default_policy_is_the_module_default(self):
-        self.assertIs(DEFAULT_LICENSE_POLICY.forbidden_prefixes[0], DEFAULT_LICENSE_POLICY.forbidden_prefixes[0])
-        classification, _ = classify_license_expression("AGPL-3.0", None)
-        self.assertEqual(classification, "forbidden")
+        # Omitting `policy` (None) must classify identically to explicitly
+        # passing DEFAULT_LICENSE_POLICY -- proving the fallback inside
+        # classify_license_expression is genuinely that same policy, not a
+        # separately-constructed equivalent that happens to agree here.
+        via_omitted_policy = classify_license_expression("AGPL-3.0", None)
+        via_explicit_policy = classify_license_expression("AGPL-3.0", DEFAULT_LICENSE_POLICY)
+        self.assertEqual(via_omitted_policy, via_explicit_policy)
+        self.assertEqual(via_omitted_policy[0], "forbidden")
 
 
 # ---------------------------------------------------------------------------

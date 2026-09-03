@@ -1145,37 +1145,40 @@ cumulative, same rule as the Build track below):
 - **Level 2** — `runDetails.builder.id` is a trusted hosted builder
   (currently just `https://github.com/actions/runner` — a deliberately
   narrow, explicit allowlist); the envelope's Sigstore identity check
-  (the same `identity_status` computed above) came back `verified`;
+  (the same `identity_status` computed above) came back `verified`; and
   `buildDefinition.externalParameters.workflow.repository` is present
-  (and matches `--expected-repository` when that flag is set); and
-  `buildDefinition.resolvedDependencies` has at least one entry with a
-  non-empty `uri`.
+  (and matches `--expected-repository` when that flag is set).
 - **Level 3** — an *unforgeable* builder identity: `runDetails.builder.id`
-  names one of the isolated control-plane signer workflows themselves (a
-  narrower allowlist than Level 2's — currently two, individually
-  reviewed, entries:
-  `https://github.com/lucid-provenance/lucid-attest/.github/workflows/sign.yml`
-  and
-  `https://github.com/lucid-provenance/lucid-attest-service/.github/workflows/sign-client.yml`),
+  names the one isolated control-plane signer workflow itself (a
+  narrower allowlist than Level 2's — currently a single, individually
+  reviewed entry,
+  `https://github.com/lucid-provenance/lucid-attest-service/.github/workflows/sign-client.yml`;
+  the original `lucid-attest`/`sign.yml` entry was removed 2026-09-03 —
+  that repo is now archived, and every real caller had already cut over),
   *and* the verified Sigstore signer identity (`--cert-identity`) is
   provably that same workflow — proving the entity that signed the
   envelope is the same one that claims to have built it, so an untrusted
   build job can no longer forge `buildDefinition`/`runDetails` even
-  though it never could forge the signature either. Plus materialized
-  locked dependencies: at least one `buildDefinition.resolvedDependencies`
-  entry must be a real `pkg:` PURL with a `sha256` digest, not just the
-  synthetic source-commit entry every statement already carries.
+  though it never could forge the signature either.
   **Fails closed for any caller whose provenance wasn't actually
-  constructed inside one of those two specific isolated signer jobs** —
-  provenance built by anything else (the untrusted build job itself, a
-  caller's own inlined workflow step, or simply no split-signer
-  architecture at all — see "Isolating signing from the build" below)
-  correctly can't reach this level, by design, not as a stub.
+  constructed inside that specific isolated signer job** — provenance
+  built by anything else (the untrusted build job itself, a caller's own
+  inlined workflow step, or simply no split-signer architecture at all —
+  see "Isolating signing from the build" below) correctly can't reach
+  this level, by design, not as a stub. Dependency-materialization
+  evidence used to be a third Level 3 item here; it moved to its own
+  non-SLSA "Dependency Materialization Evidence" section (see above) —
+  SLSA v1.0's ratified Build Track doesn't define a dependency-
+  materialization level.
 
 **`--require-slsa-build-l3`** (off by default) folds the Build track's
-cumulative Level 3 outcome into `passed`/exit code — opt-in, so no
-existing caller's gate changes until they choose to require full Build
-Level 3 compliance (which, per the above, no caller can satisfy yet).
+cumulative Level 3 outcome into `passed`/exit code — opt-in. Both Level 3
+items genuinely pass today for a caller supplying `--subject-name`/
+`--subject-digest` — confirmed against real CI runs across every current
+caller (`lucid-assay`, `lucid-console`, `lucid-dsse-collector`,
+`lucid-attest-service`, 2026-09-03) — but that's still a per-caller opt-in
+choice, not universal, so this stays opt-in rather than becoming a
+platform-wide default.
 
 **FINAL VERDICT banner**: one synthesized line summarizing the whole
 report — `PASSED` when the hard gate passed *and* both tracks are fully
@@ -1291,19 +1294,29 @@ verify (contents: read)
 
 `build`'s test/dependency execution can never reach the Sigstore signing
 credential — `id-token: write` is granted to `attest` alone. `attest` is a
-`uses:` call to [`lucid-provenance/lucid-attest`](https://github.com/lucid-provenance/lucid-attest),
-a separate, branch-protected repository hosting the signing job as a
-`workflow_call` reusable workflow, checked out at a commit SHA hardcoded
-inside that repo's own `sign.yml` (`env.TRUSTED_SIGNER_SHA`) — deliberately
-*not* a value `lucid-assay`'s `attest` job (or any other caller) can supply
-(the same pattern [`slsa-framework/slsa-github-generator`](https://github.com/slsa-framework/slsa-github-generator)
-uses). That's the gap that matters: even a PR that fully rewrites
-`lucid-assay`'s own workflow file in the same PR can't also rewrite what
-the signer trusts, since that code isn't part of the PR's diff at all. The
-source for that repo's content lives in `contrib/lucid-attest-repo/` in
-this repo (not part of `lucid-assay`'s own CI — a header comment there
-says so) along with setup instructions; `assay.yml`'s `attest` job comment
-cross-references it.
+`uses:` call to [`lucid-provenance/lucid-attest-service`](https://github.com/lucid-provenance/lucid-attest-service)'s
+`sign-client.yml`, a reusable `workflow_call` workflow backed by that
+service's own Lambda, pinned to a full commit SHA in this repo's own
+`assay.yml` (`--cert-identity` is derived by parsing that same `uses:`
+line at verify time, not hand-kept as a second copy). The signer-side half
+of "even a rewriting PR can't move the goalposts" lives on the other end
+of that call: which `lucid-assay` source commit `sign-client.yml` trusts
+for provenance construction (`PROVENANCE_SOURCE_SHA`/`SIGNER_SOURCE_SHA`)
+is hardcoded inside `lucid-attest-service`'s own workflow file, not a
+value this repo's `attest` job can supply — the same non-forgeable
+property [`slsa-framework/slsa-github-generator`](https://github.com/slsa-framework/slsa-github-generator)
+uses, just with the pin living in the signer's repo instead of the
+caller's. See *Lucid Attest Service: Technical & Architectural Summary*
+for that repo's own account.
+
+**Historical note**: earlier revisions of this architecture called a
+different repo, `lucid-attest` (its `sign.yml`, mirrored for reference in
+this repo's `contrib/lucid-attest-repo/` along with setup instructions —
+not part of `lucid-assay`'s own CI, and not the current signer's source).
+`lucid-attest` is now **archived** on GitHub; every real caller had
+already cut over to `lucid-attest-service` before the archival, and
+`contrib/lucid-attest-repo/` describes that retired signer, not the live
+one.
 
 What this still doesn't claim: reproducible builds, ephemeral/hardened
 isolation of individual build *steps* within the `build` job itself, or

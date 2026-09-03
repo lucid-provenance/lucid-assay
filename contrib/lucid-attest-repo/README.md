@@ -1,5 +1,13 @@
 # lucid-attest
 
+> **Archived 2026-09-03.** This directory mirrors the now-archived
+> `lucid-provenance/lucid-attest` repo's real content — kept for historical
+> reference and setup instructions, not as this pipeline's current signer.
+> `lucid-assay`'s own `attest` job now calls `lucid-attest-service`'s
+> `sign-client.yml` instead (see the main `README.md`'s "Isolating signing
+> from the build" section). Everything below describes the original design
+> as it was, not the live mechanism.
+
 The trusted signing boundary for [lucid-assay](https://github.com/lucid-provenance/lucid-assay)
 attestations.
 

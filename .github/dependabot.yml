@@ -1,8 +1,12 @@
 # Tracks every SHA-pinned `uses:` in this repo's own workflow files
-# against their upstream tagged releases -- both third-party actions
-# (e.g. actions/checkout) and the cross-repo lucid-attest/sign.yml pin,
-# now that lucid-attest tags real releases (v1.0.0+). Opens a PR here
-# proposing the bump, never merges automatically.
+# against their upstream tagged releases -- third-party actions (e.g.
+# actions/checkout), plus the cross-repo lucid-attest-service/sign-client.yml
+# pin once that repo starts tagging real releases (it doesn't yet -- see
+# that repo's own "Known gaps" -- so this ecosystem currently tracks it
+# by commit only, same as any other unreleased dependency). lucid-attest,
+# the original signer this pin used to point at, is archived; it never
+# reached the tagged-release state this comment used to describe either.
+# Opens a PR here proposing the bump, never merges automatically.
 #
 # The duplicate-pin danger this comment used to warn about (a bump PR
 # only touching the `attest` job's `uses:` line, leaving a separately-

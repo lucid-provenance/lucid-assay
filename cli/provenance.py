@@ -11,8 +11,10 @@ build platform that signs it -- not merely signed there after being
 assembled by an untrusted build job (see cli/verify.py's
 `_slsa_check_isolated_provenance_generation` docstring for exactly why
 that distinction matters). `lucid-assay provenance` is the narrow surface
-that makes that possible: run it from inside `lucid-attest`'s isolated
-`sign` job (see that repo's `sign.yml`), and it builds the statement
+that makes that possible: run it from inside an isolated signer job --
+today, `lucid-attest-service`'s `sign-client.yml` (the pattern was
+pioneered in `lucid-attest`'s own `sign.yml`, now archived and
+superseded) -- and it builds the statement
 using *that job's own* ambient GitHub Actions context (GITHUB_REPOSITORY/
 _SHA/RUNNER_ENVIRONMENT, as seen by the trusted job, not whatever the
 untrusted build job claims) plus a read-only, code-never-executed
@@ -97,9 +99,10 @@ def _control_plane_builder_id() -> Optional[str]:
     two different GitHub Actions concepts that happen to look similar;
     this function's whole existence was conflating them.)
 
-    lucid-attest's sign.yml now always passes --builder-id explicitly
-    (it's the one caller that authoritatively knows its own identity,
-    hardcoded the same way TRUSTED_SIGNER_SHA is), so this fallback is
+    lucid-attest-service's sign-client.yml (and, before it, lucid-attest's
+    sign.yml) always passes --builder-id explicitly -- it's the one
+    caller that authoritatively knows its own identity, hardcoded the
+    same way its own trusted source commit is -- so this fallback is
     only ever exercised by a direct, non-nested invocation -- where
     GITHUB_WORKFLOW_REF genuinely is this process's own top-level
     workflow, and the derivation is correct. None (never fabricated) when
@@ -119,7 +122,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         prog="lucid-assay provenance",
         description="Construct a SLSA v1.0 provenance in-toto Statement from this process's own ambient "
         "GitHub Actions context -- intended to run inside an isolated, trusted signer job (see "
-        "lucid-provenance/lucid-attest's sign.yml), not the untrusted job that built the subject artifact.",
+        "lucid-provenance/lucid-attest-service's sign-client.yml), not the untrusted job that built the "
+        "subject artifact.",
     )
     p.add_argument("--subject-name", required=True, help="the attested artifact's name, e.g. an image ref")
     p.add_argument("--subject-digest", required=True, help="sha256:<hex> or bare hex")
@@ -134,8 +138,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--builder-id",
         default=None,
         dest="builder_id",
-        help="explicit runDetails.builder.id to assert, e.g. https://github.com/lucid-provenance/lucid-attest/"
-        ".github/workflows/sign.yml -- the caller's own known identity, not derived here. Required for "
+        help="explicit runDetails.builder.id to assert, e.g. https://github.com/lucid-provenance/"
+        "lucid-attest-service/.github/workflows/sign-client.yml -- the caller's own known identity, not "
+        "derived here. Required for "
         "correctness when running inside a workflow_call job (see _control_plane_builder_id's docstring "
         "for why ambient GITHUB_WORKFLOW_REF can't supply this in that case); falls back to a best-effort "
         "ambient derivation when omitted, correct only for a direct, non-nested invocation.",

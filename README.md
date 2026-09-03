@@ -1195,14 +1195,17 @@ cumulative, same rule as the Build track below):
   SLSA v1.0's ratified Build Track doesn't define a dependency-
   materialization level.
 
-**`--require-slsa-build-l3`** (off by default) folds the Build track's
-cumulative Level 3 outcome into `passed`/exit code — opt-in. Both Level 3
-items genuinely pass today for a caller supplying `--subject-name`/
+**`--require-slsa-build-l3`** (off by default in the CLI itself) folds the
+Build track's cumulative Level 3 outcome into `passed`/exit code — the
+CLI's own default stays off deliberately (a caller that hasn't confirmed
+it passes on a real run shouldn't inherit a stricter gate silently), but
+every current caller's own CI workflow now passes it explicitly: both
+Level 3 items genuinely pass today for a caller supplying `--subject-name`/
 `--subject-digest` — confirmed against real CI runs across every current
 caller (`lucid-assay`, `lucid-console`, `lucid-dsse-collector`,
-`lucid-attest-service`, 2026-09-03) — but that's still a per-caller opt-in
-choice, not universal, so this stays opt-in rather than becoming a
-platform-wide default.
+`lucid-attest-service`, 2026-09-03), each verified green at an
+`ASSAY_CLI_SHA` at/after the dependency-materialization decoupling (PR
+#76) before the flag was added to that repo's own workflow.
 
 **FINAL VERDICT banner**: one synthesized line summarizing the whole
 report — `PASSED` when the hard gate passed *and* both tracks are fully

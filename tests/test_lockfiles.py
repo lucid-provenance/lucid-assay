@@ -795,6 +795,27 @@ class ParseGradleBuildFileTests(TmpDirMixin, unittest.TestCase):
     def test_missing_file_returns_empty(self):
         self.assertEqual(parse_gradle_build_file("/nonexistent/build.gradle"), [])
 
+    def test_long_non_matching_run_does_not_blow_up_regex_backtracking(self):
+        """Regression guard for a real, confirmed-not-a-false-positive
+        SonarQube finding: _GRADLE_BUILD_DEPENDENCY used to have two
+        adjacent `\\s*` quantifiers straddling an optional `\\(?` between
+        the configuration keyword and the opening quote -- an ambiguous-
+        partitioning shape that made matching quadratic against a long
+        non-matching whitespace run (confirmed empirically: 8+ seconds
+        against 50K trailing spaces before the fix, versus this test's
+        bound after it). A build.gradle is untrusted repo content this
+        pipeline parses, so a pathological line here is a real, not
+        hypothetical, DoS surface."""
+        import time
+
+        line = "implementation" + (" " * 200_000)  # never reaches a quote -> forces backtracking
+        path = self._write("build.gradle", line)
+        start = time.perf_counter()
+        result = parse_gradle_build_file(path)
+        elapsed = time.perf_counter() - start
+        self.assertEqual(result, [])
+        self.assertLess(elapsed, 1.0, f"took {elapsed:.3f}s -- regex backtracking regression")
+
 
 class ParseMavenPomDependenciesTests(TmpDirMixin, unittest.TestCase):
     def test_pom_with_namespace(self):

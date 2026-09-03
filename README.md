@@ -27,7 +27,7 @@ cli/
   parsers/sarif.py          # SARIF 2.1.0 ingestion -> differential (patch vs. legacy) findings
   parsers/github_rules.py   # GitHub branch protection/ruleset inspection via REST API
   parsers/commit_author.py  # GitHub commit-author identity (verified account) via REST API
-  parsers/lockfiles.py      # uv.lock/package-lock.json/go.sum/Gradle/Maven -> resolved_dependencies
+  parsers/lockfiles.py      # uv.lock/poetry.lock/Pipfile.lock/requirements.txt/package-lock.json/pnpm-lock.yaml/yarn.lock/go.sum/Gradle/Maven -> resolved_dependencies
   parsers/s2c2f.py          # S2C2F control evaluation (subset with a real, checkable signal) -> predicate.s2c2f
   parsers/sbom.py            # CycloneDX/SPDX SBOM ingestion -> license-policy SARIF findings + resolved_dependencies
   patch_coverage.py         # git diff base...head, intersected with coverage hit maps
@@ -176,8 +176,10 @@ under this one line since it's still "parsing"), `diff_patch_analysis`
 (`git diff`-based patch coverage, plus the separate diff SARIF uses to
 cross-reference changed lines), `ast_inspection`, `github_rules_api`,
 `rcs_scoring`, `lockfile_dependencies` (auto-detects and parses uv.lock/
-package-lock.json/go.sum/Gradle/Maven locks under `--repo-dir` into the
-predicate's `resolved_dependencies` -- independent of RCS scoring, feeds
+poetry.lock/Pipfile.lock/requirements.txt/package-lock.json/
+pnpm-lock.yaml/yarn.lock/go.sum/Gradle/Maven locks under `--repo-dir`
+into the predicate's `resolved_dependencies` --
+independent of RCS scoring, feeds
 only predicate assembly), `predicate_assembly`, and `worm_upload` (the
 fire-and-forget dispatch cost only, not the background upload itself).
 `Total Blocking Overhead` is the same figure the 50ms budget check above
@@ -538,13 +540,35 @@ content, same key, free dedup and idempotent uploads across re-attested
 runs).
 
 **`parsers/lockfiles.py`** auto-detects and parses lockfiles under
-`--repo-dir` (uv.lock, package-lock.json, go.sum, Gradle/Maven locks — any
-number/combination, at any depth outside vendored/build directories) into
-the predicate's top-level `resolved_dependencies` array: one
-`{uri, digest}` entry per dependency (a `pkg:` PURL plus an
-algorithm→hex-digest map, empty when the lockfile format itself carries no
-digest, e.g. Gradle/Maven), deduplicated by `uri`, `[]` when no recognized
-lockfile is found. Like `static_analysis`, this is purely additive
+`--repo-dir` (uv.lock, poetry.lock, Pipfile.lock, pip-compile-generated
+requirements.txt, package-lock.json, pnpm-lock.yaml, yarn.lock (both
+Classic v1 and Berry v2+), go.sum, Gradle dependency locks with a
+build.gradle/build.gradle.kts fallback for repos that never enabled
+`dependencyLocking`, Maven pom.xml — any number/combination, at any depth
+outside vendored/build directories) into the predicate's top-level
+`resolved_dependencies` array: one `{uri, digest}` entry per dependency (a
+`pkg:` PURL plus an algorithm→hex-digest map, empty when the lockfile
+format itself carries no digest, e.g. Gradle/Maven), deduplicated by
+`uri`, `[]` when no recognized lockfile is found. `pnpm-lock.yaml` and
+`yarn.lock` are both parsed by small purpose-built line scanners scoped to
+just the block(s) each needs, not a general YAML library — this module
+has stayed stdlib-only since it was written, and what each needs
+(`resolution: {integrity: ...}` for pnpm; `version`/`integrity` or
+`checksum` for yarn) is regular enough that a real YAML parser would be a
+heavier dependency than the problem warrants; Yarn Berry's own
+`checksum: <n>/<128-hex>` field is a raw SHA-512 digest, not SRI like
+every other JS-ecosystem digest this module decodes. The
+`build.gradle`/`build.gradle.kts` fallback only matches literal
+`<configuration> 'group:artifact:version'` string declarations (both
+Groovy and Kotlin DSL) — map-notation, version-catalog references, and
+variable interpolation are deliberately out of scope for a regex scanner
+over a real programming language, and a dynamic version (`31.+`) or
+Ivy-style range (`[1.0,2.0)`) is excluded the same way pom.xml's own
+unresolved `${...}` placeholder is. A `requirements.txt` only contributes
+anything when it's genuinely pip-compile output (real `--hash=` lines
+present) — a hand-written, unhashed one degrades to contributing nothing,
+the same way a missing lockfile does, since the filename alone can't
+distinguish the two. Like `static_analysis`, this is purely additive
 predicate data — it's never an RCS scoring input. **It's also unrelated to
 SLSA v1.0 provenance's `buildDefinition.resolvedDependencies`** on a
 SLSA-provenance predicate — a differently-shaped field on a differently-

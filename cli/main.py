@@ -37,8 +37,15 @@ from .parsers.sarif import (
     parse_sarif_file,
     parse_sonar_metrics_file,
 )
+from .parsers.sbom import (
+    SbomReport,
+    build_sbom_sarif_report,
+    parse_sbom_file,
+    sbom_components_to_resolved_dependencies,
+)
 from .patch_coverage import compute_patch_coverage, compute_patch_modified_lines
 from .real_coverage import CoverageTrackResult, RealCoverageResult, compute_real_coverage
+from .sbom_statement import build_sbom_statement
 from .scorer import RCSResult, score_pipeline
 from .slsa_provenance import build_slsa_provenance_statement
 
@@ -167,6 +174,55 @@ def _maybe_emit_slsa_provenance(
     return slsa_provenance_out_path
 
 
+def derive_sbom_statement_path(out_path: str, explicit: Optional[str]) -> str:
+    """Output path for the --sbom companion statement (cli/sbom_statement.
+    py): honors --sbom-statement-out verbatim when given, otherwise sits
+    as a fixed-basename sibling of --out in the same directory (e.g.
+    build/attestation.unsigned.json -> build/sbom.unsigned.json).
+    Deliberately a fixed name, not a derived-suffix scheme like
+    derive_slsa_provenance_path's own *.slsa-provenance.unsigned.json --
+    a downstream CI workflow (lucid-console's own dogfood pipeline is the
+    first real caller) references this file by that fixed, predictable
+    name, not by deriving it from --out's own basename."""
+    if explicit:
+        return explicit
+    parent = Path(out_path).parent
+    return str(parent / "sbom.unsigned.json") if str(parent) not in ("", ".") else "sbom.unsigned.json"
+
+
+def _maybe_emit_sbom_statement(
+    args: argparse.Namespace,
+    *,
+    sbom_report: Optional[SbomReport],
+    image_digest: str,
+) -> Optional[str]:
+    """Step 7c: builds and writes the --sbom companion in-toto Statement
+    (see cli/sbom_statement.py) -- a second, separate attestation wrapping
+    the SBOM's own raw document verbatim as its predicate, alongside
+    lucid-assay's own RCS predicate. Returns the path it was written to,
+    or None when --sbom wasn't passed, it failed to parse (already warned
+    about by _ingest_sbom), or its format doesn't map to a real
+    predicateType (see build_sbom_statement) -- never a fabricated/partial
+    companion statement. Extracted (same rationale as
+    _maybe_emit_slsa_provenance above) so it's unit-testable directly."""
+    if sbom_report is None or not sbom_report.available:
+        return None
+
+    statement = build_sbom_statement(
+        subject_name=args.image_ref,
+        subject_sha256=image_digest,
+        sbom_format=sbom_report.format,
+        raw_document=sbom_report.raw_document,
+    )
+    if statement is None:
+        return None
+
+    sbom_statement_out_path = safe_resolve_path(derive_sbom_statement_path(args.out, args.sbom_statement_out))
+    with open(sbom_statement_out_path, "w", encoding="utf-8") as f:
+        json.dump(statement, f, indent=2)
+    return sbom_statement_out_path
+
+
 def upload_to_worm_async(local_path: str, sha256_hex: str, bucket: str = "evidence"):
     """Fire-and-forget evidence storage dispatch."""
     def _upload():
@@ -233,15 +289,127 @@ def _ingest_sarif(args: argparse.Namespace, stage_ns: Dict[str, int]) -> Optiona
     return sarif_report
 
 
-def _detect_lockfile_dependencies(args: argparse.Namespace, stage_ns: Dict[str, int]) -> List[Dict[str, Any]]:
+def _ingest_sbom(args: argparse.Namespace, stage_ns: Dict[str, int]) -> Optional[SbomReport]:
+    """Step 3d: SBOM (CycloneDX/SPDX) ingestion, optional via --sbom.
+    Returns None when --sbom wasn't passed at all. Parsing failure (a
+    missing/corrupt/unrecognized file) degrades to a returned
+    SbomReport(available=False, ...) with a stderr WARNING -- never
+    raises, same fail-open-but-diagnosed contract as _ingest_sarif above.
+    The report's own license-policy findings are folded into sarif_report
+    by _merge_sbom_into_sarif (called right after this at its call site in
+    main()), and its components feed _detect_lockfile_dependencies' own
+    fallback below -- see cli.parsers.sbom's module docstring for why both
+    of those live in the existing sarif/lockfile pipelines rather than as
+    new predicate fields of their own."""
+    if not args.sbom:
+        return None
+    with _stage(stage_ns, "parse_inputs"):
+        report = parse_sbom_file(args.sbom)
+    if not report.available:
+        print(
+            f"WARNING: SBOM '{args.sbom}' could not be read/parsed: {'; '.join(report.reasons)}",
+            file=sys.stderr,
+        )
+    return report
+
+
+def _merge_sbom_into_sarif(
+    sarif_report: Optional[SarifSummaryReport],
+    sbom_report: Optional[SbomReport],
+    sbom_report_sha: Optional[str] = None,
+) -> Optional[SarifSummaryReport]:
+    """Folds the SBOM's license-policy findings (cli.parsers.sbom.
+    build_sbom_sarif_report) into sarif_report, so every downstream
+    consumer of sarif_report -- the scorer's static-analysis component
+    (WEIGHTS["static_analysis"]) and S2C2F's SCA-2 (License Checks) --
+    sees them exactly like any other --sarif input's findings, with no
+    special-casing. Returns sarif_report unchanged when there's no
+    available SBOM to merge (no --sbom, or it failed to parse -- already
+    warned about by _ingest_sbom above).
+
+    `sbom_report_sha` (the same --sbom file hash predicate.artifact.sbom.
+    sha256 uses) is threaded through as the synthetic SBOM tool's
+    report_hash -- schema/lucid-attestation-v1.schema.json requires every
+    static_analysis.tools[] entry to carry one; see build_sbom_sarif_
+    report's own docstring for why the --sbom file's hash is the honest
+    value here (there's no raw *SARIF* file for a synthetic tool).
+
+    When both a real --sarif input and an available SBOM are present,
+    this goes through cli.parsers.sarif.aggregate_sarif_reports() same as
+    any other multi-input merge in this pipeline -- including its existing
+    fail-closed contract that one unavailable input taints the whole
+    aggregate. That's inherited deliberately, not incidentally: a broken
+    --sarif input already degrades the static-analysis picture on its
+    own (see _ingest_sarif's WARNING above), and this function must not
+    quietly launder that into "well, at least the SBOM half was clean" --
+    the same "no partial clean bill of health" principle
+    aggregate_sarif_reports documents for its own multi-file case."""
+    if sbom_report is None or not sbom_report.available:
+        return sarif_report
+    report_hash = {"algorithm": "sha256", "value": sbom_report_sha} if sbom_report_sha else None
+    sbom_sarif = build_sbom_sarif_report(sbom_report.components, report_hash=report_hash)
+    if sarif_report is None:
+        return sbom_sarif
+    return aggregate_sarif_reports([sarif_report, sbom_sarif])
+
+
+# cli.parsers.sbom.detect_sbom_format()'s three format strings -> the
+# predicate.artifact.sbom.format enum schema/lucid-attestation-v1.schema.
+# json actually declares ("spdx-json"/"cyclonedx-json"/"syft-json") --
+# "spdx2"/"spdx3" both collapse to "spdx-json" since the schema doesn't
+# distinguish SPDX versions for this field, only the document family.
+_SBOM_SCHEMA_FORMAT = {"cyclonedx": "cyclonedx-json", "spdx2": "spdx-json", "spdx3": "spdx-json"}
+
+
+def _build_sbom_artifact_block(
+    sbom_report: Optional[SbomReport], sbom_sha256: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Populates predicate.artifact.sbom (schema/lucid-attestation-v1.
+    schema.json) from a successfully-parsed --sbom input, using the same
+    sha256 + WORM-content-addressed-uri pattern
+    predicate.test_verification.report_uri/predicate.coverage.report_uri
+    already use (see cli/hashing.py's own module docstring, which already
+    names SBOMs as a third evidence-artifact kind this hashing scheme
+    covers). Returns None (the field's own schema-declared default) when
+    --sbom wasn't passed, failed to parse, or its detected format doesn't
+    map to one of the schema's declared enum values -- never a fabricated
+    hash/uri for a file this pipeline couldn't actually validate."""
+    if sbom_report is None or not sbom_report.available or sbom_sha256 is None:
+        return None
+    schema_format = _SBOM_SCHEMA_FORMAT.get(sbom_report.format)
+    if schema_format is None:
+        return None
+    return {
+        "format": schema_format,
+        "sha256": sbom_sha256,
+        "uri": worm_uri(sbom_sha256),
+        "component_count": len(sbom_report.components),
+    }
+
+
+def _detect_lockfile_dependencies(
+    args: argparse.Namespace, stage_ns: Dict[str, int], sbom_report: Optional[SbomReport] = None
+) -> List[Dict[str, Any]]:
     """Step 6b: auto-detects and parses lockfiles under args.repo_dir
     (uv.lock/package-lock.json/go.sum/Gradle/Maven -- see
     cli.parsers.lockfiles) into the predicate's resolved_dependencies.
     Scoring-independent -- feeds build_statement() only. Extracted (same
     rationale as _ingest_sarif above) so it's unit-testable directly
-    rather than only reachable by driving main() end to end."""
+    rather than only reachable by driving main() end to end.
+
+    Falls back to the SBOM's own PURL-bearing components (see
+    cli.parsers.sbom.sbom_components_to_resolved_dependencies) only when
+    lockfile detection came up genuinely empty -- a repo with a real
+    lockfile is always the more authoritative, pipeline-native source (it
+    describes exactly what this build resolved, not what some earlier,
+    possibly-stale SBOM-generation step captured), so it's never
+    overridden or merged with the SBOM's inventory, only substituted for
+    when there's nothing else."""
     with _stage(stage_ns, "lockfile_dependencies"):
-        return detect_and_parse_dependencies(args.repo_dir)
+        deps = detect_and_parse_dependencies(args.repo_dir)
+        if deps or sbom_report is None or not sbom_report.available:
+            return deps
+        return sbom_components_to_resolved_dependencies(sbom_report.components)
 
 
 def _compute_real_coverage_analysis(
@@ -501,6 +669,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="path to a SARIF 2.1.0 static-analysis report (repeatable; e.g. semgrep, trivy, SonarQube)",
     )
     p.add_argument(
+        "--sbom",
+        default=None,
+        help="path to a CycloneDX (1.4-1.6) or SPDX (2.3/3.0) JSON SBOM. Its components' declared/"
+        "concluded licenses are evaluated against a forbidden-copyleft/permissive policy (see "
+        "cli/parsers/sbom.py) and folded into the --sarif findings (feeding the scorer's static-"
+        "analysis component and S2C2F's SCA-2 'License Checks'); its PURL-bearing components also "
+        "back-fill predicate.resolved_dependencies (S2C2F INV-1/ING-1) when lockfile detection finds "
+        "nothing on its own.",
+    )
+    p.add_argument(
         "--sonar-metrics",
         default=None,
         dest="sonar_metrics",
@@ -541,6 +719,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         dest="slsa_provenance_out",
         help="output path for the --emit-slsa-provenance statement (default: derived from --out, e.g. "
         "attestation.slsa-provenance.unsigned.json)",
+    )
+    p.add_argument(
+        "--sbom-statement-out",
+        default=None,
+        dest="sbom_statement_out",
+        help="output path for the --sbom companion in-toto statement (see cli/sbom_statement.py; default: "
+        "a fixed-basename sibling of --out in the same directory, e.g. build/attestation.unsigned.json -> "
+        "build/sbom.unsigned.json). A no-op when --sbom wasn't passed or failed to parse.",
     )
     p.add_argument("--skip-perf-budget-check", action="store_true")
     p.add_argument(
@@ -667,6 +853,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     # and builder both treat that as "not configured", not as a failure.
     sarif_report = _ingest_sarif(args, stage_ns)
 
+    # 3d. SBOM ingestion (optional, --sbom). Its license-policy findings
+    # are folded into sarif_report *before* scoring/predicate-assembly
+    # below, so both see one unified static-analysis picture regardless
+    # of whether a finding originated from a real --sarif tool or the
+    # SBOM's own license evaluation. Hashed here (not in step 4 alongside
+    # the other evidence artifacts) because _merge_sbom_into_sarif needs
+    # the hash already in hand, to give the synthetic SBOM SARIF tool a
+    # real report_hash (see that function's own docstring) -- the same
+    # sbom_report_sha value predicate.artifact.sbom.sha256 (step 7) and
+    # the WORM upload dispatch (step 8) reuse below, computed once.
+    sbom_report = _ingest_sbom(args, stage_ns)
+    # Only hash a successfully-parsed --sbom -- an unreadable/malformed one
+    # already produced a WARNING via _ingest_sbom above; hashing it here
+    # too would let predicate.artifact.sbom claim a validated SBOM exists
+    # for a file this pipeline couldn't actually read.
+    sbom_report_sha = sha256_file(args.sbom) if (sbom_report is not None and sbom_report.available) else None
+    sarif_report = _merge_sbom_into_sarif(sarif_report, sbom_report, sbom_report_sha)
+
     # 4. Hash evidence artifacts
     test_report_sha = sha256_file(args.junit_xml)
     coverage_report_sha = sha256_file(args.coverage_report)
@@ -706,7 +910,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     # 6b. Lockfile dependency detection (see _detect_lockfile_dependencies)
-    resolved_dependencies = _detect_lockfile_dependencies(args, stage_ns)
+    resolved_dependencies = _detect_lockfile_dependencies(args, stage_ns, sbom_report=sbom_report)
 
     # 6c. Vanity-test-aware real coverage (see _compute_real_coverage_analysis)
     real_coverage = _compute_real_coverage_analysis(args, coverage, ast_metrics, stage_ns)
@@ -760,6 +964,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             resolved_dependencies=resolved_dependencies,
             real_coverage=real_coverage,
             s2c2f=s2c2f_report,
+            sbom=_build_sbom_artifact_block(sbom_report, sbom_report_sha),
         )
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
@@ -779,16 +984,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         resolved_dependencies=resolved_dependencies,
     )
 
+    # 7c. --sbom's companion in-toto Statement (see cli/sbom_statement.py):
+    # a second, separate attestation wrapping the SBOM's own raw document
+    # verbatim, alongside the RCS predicate above. Independent of both the
+    # RCS predicate and any --emit-slsa-provenance statement -- same
+    # subject digest, but its own file and (if --sign/--dry-run-sign) its
+    # own DSSE envelope. A no-op (returns None) when --sbom wasn't passed
+    # or failed to parse.
+    sbom_statement_out_path = _maybe_emit_sbom_statement(
+        args, sbom_report=sbom_report, image_digest=image_digest
+    )
+
     # 8. Async WORM uploads (fire-and-forget: the timed cost here is only
     # the dispatch/submission overhead, not the background upload itself)
     with _stage(stage_ns, "worm_upload"):
         upload_to_worm_async(args.junit_xml, test_report_sha)
         upload_to_worm_async(args.coverage_report, coverage_report_sha)
+        if sbom_report_sha is not None:
+            upload_to_worm_async(args.sbom, sbom_report_sha)
 
     # 9. Keyless signing
     sign_total_ns, sign_sub_ns, signed_path = _maybe_sign(args, out_path)
     if slsa_provenance_out_path is not None:
         _maybe_sign(args, slsa_provenance_out_path)
+    if sbom_statement_out_path is not None:
+        _maybe_sign(args, sbom_statement_out_path)
 
     # 9b. Automatically persist this run's FAILED/GATED/PASSED verdict onto
     # the just-signed envelope (see _maybe_annotate_verdict) -- best-effort,

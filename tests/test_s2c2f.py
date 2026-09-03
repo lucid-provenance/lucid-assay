@@ -13,7 +13,8 @@ from cli.parsers.s2c2f import (
     STATUS_UNMET,
     evaluate_s2c2f,
 )
-from cli.parsers.sarif import SarifSummaryReport
+from cli.parsers.sarif import SarifRuleGroup, SarifSummaryReport, SarifToolSummary
+from cli.parsers.sbom import SbomComponent, build_sbom_sarif_report, sbom_components_to_resolved_dependencies
 
 
 def _governance(**overrides):
@@ -146,6 +147,115 @@ class EvaluateS2C2FTests(unittest.TestCase):
         controls = _controls_by_id(report)
         self.assertEqual(controls["SCA-1"].status, STATUS_NOT_YET_REPORTED)
         self.assertEqual(controls["SCA-2"].status, STATUS_NOT_YET_REPORTED)
+
+    def test_clean_grype_sarif_satisfies_sca1(self):
+        # Grype ran (driver present, tools_scanned=["grype"]), found
+        # nothing -- SCA-1 is a process-existence control ("is
+        # vulnerability scanning in place"), so a clean scan still counts.
+        sarif = SarifSummaryReport(available=True, tools_scanned=["grype"], tools=[SarifToolSummary(name="grype")])
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(),
+            repository="acme/widgets",
+            resolved_dependencies=[],
+            sarif_report=sarif,
+            branch_governance=_governance(),
+            token=None,
+        )
+        control = _controls_by_id(report)["SCA-1"]
+        self.assertEqual(control.status, STATUS_MET)
+        self.assertIn("grype", control.detail)
+
+    def test_finding_heavy_grype_sarif_still_satisfies_sca1_not_unmet(self):
+        # A Grype run that found real CVEs still has the scanning control
+        # in place -- SCA-1 must not flip to unmet because vulnerabilities
+        # were found. The findings themselves are a separate signal,
+        # surfaced in predicate.static_analysis, not in this control's
+        # met/unmet status (same precedent as SCA-2 and a forbidden
+        # license: the check having run is what's credited).
+        tool = SarifToolSummary(
+            name="grype", errors_count=2, critical_count=1, high_count=1, total_findings=2,
+            rules=[
+                SarifRuleGroup(rule_id="CVE-2024-0001-openssl", count=1, security_severity="critical"),
+                SarifRuleGroup(rule_id="CVE-2024-0002-curl", count=1, security_severity="high"),
+            ],
+        )
+        sarif = SarifSummaryReport(
+            available=True, tools_scanned=["grype"], tools=[tool],
+            total_findings=2, errors_count=2, critical_count=1, high_count=1,
+        )
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(),
+            repository="acme/widgets",
+            resolved_dependencies=[],
+            sarif_report=sarif,
+            branch_governance=_governance(),
+            token=None,
+        )
+        self.assertEqual(_controls_by_id(report)["SCA-1"].status, STATUS_MET)
+
+    def test_grype_sarif_alone_does_not_satisfy_sca3(self):
+        # Regression guard: Grype's SARIF output carries zero EOL/
+        # unmaintained-package signal (confirmed against its own SARIF
+        # presenter source -- AlertsByPackage/distro-EOL data is a
+        # separate structure the SARIF presenter never reads). A Grype
+        # SARIF report -- clean or finding-heavy -- must never credit
+        # SCA-3 on its own; that control stays scoped to the GitHub
+        # Dependabot alerts API, its only honest signal.
+        sarif = SarifSummaryReport(available=True, tools_scanned=["grype"], tools=[SarifToolSummary(name="grype")])
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(),
+            repository="acme/widgets",
+            resolved_dependencies=[],
+            sarif_report=sarif,
+            branch_governance=_governance(),
+            token=None,
+        )
+        self.assertEqual(_controls_by_id(report)["SCA-3"].status, STATUS_NOT_YET_REPORTED)
+
+    def test_sbom_license_findings_satisfy_sca2_end_to_end(self):
+        # The real integration this module exists to close: a --sbom's
+        # forbidden-license findings, converted to a SARIF report by
+        # cli.parsers.sbom.build_sbom_sarif_report exactly the way
+        # cli.main wires it, flip SCA-2 from not_yet_reported to met with
+        # no dedicated SBOM-awareness inside s2c2f.py itself -- it's just
+        # another recognized SARIF tool name.
+        components = [SbomComponent(name="bad", purl="pkg:pypi/bad@1.0", license_expression="AGPL-3.0")]
+        sarif = build_sbom_sarif_report(components)
+        deps = sbom_components_to_resolved_dependencies(components)
+
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(),
+            repository="acme/widgets",
+            resolved_dependencies=deps,
+            sarif_report=sarif,
+            branch_governance=_governance(),
+            token=None,
+        )
+        controls = _controls_by_id(report)
+        self.assertEqual(controls["SCA-2"].status, STATUS_MET)
+        self.assertIn("lucid-assay-sbom-license-policy", controls["SCA-2"].detail)
+        # INV-1/ING-1 come along for free -- the SBOM's PURLs feed
+        # resolved_dependencies exactly like a lockfile's would.
+        self.assertEqual(controls["INV-1"].status, STATUS_MET)
+        self.assertEqual(controls["ING-1"].status, STATUS_MET)
+
+    def test_sbom_with_only_clean_components_still_satisfies_sca2(self):
+        # SCA-2 means "was a license check performed", not "did it find a
+        # violation" -- a clean scan (the tool ran, found nothing bad)
+        # still counts, same as SCA-1 crediting a vulnerability scanner
+        # that happened to find zero CVEs.
+        components = [SbomComponent(name="ok", purl="pkg:pypi/ok@1.0", license_expression="MIT")]
+        sarif = build_sbom_sarif_report(components)  # available=True, but zero findings
+
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(),
+            repository="acme/widgets",
+            resolved_dependencies=sbom_components_to_resolved_dependencies(components),
+            sarif_report=sarif,
+            branch_governance=_governance(),
+            token=None,
+        )
+        self.assertEqual(_controls_by_id(report)["SCA-2"].status, STATUS_MET)
 
     def test_dependabot_config_file_satisfies_upd3(self):
         with tempfile.TemporaryDirectory() as repo_dir:

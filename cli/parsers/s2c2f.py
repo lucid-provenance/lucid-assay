@@ -280,7 +280,14 @@ def _find_private_package_proxy_config(repo_dir: str) -> Optional[str]:
 # _merge_sonar_metrics/parse_sonar_metrics_file already uses for
 # identifying a SonarQube tool by name.
 _SCA_TOOL_NAME_PATTERNS = ("trivy", "grype", "snyk", "osv-scanner", "npm-audit", "safety", "pip-audit", "dependabot")
-_LICENSE_TOOL_NAME_PATTERNS = ("license-checker", "licensee", "fossa", "scancode", "license-finder")
+# "sbom-license" matches cli.parsers.sbom.SBOM_LICENSE_TOOL_NAME
+# ("lucid-assay-sbom-license-policy") -- this module's own synthetic SARIF
+# tool for --sbom-derived license-policy findings. Unlike a real
+# multi-purpose scanner (e.g. Trivy, which shares one driver name across
+# vulnerability/license/secret/misconfig scan classes), that tool only
+# ever emits license findings, so a plain name match here is unambiguous
+# and correct -- no tag-based corroboration needed.
+_LICENSE_TOOL_NAME_PATTERNS = ("license-checker", "licensee", "fossa", "scancode", "license-finder", "sbom-license")
 
 
 def _sarif_tool_name_matches(tools_scanned: List[str], patterns: tuple) -> Optional[str]:

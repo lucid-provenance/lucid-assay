@@ -243,6 +243,14 @@ def build_statement(
             "none_count": sarif_report.none_count,
             "patch_errors_count": sarif_report.patch_errors_count,
             "patch_warnings_count": sarif_report.patch_warnings_count,
+            # Critical/High/Medium/Low, rolled up from findings' own
+            # security_severity band (see SarifFinding.security_severity's
+            # docstring) -- independent of errors_count/warnings_count/etc.
+            # above, which bucket by the SARIF spec's own coarser `level`.
+            "critical_count": sarif_report.critical_count,
+            "high_count": sarif_report.high_count,
+            "medium_count": sarif_report.medium_count,
+            "low_count": sarif_report.low_count,
             "findings": [f.as_dict() for f in sarif_report.findings],
             "tools": [t.as_dict() for t in sarif_report.tools],
             "reasons": sarif_report.reasons,
@@ -268,6 +276,10 @@ def build_statement(
             "none_count": 0,
             "patch_errors_count": 0,
             "patch_warnings_count": 0,
+            "critical_count": 0,
+            "high_count": 0,
+            "medium_count": 0,
+            "low_count": 0,
             "findings": [],
             "tools": [],
             "reasons": ["no --sarif reports configured for this run"],

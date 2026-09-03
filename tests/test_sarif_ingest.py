@@ -260,6 +260,134 @@ class RuleGroupingTests(_TempFileMixin, unittest.TestCase):
         self.assertEqual(report.findings[0].rule_id, "unknown-rule")
 
 
+def _grype_rule(rule_id, security_severity):
+    """One driver.rules[] entry shaped like Grype's real SARIF output
+    (confirmed against grype/presenter/sarif/presenter.go): `properties`
+    carries only "security-severity" (a CVSS-style numeric string) and
+    "purls" -- no "tags", no "category". ruleId itself is
+    "<vuln-id>-<package-name>" (Grype's own ruleID() format), not a bare
+    CVE id."""
+    return {"id": rule_id, "properties": {"security-severity": security_severity, "purls": ["pkg:pypi/example@1.0"]}}
+
+
+def _grype_result(rule_id, level, uri="requirements.txt", line=1, message="vulnerable package"):
+    return _sarif_result(rule_id, level, uri, line, message)
+
+
+class GrypeSeverityBandTests(_TempFileMixin, unittest.TestCase):
+    """Grype-shaped SARIF fixtures (tool.driver.name == "grype", ruleId ==
+    "<vuln-id>-<package>", properties["security-severity"] a CVSS-style
+    numeric string, no tags/category) exercising the critical/high/medium/
+    low severity-band rollup (_security_severity_band and friends)."""
+
+    def test_clean_grype_run_has_zero_findings_and_zero_bands(self):
+        # A clean run: grype executed, driver present, zero results.
+        doc = _sarif_doc([_run("grype", [], rules=[])])
+        report = parse_sarif_file(self._write(doc))
+
+        self.assertTrue(report.available)
+        self.assertEqual(report.tools_scanned, ["grype"])
+        self.assertEqual(report.total_findings, 0)
+        for band in ("critical_count", "high_count", "medium_count", "low_count"):
+            self.assertEqual(getattr(report, band), 0, band)
+        tool = report.tools[0]
+        for band in ("critical_count", "high_count", "medium_count", "low_count"):
+            self.assertEqual(getattr(tool, band), 0, band)
+
+    def test_finding_heavy_grype_run_buckets_every_severity_correctly(self):
+        rules = [
+            _grype_rule("CVE-2024-0001-openssl", "9.8"),   # critical
+            _grype_rule("CVE-2024-0002-curl", "7.5"),        # high
+            _grype_rule("CVE-2024-0003-libxml2", "5.3"),     # medium
+            _grype_rule("CVE-2024-0004-zlib", "2.1"),         # low
+            _grype_rule("CVE-2024-0005-unknown-pkg", "0.0"),  # no CVSS data -- unbanded
+        ]
+        results = [
+            _grype_result("CVE-2024-0001-openssl", "error"),
+            _grype_result("CVE-2024-0002-curl", "error"),
+            _grype_result("CVE-2024-0003-libxml2", "warning"),
+            _grype_result("CVE-2024-0004-zlib", "note"),
+            _grype_result("CVE-2024-0005-unknown-pkg", "note"),
+        ]
+        doc = _sarif_doc([_run("grype", results, rules=rules)])
+        report = parse_sarif_file(self._write(doc))
+
+        self.assertEqual(report.total_findings, 5)
+        self.assertEqual(report.critical_count, 1)
+        self.assertEqual(report.high_count, 1)
+        self.assertEqual(report.medium_count, 1)
+        self.assertEqual(report.low_count, 1)
+        # The 0.0-CVSS finding contributes to none of the four bands --
+        # "no CVSS data" is not the same as "confirmed low severity".
+        self.assertEqual(1 + 1 + 1 + 1, report.critical_count + report.high_count + report.medium_count + report.low_count)
+
+        by_id = {f.rule_id: f for f in report.findings}
+        self.assertEqual(by_id["CVE-2024-0001-openssl"].security_severity, "critical")
+        self.assertEqual(by_id["CVE-2024-0002-curl"].security_severity, "high")
+        self.assertEqual(by_id["CVE-2024-0003-libxml2"].security_severity, "medium")
+        self.assertEqual(by_id["CVE-2024-0004-zlib"].security_severity, "low")
+        self.assertIsNone(by_id["CVE-2024-0005-unknown-pkg"].security_severity)
+
+        tool = report.tools[0]
+        self.assertEqual((tool.critical_count, tool.high_count, tool.medium_count, tool.low_count), (1, 1, 1, 1))
+        rule_by_id = {r.rule_id: r for r in tool.rules}
+        self.assertEqual(rule_by_id["CVE-2024-0001-openssl"].security_severity, "critical")
+
+    def test_severity_band_thresholds_are_inclusive_at_their_lower_bound(self):
+        rules = [
+            _grype_rule("A-pkg", "9.0"),   # exactly the critical threshold
+            _grype_rule("B-pkg", "7.0"),   # exactly the high threshold
+            _grype_rule("C-pkg", "4.0"),   # exactly the medium threshold
+            _grype_rule("D-pkg", "0.1"),   # smallest positive score -> low
+        ]
+        results = [_grype_result(rid, "error") for rid in ("A-pkg", "B-pkg", "C-pkg", "D-pkg")]
+        doc = _sarif_doc([_run("grype", results, rules=rules)])
+        report = parse_sarif_file(self._write(doc))
+        by_id = {f.rule_id: f.security_severity for f in report.findings}
+        self.assertEqual(by_id["A-pkg"], "critical")
+        self.assertEqual(by_id["B-pkg"], "high")
+        self.assertEqual(by_id["C-pkg"], "medium")
+        self.assertEqual(by_id["D-pkg"], "low")
+
+    def test_malformed_or_missing_security_severity_is_no_band(self):
+        rules = [
+            {"id": "no-props", "properties": {}},
+            {"id": "non-numeric", "properties": {"security-severity": "not-a-number"}},
+            {"id": "negative", "properties": {"security-severity": "-1.0"}},
+        ]
+        results = [_grype_result(rid, "error") for rid in ("no-props", "non-numeric", "negative")]
+        doc = _sarif_doc([_run("grype", results, rules=rules)])
+        report = parse_sarif_file(self._write(doc))
+        self.assertTrue(all(f.security_severity is None for f in report.findings))
+        self.assertEqual(report.critical_count + report.high_count + report.medium_count + report.low_count, 0)
+
+    def test_aggregate_sums_severity_bands_across_sarif_inputs(self):
+        doc1 = _sarif_doc([_run("grype", [_grype_result("A-pkg", "error")], rules=[_grype_rule("A-pkg", "9.5")])])
+        doc2 = _sarif_doc([_run("grype", [_grype_result("B-pkg", "error")], rules=[_grype_rule("B-pkg", "9.1")])])
+        r1 = parse_sarif_file(self._write(doc1))
+        r2 = parse_sarif_file(self._write(doc2))
+        merged = aggregate_sarif_reports([r1, r2])
+        self.assertEqual(merged.critical_count, 2)
+
+    def test_rule_seen_without_a_descriptor_first_is_backfilled_by_a_later_run(self):
+        # A rule_id can appear in one run's results with no matching
+        # driver.rules[] entry in *that* run (category/tags/
+        # security_severity all unset), then get its descriptor filled in
+        # by a later run from the same tool (tool_state persists across
+        # every run in a file, keyed by tool name) -- the rule's category/
+        # tags/security_severity should backfill from whichever run
+        # actually described it, not stay permanently empty.
+        doc = _sarif_doc([
+            _run("grype", [_grype_result("CVE-2024-9999-pkg", "error")], rules=[]),  # no descriptor yet
+            _run("grype", [_grype_result("CVE-2024-9999-pkg", "error")], rules=[_grype_rule("CVE-2024-9999-pkg", "9.9")]),
+        ])
+        report = parse_sarif_file(self._write(doc))
+        tool = report.tools[0]
+        rule = next(r for r in tool.rules if r.rule_id == "CVE-2024-9999-pkg")
+        self.assertEqual(rule.count, 2)
+        self.assertEqual(rule.security_severity, "critical")
+
+
 class SonarQubeExtensionTests(_TempFileMixin, unittest.TestCase):
     """SonarQube SARIF export with extension/property-bag parsing, both
     embedded in the SARIF file and merged in externally via

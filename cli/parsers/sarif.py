@@ -61,6 +61,8 @@ MAX_SARIF_FILE_SIZE = 10 * 1024 * 1024  # 10MB limit
 VALID_LEVELS = {"error", "warning", "note", "none"}
 DEFAULT_LEVEL = "warning"
 
+VALID_SEVERITY_BANDS = {"critical", "high", "medium", "low"}
+
 # api/measures/component metric keys -> our extension key names.
 _SONAR_METRIC_ALIASES = {
     "cognitive_complexity": "cognitive_complexity",
@@ -90,6 +92,15 @@ class SarifFinding:
     is_new_in_patch: bool = False
     category: Optional[str] = None
     tags: List[str] = field(default_factory=list)
+    # Critical/High/Medium/Low, derived from the rule's own
+    # properties["security-severity"] (a CVSS-style numeric string -- the
+    # GitHub code-scanning SARIF convention several security scanners
+    # populate, e.g. Grype, CodeQL, Snyk; see _security_severity_band()).
+    # None when the tool didn't provide one -- never guessed at from
+    # `level` alone, which is a coarser, spec-standard bucket (error/
+    # warning/note/none) that conflates e.g. Critical and High into one
+    # "error" value for a tool like Grype.
+    security_severity: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -102,6 +113,7 @@ class SarifFinding:
             "is_new_in_patch": self.is_new_in_patch,
             "category": self.category,
             "tags": self.tags,
+            "security_severity": self.security_severity,
         }
 
 
@@ -112,6 +124,7 @@ class SarifRuleGroup:
     count: int
     category: Optional[str] = None
     tags: List[str] = field(default_factory=list)
+    security_severity: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -119,6 +132,7 @@ class SarifRuleGroup:
             "count": self.count,
             "category": self.category,
             "tags": self.tags,
+            "security_severity": self.security_severity,
         }
 
 
@@ -137,6 +151,15 @@ class SarifToolSummary:
     notes_count: int = 0
     none_count: int = 0
     total_findings: int = 0
+    # Rolled up from findings' own security_severity band -- see
+    # SarifFinding.security_severity's docstring. Independent of the
+    # errors/warnings/notes/none counts above (those bucket by the SARIF
+    # spec's own coarser `level`; these bucket by a tool-provided,
+    # finer-grained CVSS-derived severity when one is actually available).
+    critical_count: int = 0
+    high_count: int = 0
+    medium_count: int = 0
+    low_count: int = 0
     rules: List[SarifRuleGroup] = field(default_factory=list)
     extensions: Dict[str, Any] = field(default_factory=dict)
     report_hash: Optional[Dict[str, str]] = None
@@ -152,6 +175,10 @@ class SarifToolSummary:
                 "notes": self.notes_count,
                 "none": self.none_count,
                 "total_findings": self.total_findings,
+                "critical": self.critical_count,
+                "high": self.high_count,
+                "medium": self.medium_count,
+                "low": self.low_count,
             },
             "rules": [r.as_dict() for r in self.rules],
             "extensions": self.extensions,
@@ -170,6 +197,12 @@ class SarifSummaryReport:
     none_count: int = 0
     patch_errors_count: int = 0
     patch_warnings_count: int = 0
+    # Same security_severity rollup as SarifToolSummary's own, aggregated
+    # across every tool in this report.
+    critical_count: int = 0
+    high_count: int = 0
+    medium_count: int = 0
+    low_count: int = 0
     findings: List[SarifFinding] = field(default_factory=list)
     tools_scanned: List[str] = field(default_factory=list)
     tools: List[SarifToolSummary] = field(default_factory=list)
@@ -185,6 +218,10 @@ class SarifSummaryReport:
             "none_count": self.none_count,
             "patch_errors_count": self.patch_errors_count,
             "patch_warnings_count": self.patch_warnings_count,
+            "critical_count": self.critical_count,
+            "high_count": self.high_count,
+            "medium_count": self.medium_count,
+            "low_count": self.low_count,
             "findings": [f.as_dict() for f in self.findings],
             "tools_scanned": self.tools_scanned,
             "tools": [t.as_dict() for t in self.tools],
@@ -300,11 +337,43 @@ def _extract_location(result: Dict[str, Any]) -> tuple:
     return file_path, start_line
 
 
+def _security_severity_band(raw: Any) -> Optional[str]:
+    """Maps a SARIF rule's properties["security-severity"] value to a
+    critical/high/medium/low band, using the same CVSS score bands
+    GitHub's own code-scanning UI uses (>=9.0 critical, >=7.0 high, >=4.0
+    medium, >0.0 low). "security-severity" (hyphenated, always a numeric
+    string) is GitHub's own documented SARIF property for this -- not
+    invented here -- and is populated by several real security scanners
+    (confirmed directly against Grype's own SARIF presenter source: it
+    prefers a real CVSS base score when available, falling back to a
+    fixed value per its own Critical/High/Medium/Low severity bucket
+    otherwise).
+
+    None for a missing/unparseable/non-positive value -- 0.0 is Grype's
+    own "no CVSS data available" fallback (see its `securitySeverityValue`
+    default case), not a genuine zero-severity claim, so it's treated the
+    same as absent: no band, never guessed at."""
+    try:
+        score = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(score) or score <= 0.0:
+        return None
+    if score >= 9.0:
+        return "critical"
+    if score >= 7.0:
+        return "high"
+    if score >= 4.0:
+        return "medium"
+    return "low"
+
+
 def _extract_rule_descriptors(driver: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Maps ruleId -> {"category": str|None, "tags": [str, ...]} from a
-    SARIF tool driver's `rules` array (ReportingDescriptor objects). Missing/
-    malformed entries are skipped individually rather than discarding the
-    whole descriptor table."""
+    """Maps ruleId -> {"category": str|None, "tags": [str, ...],
+    "security_severity": str|None} from a SARIF tool driver's `rules`
+    array (ReportingDescriptor objects). Missing/malformed entries are
+    skipped individually rather than discarding the whole descriptor
+    table."""
     descriptors: Dict[str, Dict[str, Any]] = {}
     rules = driver.get("rules")
     if not isinstance(rules, list):
@@ -326,7 +395,9 @@ def _extract_rule_descriptors(driver: Dict[str, Any]) -> Dict[str, Dict[str, Any
         category = props.get("category")
         category = str(category) if isinstance(category, (str, int)) else None
 
-        descriptors[rule_id] = {"category": category, "tags": tags}
+        security_severity = _security_severity_band(props.get("security-severity"))
+
+        descriptors[rule_id] = {"category": category, "tags": tags, "security_severity": security_severity}
 
     return descriptors
 
@@ -404,7 +475,8 @@ def _init_tool_state() -> Dict[str, Any]:
         "version": None,
         "information_uri": None,
         "counts": {"error": 0, "warning": 0, "note": 0, "none": 0},
-        "rules": {},  # rule_id -> {"count": int, "category": ..., "tags": [...]}
+        "severity_bands": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+        "rules": {},  # rule_id -> {"count": int, "category": ..., "tags": [...], "security_severity": ...}
         "extensions": {},
     }
 
@@ -460,6 +532,7 @@ def _build_finding(
     descriptor = rule_descriptors.get(rule_id, {})
     category = descriptor.get("category")
     tags = list(descriptor.get("tags") or [])
+    security_severity = descriptor.get("security_severity")
 
     is_new = False
     if file_path_norm and start_line:
@@ -477,19 +550,25 @@ def _build_finding(
         is_new_in_patch=is_new,
         category=category,
         tags=tags,
+        security_severity=security_severity,
     )
 
 
 def _record_finding_in_tool_state(state: Dict[str, Any], finding: SarifFinding) -> None:
     state["counts"][finding.level] += 1
+    if finding.security_severity in VALID_SEVERITY_BANDS:
+        state["severity_bands"][finding.security_severity] += 1
     rule_state = state["rules"].setdefault(
-        finding.rule_id, {"count": 0, "category": finding.category, "tags": finding.tags}
+        finding.rule_id,
+        {"count": 0, "category": finding.category, "tags": finding.tags, "security_severity": finding.security_severity},
     )
     rule_state["count"] += 1
     if not rule_state["category"] and finding.category:
         rule_state["category"] = finding.category
     if not rule_state["tags"] and finding.tags:
         rule_state["tags"] = finding.tags
+    if not rule_state["security_severity"] and finding.security_severity:
+        rule_state["security_severity"] = finding.security_severity
 
 
 def _extract_results(
@@ -550,6 +629,15 @@ def _count_findings_by_level(findings: List[SarifFinding]) -> Dict[str, int]:
     }
 
 
+def _count_findings_by_severity_band(findings: List[SarifFinding]) -> Dict[str, int]:
+    return {
+        "critical_count": sum(1 for f in findings if f.security_severity == "critical"),
+        "high_count": sum(1 for f in findings if f.security_severity == "high"),
+        "medium_count": sum(1 for f in findings if f.security_severity == "medium"),
+        "low_count": sum(1 for f in findings if f.security_severity == "low"),
+    }
+
+
 def _count_patch_differential_findings(findings: List[SarifFinding]) -> Dict[str, int]:
     return {
         "patch_errors_count": sum(1 for f in findings if f.is_new_in_patch and f.level == "error"),
@@ -558,11 +646,16 @@ def _count_patch_differential_findings(findings: List[SarifFinding]) -> Dict[str
 
 
 def _summarize_findings(findings: List[SarifFinding]) -> Dict[str, int]:
-    """The six aggregate counts (errors/warnings/notes/none, and
+    """The ten aggregate counts (errors/warnings/notes/none by SARIF
+    `level`; critical/high/medium/low by security_severity band;
     patch-differential errors/warnings) derived from a findings list --
     shared by parse_sarif_file and aggregate_sarif_reports so the two
     can never drift out of sync with each other."""
-    return {**_count_findings_by_level(findings), **_count_patch_differential_findings(findings)}
+    return {
+        **_count_findings_by_level(findings),
+        **_count_findings_by_severity_band(findings),
+        **_count_patch_differential_findings(findings),
+    }
 
 
 def _build_tool_summaries(
@@ -572,8 +665,12 @@ def _build_tool_summaries(
     for name in tools_scanned:
         state = tool_state[name]
         counts = state["counts"]
+        bands = state["severity_bands"]
         rule_groups = [
-            SarifRuleGroup(rule_id=rid, count=info["count"], category=info["category"], tags=info["tags"])
+            SarifRuleGroup(
+                rule_id=rid, count=info["count"], category=info["category"], tags=info["tags"],
+                security_severity=info["security_severity"],
+            )
             for rid, info in sorted(state["rules"].items())
         ]
         tools.append(
@@ -586,6 +683,10 @@ def _build_tool_summaries(
                 notes_count=counts["note"],
                 none_count=counts["none"],
                 total_findings=sum(counts.values()),
+                critical_count=bands["critical"],
+                high_count=bands["high"],
+                medium_count=bands["medium"],
+                low_count=bands["low"],
                 rules=rule_groups,
                 extensions=state["extensions"],
                 report_hash=dict(report_hash),

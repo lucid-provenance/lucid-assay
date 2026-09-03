@@ -2,12 +2,21 @@ name: Lucid Assay
 
 # run-name: overrides the Actions run-list headline, which otherwise
 # defaults to the triggering commit message -- indistinguishable at a
-# glance from Publish Assay Image's own run on the same commit (both
-# workflows can legitimately fire off one push when it touches cli/**).
-# Falls back through whichever triggering-event context actually exists:
-# push has head_commit.message, pull_request has pull_request.title,
-# workflow_dispatch has neither.
-run-name: "Score & attest: ${{ github.event.head_commit.message || github.event.pull_request.title || github.ref_name }}"
+# glance from two runs of *this same* workflow on the *same* commit:
+# `on.push`'s `feat/**` branch pattern and `on.pull_request` both fire
+# independently the moment a feature-branch push also has an open PR
+# against main, and a PR's title commonly just mirrors its commit
+# message's subject line, so the old run-name (commit message ||
+# PR title || ref name, no event-type prefix) rendered near-identically
+# for both -- confirmed for real: PR #73 and its underlying push both
+# showed as "Score & attest: feat(sbom): ..." in the run list, distinguishable
+# only by a small, easy-to-miss event-type badge. Leading with the event
+# type (+ PR number, when there is one) makes the two visually
+# unambiguous at a glance, without needing that badge. Also still
+# distinguishes from Publish Assay Image's own run on the same commit
+# (both workflows can legitimately fire off one push when it touches
+# cli/**) -- unchanged from this field's original purpose.
+run-name: "Score & attest: ${{ github.event_name == 'pull_request' && format('PR #{0}: {1}', github.event.pull_request.number, github.event.pull_request.title) || github.event_name == 'push' && format('push ({0}): {1}', github.ref_name, github.event.head_commit.message) || format('{0}: {1}', github.event_name, github.ref_name) }}"
 
 # Deliberately `pull_request`, NOT `pull_request_target`: this workflow
 # checks out and executes code from the PR head ref, so it must run in the

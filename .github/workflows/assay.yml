@@ -147,8 +147,23 @@ jobs:
       # declared ranges -- and before "Execute Tests with Telemetry"
       # creates build/, so there's no stray build output for Syft to see.
       # Unlike the other three repos' copy of this step, no --exclude is
-      # needed: lucid-assay's own build job never vendors a second, nested
-      # checkout of itself the way their `_assay/` does.
+      # needed for a nested self-checkout: lucid-assay's own build job
+      # never vendors a second, nested checkout of itself the way their
+      # `_assay/` does. It does need one for a different, real noise
+      # source, found empirically 2026-09-04 against a real signed run's
+      # SBOM: Syft's uv.lock-entry cataloger re-lists every installed
+      # Python package a *second* time (metadataType
+      # "python-uv-lock-entry") with zero license metadata -- uv.lock
+      # carries none -- duplicating the same package the
+      # python-installed-package-cataloger already correctly reported
+      # (real dist-info METADATA, real license) moments earlier. Left in,
+      # this doubled the license-policy tool's "unclassified" warning
+      # count for every dependency the lockfile also names. --exclude
+      # './uv.lock' stops Syft from cataloging the lockfile a second,
+      # redundant way; the real dependency-lockfile parsing this repo
+      # does elsewhere (cli/parsers/lockfiles.py, feeding
+      # resolved_dependencies) reads uv.lock directly and is entirely
+      # unaffected -- this exclude only scopes what Syft itself walks.
       #
       # --user matches the runner's own UID so Syft's container (whose own
       # default user isn't the runner's) doesn't write a root-owned
@@ -164,7 +179,13 @@ jobs:
             -v "$PWD:/workspace" \
             -w /workspace \
             ghcr.io/anchore/syft@sha256:95fe0835e5bebc6f8b1f8acef68d47d63d594ef4c0f25c097ff853b23cbac74c \
-            dir:. -o cyclonedx-json=build/sbom.cdx.json
+            dir:. \
+            --exclude './uv.lock' \
+            --exclude './**/__pycache__/**' \
+            --exclude './**/*.egg-info/**' \
+            --exclude './build/**' \
+            --exclude './dist/**' \
+            -o cyclonedx-json=build/sbom.cdx.json
           test -s build/sbom.cdx.json || { echo "ERROR: Syft did not produce build/sbom.cdx.json" >&2; exit 1; }
 
       # Platform-agnostic vulnerability scan via Grype, pointed at the SBOM

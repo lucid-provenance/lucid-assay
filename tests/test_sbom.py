@@ -247,6 +247,38 @@ class ParseCycloneDxTests(unittest.TestCase):
         comps = parse_cyclonedx_sbom(_cdx_doc(["not-a-dict", None, {"name": "ok"}]))
         self.assertEqual([c.name for c in comps], ["ok"])
 
+    def test_file_type_component_is_excluded(self):
+        # Syft's file cataloger -- dist-info METADATA/RECORD, workflow
+        # YAMLs, anything with no license concept of its own. Confirmed
+        # empirically against a real Syft SBOM: half its components were
+        # this type, none carrying a purl or license.
+        comps = parse_cyclonedx_sbom(_cdx_doc([
+            {"type": "file", "name": "/workspace/.venv/.../METADATA"},
+            {"type": "library", "name": "real-dep", "purl": "pkg:pypi/real-dep@1.0"},
+        ]))
+        self.assertEqual([c.name for c in comps], ["real-dep"])
+
+    def test_non_file_types_are_not_excluded(self):
+        # Deliberately not a "library"-only allowlist -- application/
+        # framework/container/etc. can all be real, license-bearing
+        # components depending on what generated the SBOM.
+        for comp_type in ("library", "application", "framework", "container", "operating-system"):
+            with self.subTest(comp_type=comp_type):
+                comps = parse_cyclonedx_sbom(_cdx_doc([{"type": comp_type, "name": "x"}]))
+                self.assertEqual([c.name for c in comps], ["x"])
+
+    def test_component_with_no_type_field_is_not_excluded(self):
+        comps = parse_cyclonedx_sbom(_cdx_doc([{"name": "untyped"}]))
+        self.assertEqual([c.name for c in comps], ["untyped"])
+
+    def test_nested_sub_component_of_a_file_type_parent_is_still_walked(self):
+        doc = _cdx_doc([
+            {"type": "file", "name": "container", "components": [
+                {"type": "library", "name": "bundled", "purl": "pkg:pypi/bundled@1.0"},
+            ]},
+        ])
+        self.assertEqual([c.name for c in parse_cyclonedx_sbom(doc)], ["bundled"])
+
 
 # ---------------------------------------------------------------------------
 # SPDX 2.x parsing

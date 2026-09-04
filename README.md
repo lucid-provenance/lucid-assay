@@ -412,6 +412,21 @@ best-effort SPDX-expression evaluator (flattened AND/OR/WITH splitting, no
 operator-precedence/nesting awareness); see its own docstring for exactly
 what boolean structure it does and doesn't honor.
 
+Only CycloneDX components carrying a real component `type` other than
+`"file"` are evaluated — Syft's file cataloger emits a `type: "file"`
+entry for every loose file it walks past (dist-info `METADATA`/`RECORD`,
+a `.github/workflows/*.yml`, ...), none of which is a third-party
+dependency with a license concept of its own; left unfiltered these
+correctly-but-unhelpfully classify as `"unclassified"` every time (found
+2026-09-04 against a real Syft SBOM: 128 of 256 components, exactly half
+that run's `"unclassified"` warning count). This is deliberately an
+exclude-`"file"` rule, not a `"library"`-only allowlist — narrowing to one
+type would silently drop real components a different ecosystem's Syft/
+CycloneDX output legitimately reports under `"application"`/
+`"framework"`/`"container"`/etc. SPDX parsing is unaffected — its own
+`packages[]`/`files[]` split means this module already only ever reads
+`packages[]`.
+
 The policy result is converted into the *same* `SarifFinding`/
 `SarifToolSummary`/`SarifSummaryReport` shapes `parse_sarif_file()`
 produces from a real SARIF file (`build_sbom_sarif_report()`) — a

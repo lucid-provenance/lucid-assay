@@ -53,6 +53,14 @@ Hardened against:
     tokens) classifies as "unclassified", never silently folded into
     "permissive"/clean -- an unknown license is a real, distinct signal a
     compliance report must not hide.
+  - A CycloneDX component with `type: "file"` (Syft's file cataloger --
+    dist-info metadata files, workflow YAMLs, anything with no license
+    concept of its own) is excluded before license evaluation ever runs,
+    never counted as a real dependency with an "unclassified" license --
+    see _cdx_component_to_sbom_component's own comment for why this is an
+    exclude-"file" rule, not a "library"-only allowlist. SPDX's own
+    packages[]/files[] split means this only applies to CycloneDX; SPDX
+    parsing already reads packages[] exclusively.
   - classify_license_expression() is a deliberately shallow, best-effort
     SPDX-license-expression evaluator (flattened AND/OR/WITH splitting,
     no operator-precedence/nesting awareness) -- see its own docstring for
@@ -335,6 +343,23 @@ def _cdx_component_digest(comp: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _cdx_component_to_sbom_component(comp: Dict[str, Any]) -> Optional[SbomComponent]:
+    # CycloneDX's own "type" enum includes "file" -- Syft's file cataloger
+    # emits one of these for every loose file it walks past (a dist-info
+    # METADATA/RECORD/top_level.txt, a .github/workflows/*.yml, ...), none
+    # of which is a third-party dependency with a license concept of its
+    # own. Left unfiltered, these correctly (and unhelpfully) classify as
+    # "unclassified" every time -- confirmed empirically against a real
+    # Syft-generated SBOM: 128 of that run's 256 total components were
+    # type=="file", zero of which ever carry a purl or licenses field.
+    # Every other CycloneDX component type ("library", "application",
+    # "framework", "container", "operating-system", ...) can be a real,
+    # license-bearing shipped component depending on what generated the
+    # SBOM, so this is deliberately an exclude-"file" rule, not an
+    # allowlist of "library" alone -- narrowing to one type would silently
+    # drop real components a different ecosystem's Syft/CycloneDX output
+    # legitimately reports under a different type.
+    if comp.get("type") == "file":
+        return None
     name = comp.get("name")
     if not isinstance(name, str) or not name.strip():
         return None

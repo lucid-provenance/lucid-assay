@@ -53,12 +53,12 @@ def _repo_gov(
     }
 
 
-def _signed(sig_type="gpg") -> Dict[str, Any]:
-    return {"available": True, "verified": True, "reason": "valid", "signature_type": sig_type}
+def _signed(sig_type="gpg", source_sha=None) -> Dict[str, Any]:
+    return {"available": True, "verified": True, "reason": "valid", "signature_type": sig_type, "source_sha": source_sha}
 
 
-def _unsigned(reason="unsigned") -> Dict[str, Any]:
-    return {"available": True, "verified": False, "reason": reason, "signature_type": None}
+def _unsigned(reason="unsigned", source_sha=None) -> Dict[str, Any]:
+    return {"available": True, "verified": False, "reason": reason, "signature_type": None, "source_sha": source_sha}
 
 
 def _statement(*, repository_governance=None, rcs_value=85) -> Dict[str, Any]:
@@ -153,7 +153,7 @@ class RepoGovCheckCommitSigningTests(unittest.TestCase):
     def test_unsigned_fails_with_github_reason_quoted(self):
         result = _repo_gov_check_commit_signing(_repo_gov(commit_signature=_unsigned("unsigned")))
         self.assertFalse(result["passed"])
-        self.assertIn("'unsigned'", result["detail"])
+        self.assertIn("(unsigned)", result["detail"])
 
     def test_unsigned_with_no_reason_still_fails_without_crashing(self):
         commit_sig = _unsigned()
@@ -161,6 +161,43 @@ class RepoGovCheckCommitSigningTests(unittest.TestCase):
         result = _repo_gov_check_commit_signing(_repo_gov(commit_signature=commit_sig))
         self.assertFalse(result["passed"])
         self.assertIn("unsigned or unverified", result["detail"])
+
+    def test_verified_with_source_sha_notes_the_walk_back_in_the_label(self):
+        """source_sha set means commit_author.py walked back through a
+        GitHub-web-flow merge commit -- the label must say so, so a
+        reader isn't misled into thinking HEAD itself (often the merge
+        commit) was what got cryptographically verified."""
+        commit_sig = _signed("ssh", source_sha="a" * 40)
+        result = _repo_gov_check_commit_signing(_repo_gov(commit_signature=commit_sig))
+        self.assertTrue(result["passed"])
+        self.assertIn("verified via SSH on the PR's own head commit", result["label"])
+        self.assertIn("not the merge commit", result["label"])
+
+    def test_verified_without_source_sha_omits_the_walk_back_clause(self):
+        commit_sig = _signed("gpg", source_sha=None)
+        result = _repo_gov_check_commit_signing(_repo_gov(commit_signature=commit_sig))
+        self.assertTrue(result["passed"])
+        self.assertNotIn("PR's own head commit", result["label"])
+
+    def test_unsigned_with_source_sha_notes_the_walk_back_in_the_detail(self):
+        commit_sig = _unsigned("unsigned", source_sha="a" * 40)
+        result = _repo_gov_check_commit_signing(_repo_gov(commit_signature=commit_sig))
+        self.assertFalse(result["passed"])
+        self.assertIn("PR's own head commit", result["detail"])
+
+    def test_walk_back_failure_reason_surfaced_as_a_normal_failure(self):
+        """commit_author.py reports a failed walk-back as
+        verified=None/reason=<explanation> -- this must render as an
+        honest failure, not silently pass."""
+        commit_sig = {
+            "available": True, "verified": None,
+            "reason": "gave up walking back through GitHub-generated merge commits after 5 hops "
+                      "without reaching a non-merge commit",
+            "signature_type": None, "source_sha": "b" * 40,
+        }
+        result = _repo_gov_check_commit_signing(_repo_gov(commit_signature=commit_sig))
+        self.assertFalse(result["passed"])
+        self.assertIn("gave up walking back", result["detail"])
 
 
 class RepoGovCheckLinearHistoryTests(unittest.TestCase):
@@ -267,6 +304,27 @@ class RepositoryGovernanceIntegrationTests(unittest.TestCase):
         summary = _render_step_summary_markdown(result)
 
         self.assertNotIn("Repository & Workstation Governance", summary)
+
+    def test_section_renders_immediately_after_run_identity_before_slsa_tracks(self):
+        """Section order is a deliberate policy choice (supply-chain
+        provenance flows from developer workstation/repo rules outward
+        to the build factory floor), not incidental -- lock it in so a
+        future edit to _render_track_sections can't silently reorder it
+        back."""
+        statement = _statement(repository_governance=_repo_gov(commit_signature=_signed()))
+        envelope = _envelope(statement)
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        lines = _render_step_summary_markdown(result).splitlines()
+
+        run_identity_idx = next(i for i, l in enumerate(lines) if "Run Identity & Gate Parameters" in l)
+        repo_gov_idx = next(i for i, l in enumerate(lines) if "Repository & Workstation Governance" in l)
+        source_track_idx = next(i for i, l in enumerate(lines) if l.startswith("Source Track"))
+        build_track_idx = next(i for i, l in enumerate(lines) if l == "SLSA Build Track")
+
+        self.assertLess(run_identity_idx, repo_gov_idx)
+        self.assertLess(repo_gov_idx, source_track_idx)
+        self.assertLess(repo_gov_idx, build_track_idx)
 
     def test_json_payload_carries_repository_governance_items(self):
         statement = _statement(repository_governance=_repo_gov(commit_signature=_signed()))

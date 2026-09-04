@@ -142,21 +142,25 @@
           "type": ["object", "null"],
           "additionalProperties": false,
           "description": "Null when no commit_author was collected at all (e.g. off-CI, no GITHUB_TOKEN, or an attestation predating this field) -- absence must not be read as verified.",
-          "required": ["available", "verified", "reason", "signature_type"],
+          "required": ["available", "verified", "reason", "signature_type", "source_sha"],
           "properties": {
             "available": { "type": "boolean" },
             "verified": {
               "type": ["boolean", "null"],
-              "description": "GitHub's own commit.verification.verified. Null when not captured (distinct from a confirmed-unsigned commit, which is false)."
+              "description": "Whether source_sha's own commit.verification.verified came back true. Null when not captured, or when a GitHub-web-flow merge commit walk-back (see below) failed partway through -- distinct from a confirmed-unsigned commit, which is false."
             },
             "reason": {
               "type": ["string", "null"],
-              "description": "GitHub's own commit.verification.reason (e.g. 'valid', 'unsigned', 'bad_signature')."
+              "description": "GitHub's own commit.verification.reason (e.g. 'valid', 'unsigned', 'bad_signature') for source_sha, or a walk-back failure explanation when verified is null because the walk-back itself failed."
             },
             "signature_type": {
               "type": ["string", "null"],
               "enum": ["gpg", "ssh", null],
-              "description": "Inferred from the raw signature blob's own PEM-style header. Null when no signature is present or its header isn't recognized."
+              "description": "Inferred from source_sha's own raw signature blob PEM-style header. Null when no signature is present or its header isn't recognized."
+            },
+            "source_sha": {
+              "type": ["string", "null"],
+              "description": "The commit whose own signature this verdict actually describes. Null when the originally-requested commit's own signature was evaluated directly; set to a different SHA when that commit was a GitHub-web-flow-generated merge commit (auto-signed by GitHub's own key on every PR merge, regardless of the author's own signing setup) and this walked back to the PR's real head commit instead -- see cli/parsers/commit_author.py's docstring."
             }
           }
         }

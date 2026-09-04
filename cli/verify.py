@@ -2618,6 +2618,145 @@ def _evaluate_informational_tracks(
     )
 
 
+@dataclass
+class _StatementDerivedFields:
+    """Every field verify_dsse_attestation() derives from a successfully-
+    decoded statement's predicate -- pulled out of that function's own
+    `if statement is not None:` block into _evaluate_decoded_statement()
+    below purely to keep verify_dsse_attestation's own cognitive
+    complexity under this repo's lint threshold (the block itself was the
+    single largest nesting contributor: several independent branches all
+    one level deeper for the whole 80-line span). No behavior change --
+    same fields, same order, same logic, just callable and independently
+    readable on its own. `violations`/`warnings` are deliberately not
+    part of this: the helper mutates the caller's own lists in place (the
+    same objects _decode_envelope_statement already produced), matching
+    how every other helper verify_dsse_attestation calls already
+    accumulates onto them, rather than yet another pair of lists to merge
+    back in."""
+    rcs_value: Optional[int]
+    degraded: bool
+    degraded_field_present: bool
+    degraded_reasons: Optional[List[str]]
+    subject_digests: List[str]
+    metrics: Dict[str, Any]
+    static_analysis_tools: List[Dict[str, Any]]
+    s2c2f_controls: List[Dict[str, Any]]
+    dependency_governance_items: List[Dict[str, Any]]
+    repository_governance_items: List[Dict[str, Any]]
+    schema_validation_status: str
+    predicate: Dict[str, Any]
+
+
+def _evaluate_decoded_statement(
+    statement: Dict[str, Any],
+    violations: List[str],
+    warnings: List[str],
+    *,
+    min_rcs: int,
+    require_digest: Optional[str],
+    disallow_degraded: bool,
+    require_commit_signing: bool,
+) -> _StatementDerivedFields:
+    """The former body of verify_dsse_attestation()'s `if statement is not
+    None:` block, extracted verbatim -- see _StatementDerivedFields' own
+    docstring for why. `violations`/`warnings` are mutated in place (the
+    same lists the caller already has from _decode_envelope_statement),
+    not returned."""
+    statement_type = statement.get("_type")
+    if statement_type != EXPECTED_STATEMENT_TYPE:
+        warnings.append(f"unexpected in-toto _type: {statement_type!r}")
+
+    predicate_type = statement.get("predicateType")
+    if predicate_type != EXPECTED_PREDICATE_TYPE:
+        violations.append(f"unexpected predicateType: {predicate_type!r} (expected {EXPECTED_PREDICATE_TYPE!r})")
+
+    subject_digests = _extract_subject_digests(statement)
+
+    predicate = statement.get("predicate")
+    predicate = predicate if isinstance(predicate, dict) else {}
+
+    # Formal schema validation, ahead of policy evaluation/score checks
+    # per this guard's purpose: catch a structurally malformed predicate
+    # before any of the checks below try to read fields out of it.
+    # Fails open, never blocking: jsonschema not being installed, the
+    # packaged schema file being unavailable/unreadable, or validation
+    # itself raising unexpectedly all degrade to "skipped" with a
+    # diagnostic warning -- only an actual, successfully-run schema
+    # mismatch becomes a blocking violation.
+    # Diagnostic, not a gate: this predicate schema has evolved (and
+    # will keep evolving -- see e.g. static_analysis/degraded_reasons/
+    # branch_governance, all added after the first attestations that
+    # lacked them were already signed) and hand-built partial predicates
+    # are a legitimate, deliberate testing pattern elsewhere in this
+    # codebase. A schema mismatch surfaces as a `warnings` entry with
+    # the precise violation, never as a blocking `violations` one --
+    # otherwise every older real attestation predating a schema change,
+    # and every test fixture that only populates the fields relevant to
+    # what it's testing, would start failing --min-rcs runs outright.
+    schema_validation_status, schema_messages = _validate_against_schema(predicate)
+    if schema_validation_status == "failed":
+        warnings.extend(f"predicate schema violation: {m}" for m in schema_messages)
+    elif schema_validation_status == "skipped":
+        warnings.extend(f"schema validation skipped: {m}" for m in schema_messages)
+
+    rcs_value, degraded, degraded_field_present, degraded_reasons, rcs_violations = _validate_rcs_block(predicate)
+    violations.extend(rcs_violations)
+
+    metrics = _extract_metrics(predicate)
+    static_analysis_tools = _extract_static_analysis_tools(predicate)
+    s2c2f_controls = _extract_s2c2f_controls(predicate)
+    dependency_governance_items = _extract_dependency_evidence(predicate)
+    repository_governance_items = _extract_repository_governance(predicate)
+
+    # --require-commit-signing: same opt-in-gate shape as
+    # --require-slsa-build-l3 (see that flag's own handling), but
+    # folding in only the one item this section has a confirmed gate
+    # path for -- the other three (branch-ruleset hygiene) stay
+    # purely informational regardless of this flag.
+    if require_commit_signing:
+        # _extract_repository_governance() always puts the commit-
+        # signing item first when it returns anything at all (see its
+        # own construction) -- an empty list means repository_governance
+        # was never captured for this run, treated the same as "not
+        # signed" rather than "check not applicable", same fail-closed
+        # default every other opt-in gate here uses.
+        commit_signing_passed = bool(repository_governance_items) and repository_governance_items[0]["passed"]
+        if not commit_signing_passed:
+            violations.append(
+                "--require-commit-signing was set, but HEAD's commit is not cryptographically signed/verified "
+                "(see the Repository & Workstation Governance section above for the exact reason)"
+            )
+
+    gate_violations, gate_warnings = _evaluate_policy_gates(
+        rcs_value=rcs_value,
+        min_rcs=min_rcs,
+        require_digest=require_digest,
+        subject_digests=subject_digests,
+        disallow_degraded=disallow_degraded,
+        degraded=degraded,
+        degraded_field_present=degraded_field_present,
+        degraded_reasons=degraded_reasons,
+    )
+    violations.extend(gate_violations)
+    warnings.extend(gate_warnings)
+
+    return _StatementDerivedFields(
+        rcs_value=rcs_value,
+        degraded=degraded,
+        degraded_field_present=degraded_field_present,
+        degraded_reasons=degraded_reasons,
+        subject_digests=subject_digests,
+        metrics=metrics,
+        static_analysis_tools=static_analysis_tools,
+        s2c2f_controls=s2c2f_controls,
+        dependency_governance_items=dependency_governance_items,
+        repository_governance_items=repository_governance_items,
+        schema_validation_status=schema_validation_status,
+        predicate=predicate,
+    )
+
+
 def verify_dsse_attestation(
     envelope: Dict[str, Any],
     *,
@@ -2663,10 +2802,13 @@ def verify_dsse_attestation(
     such opt-in path today; setting this flag does not gate on them.
 
     Orchestrates (see each helper's own docstring for its contract):
-      _decode_envelope_statement   -- structure + payload decode
-      _validate_against_schema     -- optional/diagnostic JSON Schema check
-      _validate_rcs_block          -- RCS field type/range validation
-      _evaluate_policy_gates       -- --min-rcs/--require-digest/--disallow-degraded
+      _decode_envelope_statement     -- structure + payload decode
+      _evaluate_decoded_statement    -- schema validation, RCS/S2C2F/dependency/
+                                        repository-governance extraction, and
+                                        policy-gate evaluation, all off one
+                                        successfully-decoded statement (itself
+                                        wraps _validate_against_schema/
+                                        _validate_rcs_block/_evaluate_policy_gates)
       _verify_sigstore_identity      -- best-effort Sigstore identity check
       _evaluate_informational_tracks -- SLSA Source Level 1-4 + Build Level 1-3 checklists
     """
@@ -2713,84 +2855,29 @@ def verify_dsse_attestation(
     repository_governance_items: List[Dict[str, Any]] = []
     schema_validation_status = "skipped"
 
+    predicate: Dict[str, Any] = {}
     if statement is not None:
-        statement_type = statement.get("_type")
-        if statement_type != EXPECTED_STATEMENT_TYPE:
-            warnings.append(f"unexpected in-toto _type: {statement_type!r}")
-
-        predicate_type = statement.get("predicateType")
-        if predicate_type != EXPECTED_PREDICATE_TYPE:
-            violations.append(f"unexpected predicateType: {predicate_type!r} (expected {EXPECTED_PREDICATE_TYPE!r})")
-
-        subject_digests = _extract_subject_digests(statement)
-
-        predicate = statement.get("predicate")
-        predicate = predicate if isinstance(predicate, dict) else {}
-
-        # Formal schema validation, ahead of policy evaluation/score checks
-        # per this guard's purpose: catch a structurally malformed predicate
-        # before any of the checks below try to read fields out of it.
-        # Fails open, never blocking: jsonschema not being installed, the
-        # packaged schema file being unavailable/unreadable, or validation
-        # itself raising unexpectedly all degrade to "skipped" with a
-        # diagnostic warning -- only an actual, successfully-run schema
-        # mismatch becomes a blocking violation.
-        # Diagnostic, not a gate: this predicate schema has evolved (and
-        # will keep evolving -- see e.g. static_analysis/degraded_reasons/
-        # branch_governance, all added after the first attestations that
-        # lacked them were already signed) and hand-built partial predicates
-        # are a legitimate, deliberate testing pattern elsewhere in this
-        # codebase. A schema mismatch surfaces as a `warnings` entry with
-        # the precise violation, never as a blocking `violations` one --
-        # otherwise every older real attestation predating a schema change,
-        # and every test fixture that only populates the fields relevant to
-        # what it's testing, would start failing --min-rcs runs outright.
-        schema_validation_status, schema_messages = _validate_against_schema(predicate)
-        if schema_validation_status == "failed":
-            warnings.extend(f"predicate schema violation: {m}" for m in schema_messages)
-        elif schema_validation_status == "skipped":
-            warnings.extend(f"schema validation skipped: {m}" for m in schema_messages)
-
-        rcs_value, degraded, degraded_field_present, degraded_reasons, rcs_violations = _validate_rcs_block(predicate)
-        violations.extend(rcs_violations)
-
-        metrics = _extract_metrics(predicate)
-        static_analysis_tools = _extract_static_analysis_tools(predicate)
-        s2c2f_controls = _extract_s2c2f_controls(predicate)
-        dependency_governance_items = _extract_dependency_evidence(predicate)
-        repository_governance_items = _extract_repository_governance(predicate)
-
-        # --require-commit-signing: same opt-in-gate shape as
-        # --require-slsa-build-l3 (see that flag's own handling), but
-        # folding in only the one item this section has a confirmed gate
-        # path for -- the other three (branch-ruleset hygiene) stay
-        # purely informational regardless of this flag.
-        if require_commit_signing:
-            # _extract_repository_governance() always puts the commit-
-            # signing item first when it returns anything at all (see its
-            # own construction) -- an empty list means repository_governance
-            # was never captured for this run, treated the same as "not
-            # signed" rather than "check not applicable", same fail-closed
-            # default every other opt-in gate here uses.
-            commit_signing_passed = bool(repository_governance_items) and repository_governance_items[0]["passed"]
-            if not commit_signing_passed:
-                violations.append(
-                    "--require-commit-signing was set, but HEAD's commit is not cryptographically signed/verified "
-                    "(see the Repository & Workstation Governance section above for the exact reason)"
-                )
-
-        gate_violations, gate_warnings = _evaluate_policy_gates(
-            rcs_value=rcs_value,
+        fields = _evaluate_decoded_statement(
+            statement,
+            violations,
+            warnings,
             min_rcs=min_rcs,
             require_digest=require_digest,
-            subject_digests=subject_digests,
             disallow_degraded=disallow_degraded,
-            degraded=degraded,
-            degraded_field_present=degraded_field_present,
-            degraded_reasons=degraded_reasons,
+            require_commit_signing=require_commit_signing,
         )
-        violations.extend(gate_violations)
-        warnings.extend(gate_warnings)
+        rcs_value = fields.rcs_value
+        degraded = fields.degraded
+        degraded_field_present = fields.degraded_field_present
+        degraded_reasons = fields.degraded_reasons
+        subject_digests = fields.subject_digests
+        metrics = fields.metrics
+        static_analysis_tools = fields.static_analysis_tools
+        s2c2f_controls = fields.s2c2f_controls
+        dependency_governance_items = fields.dependency_governance_items
+        repository_governance_items = fields.repository_governance_items
+        schema_validation_status = fields.schema_validation_status
+        predicate = fields.predicate
 
     # Independent of statement decode success -- _rekor lives on the
     # envelope itself, not the signed payload (see _extract_rekor_info).

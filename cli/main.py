@@ -38,8 +38,10 @@ from .parsers.sarif import (
     parse_sonar_metrics_file,
 )
 from .parsers.sbom import (
+    LicenseCuration,
     SbomReport,
     build_sbom_sarif_report,
+    load_license_curations,
     parse_sbom_file,
     sbom_components_to_resolved_dependencies,
 )
@@ -365,10 +367,31 @@ def _ingest_sbom(args: argparse.Namespace, stage_ns: Dict[str, int]) -> Optional
     return report
 
 
+def _load_license_curations(args: argparse.Namespace) -> Dict[str, LicenseCuration]:
+    """Step 3d (companion to _ingest_sbom): loads --license-curations, if
+    given. Fails closed to {} on any missing/malformed file (see
+    load_license_curations's own contract) with a stderr WARNING so a
+    typo'd path doesn't silently disable curation -- it just means every
+    "unclassified, no license metadata at all" component stays
+    unclassified rather than being silently uncurated, same fail-closed
+    posture as every other optional evidence input in this pipeline."""
+    if not args.license_curations:
+        return {}
+    curations = load_license_curations(args.license_curations)
+    if not curations:
+        print(
+            f"WARNING: --license-curations '{args.license_curations}' produced zero valid entries "
+            f"(missing/unreadable/malformed file, or every entry failed validation)",
+            file=sys.stderr,
+        )
+    return curations
+
+
 def _merge_sbom_into_sarif(
     sarif_report: Optional[SarifSummaryReport],
     sbom_report: Optional[SbomReport],
     sbom_report_sha: Optional[str] = None,
+    license_curations: Optional[Dict[str, LicenseCuration]] = None,
 ) -> Optional[SarifSummaryReport]:
     """Folds the SBOM's license-policy findings (cli.parsers.sbom.
     build_sbom_sarif_report) into sarif_report, so every downstream
@@ -386,6 +409,11 @@ def _merge_sbom_into_sarif(
     report's own docstring for why the --sbom file's hash is the honest
     value here (there's no raw *SARIF* file for a synthetic tool).
 
+    `license_curations` (from --license-curations, see
+    _load_license_curations) is threaded straight through to
+    build_sbom_sarif_report -- see cli.parsers.sbom.build_license_findings
+    for what it can and can't override.
+
     When both a real --sarif input and an available SBOM are present,
     this goes through cli.parsers.sarif.aggregate_sarif_reports() same as
     any other multi-input merge in this pipeline -- including its existing
@@ -399,7 +427,7 @@ def _merge_sbom_into_sarif(
     if sbom_report is None or not sbom_report.available:
         return sarif_report
     report_hash = {"algorithm": "sha256", "value": sbom_report_sha} if sbom_report_sha else None
-    sbom_sarif = build_sbom_sarif_report(sbom_report.components, report_hash=report_hash)
+    sbom_sarif = build_sbom_sarif_report(sbom_report.components, report_hash=report_hash, curations=license_curations)
     if sarif_report is None:
         return sbom_sarif
     return aggregate_sarif_reports([sarif_report, sbom_sarif])
@@ -728,7 +756,24 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "cli/parsers/sbom.py) and folded into the --sarif findings (feeding the scorer's static-"
         "analysis component and S2C2F's SCA-2 'License Checks'); its PURL-bearing components also "
         "back-fill predicate.resolved_dependencies (S2C2F INV-1/ING-1) when lockfile detection finds "
-        "nothing on its own.",
+        "nothing on its own. An unclassified (no recognized license) component is a blocking error "
+        "for a real distribution ecosystem (pypi/npm/cargo/golang/maven/... , container/OS packages) "
+        "and a non-blocking warning otherwise (CI tooling, e.g. pkg:github/... GitHub Actions, which "
+        "structurally never carries license metadata) -- see --license-curations below for genuinely "
+        "missing upstream metadata on a real distribution package.",
+    )
+    p.add_argument(
+        "--license-curations",
+        default=None,
+        dest="license_curations",
+        help="path to a JSON file of human-reviewed license exceptions, keyed by PURL (exact-with-"
+        "version, or name-only to apply across every version) to {\"asserted_license\", \"evidence\", "
+        "\"curator\", \"date\"?} -- see cli/parsers/sbom.py's load_license_curations(). Rescues an "
+        "--sbom component that has zero license metadata at all into a resolved, audited 'curated' "
+        "state (a non-blocking SARIF 'note', never silently hidden); can never launder a component "
+        "whose own detected license is already forbidden, and never applies to one already "
+        "unambiguously permissive. A missing/malformed file or invalid entry degrades to no curation "
+        "for that entry (stderr WARNING), never an error.",
     )
     p.add_argument(
         "--sonar-metrics",
@@ -929,7 +974,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # too would let predicate.artifact.sbom claim a validated SBOM exists
     # for a file this pipeline couldn't actually read.
     sbom_report_sha = sha256_file(args.sbom) if (sbom_report is not None and sbom_report.available) else None
-    sarif_report = _merge_sbom_into_sarif(sarif_report, sbom_report, sbom_report_sha)
+    license_curations = _load_license_curations(args)
+    sarif_report = _merge_sbom_into_sarif(sarif_report, sbom_report, sbom_report_sha, license_curations)
 
     # 4. Hash evidence artifacts
     test_report_sha = sha256_file(args.junit_xml)

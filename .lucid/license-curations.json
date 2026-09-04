@@ -1,0 +1,45 @@
+{
+  "_comment": "Human-reviewed license exceptions for --license-curations. See cli/parsers/sbom.py's LicenseCuration/load_license_curations() for the schema and cli/main.py's --license-curations help text for what this can and can't override -- it rescues a component with zero license metadata from Syft into a resolved, audited state, but can never launder a component whose asserted license itself classifies as forbidden under DEFAULT_LICENSE_POLICY. Keyed by PURL, name-only (no @version) so an entry survives a routine dependency version bump without going stale.",
+  "pkg:pypi/certifi": {
+    "asserted_license": "MPL-2.0",
+    "evidence": "https://github.com/certifi/python-certifi/blob/master/LICENSE",
+    "curator": "bill.wonch@gmail.com",
+    "date": "2026-09-04"
+  },
+  "pkg:pypi/tree-sitter": {
+    "asserted_license": "MIT",
+    "evidence": "https://github.com/tree-sitter/py-tree-sitter (PyPI classifier: License :: OSI Approved :: MIT License)",
+    "curator": "bill.wonch@gmail.com",
+    "date": "2026-09-04"
+  },
+  "pkg:pypi/sigstore": {
+    "asserted_license": "Apache-2.0",
+    "evidence": "https://github.com/sigstore/sigstore-python (PyPI classifier: License :: OSI Approved :: Apache Software License; LICENSE file present)",
+    "curator": "bill.wonch@gmail.com",
+    "date": "2026-09-04"
+  },
+  "pkg:pypi/sigstore-models": {
+    "asserted_license": "MIT",
+    "evidence": "https://github.com/astral-sh/sigstore-models (GitHub license API: spdx_id MIT)",
+    "curator": "bill.wonch@gmail.com",
+    "date": "2026-09-04"
+  },
+  "pkg:pypi/rfc3161-client": {
+    "asserted_license": "Apache-2.0",
+    "evidence": "https://github.com/trailofbits/rfc3161-client (PyPI classifier: License :: OSI Approved :: Apache Software License)",
+    "curator": "bill.wonch@gmail.com",
+    "date": "2026-09-04"
+  },
+  "pkg:pypi/markdown-it-py": {
+    "asserted_license": "MIT",
+    "evidence": "https://github.com/executablebooks/markdown-it-py (PyPI classifier: License :: OSI Approved :: MIT License)",
+    "curator": "bill.wonch@gmail.com",
+    "date": "2026-09-04"
+  },
+  "pkg:pypi/id": {
+    "asserted_license": "Apache-2.0",
+    "evidence": "https://github.com/di/id (PyPI classifier: License :: OSI Approved :: Apache Software License; LICENSE file present)",
+    "curator": "bill.wonch@gmail.com",
+    "date": "2026-09-04"
+  }
+}

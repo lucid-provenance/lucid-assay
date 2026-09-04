@@ -430,9 +430,18 @@ CycloneDX output legitimately reports under `"application"`/
 The policy result is converted into the *same* `SarifFinding`/
 `SarifToolSummary`/`SarifSummaryReport` shapes `parse_sarif_file()`
 produces from a real SARIF file (`build_sbom_sarif_report()`) — a
-`"forbidden"` component becomes an `error`-level finding, `"unclassified"`
-becomes `warning`, and a `"permissive"` one produces no finding at all
-(same as a passing SARIF rule never emitting a `results[]` entry). `cli.
+`"forbidden"` component always becomes an `error`-level finding; a
+`"permissive"` one produces no finding at all (same as a passing SARIF
+rule never emitting a `results[]` entry). `"unclassified"` is
+ecosystem-scoped, not a flat severity: `error` (blocking) for a component
+in a real distribution ecosystem — `pkg:pypi/`, `npm`, `cargo`, `golang`,
+`maven`, `gem`, `nuget`, `conda`, `composer`, `hex`, `pub`, `cocoapods`,
+`swift`, plus container/OS package types (`deb`/`rpm`/`apk`/`oci`/
+`docker`/`generic`) — and `warning` (non-blocking) for anything else, most
+notably `pkg:github/...` (Syft's github-actions-usage cataloger, which
+structurally never surfaces license metadata for a GitHub Action — gating
+that the same as a real dependency would permanently fail this check for
+any repo using any Action). `cli.
 main` folds this synthetic report into whatever real `--sarif` input it
 already has via `aggregate_sarif_reports()` *before* scoring, so a `--sbom`
 finding feeds the scorer's static-analysis component (`WEIGHTS
@@ -469,6 +478,49 @@ both collapse to the one schema-declared value); a `--sbom` that failed to
 parse leaves the field at its schema-declared `null` default rather than
 claiming a validated artifact exists for a file this pipeline couldn't
 actually read.
+
+### `--license-curations`: human-reviewed exceptions for missing upstream license metadata
+
+The ecosystem-scoped strict gate above still has no fix for one real case:
+a distribution-ecosystem component (a real PyPI/npm/etc. package) that
+Syft found **zero** license metadata for at all — several real packages
+ship no structured `license`/`license_expression` field, only an OSI
+Trove classifier or a bare `LICENSE` file Syft's cataloger doesn't read.
+`--license-curations <path>` points at a checked-in JSON file (JSON, not
+YAML — this module stays stdlib-only by design, same as
+`parsers/lockfiles.py`) of exceptions, keyed by PURL — exact-with-version,
+or name-only (no `@version`, to survive a routine dependency bump without
+going stale; exact-version takes precedence when both exist):
+
+```json
+{
+  "pkg:pypi/tree-sitter": {
+    "asserted_license": "MIT",
+    "evidence": "https://github.com/tree-sitter/py-tree-sitter (PyPI classifier: License :: OSI Approved :: MIT License)",
+    "curator": "you@example.com",
+    "date": "2026-09-04"
+  }
+}
+```
+
+`asserted_license`/`evidence`/`curator` are all required (`date` is
+optional but conventional); an entry missing any required field is
+dropped individually, never half-applied. Deliberately narrow: this can
+only rescue an already-`"unclassified"` component into a resolved,
+audited `"curated"` state — rendered as a SARIF `"note"`-level finding
+(visible, never silently hidden, and never counted toward
+`errors_count`/`warnings_count`) — never consulted for an
+already-`"forbidden"` or already-`"permissive"` result. Critically, the
+curation's own `asserted_license` is independently re-run through the
+same policy: if a curator's assertion itself classifies `"forbidden"`,
+the finding stays `"forbidden"` (citing the curator's own claim
+transparently) — a curation can never launder an actually-forbidden
+license past the gate. This repo's own `.lucid/license-curations.json` is
+a real, live example (six real dependencies with no structured PyPI
+metadata, plus `certifi`'s `MPL-2.0` — a deliberate, single-package
+exception rather than a platform-wide `DEFAULT_PERMISSIVE_EXACT` change,
+since MPL-2.0 is a real weak-copyleft policy call this mechanism
+doesn't make unilaterally).
 
 ### `--sbom`'s companion in-toto statement
 

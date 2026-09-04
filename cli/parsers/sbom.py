@@ -149,9 +149,40 @@ class LicensePolicy:
 # present in the report, not silently absorbed into either bucket.
 DEFAULT_FORBIDDEN_PREFIXES: Tuple[str, ...] = ("AGPL-", "GPL-", "SSPL-", "CC-BY-NC-")
 DEFAULT_PERMISSIVE_PREFIXES: Tuple[str, ...] = ("APACHE-", "BSD-")
+# PSF-2.0 (Python Software Foundation License 2.0) added 2026-09-04: a real,
+# standard, OSI-approved permissive SPDX id -- structurally the same
+# obligation profile as PYTHON-2.0 already listed, just a different id
+# (found unclassified on a real dependency, typing-extensions, that
+# genuinely carries this license). Not a normalization/alias -- PSF-2.0 is
+# already the correct SPDX identifier, simply missing from this set.
 DEFAULT_PERMISSIVE_EXACT: FrozenSet[str] = frozenset(
-    {"MIT", "MIT-0", "ISC", "0BSD", "UNLICENSE", "ZLIB", "POSTGRESQL", "BSL-1.0", "PYTHON-2.0"}
+    {"MIT", "MIT-0", "ISC", "0BSD", "UNLICENSE", "ZLIB", "POSTGRESQL", "BSL-1.0", "PYTHON-2.0", "PSF-2.0"}
 )
+
+# A small, deliberately non-exhaustive table of common free-text / legacy
+# license names (PyPI Trove-classifier-style strings, pre-SPDX project
+# metadata, ...) that never match DEFAULT_LICENSE_POLICY's prefix/exact
+# rules as-is because they aren't normalized SPDX identifiers -- e.g. a
+# CycloneDX {"license": {"name": "Apache License, Version 2.0"}} entry
+# (free text, not an "id") passes through _cdx_license_expression()
+# unchanged (see that function's own docstring), and a real dependency
+# (pyopenssl) was found carrying exactly this string. Matched as a whole
+# expression, case-insensitively, *before* tokenizing -- these are
+# irregular multi-word phrases, not SPDX-prefixed identifiers a per-term
+# prefix/exact check could ever recognize. Add entries only as real gaps
+# are found against real SBOM data, same discipline as every other
+# best-effort table in this module -- this is not an attempt at exhaustive
+# free-text license-string recognition.
+_LICENSE_NAME_ALIASES: Dict[str, str] = {
+    "APACHE LICENSE, VERSION 2.0": "Apache-2.0",
+    "APACHE LICENSE 2.0": "Apache-2.0",
+    "APACHE SOFTWARE LICENSE": "Apache-2.0",
+    "APACHE 2.0": "Apache-2.0",
+    "ASL 2.0": "Apache-2.0",
+    "BSD LICENSE": "BSD-3-Clause",
+    "NEW BSD LICENSE": "BSD-3-Clause",
+    "MIT LICENSE": "MIT",
+}
 
 DEFAULT_LICENSE_POLICY = LicensePolicy(
     forbidden_prefixes=DEFAULT_FORBIDDEN_PREFIXES,
@@ -234,6 +265,15 @@ def classify_license_expression(
     information available" tokens) classify as "unclassified" -- an
     unknown license is a real, distinct signal, never silently folded
     into "permissive"/clean.
+
+    Before tokenizing, the *entire* trimmed expression is checked against
+    _LICENSE_NAME_ALIASES (case-insensitively, whole-string only -- never
+    a partial/substring match inside a larger compound expression) and
+    rewritten to the real SPDX id it aliases, if any. This is what lets a
+    free-text CycloneDX `{"license": {"name": "..."}}` value (see
+    _cdx_license_expression's own docstring for why that's preserved
+    verbatim rather than dropped) still classify correctly against the
+    same prefix/exact rules a normalized SPDX id would.
     """
     policy = policy or DEFAULT_LICENSE_POLICY
     if not expression or not expression.strip():
@@ -241,6 +281,9 @@ def classify_license_expression(
     normalized = expression.strip()
     if normalized.upper() in _UNSPECIFIED_TOKENS:
         return "unclassified", []
+    aliased = _LICENSE_NAME_ALIASES.get(normalized.upper())
+    if aliased:
+        normalized = aliased
 
     tokens = _tokenize(normalized)
     terms = _split_terms(tokens)
@@ -672,51 +715,254 @@ def sbom_components_to_resolved_dependencies(components: List[SbomComponent]) ->
 
 
 # ---------------------------------------------------------------------------
+# License curation overlay -- a checked-in, human-reviewed exception file
+# for the case classify_license_expression() has no data to work with at
+# all (Syft found zero license metadata for a real, genuinely-installed
+# package -- not a policy-classification gap, an upstream-metadata gap).
+# Deliberately narrow in scope: it can rescue an "unclassified" component
+# into a resolved, audited state, but it can never launder a component
+# whose curator-asserted license itself classifies as "forbidden" -- see
+# build_license_findings for exactly where that line is drawn. JSON, not
+# YAML: this module (like cli.parsers.lockfiles) stays stdlib-only by
+# design, and PyYAML isn't a dependency anywhere else in this project.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LicenseCuration:
+    """One human-reviewed exception entry, keyed by PURL in the curation
+    file. All three fields are required and validated non-empty by
+    load_license_curations() -- an entry missing any of them is dropped
+    entirely (never half-applied), same fail-closed contract as a
+    malformed SBOM component."""
+    __test__ = False
+    asserted_license: str
+    evidence: str
+    curator: str
+    date: Optional[str] = None
+
+
+def _valid_curation_entry(raw: Any) -> Optional[LicenseCuration]:
+    if not isinstance(raw, dict):
+        return None
+    asserted = raw.get("asserted_license")
+    evidence = raw.get("evidence")
+    curator = raw.get("curator")
+    if not all(isinstance(v, str) and v.strip() for v in (asserted, evidence, curator)):
+        return None
+    date = raw.get("date")
+    date = date.strip() if isinstance(date, str) and date.strip() else None
+    return LicenseCuration(
+        asserted_license=asserted.strip(), evidence=evidence.strip(), curator=curator.strip(), date=date
+    )
+
+
+def load_license_curations(path: Union[str, Path]) -> Dict[str, LicenseCuration]:
+    """Loads a `--license-curations` JSON file: a flat object mapping a
+    PURL (exact, with version -- e.g. "pkg:pypi/certifi@2026.7.22" -- or
+    name-only -- "pkg:pypi/certifi", applying across every version) to a
+    curation entry `{"asserted_license", "evidence", "curator", "date"?}`.
+    Fails closed to `{}` on a missing/oversized/unreadable/malformed file
+    or a malformed individual entry -- never raises, same contract as
+    every other parser in this package. An entry failing validation is
+    dropped individually, not the whole file."""
+    try:
+        resolved = safe_resolve_path(path)
+        if resolved.stat().st_size > MAX_SBOM_FILE_SIZE:
+            return {}
+        with open(resolved, "rb") as f:
+            raw = f.read()
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnsafePathError, OSError, json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    result: Dict[str, LicenseCuration] = {}
+    for key, entry in doc.items():
+        if not isinstance(key, str) or not key.strip():
+            continue
+        curation = _valid_curation_entry(entry)
+        if curation:
+            result[key.strip()] = curation
+    return result
+
+
+def _purl_name_key(purl: Optional[str]) -> Optional[str]:
+    """Strips a PURL's @version (and any ?qualifiers/#subpath) down to its
+    bare "pkg:type/name" form, for the curation file's name-only match
+    fallback. None when `purl` has no version to strip -- the exact-purl
+    lookup already covers that case, nothing further to try."""
+    if not purl or not purl.startswith("pkg:"):
+        return None
+    base = purl.split("?", 1)[0].split("#", 1)[0]
+    return base.split("@", 1)[0] if "@" in base else None
+
+
+def _find_curation(purl: Optional[str], curations: Dict[str, LicenseCuration]) -> Optional[LicenseCuration]:
+    if not purl or not curations:
+        return None
+    if purl in curations:
+        return curations[purl]
+    name_key = _purl_name_key(purl)
+    return curations.get(name_key) if name_key else None
+
+
+# ---------------------------------------------------------------------------
 # License-policy evaluation -> SARIF-compatible findings
 # ---------------------------------------------------------------------------
 
-_CLASSIFICATION_TO_LEVEL = {"forbidden": "error", "unclassified": "warning"}
+# Real package-manager / distribution ecosystems a shipped runtime or
+# container/OS-layer component can genuinely belong to -- these are the
+# only PURL types the license-blocking gate is strict on (an unclassified
+# finding here is a hard "error"). CI/build-tooling ecosystems (Syft's
+# github-actions-usage cataloger emits "pkg:github/...") and anything with
+# no PURL at all are deliberately excluded: a GitHub Action is build
+# pipeline tooling, not a distributed software component, and Syft's
+# github-actions-usage cataloger structurally never surfaces license
+# metadata for one regardless of how well-maintained it is -- gating on
+# that would permanently fail this check for any repo using any Action,
+# with no fix available. Confirmed against a real run: after the noise
+# fixes above, every one of that run's residual "pkg:github/..." findings
+# had this exact shape. Non-strict findings still render (level
+# "warning"), never silently dropped -- they're just not blocking.
+_DISTRIBUTION_PURL_TYPES: FrozenSet[str] = frozenset(
+    {
+        "pypi", "npm", "cargo", "golang", "maven", "gem", "nuget", "conda",
+        "composer", "hex", "pub", "cocoapods", "swift",
+        # container/OS package ecosystems
+        "deb", "rpm", "apk", "oci", "docker", "generic",
+    }
+)
 
 
-def _finding_message(comp: SbomComponent, classification: str, matched_terms: List[str]) -> str:
+def _purl_ecosystem(purl: Optional[str]) -> Optional[str]:
+    if not purl or not purl.startswith("pkg:"):
+        return None
+    return purl[4:].split("/", 1)[0].split("@", 1)[0].lower() or None
+
+
+def _is_distribution_component(purl: Optional[str]) -> bool:
+    ecosystem = _purl_ecosystem(purl)
+    return ecosystem is not None and ecosystem in _DISTRIBUTION_PURL_TYPES
+
+
+def _finding_message(
+    comp: SbomComponent, classification: str, matched_terms: List[str], curation: Optional[LicenseCuration] = None
+) -> str:
     label = comp.license_expression or "(no license information)"
     identity = f"{comp.name}@{comp.version}" if comp.version else comp.name
     if classification == "forbidden":
+        if curation:
+            return (
+                f"{identity} has a curated license assertion ({curation.asserted_license}, "
+                f"curator: {curation.curator}) that itself is a forbidden license under policy; "
+                f"matched forbidden term(s): {', '.join(matched_terms)} -- curation does not override "
+                f"a confirmed policy violation"
+            )
         return (
             f"{identity} declares a forbidden license ({label}); "
             f"matched forbidden term(s): {', '.join(matched_terms)}"
         )
+    if not _is_distribution_component(comp.purl):
+        return (
+            f"{identity} declares an unclassified license ({label}) -- not recognized as permissive or "
+            f"forbidden by policy; non-blocking (CI/build tooling, not a shipped runtime component)"
+        )
     return f"{identity} declares an unclassified license ({label}) -- not recognized as permissive or forbidden by policy"
 
 
+def _curated_finding_message(comp: SbomComponent, curation: LicenseCuration) -> str:
+    identity = f"{comp.name}@{comp.version}" if comp.version else comp.name
+    date_suffix = f", {curation.date}" if curation.date else ""
+    return (
+        f"{identity} has no license metadata from the SBOM; curated as {curation.asserted_license} "
+        f"by {curation.curator}{date_suffix} (evidence: {curation.evidence})"
+    )
+
+
 def build_license_findings(
-    components: List[SbomComponent], policy: Optional[LicensePolicy] = None
+    components: List[SbomComponent],
+    policy: Optional[LicensePolicy] = None,
+    curations: Optional[Dict[str, LicenseCuration]] = None,
 ) -> Tuple[List[SarifFinding], Dict[str, int]]:
     """Evaluates every component's license_expression against `policy`
     (default DEFAULT_LICENSE_POLICY) and returns
     (findings, {classification: count}). A "permissive" classification
     produces no finding at all -- a clean dependency isn't itself a
     differential signal, the same way a passing SARIF rule never emits a
-    results[] entry for code with no problem. "forbidden" findings are
-    level "error"; "unclassified" ones are level "warning" -- present in
-    the report so an unreviewed/custom license is visible, but weighed
-    less severely than a confirmed policy violation."""
+    results[] entry for code with no problem.
+
+    "forbidden" is always level "error", unconditionally. "unclassified"
+    is level "error" too, but *only* for a component belonging to a real
+    distribution ecosystem (see _DISTRIBUTION_PURL_TYPES) -- CI/build
+    tooling (a `pkg:github/...` GitHub Action, or anything with no PURL
+    at all) stays level "warning", non-blocking, since there's no fix a
+    tenant could ever apply to satisfy a strict gate there.
+
+    `curations` (optional, from load_license_curations()) can rescue an
+    "unclassified" component that genuinely has no license metadata at
+    all into a resolved "curated" state -- a distinct, non-blocking
+    tally bucket, rendered as a "note"-level finding (visible, audited,
+    never silently hidden: message cites the curator, evidence, and
+    asserted license verbatim). This can never launder a real policy
+    violation: the curation's own asserted_license is independently run
+    back through `policy`, and if *that* comes back "forbidden", the
+    finding stays "forbidden" -- citing the curator's own assertion
+    rather than silently trusting it. Only consulted when the
+    component's own detected classification is "unclassified" -- a
+    curation never overrides an already-"forbidden" or already-
+    "permissive" result."""
     policy = policy or DEFAULT_LICENSE_POLICY
+    curations = curations or {}
     findings: List[SarifFinding] = []
-    tally: Dict[str, int] = {"forbidden": 0, "unclassified": 0, "permissive": 0}
+    tally: Dict[str, int] = {"forbidden": 0, "unclassified": 0, "permissive": 0, "curated": 0}
 
     for comp in components:
         classification, matched_terms = classify_license_expression(comp.license_expression, policy)
+        curation: Optional[LicenseCuration] = None
+
+        if classification == "unclassified":
+            curation = _find_curation(comp.purl, curations)
+            if curation:
+                asserted_classification, asserted_terms = classify_license_expression(
+                    curation.asserted_license, policy
+                )
+                if asserted_classification == "forbidden":
+                    classification = "forbidden"
+                    matched_terms = asserted_terms
+                else:
+                    classification = "curated"
+
         tally[classification] = tally.get(classification, 0) + 1
         if classification == "permissive":
             continue
+
+        if classification == "curated":
+            findings.append(
+                SarifFinding(
+                    tool_name=SBOM_LICENSE_TOOL_NAME,
+                    rule_id="sbom-license/curated",
+                    level="note",
+                    message=_curated_finding_message(comp, curation),  # type: ignore[arg-type]
+                    file_path=comp.purl or comp.name,
+                    start_line=0,
+                    category="license",
+                    tags=["license", "curated"],
+                )
+            )
+            continue
+
+        if classification == "forbidden":
+            level = "error"
+        else:
+            level = "error" if _is_distribution_component(comp.purl) else "warning"
 
         findings.append(
             SarifFinding(
                 tool_name=SBOM_LICENSE_TOOL_NAME,
                 rule_id=f"sbom-license/{classification}",
-                level=_CLASSIFICATION_TO_LEVEL[classification],
-                message=_finding_message(comp, classification, matched_terms),
+                level=level,
+                message=_finding_message(comp, classification, matched_terms, curation),
                 file_path=comp.purl or comp.name,
                 start_line=0,
                 category="license",
@@ -730,6 +976,7 @@ def build_sbom_sarif_report(
     components: List[SbomComponent],
     policy: Optional[LicensePolicy] = None,
     report_hash: Optional[Dict[str, str]] = None,
+    curations: Optional[Dict[str, LicenseCuration]] = None,
 ) -> SarifSummaryReport:
     """Evaluates `components`' licenses against `policy` and packages the
     result as a SarifSummaryReport carrying one synthetic tool run
@@ -748,8 +995,14 @@ def build_sbom_sarif_report(
     from (see cli.main._merge_sbom_into_sarif, which threads through the
     same hash predicate.artifact.sbom.sha256 also uses). None (the
     dataclass default) when the caller has no hash to offer -- never a
-    fabricated one."""
-    findings, tally = build_license_findings(components, policy)
+    fabricated one.
+
+    `curations` -- see build_license_findings; threaded straight through.
+    A curated finding renders at SARIF level "note" (notes_count below),
+    distinct from both errors_count and warnings_count -- never counted
+    toward either, since it's a resolved, audited exception, not an open
+    question."""
+    findings, tally = build_license_findings(components, policy, curations)
 
     rule_groups: Dict[str, SarifRuleGroup] = {}
     for f in findings:
@@ -760,11 +1013,13 @@ def build_sbom_sarif_report(
 
     errors_count = sum(1 for f in findings if f.level == "error")
     warnings_count = sum(1 for f in findings if f.level == "warning")
+    notes_count = sum(1 for f in findings if f.level == "note")
 
     tool = SarifToolSummary(
         name=SBOM_LICENSE_TOOL_NAME,
         errors_count=errors_count,
         warnings_count=warnings_count,
+        notes_count=notes_count,
         total_findings=len(findings),
         report_hash=dict(report_hash) if report_hash else None,
         rules=list(rule_groups.values()),
@@ -776,6 +1031,7 @@ def build_sbom_sarif_report(
         total_findings=len(findings),
         errors_count=errors_count,
         warnings_count=warnings_count,
+        notes_count=notes_count,
         findings=findings,
         tools_scanned=[SBOM_LICENSE_TOOL_NAME],
         tools=[tool],

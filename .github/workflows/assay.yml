@@ -451,6 +451,15 @@ jobs:
           # this runs both are guaranteed present -- same convention the
           # other three repos' own copy of this wiring already uses.
           EXTRA_ARGS+=(--sbom build/sbom.cdx.json --sarif build/grype.sarif)
+          # .lucid/license-curations.json: human-reviewed exceptions for
+          # this repo's own real dependencies that Syft's SBOM found zero
+          # structured license metadata for (a real PyPI-metadata gap, not
+          # a lucid-assay bug -- each entry cites its own real evidence:
+          # an OSI classifier or GitHub's own license-detection API). See
+          # cli/parsers/sbom.py's LicenseCuration for the schema and what
+          # this can/can't override -- it never launders an actually-
+          # forbidden license.
+          EXTRA_ARGS+=(--license-curations .lucid/license-curations.json)
           # Same existence-guarded pattern: the "Execute Tests with
           # Telemetry" step above always produces this file, but degrading
           # to "real coverage analysis unavailable" (cli.main treats a

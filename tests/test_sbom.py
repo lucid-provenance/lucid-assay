@@ -16,12 +16,14 @@ from cli.parsers.sarif import SarifSummaryReport
 from cli.parsers.sbom import (
     DEFAULT_LICENSE_POLICY,
     SBOM_LICENSE_TOOL_NAME,
+    LicenseCuration,
     LicensePolicy,
     SbomComponent,
     build_license_findings,
     build_sbom_sarif_report,
     classify_license_expression,
     detect_sbom_format,
+    load_license_curations,
     parse_cyclonedx_sbom,
     parse_sbom_file,
     parse_spdx3_sbom,
@@ -496,7 +498,7 @@ class BuildLicenseFindingsTests(unittest.TestCase):
     def test_permissive_component_produces_no_finding(self):
         findings, tally = build_license_findings([SbomComponent(name="clean", license_expression="MIT")])
         self.assertEqual(findings, [])
-        self.assertEqual(tally, {"forbidden": 0, "unclassified": 0, "permissive": 1})
+        self.assertEqual(tally, {"forbidden": 0, "unclassified": 0, "permissive": 1, "curated": 0})
 
     def test_forbidden_component_produces_error_finding(self):
         findings, tally = build_license_findings(
@@ -536,7 +538,7 @@ class BuildSbomSarifReportTests(unittest.TestCase):
         self.assertEqual(report.total_findings, 1)
         self.assertEqual(report.errors_count, 1)
         self.assertEqual(len(report.tools), 1)
-        self.assertEqual(report.tools[0].extensions["sbom_license_policy"], {"forbidden": 1, "unclassified": 0, "permissive": 1})
+        self.assertEqual(report.tools[0].extensions["sbom_license_policy"], {"forbidden": 1, "unclassified": 0, "permissive": 1, "curated": 0})
 
     def test_report_hash_defaults_to_none(self):
         report = build_sbom_sarif_report([SbomComponent(name="ok", license_expression="MIT")])
@@ -555,6 +557,181 @@ class BuildSbomSarifReportTests(unittest.TestCase):
         report = build_sbom_sarif_report([])
         self.assertTrue(report.available)
         self.assertEqual(report.total_findings, 0)
+
+
+# ---------------------------------------------------------------------------
+# Ecosystem-scoped strict gate (2026-09-04): unclassified is "error" only
+# for a real distribution ecosystem; CI/build tooling (pkg:github/...) and
+# anything with no PURL stay "warning", non-blocking.
+# ---------------------------------------------------------------------------
+
+
+class EcosystemScopedUnclassifiedLevelTests(unittest.TestCase):
+    def test_pypi_unclassified_is_blocking_error(self):
+        findings, _ = build_license_findings([SbomComponent(name="x", purl="pkg:pypi/x@1.0")])
+        self.assertEqual(findings[0].level, "error")
+
+    def test_npm_unclassified_is_blocking_error(self):
+        findings, _ = build_license_findings([SbomComponent(name="x", purl="pkg:npm/x@1.0")])
+        self.assertEqual(findings[0].level, "error")
+
+    def test_github_action_unclassified_is_non_blocking_warning(self):
+        findings, _ = build_license_findings(
+            [SbomComponent(name="actions/checkout", purl="pkg:github/actions/checkout@v4")]
+        )
+        self.assertEqual(findings[0].level, "warning")
+        self.assertIn("non-blocking", findings[0].message)
+
+    def test_no_purl_unclassified_is_non_blocking_warning(self):
+        findings, _ = build_license_findings([SbomComponent(name="bare")])
+        self.assertEqual(findings[0].level, "warning")
+
+    def test_forbidden_is_always_error_regardless_of_ecosystem(self):
+        findings, _ = build_license_findings(
+            [SbomComponent(name="x", purl="pkg:github/org/x@1.0", license_expression="AGPL-3.0")]
+        )
+        self.assertEqual(findings[0].level, "error")
+
+
+# ---------------------------------------------------------------------------
+# Free-text / legacy license name normalization
+# ---------------------------------------------------------------------------
+
+
+class LicenseNameAliasTests(unittest.TestCase):
+    def test_free_text_apache_name_normalizes_to_permissive(self):
+        self.assertEqual(classify_license_expression("Apache License, Version 2.0"), ("permissive", []))
+
+    def test_free_text_bsd_name_normalizes_to_permissive(self):
+        self.assertEqual(classify_license_expression("BSD License"), ("permissive", []))
+
+    def test_alias_match_is_case_insensitive(self):
+        self.assertEqual(classify_license_expression("apache license, version 2.0"), ("permissive", []))
+
+    def test_unaliased_free_text_is_still_unclassified(self):
+        classification, _ = classify_license_expression("Some Custom EULA")
+        self.assertEqual(classification, "unclassified")
+
+
+# ---------------------------------------------------------------------------
+# License curation overlay
+# ---------------------------------------------------------------------------
+
+
+class LoadLicenseCurationsTests(TmpDirMixin, unittest.TestCase):
+    def test_valid_entry_is_loaded(self):
+        path = self._write_json("curations.json", {
+            "pkg:pypi/tree-sitter@0.26.0": {
+                "asserted_license": "MIT",
+                "evidence": "https://pypi.org/project/tree-sitter/",
+                "curator": "bill.wonch@gmail.com",
+                "date": "2026-09-04",
+            }
+        })
+        curations = load_license_curations(path)
+        self.assertIn("pkg:pypi/tree-sitter@0.26.0", curations)
+        self.assertEqual(curations["pkg:pypi/tree-sitter@0.26.0"].asserted_license, "MIT")
+
+    def test_entry_missing_a_required_field_is_dropped(self):
+        path = self._write_json("curations.json", {
+            "pkg:pypi/x@1.0": {"asserted_license": "MIT", "evidence": "https://example.com"}
+        })
+        self.assertEqual(load_license_curations(path), {})
+
+    def test_missing_file_degrades_to_empty(self):
+        self.assertEqual(load_license_curations("/nonexistent/curations.json"), {})
+
+    def test_malformed_json_degrades_to_empty(self):
+        d = self._tmp()
+        path = os.path.join(d, "bad.json")
+        with open(path, "w") as f:
+            f.write("{not json")
+        self.assertEqual(load_license_curations(path), {})
+
+    def test_non_object_top_level_degrades_to_empty(self):
+        path = self._write_json("curations.json", ["not", "an", "object"])
+        self.assertEqual(load_license_curations(path), {})
+
+
+class CurationOverlayTests(unittest.TestCase):
+    def test_exact_purl_match_resolves_to_curated(self):
+        curations = {
+            "pkg:pypi/tree-sitter@0.26.0": LicenseCuration(
+                asserted_license="MIT", evidence="https://pypi.org/project/tree-sitter/", curator="bill"
+            )
+        }
+        comp = SbomComponent(name="tree-sitter", version="0.26.0", purl="pkg:pypi/tree-sitter@0.26.0")
+        findings, tally = build_license_findings([comp], curations=curations)
+        self.assertEqual(tally["curated"], 1)
+        self.assertEqual(tally["unclassified"], 0)
+        self.assertEqual(findings[0].level, "note")
+        self.assertIn("curated as MIT", findings[0].message)
+        self.assertIn("bill", findings[0].message)
+
+    def test_name_only_purl_matches_regardless_of_version(self):
+        curations = {
+            "pkg:pypi/tree-sitter": LicenseCuration(
+                asserted_license="MIT", evidence="https://pypi.org/project/tree-sitter/", curator="bill"
+            )
+        }
+        comp = SbomComponent(name="tree-sitter", version="9.9.9", purl="pkg:pypi/tree-sitter@9.9.9")
+        findings, tally = build_license_findings([comp], curations=curations)
+        self.assertEqual(tally["curated"], 1)
+
+    def test_exact_version_match_takes_precedence_over_name_only(self):
+        curations = {
+            "pkg:pypi/x": LicenseCuration(asserted_license="MIT", evidence="e", curator="c"),
+            "pkg:pypi/x@2.0": LicenseCuration(asserted_license="Apache-2.0", evidence="e2", curator="c2"),
+        }
+        comp = SbomComponent(name="x", version="2.0", purl="pkg:pypi/x@2.0")
+        findings, _ = build_license_findings([comp], curations=curations)
+        self.assertIn("Apache-2.0", findings[0].message)
+
+    def test_curation_asserting_a_forbidden_license_does_not_launder_it(self):
+        curations = {
+            "pkg:pypi/x@1.0": LicenseCuration(asserted_license="AGPL-3.0", evidence="e", curator="c")
+        }
+        comp = SbomComponent(name="x", version="1.0", purl="pkg:pypi/x@1.0")
+        findings, tally = build_license_findings([comp], curations=curations)
+        self.assertEqual(tally["forbidden"], 1)
+        self.assertEqual(tally["curated"], 0)
+        self.assertEqual(findings[0].level, "error")
+        self.assertIn("curated license assertion", findings[0].message)
+
+    def test_curation_never_consulted_for_an_already_forbidden_component(self):
+        # A curation entry existing for this PURL must not matter -- the
+        # component's own detected license is already forbidden, full stop.
+        curations = {
+            "pkg:pypi/x@1.0": LicenseCuration(asserted_license="MIT", evidence="e", curator="c")
+        }
+        comp = SbomComponent(name="x", version="1.0", purl="pkg:pypi/x@1.0", license_expression="GPL-3.0-only")
+        findings, tally = build_license_findings([comp], curations=curations)
+        self.assertEqual(tally["forbidden"], 1)
+        self.assertEqual(tally["curated"], 0)
+
+    def test_curation_never_consulted_for_an_already_permissive_component(self):
+        curations = {
+            "pkg:pypi/x@1.0": LicenseCuration(asserted_license="AGPL-3.0", evidence="e", curator="c")
+        }
+        comp = SbomComponent(name="x", version="1.0", purl="pkg:pypi/x@1.0", license_expression="MIT")
+        findings, tally = build_license_findings([comp], curations=curations)
+        self.assertEqual(tally["permissive"], 1)
+        self.assertEqual(findings, [])
+
+    def test_no_matching_curation_stays_unclassified(self):
+        curations = {"pkg:pypi/other@1.0": LicenseCuration(asserted_license="MIT", evidence="e", curator="c")}
+        comp = SbomComponent(name="x", version="1.0", purl="pkg:pypi/x@1.0")
+        findings, tally = build_license_findings([comp], curations=curations)
+        self.assertEqual(tally["unclassified"], 1)
+        self.assertEqual(findings[0].level, "error")  # pypi is a distribution ecosystem
+
+    def test_curated_finding_does_not_count_as_error_or_warning(self):
+        curations = {"pkg:pypi/x@1.0": LicenseCuration(asserted_license="MIT", evidence="e", curator="c")}
+        comp = SbomComponent(name="x", version="1.0", purl="pkg:pypi/x@1.0")
+        report = build_sbom_sarif_report([comp], curations=curations)
+        self.assertEqual(report.errors_count, 0)
+        self.assertEqual(report.warnings_count, 0)
+        self.assertEqual(report.notes_count, 1)
 
 
 if __name__ == "__main__":

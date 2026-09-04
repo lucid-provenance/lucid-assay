@@ -305,6 +305,27 @@ class RepositoryGovernanceIntegrationTests(unittest.TestCase):
 
         self.assertNotIn("Repository & Workstation Governance", summary)
 
+    def test_section_renders_immediately_after_run_identity_before_slsa_tracks(self):
+        """Section order is a deliberate policy choice (supply-chain
+        provenance flows from developer workstation/repo rules outward
+        to the build factory floor), not incidental -- lock it in so a
+        future edit to _render_track_sections can't silently reorder it
+        back."""
+        statement = _statement(repository_governance=_repo_gov(commit_signature=_signed()))
+        envelope = _envelope(statement)
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        lines = _render_step_summary_markdown(result).splitlines()
+
+        run_identity_idx = next(i for i, l in enumerate(lines) if "Run Identity & Gate Parameters" in l)
+        repo_gov_idx = next(i for i, l in enumerate(lines) if "Repository & Workstation Governance" in l)
+        source_track_idx = next(i for i, l in enumerate(lines) if l.startswith("Source Track"))
+        build_track_idx = next(i for i, l in enumerate(lines) if l == "SLSA Build Track")
+
+        self.assertLess(run_identity_idx, repo_gov_idx)
+        self.assertLess(repo_gov_idx, source_track_idx)
+        self.assertLess(repo_gov_idx, build_track_idx)
+
     def test_json_payload_carries_repository_governance_items(self):
         statement = _statement(repository_governance=_repo_gov(commit_signature=_signed()))
         envelope = _envelope(statement)

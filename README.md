@@ -1037,7 +1037,10 @@ separation reasoning the Dependency Materialization Evidence section
 above already established for a different, non-SLSA-shaped signal. Like
 that section (and the S2C2F Compliance Matrix), it's a flat list with no
 cumulative `Status:` line — four independent controls, not a leveled
-track.
+track. Rendered immediately after Run Identity & Gate Parameters, ahead
+of both SLSA tracks below — supply-chain provenance flows from developer
+workstation/repo rules outward to the build factory floor, so evaluating
+repo governance first mirrors the code's actual physical lifecycle.
 
 - **Cryptographic Commit Signing** — `repository_governance
   .commit_signature.verified == true`: GitHub's own `commit.verification`
@@ -1107,6 +1110,13 @@ separate "unavailable" state — the same fail-closed contract this
 checklist has always had.
 
 ```text
+=== Repository & Workstation Governance (Policy Assessment) (3/4 controls met) ===
+[✓] Cryptographic Commit Signing (verified via GPG on the PR's own head commit a0585b697a19, not the merge commit)
+[✓] Linear History Enforced (merge commits disallowed)
+[✓] Force Pushes Blocked (history rewrite disabled)
+[✗] Branch Deletion Blocked -- no 'deletion' rule is active on this branch
+=====================================
+
 Source Track (SLSA Source — Draft Specification)
 === Source Policy Level 1: Version Controlled Source Assessment ===
 [✓] Version Controlled Source (VCS provider & branch binding)
@@ -1143,13 +1153,6 @@ Status: PASSED (SLSA Build Level 2)
 [✗] Unforgeable Control-Plane Builder Identity (https://github.com/actions/runner) -- builder id is not in the trusted isolated-control-plane allowlist [...]
 [✗] Isolated Provenance Generation (signer identity matches builder identity) -- ...
 Status: FAILED (SLSA Build Level 3)
-=====================================
-
-=== Repository & Workstation Governance (Policy Assessment) (3/4 controls met) ===
-[✓] Cryptographic Commit Signing (verified via GPG on the PR's own head commit a0585b697a19, not the merge commit)
-[✓] Linear History Enforced (merge commits disallowed)
-[✓] Force Pushes Blocked (history rewrite disabled)
-[✗] Branch Deletion Blocked -- no 'deletion' rule is active on this branch
 =====================================
 
 === Dependency Materialization Evidence (2/3 present; informs S2C2F ING-1/ING-2) ===

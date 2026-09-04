@@ -3049,11 +3049,11 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
     predicate traces back to, and the exact --min-rcs/--disallow-degraded/
     etc. this call enforced), Static Analysis (the per-tool SARIF/SonarQube
     breakdown from _format_static_analysis_table, when any tools were
-    ingested), Source Track (SLSA Source, Levels 1-4), SLSA Build Track
-    (Levels 1-3), Repository & Workstation Governance
+    ingested), Repository & Workstation Governance
     (_format_repository_governance_report, when any was found -- solo-
     maintainer compensating controls, deliberately not part of either
-    SLSA track), Dependency Materialization Evidence
+    SLSA track), Source Track (SLSA Source, Levels 1-4), SLSA Build Track
+    (Levels 1-3), Dependency Materialization Evidence
     (_format_dependency_governance_report, when any evidence was found),
     the S2C2F Compliance Matrix (_format_s2c2f_report, when any
     controls were evaluated), CD / Signing (_format_signing_report --
@@ -3075,6 +3075,18 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
         lines.append("")
         lines.append("  static analysis:")
         lines.extend(_format_static_analysis_table(result.static_analysis_tools))
+
+    # Repository & Workstation Governance renders immediately after Run
+    # Identity & Gate Parameters, ahead of both SLSA tracks -- supply-
+    # chain provenance flows from developer workstation/repo rules
+    # outward to the build factory floor, so evaluating repo governance
+    # first mirrors the code's actual physical lifecycle rather than the
+    # order the two ratified/draft SLSA tracks happen to be defined in.
+    repo_governance_lines = _format_repository_governance_report(result.repository_governance_items)
+    if repo_governance_lines:
+        lines.append("")
+        lines.extend(repo_governance_lines)
+
     source_levels = [result.source_level1, result.source_level2, result.source_level3, result.source_level4]
     build_levels = [result.slsa_level1, result.slsa_level2, result.slsa_level3]
 
@@ -3093,11 +3105,6 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
         lines.extend(track_lines)
     else:
         build_cumulative = []
-
-    repo_governance_lines = _format_repository_governance_report(result.repository_governance_items)
-    if repo_governance_lines:
-        lines.append("")
-        lines.extend(repo_governance_lines)
 
     dependency_lines = _format_dependency_governance_report(result.dependency_governance_items)
     if dependency_lines:

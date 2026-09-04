@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cli.parsers.commit_author import CommitAuthorReport, inspect_commit_author
+from cli.parsers.commit_author import CommitAuthorReport, inspect_commit_author, _signature_type_from_blob
 
 _REPO = "acme/widgets"
 _SHA = "b" * 40
@@ -30,9 +30,12 @@ def _mock_response(payload):
     return resp
 
 
-def _commit_payload(*, author_login=None, author_name="Some Author", author_email="someone@example.com"):
+def _commit_payload(*, author_login=None, author_name="Some Author", author_email="someone@example.com", verification=None):
     return {
-        "commit": {"author": {"name": author_name, "email": author_email}},
+        "commit": {
+            "author": {"name": author_name, "email": author_email},
+            "verification": verification if verification is not None else {},
+        },
         "author": ({"login": author_login} if author_login else None),
     }
 
@@ -100,6 +103,98 @@ class VerifiedAccountResolutionTests(unittest.TestCase):
         self.assertIn("unexpected response shape", result.reason)
 
 
+class SignatureTypeFromBlobTests(unittest.TestCase):
+    def test_pgp_header_detected(self):
+        self.assertEqual(_signature_type_from_blob("-----BEGIN PGP SIGNATURE-----\n\n...\n"), "gpg")
+
+    def test_ssh_header_detected(self):
+        self.assertEqual(_signature_type_from_blob("-----BEGIN SSH SIGNATURE-----\n...\n"), "ssh")
+
+    def test_leading_whitespace_tolerated(self):
+        self.assertEqual(_signature_type_from_blob("  \n-----BEGIN SSH SIGNATURE-----\n..."), "ssh")
+
+    def test_unrecognized_header_returns_none(self):
+        self.assertIsNone(_signature_type_from_blob("-----BEGIN SOMETHING ELSE-----\n"))
+
+    def test_none_returns_none(self):
+        self.assertIsNone(_signature_type_from_blob(None))
+
+    def test_non_string_returns_none(self):
+        self.assertIsNone(_signature_type_from_blob(12345))
+
+
+class CommitSignatureVerificationTests(unittest.TestCase):
+    # Real shapes confirmed against GitHub's actual API (repos/lucid-provenance/
+    # lucid-assay/commits/<sha>) before writing this -- both a real GitHub-signed
+    # merge commit (verified/valid/PGP) and a real unsigned one, not guessed.
+    _REAL_VERIFIED = {
+        "verified": True,
+        "reason": "valid",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\nwsFcBAABCAAQ...\n-----END PGP SIGNATURE-----\n",
+        "payload": "tree ...",
+    }
+    _REAL_UNSIGNED = {"verified": False, "reason": "unsigned", "signature": None, "payload": None}
+
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_real_verified_gpg_commit(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(
+            _commit_payload(author_login="octocat", verification=self._REAL_VERIFIED)
+        )
+        result = inspect_commit_author(_REPO, _SHA, token="tok")
+        self.assertTrue(result.commit_signature_verified)
+        self.assertEqual(result.commit_signature_reason, "valid")
+        self.assertEqual(result.commit_signature_type, "gpg")
+
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_real_unsigned_commit(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(
+            _commit_payload(author_login="octocat", verification=self._REAL_UNSIGNED)
+        )
+        result = inspect_commit_author(_REPO, _SHA, token="tok")
+        self.assertFalse(result.commit_signature_verified)
+        self.assertEqual(result.commit_signature_reason, "unsigned")
+        self.assertIsNone(result.commit_signature_type)
+
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_ssh_signed_commit(self, mock_urlopen):
+        verification = {
+            "verified": True, "reason": "valid",
+            "signature": "-----BEGIN SSH SIGNATURE-----\n...\n-----END SSH SIGNATURE-----\n",
+        }
+        mock_urlopen.return_value = _mock_response(_commit_payload(author_login="octocat", verification=verification))
+        result = inspect_commit_author(_REPO, _SHA, token="tok")
+        self.assertTrue(result.commit_signature_verified)
+        self.assertEqual(result.commit_signature_type, "ssh")
+
+    def test_missing_verification_block_degrades_to_none_not_false(self):
+        """A response shape with no verification block at all (older API
+        version, or a hand-built test fixture predating this field) must
+        report None -- distinct from a confirmed-unsigned commit's False --
+        so a caller can tell 'not asked' from 'asked and no'."""
+        with patch("cli.parsers.commit_author.urllib.request.urlopen") as mock_urlopen:
+            payload = _commit_payload(author_login="octocat")
+            del payload["commit"]["verification"]
+            mock_urlopen.return_value = _mock_response(payload)
+            result = inspect_commit_author(_REPO, _SHA, token="tok")
+        self.assertIsNone(result.commit_signature_verified)
+        self.assertIsNone(result.commit_signature_reason)
+        self.assertIsNone(result.commit_signature_type)
+
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_signature_verification_independent_of_author_verification(self, mock_urlopen):
+        """A signed commit whose author email doesn't resolve to a linked
+        GitHub account (verified_github_account=False) must still report
+        its own, independent signature verification result -- the two
+        checks answer genuinely different questions and neither should
+        suppress the other."""
+        mock_urlopen.return_value = _mock_response(
+            _commit_payload(author_login=None, verification=self._REAL_VERIFIED)
+        )
+        result = inspect_commit_author(_REPO, _SHA, token="tok")
+        self.assertFalse(result.verified_github_account)
+        self.assertTrue(result.commit_signature_verified)
+
+
 class TransportErrorTests(unittest.TestCase):
     @patch("cli.parsers.commit_author.urllib.request.urlopen")
     def test_404_fails_closed_with_reason(self, mock_urlopen):
@@ -137,6 +232,9 @@ class AsDictTests(unittest.TestCase):
             github_login="a",
             verified_github_account=True,
             reason="ok",
+            commit_signature_verified=True,
+            commit_signature_reason="valid",
+            commit_signature_type="gpg",
         )
         self.assertEqual(
             report.as_dict(),
@@ -148,6 +246,9 @@ class AsDictTests(unittest.TestCase):
                 "github_login": "a",
                 "verified_github_account": True,
                 "reason": "ok",
+                "commit_signature_verified": True,
+                "commit_signature_reason": "valid",
+                "commit_signature_type": "gpg",
             },
         )
 

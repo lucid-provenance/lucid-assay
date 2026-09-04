@@ -1025,6 +1025,48 @@ logic) — the two can legitimately disagree for the same run; this
 section's header names those control IDs only as context for what the
 evidence *informs*, not as a claim that it computes them.
 
+**Repository & Workstation Governance** (`predicate.repository_governance`,
+informational by default): four compensating controls for a
+solo-maintained repo that structurally can't satisfy SLSA Source Level
+4's two-party review — cryptographic commit signing and three
+branch-ruleset hygiene checks (linear history, force-push blocking,
+branch-deletion blocking). Deliberately kept out of both the ratified
+Build Track and the still-draft Source Track: this is this project's own
+policy assessment, not a claim about either specification — the same
+separation reasoning the Dependency Materialization Evidence section
+above already established for a different, non-SLSA-shaped signal. Like
+that section (and the S2C2F Compliance Matrix), it's a flat list with no
+cumulative `Status:` line — four independent controls, not a leveled
+track.
+
+- **Cryptographic Commit Signing** — `repository_governance
+  .commit_signature.verified == true`: GitHub's own `commit.verification`
+  field (`GET /repos/{repo}/commits/{sha}`) reports the commit's GPG or
+  SSH signature as cryptographically valid. A materially *stronger* claim
+  than Source Level 3's account-link check above — proof the commit
+  content itself wasn't altered after signing, not just that the author
+  email resolves to a linked account — which is exactly why it's kept in
+  a separate section rather than folded into Source Level 3's own
+  semantics (see `parsers/commit_author.py`'s docstring). Collected by
+  the same module, using the same ambient `GITHUB_TOKEN`.
+- **Linear History Enforced** / **Force Pushes Blocked** / **Branch
+  Deletion Blocked** — whether a `required_linear_history` /
+  `non_fast_forward` / `deletion` rule (respectively) is active on the
+  branch's GitHub ruleset (`GET /repos/{repo}/rules/branches/{branch}`,
+  the same endpoint branch governance already queries — see
+  `parsers/github_rules.py`). Fails closed identically to every other
+  branch-governance-derived check when the underlying query itself was
+  unavailable (missing/under-scoped token, 401/403) — distinguished from
+  "queried successfully, rule inactive" by detail text, not by outcome.
+
+**`--require-commit-signing`** (off by default) is the only control in
+this section with a gate path: it folds just the Cryptographic Commit
+Signing item into `passed`/exit code, the same off-by-default,
+opt-in-only shape as `--require-slsa-build-l3` above. The other three
+branch-ruleset-hygiene items have no gate path today and are unaffected
+by this flag — a signed commit on a branch with no ruleset hygiene at all
+still passes with `--require-commit-signing` set.
+
 **`--slsa-envelope PATH`** loads a *second* DSSE envelope alongside the
 primary one so both tracks can be evaluated together from the right
 source: the Source track reads `vcs`/`branch_governance` off whichever
@@ -1074,6 +1116,13 @@ Status: PASSED (SLSA Build Level 2)
 [✗] Unforgeable Control-Plane Builder Identity (https://github.com/actions/runner) -- builder id is not in the trusted isolated-control-plane allowlist [...]
 [✗] Isolated Provenance Generation (signer identity matches builder identity) -- ...
 Status: FAILED (SLSA Build Level 3)
+=====================================
+
+=== Repository & Workstation Governance (Policy Assessment) (3/4 controls met) ===
+[✓] Cryptographic Commit Signing (verified via GPG)
+[✓] Linear History Enforced (merge commits disallowed)
+[✓] Force Pushes Blocked (history rewrite disabled)
+[✗] Branch Deletion Blocked -- no 'deletion' rule is active on this branch
 =====================================
 
 === Dependency Materialization Evidence (2/3 present; informs S2C2F ING-1/ING-2) ===

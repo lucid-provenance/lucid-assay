@@ -542,6 +542,62 @@ class BuilderStatementTests(unittest.TestCase):
         self.assertEqual(commit_author_block["github_login"], "billwonch")
         self.assertTrue(commit_author_block["verified_github_account"])
 
+    def test_repository_governance_is_embedded_from_branch_governance_hygiene_fields(self):
+        bg = _default_branch_governance()
+        bg.linear_history_required = True
+        bg.force_pushes_blocked = True
+        bg.deletions_blocked = True
+        statement = build_statement(**_base_kwargs(branch_governance=bg))
+        repo_gov_block = statement["predicate"]["repository_governance"]
+        self.assertTrue(repo_gov_block["available"])
+        self.assertTrue(repo_gov_block["linear_history_required"])
+        self.assertTrue(repo_gov_block["force_pushes_blocked"])
+        self.assertTrue(repo_gov_block["deletions_blocked"])
+
+    def test_repository_governance_hygiene_fields_default_false(self):
+        """_default_branch_governance() doesn't set the 3 hygiene fields --
+        confirms build_statement() doesn't silently default them to True."""
+        statement = build_statement(**_base_kwargs())
+        repo_gov_block = statement["predicate"]["repository_governance"]
+        self.assertFalse(repo_gov_block["linear_history_required"])
+        self.assertFalse(repo_gov_block["force_pushes_blocked"])
+        self.assertFalse(repo_gov_block["deletions_blocked"])
+
+    def test_repository_governance_commit_signature_is_none_without_commit_author(self):
+        statement = build_statement(**_base_kwargs())
+        repo_gov_block = statement["predicate"]["repository_governance"]
+        self.assertIsNone(repo_gov_block["commit_signature"])
+
+    def test_repository_governance_commit_signature_is_embedded_when_commit_author_supplied(self):
+        from cli.parsers.commit_author import CommitAuthorReport
+
+        report = CommitAuthorReport(
+            available=True,
+            commit_sha="b" * 40,
+            name="Bill Wonch",
+            email="bill.wonch@gmail.com",
+            github_login="billwonch",
+            verified_github_account=True,
+            reason="commit author email resolved to verified GitHub account 'billwonch'",
+            commit_signature_verified=True,
+            commit_signature_reason="valid",
+            commit_signature_type="gpg",
+        )
+        statement = build_statement(**_base_kwargs(commit_author=report))
+        commit_sig_block = statement["predicate"]["repository_governance"]["commit_signature"]
+        self.assertTrue(commit_sig_block["available"])
+        self.assertTrue(commit_sig_block["verified"])
+        self.assertEqual(commit_sig_block["reason"], "valid")
+        self.assertEqual(commit_sig_block["signature_type"], "gpg")
+
+    def test_repository_governance_available_follows_branch_governance_availability(self):
+        bg = _default_branch_governance()
+        bg.available = False
+        bg.reason = "GitHub API authentication/authorization failed"
+        statement = build_statement(**_base_kwargs(branch_governance=bg))
+        repo_gov_block = statement["predicate"]["repository_governance"]
+        self.assertFalse(repo_gov_block["available"])
+
 
 class PipelineBlockTests(unittest.TestCase):
     """predicate.pipeline (schema-required: run_id/workflow_ref/ci_provider/

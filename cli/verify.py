@@ -253,6 +253,15 @@ class VerificationResult:
     # materialization level -- see _format_dependency_governance_report.
     # Purely informational, same non-gating contract as s2c2f_controls.
     dependency_governance_items: List[Dict[str, Any]] = field(default_factory=list)
+    # predicate.repository_governance, evaluated into a checklist (see
+    # _extract_repository_governance) -- solo-maintainer compensating
+    # controls (cryptographic commit signing, branch-ruleset hygiene),
+    # deliberately isolated from both the ratified SLSA Build Track and
+    # the still-draft Source Track, same separation principle as
+    # dependency_governance_items above. Purely informational except the
+    # commit-signing item, which --require-commit-signing can opt into
+    # gating (see verify_dsse_attestation).
+    repository_governance_items: List[Dict[str, Any]] = field(default_factory=list)
     # The signed envelope's own _rekor.logIndex/logUrl (cli/oidc_signer.py)
     # -- not part of the signed predicate (see _extract_rekor_info's
     # docstring for why). Both None on --dry-run-sign or an envelope
@@ -331,6 +340,7 @@ class VerificationResult:
             "static_analysis_tools": self.static_analysis_tools,
             "s2c2f_controls": self.s2c2f_controls,
             "dependency_governance_items": self.dependency_governance_items,
+            "repository_governance_items": self.repository_governance_items,
             "rekor_log_index": self.rekor_log_index,
             "rekor_log_url": self.rekor_log_url,
             "source_highest_level": self.source_highest_level,
@@ -441,6 +451,89 @@ def _extract_s2c2f_controls(predicate: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(controls, list):
         return []
     return [c for c in controls if isinstance(c, dict)]
+
+
+def _extract_repository_governance(predicate: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Builds the Repository & Workstation Governance checklist (see
+    _format_repository_governance_report) from lucid-assay's own
+    predicate.repository_governance (cli/parsers/github_rules.py +
+    cli/parsers/commit_author.py) -- compensating controls for a
+    solo-maintained repo that structurally can't satisfy SLSA Source
+    Level 4's two-party review (see cli/verify.py's own module docstring
+    on that limitation). Deliberately isolated from both the ratified
+    SLSA Build Track and the still-draft Source Track: this project's own
+    policy assessment, not a claim about either specification -- the same
+    separation reasoning Rev. 8's dependency-materialization decoupling
+    already established for a different section. Renders all four items
+    (even a failing/unavailable one) once repository_governance is
+    present at all, rather than silently dropping the section, matching
+    branch_governance's own "always show why, never just disappear"
+    convention. [] (no section at all) only when
+    predicate.repository_governance is absent entirely -- an attestation
+    predating this field, matching every other optional section here."""
+    repo_gov = predicate.get("repository_governance")
+    if not isinstance(repo_gov, dict):
+        return []
+    return [
+        _repo_gov_check_commit_signing(repo_gov),
+        _repo_gov_check_linear_history(repo_gov),
+        _repo_gov_check_force_pushes_blocked(repo_gov),
+        _repo_gov_check_deletions_blocked(repo_gov),
+    ]
+
+
+def _repo_gov_check_commit_signing(repo_gov: Dict[str, Any]) -> Dict[str, Any]:
+    """Cryptographic proof HEAD's own commit content wasn't altered after
+    signing -- a materially different, stronger claim than SLSA Source
+    Level 3's account-link check (see cli/parsers/commit_author.py's own
+    docstring for why the two are kept apart). The only item in this
+    section with an opt-in path into the hard gate -- see
+    --require-commit-signing."""
+    label = "Cryptographic Commit Signing"
+    commit_sig = repo_gov.get("commit_signature")
+    if not isinstance(commit_sig, dict):
+        return _slsa_item(label, False, "commit author identity was not captured for this run -- no commit signature data available")
+    if not commit_sig.get("available", False):
+        return _slsa_item(label, False, "commit signature verification unavailable (see vcs.commit_author's own reason)")
+
+    if commit_sig.get("verified") is True:
+        sig_type = commit_sig.get("signature_type")
+        via = f" via {sig_type.upper()}" if isinstance(sig_type, str) and sig_type else ""
+        return _slsa_item(f"{label} (verified{via})", True)
+
+    reason = commit_sig.get("reason")
+    detail = f"commit is unsigned or unverified -- GitHub reports {reason!r}" if reason else "commit is unsigned or unverified"
+    return _slsa_item(label, False, detail)
+
+
+def _repo_gov_check_linear_history(repo_gov: Dict[str, Any]) -> Dict[str, Any]:
+    label = "Linear History Enforced"
+    if not repo_gov.get("available", False):
+        return _slsa_item(label, False, "branch governance unavailable for this run (see branch_governance's own reason)")
+    if repo_gov.get("linear_history_required") is True:
+        return _slsa_item(f"{label} (merge commits disallowed)", True)
+    return _slsa_item(label, False, "no 'required_linear_history' rule is active on this branch")
+
+
+def _repo_gov_check_force_pushes_blocked(repo_gov: Dict[str, Any]) -> Dict[str, Any]:
+    label = "Force Pushes Blocked"
+    if not repo_gov.get("available", False):
+        return _slsa_item(label, False, "branch governance unavailable for this run (see branch_governance's own reason)")
+    if repo_gov.get("force_pushes_blocked") is True:
+        return _slsa_item(f"{label} (history rewrite disabled)", True)
+    return _slsa_item(
+        label, False,
+        "no 'non_fast_forward' rule is active on this branch -- history rewrite via force-push is not blocked",
+    )
+
+
+def _repo_gov_check_deletions_blocked(repo_gov: Dict[str, Any]) -> Dict[str, Any]:
+    label = "Branch Deletion Blocked"
+    if not repo_gov.get("available", False):
+        return _slsa_item(label, False, "branch governance unavailable for this run (see branch_governance's own reason)")
+    if repo_gov.get("deletions_blocked") is True:
+        return _slsa_item(label, True)
+    return _slsa_item(label, False, "no 'deletion' rule is active on this branch")
 
 
 def _extract_dependency_evidence(predicate: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1241,6 +1334,36 @@ def _format_s2c2f_report(controls: List[Dict[str, Any]]) -> List[str]:
     return lines
 
 
+def _format_repository_governance_report(items: List[Dict[str, Any]]) -> List[str]:
+    """Renders the Repository & Workstation Governance checklist (see
+    _extract_repository_governance) -- solo-maintainer compensating
+    controls (cryptographic commit signing, branch-ruleset hygiene), kept
+    deliberately isolated from both the ratified SLSA Build Track and the
+    still-draft Source Track: this project's own policy assessment, not
+    a claim about either specification. Purely informational like the
+    S2C2F/Dependency Materialization Evidence sections -- no cumulative
+    Status line, since these are four independent controls, not a leveled
+    track. One exception to "purely informational": the Cryptographic
+    Commit Signing item specifically can be folded into the hard gate via
+    --require-commit-signing (see verify_dsse_attestation) -- the other
+    three have no such opt-in path today, so a caller must not assume
+    setting that flag also requires branch-ruleset hygiene. [] (no
+    section at all) when _extract_repository_governance found nothing,
+    matching every other optional section here."""
+    if not items:
+        return []
+    met_count = sum(1 for i in items if i["passed"])
+    lines = [f"=== Repository & Workstation Governance (Policy Assessment) ({met_count}/{len(items)} controls met) ==="]
+    for item in items:
+        mark = "✓" if item["passed"] else "✗"
+        line = f"[{mark}] {item['label']}"
+        if not item["passed"] and item["detail"]:
+            line += f" -- {item['detail']}"
+        lines.append(line)
+    lines.append(_SECTION_DIVIDER)
+    return lines
+
+
 def _format_dependency_governance_report(items: List[Dict[str, Any]]) -> List[str]:
     """Renders the Dependency Materialization Evidence checklist (see
     _extract_dependency_evidence) -- lucid-assay's own predicate.
@@ -1821,6 +1944,9 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
         },
         "dependency_governance": {
             "items": result.dependency_governance_items,
+        },
+        "repository_governance": {
+            "items": result.repository_governance_items,
         },
         "identity": {
             "status": result.identity_status,
@@ -2495,6 +2621,7 @@ def verify_dsse_attestation(
     expected_ref: Optional[str] = None,
     slsa_statement: Optional[Dict[str, Any]] = None,
     require_slsa_build_l3: bool = False,
+    require_commit_signing: bool = False,
 ) -> VerificationResult:
     """Validates a DSSE envelope's structure, decodes its in-toto Statement
     payload, best-effort verifies the Sigstore signing identity, and enforces
@@ -2516,6 +2643,12 @@ def verify_dsse_attestation(
     existing callers' admission gate is untouched until they choose to
     require it (see cli/verify.py's module-level SLSA Build Level 3
     section for why every caller legitimately fails it today).
+
+    `require_commit_signing`, when True, folds the Repository &
+    Workstation Governance section's Cryptographic Commit Signing item
+    specifically into `passed`/exit code -- opt-in, off by default. The
+    other three items in that section (branch-ruleset hygiene) have no
+    such opt-in path today; setting this flag does not gate on them.
 
     Orchestrates (see each helper's own docstring for its contract):
       _decode_envelope_statement   -- structure + payload decode
@@ -2541,6 +2674,7 @@ def verify_dsse_attestation(
         "expected_workflow": expected_workflow,
         "expected_ref": expected_ref,
         "require_slsa_build_l3": require_slsa_build_l3,
+        "require_commit_signing": require_commit_signing,
     }
 
     if not isinstance(envelope, dict):
@@ -2564,6 +2698,7 @@ def verify_dsse_attestation(
     static_analysis_tools: List[Dict[str, Any]] = []
     s2c2f_controls: List[Dict[str, Any]] = []
     dependency_governance_items: List[Dict[str, Any]] = []
+    repository_governance_items: List[Dict[str, Any]] = []
     schema_validation_status = "skipped"
 
     if statement is not None:
@@ -2611,6 +2746,26 @@ def verify_dsse_attestation(
         static_analysis_tools = _extract_static_analysis_tools(predicate)
         s2c2f_controls = _extract_s2c2f_controls(predicate)
         dependency_governance_items = _extract_dependency_evidence(predicate)
+        repository_governance_items = _extract_repository_governance(predicate)
+
+        # --require-commit-signing: same opt-in-gate shape as
+        # --require-slsa-build-l3 (see that flag's own handling), but
+        # folding in only the one item this section has a confirmed gate
+        # path for -- the other three (branch-ruleset hygiene) stay
+        # purely informational regardless of this flag.
+        if require_commit_signing:
+            # _extract_repository_governance() always puts the commit-
+            # signing item first when it returns anything at all (see its
+            # own construction) -- an empty list means repository_governance
+            # was never captured for this run, treated the same as "not
+            # signed" rather than "check not applicable", same fail-closed
+            # default every other opt-in gate here uses.
+            commit_signing_passed = bool(repository_governance_items) and repository_governance_items[0]["passed"]
+            if not commit_signing_passed:
+                violations.append(
+                    "--require-commit-signing was set, but HEAD's commit is not cryptographically signed/verified "
+                    "(see the Repository & Workstation Governance section above for the exact reason)"
+                )
 
         gate_violations, gate_warnings = _evaluate_policy_gates(
             rcs_value=rcs_value,
@@ -2687,6 +2842,7 @@ def verify_dsse_attestation(
         static_analysis_tools=static_analysis_tools,
         s2c2f_controls=s2c2f_controls,
         dependency_governance_items=dependency_governance_items,
+        repository_governance_items=repository_governance_items,
         rekor_log_index=rekor_log_index,
         rekor_log_url=rekor_log_url,
         schema_validation_status=schema_validation_status,
@@ -2777,6 +2933,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "off by default: it genuinely passes today when a caller supplies --subject-name/"
         "--subject-digest (confirmed against real CI runs, 2026-09-03), but that's still an opt-in "
         "caller choice, not universal (see cli/verify.py's SLSA Build Level 3 section)",
+    )
+    p.add_argument(
+        "--require-commit-signing",
+        action="store_true",
+        dest="require_commit_signing",
+        help="fail the gate if HEAD's commit is not cryptographically signed/verified (Repository & "
+        "Workstation Governance section's Cryptographic Commit Signing item only -- the section's "
+        "other three, branch-ruleset-hygiene items have no gate path yet) -- off by default",
     )
     p.add_argument(
         "--format",
@@ -2874,7 +3038,10 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
     etc. this call enforced), Static Analysis (the per-tool SARIF/SonarQube
     breakdown from _format_static_analysis_table, when any tools were
     ingested), Source Track (SLSA Source, Levels 1-4), SLSA Build Track
-    (Levels 1-3), Dependency Materialization Evidence
+    (Levels 1-3), Repository & Workstation Governance
+    (_format_repository_governance_report, when any was found -- solo-
+    maintainer compensating controls, deliberately not part of either
+    SLSA track), Dependency Materialization Evidence
     (_format_dependency_governance_report, when any evidence was found),
     the S2C2F Compliance Matrix (_format_s2c2f_report, when any
     controls were evaluated), CD / Signing (_format_signing_report --
@@ -2914,6 +3081,11 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
         lines.extend(track_lines)
     else:
         build_cumulative = []
+
+    repo_governance_lines = _format_repository_governance_report(result.repository_governance_items)
+    if repo_governance_lines:
+        lines.append("")
+        lines.extend(repo_governance_lines)
 
     dependency_lines = _format_dependency_governance_report(result.dependency_governance_items)
     if dependency_lines:
@@ -3199,6 +3371,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         expected_ref=args.expected_ref,
         slsa_statement=slsa_statement,
         require_slsa_build_l3=args.require_slsa_build_l3,
+        require_commit_signing=args.require_commit_signing,
     )
 
     if _resolve_output_format(args) == "json":

@@ -10,6 +10,7 @@
     "pipeline",
     "vcs",
     "branch_governance",
+    "repository_governance",
     "artifact",
     "test_verification",
     "coverage",
@@ -111,6 +112,53 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "The `context` of every required_status_checks rule entry applying to this branch (e.g. \"ci/lucid-assay-verify\"). Absent/empty on attestations predating this field, or whenever available=false."
+        },
+        "linear_history_required": {
+          "type": "boolean",
+          "description": "Whether a 'required_linear_history' rule is active on the branch (merge commits disallowed -- squash/rebase only). Absent on attestations predating this field, or whenever available=false."
+        },
+        "force_pushes_blocked": {
+          "type": "boolean",
+          "description": "Whether a 'non_fast_forward' rule is active on the branch (history rewrite via force-push disallowed). Absent on attestations predating this field, or whenever available=false."
+        },
+        "deletions_blocked": {
+          "type": "boolean",
+          "description": "Whether a 'deletion' rule is active on the branch (branch deletion disallowed). Absent on attestations predating this field, or whenever available=false."
+        }
+      }
+    },
+
+    "repository_governance": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Repository/workstation-hygiene compensating controls (cli/parsers/github_rules.py, cli/parsers/commit_author.py) for a solo-maintained repo that structurally can't satisfy SLSA Source Level 4's two-party review -- see cli/verify.py's Repository & Workstation Governance section. Deliberately separate from vcs (SLSA Build/Source reads) and branch_governance (S2C2F/RCS governance scoring reads): this project's own policy assessment, not a claim about either ratified/draft specification.",
+      "required": ["available", "linear_history_required", "force_pushes_blocked", "deletions_blocked"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "linear_history_required": { "type": "boolean" },
+        "force_pushes_blocked": { "type": "boolean" },
+        "deletions_blocked": { "type": "boolean" },
+        "commit_signature": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "Null when no commit_author was collected at all (e.g. off-CI, no GITHUB_TOKEN, or an attestation predating this field) -- absence must not be read as verified.",
+          "required": ["available", "verified", "reason", "signature_type"],
+          "properties": {
+            "available": { "type": "boolean" },
+            "verified": {
+              "type": ["boolean", "null"],
+              "description": "GitHub's own commit.verification.verified. Null when not captured (distinct from a confirmed-unsigned commit, which is false)."
+            },
+            "reason": {
+              "type": ["string", "null"],
+              "description": "GitHub's own commit.verification.reason (e.g. 'valid', 'unsigned', 'bad_signature')."
+            },
+            "signature_type": {
+              "type": ["string", "null"],
+              "enum": ["gpg", "ssh", null],
+              "description": "Inferred from the raw signature blob's own PEM-style header. Null when no signature is present or its header isn't recognized."
+            }
+          }
         }
       }
     },

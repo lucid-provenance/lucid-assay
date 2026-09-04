@@ -5,7 +5,17 @@ Queries GitHub's REST API for the *effective* rules on a branch (the
 union of every applicable repository + organization ruleset) and cross-
 references active rulesets' bypass actors, so a run can tell whether
 "branch protection" actually prevents an unreviewed direct commit or
-merge, as opposed to merely appearing to.
+merge, as opposed to merely appearing to. Also derives three repository-
+hygiene signals from the same rules-for-branch response (see
+_derive_branch_hygiene): whether force-pushes and branch deletion are
+blocked, and whether linear history is required -- compensating controls
+cli/verify.py's Repository & Workstation Governance section reports for
+a solo-maintained repo that structurally can't satisfy SLSA Source
+Level 4's two-party review. Deliberately still reading only the newer
+rulesets API's rule-type array (`{"type": ..., "parameters": {...}}`),
+never the classic branch-protection API's flat booleans
+(allow_force_pushes, enforce_admins, ...) -- this module has never used
+the latter, for the reasons its own earlier notes already give.
 
 Hardened against:
   - Missing/expired GITHUB_TOKEN (degrades to available=False, never raises)
@@ -200,6 +210,14 @@ class BranchGovernanceReport:
     # attestation verification, without this module needing to know
     # anything about S2C2F itself.
     required_status_check_contexts: List[str] = field(default_factory=list)
+    # Repository/workstation-hygiene rules (see _derive_branch_hygiene) --
+    # False rather than omitted when no such rule exists, or on an
+    # attestation predating these fields, or whenever available is False;
+    # never populated at all in that last case, same convention
+    # required_status_check_contexts already uses.
+    linear_history_required: bool = False
+    force_pushes_blocked: bool = False
+    deletions_blocked: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -214,6 +232,9 @@ class BranchGovernanceReport:
             "reason": self.reason,
             "reason_code": self.reason_code,
             "required_status_check_contexts": self.required_status_check_contexts,
+            "linear_history_required": self.linear_history_required,
+            "force_pushes_blocked": self.force_pushes_blocked,
+            "deletions_blocked": self.deletions_blocked,
         }
 
 
@@ -536,6 +557,38 @@ def _derive_required_status_check_contexts(rules: List[Any]) -> List[str]:
     return contexts
 
 
+def _has_rule_type(rules: List[Any], rule_type: str) -> bool:
+    """Whether any active rule in the rules-for-branch response has the
+    given `type` -- the same "presence of this rule type means the
+    behavior it names is active" reading _derive_pr_requirements already
+    uses for "pull_request", generalized. Real GitHub ruleset rule-type
+    strings (confirmed against the REST API's own documented enum, not
+    guessed): "non_fast_forward" (blocks force-pushes -- GitHub's own
+    name for what a force-push actually is at the git-protocol level, a
+    non-fast-forward ref update), "deletion" (blocks branch deletion),
+    "required_linear_history" (blocks merge commits, requiring squash/
+    rebase). Deliberately not the classic branch-protection API's flat
+    booleans (allow_force_pushes, enforce_admins, ...) -- this module
+    only ever reads the newer rulesets API (see its own docstring)."""
+    return any(isinstance(r, dict) and r.get("type") == rule_type for r in rules)
+
+
+def _derive_branch_hygiene(rules: List[Any]) -> Tuple[bool, bool, bool]:
+    """Returns (linear_history_required, force_pushes_blocked,
+    deletions_blocked) from the rules-for-branch response -- repository/
+    workstation-hygiene compensating controls for a solo-maintained repo
+    that structurally can't satisfy SLSA Source Level 4's two-party
+    review (see cli/verify.py's Repository & Workstation Governance
+    section). Deliberately not folded into the ratified SLSA Build
+    checklist or the still-draft Source Track: these are this project's
+    own policy assessment, not a claim about either specification."""
+    return (
+        _has_rule_type(rules, "required_linear_history"),
+        _has_rule_type(rules, "non_fast_forward"),
+        _has_rule_type(rules, "deletion"),
+    )
+
+
 def _classify_bypass_actors(
     bypass_actors: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], bool]:
@@ -653,6 +706,7 @@ def inspect_branch_governance(
 
     pull_request_required, approvals_required, direct_push_prevented = _derive_pr_requirements(rules)
     required_status_check_contexts = _derive_required_status_check_contexts(rules)
+    linear_history_required, force_pushes_blocked, deletions_blocked = _derive_branch_hygiene(rules)
     always_bypass, pr_only_bypass, unknown_mode_bypass, admin_enforced = _classify_bypass_actors(bypass_actors)
     bypass_actors_count = len(bypass_actors)
 
@@ -683,4 +737,7 @@ def inspect_branch_governance(
         warnings=warnings,
         reason=reason,
         required_status_check_contexts=required_status_check_contexts,
+        linear_history_required=linear_history_required,
+        force_pushes_blocked=force_pushes_blocked,
+        deletions_blocked=deletions_blocked,
     )

@@ -332,6 +332,38 @@ def build_statement(
             # cli/parsers/s2c2f.py's AUD-1 (Enforcing Provenance) check.
             "required_status_check_contexts": branch_governance.required_status_check_contexts,
         },
+        # Repository/workstation-hygiene compensating controls for a
+        # solo-maintained repo that structurally can't satisfy SLSA
+        # Source Level 4's two-party review -- see cli/verify.py's
+        # Repository & Workstation Governance section. Deliberately a
+        # separate top-level block from both vcs (what the ratified SLSA
+        # Build checklist and still-draft Source Track read) and
+        # branch_governance (what S2C2F/RCS governance scoring reads):
+        # this is this project's own policy assessment, not a claim
+        # about either specification, and mixing it into either of those
+        # blocks would blur that line the same way folding it into the
+        # SLSA Build Track checklist itself would (see cli/verify.py's
+        # Rev. 8 dependency-materialization decoupling for the identical
+        # reasoning applied there).
+        "repository_governance": {
+            "available": branch_governance.available,
+            "linear_history_required": branch_governance.linear_history_required,
+            "force_pushes_blocked": branch_governance.force_pushes_blocked,
+            "deletions_blocked": branch_governance.deletions_blocked,
+            # None (not a nested dict) when no commit_author was supplied
+            # at all -- same "caller didn't check" vs. "checked and
+            # found nothing" distinction vcs.commit_author already makes.
+            "commit_signature": (
+                {
+                    "available": commit_author.available,
+                    "verified": commit_author.commit_signature_verified,
+                    "reason": commit_author.commit_signature_reason,
+                    "signature_type": commit_author.commit_signature_type,
+                }
+                if commit_author is not None
+                else None
+            ),
+        },
         "artifact": {
             "subject": {
                 "name": subject_name,

@@ -569,6 +569,7 @@ class BuildVerdictEnvelopeBlockTests(unittest.TestCase):
         for lvl in block["build_checklist"]:
             self.assertEqual(lvl["track"], "Build")
 
+        self.assertIn("repository_governance_items", block)
         json.dumps(block)  # must stay JSON-serializable with the new keys too
 
     def test_malformed_envelope_still_produces_a_failed_block(self):
@@ -582,6 +583,32 @@ class BuildVerdictEnvelopeBlockTests(unittest.TestCase):
         # evaluated -- an honest empty list, not a fabricated row.
         self.assertIsInstance(block["source_checklist"], list)
         self.assertIsInstance(block["build_checklist"], list)
+        self.assertEqual(block["repository_governance_items"], [])
+        json.dumps(block)
+
+    def test_block_carries_the_real_repository_governance_items(self):
+        statement = _statement(rcs_value=90)
+        statement["predicate"]["repository_governance"] = {
+            "available": True, "linear_history_required": True,
+            "force_pushes_blocked": True, "deletions_blocked": False,
+            "commit_signature": {
+                "available": True, "verified": True, "reason": "valid",
+                "signature_type": "gpg", "source_sha": None,
+            },
+        }
+        envelope = _envelope(statement)
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+        block = _build_verdict_envelope_block(result)
+
+        self.assertEqual(len(block["repository_governance_items"]), 4)
+        for item in block["repository_governance_items"]:
+            self.assertIn("label", item)
+            self.assertIn("passed", item)
+            self.assertIn("detail", item)
+        by_label_prefix = {item["label"].split(" (")[0]: item for item in block["repository_governance_items"]}
+        self.assertTrue(by_label_prefix["Cryptographic Commit Signing"]["passed"])
+        self.assertFalse(by_label_prefix["Branch Deletion Blocked"]["passed"])
         json.dumps(block)
 
 

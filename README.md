@@ -918,6 +918,16 @@ part of the signed DSSE payload:
 }
 ```
 
+(Trimmed for brevity — the block also carries `source_checklist`/
+`build_checklist` (the real, itemized per-criterion SLSA Source/Build
+results — see "SLSA Source & Build Track checklists" above) and
+`repository_governance_items` (the same real `{label, passed, detail}`
+rows the Repository & Workstation Governance section renders — see that
+section above), each the exact same data this call's own text/JSON
+report already showed, persisted here so a downstream reader like
+lucid-console doesn't have to re-run `verify` or re-derive pass/fail
+from raw predicate fields itself.)
+
 Deliberately **not** baked into the signed predicate at build time: a
 verdict is a function of *this call's* gate parameters (`--min-rcs`,
 `--disallow-degraded`, `--cert-identity`, ...), not an intrinsic fact

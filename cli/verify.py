@@ -3230,6 +3230,12 @@ def _build_verdict_envelope_block(result: VerificationResult) -> Dict[str, Any]:
     this lives in the same unsigned `_verdict` block rather than a
     separate signed or unsigned field.
 
+    `repository_governance_items` is the same real, flat {label, passed,
+    detail} checklist _format_repository_governance_report renders --
+    persisted here for the same reason source_checklist/build_checklist
+    are, so lucid-console doesn't have to re-derive pass/fail from
+    predicate.repository_governance's raw booleans itself.
+
     Deliberately NOT part of the signed DSSE payload: a verdict is a
     function of gate parameters (--min-rcs, --disallow-degraded,
     --cert-identity, ...) chosen per verify call, not an intrinsic fact
@@ -3266,6 +3272,22 @@ def _build_verdict_envelope_block(result: VerificationResult) -> Dict[str, Any]:
             [result.source_level1, result.source_level2, result.source_level3, result.source_level4]
         ),
         "build_checklist": _checklist_envelope_rows([result.slsa_level1, result.slsa_level2, result.slsa_level3]),
+        # The same real, flat {label, passed, detail} rows (_slsa_item)
+        # _format_repository_governance_report already renders -- unlike
+        # source_checklist/build_checklist, repository_governance_items
+        # has no gate-parameter dependency at all (see
+        # _extract_repository_governance/_repo_gov_check_*'s own
+        # signatures: only the predicate's repository_governance block
+        # in, nothing from this call's --cert-identity/--expected-* gate
+        # parameters), so it's arguably an intrinsic artifact fact rather
+        # than a function of this call -- persisted here anyway, in the
+        # same unsigned _verdict block as source_checklist/build_checklist,
+        # so a downstream reader (lucid-console) has one real, already-
+        # computed place to read the checklist from rather than
+        # re-deriving pass/fail from predicate.repository_governance's
+        # raw booleans itself. [] when repository_governance_items is
+        # empty (predicate.repository_governance was absent).
+        "repository_governance_items": result.repository_governance_items,
         "gate_params": result.gate_params,
         "computed_at": _now_iso(),
     }

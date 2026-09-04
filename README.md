@@ -498,6 +498,44 @@ into `verify.py` itself would break that separation — it operates purely
 on the already-signed, decoded predicate, never on this package's own
 parser dataclasses.
 
+### `--sarif`'s companion in-toto statement
+
+A `--sarif`-repeatable pipeline run also makes `cli.main` write a **third,
+separate** in-toto Statement (`cli/sarif_statement.py`), alongside the
+primary RCS predicate and the `--sbom` companion statement above: same
+subject artifact, `predicateType`
+`https://lucidprovenance.io/attestations/sarif-reports/v1` (a
+project-owned identifier — unlike CycloneDX/SPDX, SARIF has no established
+in-toto predicateType of its own to reuse), and `predicate` set to
+`{"reports": {tool_name: raw_document, ...}}` — every `--sarif` input's own
+raw document, **verbatim**, keyed by the tool name each document's own
+`runs[].tool.driver.name` reports (the same identifier
+`static_analysis.tools[].name`/S2C2F's own tool-name matching already
+uses). Never a re-derivation from `parsers/sarif.py`'s own
+`SarifSummaryReport`/`SarifFinding` extraction, which is a lossy,
+scoring-oriented projection, not a faithful copy of the original
+document(s).
+
+One statement, not one per `--sarif` input: lucid-dsse-collector's ingest
+pipeline only ever keeps a single decoded statement per predicateType out
+of one bundle, so N raw `--sarif` inputs are bundled into this one
+statement rather than requiring the collector to support multiple
+statements sharing a predicateType. The synthetic
+`lucid-assay-sbom-license-policy` "tool" (`build_sbom_sarif_report`) never
+appears here — it has no raw document at all, its findings are synthesized
+in-memory from the SBOM's own component list, never round-tripped through
+an actual SARIF file on disk.
+
+Written alongside `--out` as a fixed-basename sibling
+(`--sarif-reports-statement-out` to override; default e.g.
+`build/attestation.unsigned.json` → `build/sarif-reports.unsigned.json` —
+same fixed-name convention `--sbom-statement-out` uses, for the same
+reason). A no-op (no file written) when `--sarif` wasn't passed, every
+input failed to load, or none yielded an addressable tool name at all —
+never a fabricated/partial companion statement. If `--sign`/`--dry-run-sign`
+was also passed, this statement is signed into its own DSSE envelope the
+same way the other two are.
+
 `lucid-assay run` is an explicit alias for the pipeline above (it's also
 what runs with no subcommand at all, so `run` is optional, not required —
 existing invocations with no subcommand keep working unchanged).
@@ -1400,7 +1438,7 @@ build (contents: read, security-events: write)
 attest (id-token: write -- the ONLY job with it)
   download-artifact -> `lucid-assay provenance` (constructs SLSA statement
   from this job's own trusted context, not build's) -> `lucid-assay sign`
-  (both statements, atomically) -> upload-artifact "signed-statements"
+  (every statement in the bundle, atomically) -> upload-artifact "signed-statements"
          |
          v
 verify (contents: read)

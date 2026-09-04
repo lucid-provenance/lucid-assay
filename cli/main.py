@@ -45,6 +45,7 @@ from .parsers.sbom import (
 )
 from .patch_coverage import compute_patch_coverage, compute_patch_modified_lines
 from .real_coverage import CoverageTrackResult, RealCoverageResult, compute_real_coverage
+from .sarif_statement import build_sarif_reports_statement
 from .sbom_statement import build_sbom_statement
 from .scorer import RCSResult, score_pipeline
 from .slsa_provenance import build_slsa_provenance_statement
@@ -221,6 +222,57 @@ def _maybe_emit_sbom_statement(
     with open(sbom_statement_out_path, "w", encoding="utf-8") as f:
         json.dump(statement, f, indent=2)
     return sbom_statement_out_path
+
+
+def derive_sarif_reports_statement_path(out_path: str, explicit: Optional[str]) -> str:
+    """Output path for the --sarif companion statement (cli/sarif_statement.
+    py): honors --sarif-reports-statement-out verbatim when given, otherwise
+    sits as a fixed-basename sibling of --out in the same directory (e.g.
+    build/attestation.unsigned.json -> build/sarif-reports.unsigned.json) --
+    same fixed-name-not-derived-suffix convention derive_sbom_statement_path
+    uses, and for the identical reason: a downstream CI workflow references
+    this file by a fixed, predictable name, not by deriving it from --out's
+    own basename."""
+    if explicit:
+        return explicit
+    parent = Path(out_path).parent
+    return str(parent / "sarif-reports.unsigned.json") if str(parent) not in ("", ".") else "sarif-reports.unsigned.json"
+
+
+def _maybe_emit_sarif_reports_statement(
+    args: argparse.Namespace,
+    *,
+    image_digest: str,
+) -> Optional[str]:
+    """Step 7d: builds and writes the --sarif companion in-toto Statement
+    (see cli/sarif_statement.py) -- a third, separate attestation wrapping
+    every raw --sarif input's own document verbatim as one predicate,
+    alongside the RCS predicate and the --sbom companion statement above.
+    Returns the path it was written to, or None when --sarif wasn't passed,
+    every input failed to load, or none yielded an addressable tool name at
+    all (see build_sarif_reports_statement) -- never a fabricated/partial
+    companion statement. Reads args.sarif directly rather than threading
+    sarif_report through: the raw documents this wraps are never retained
+    on SarifSummaryReport (a lossy, scoring-oriented projection -- see
+    cli.parsers.sarif's own module docstring), so there's nothing on it
+    this function could reuse anyway."""
+    if not args.sarif:
+        return None
+
+    statement = build_sarif_reports_statement(
+        subject_name=args.image_ref,
+        subject_sha256=image_digest,
+        sarif_paths=args.sarif,
+    )
+    if statement is None:
+        return None
+
+    sarif_reports_statement_out_path = safe_resolve_path(
+        derive_sarif_reports_statement_path(args.out, args.sarif_reports_statement_out)
+    )
+    with open(sarif_reports_statement_out_path, "w", encoding="utf-8") as f:
+        json.dump(statement, f, indent=2)
+    return sarif_reports_statement_out_path
 
 
 def upload_to_worm_async(local_path: str, sha256_hex: str, bucket: str = "evidence"):
@@ -728,6 +780,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "a fixed-basename sibling of --out in the same directory, e.g. build/attestation.unsigned.json -> "
         "build/sbom.unsigned.json). A no-op when --sbom wasn't passed or failed to parse.",
     )
+    p.add_argument(
+        "--sarif-reports-statement-out",
+        default=None,
+        dest="sarif_reports_statement_out",
+        help="output path for the --sarif companion in-toto statement (see cli/sarif_statement.py; default: "
+        "a fixed-basename sibling of --out in the same directory, e.g. build/attestation.unsigned.json -> "
+        "build/sarif-reports.unsigned.json). A no-op when --sarif wasn't passed or every input failed to load.",
+    )
     p.add_argument("--skip-perf-budget-check", action="store_true")
     p.add_argument(
         "--debug",
@@ -995,6 +1055,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         args, sbom_report=sbom_report, image_digest=image_digest
     )
 
+    # 7d. --sarif's companion in-toto Statement (see cli/sarif_statement.py):
+    # a third, separate attestation wrapping every raw --sarif input's own
+    # document verbatim, alongside the RCS predicate, any --emit-slsa-
+    # provenance statement, and the --sbom companion statement above.
+    # Independent of all three -- same subject digest, but its own file and
+    # (if --sign/--dry-run-sign) its own DSSE envelope. A no-op (returns
+    # None) when --sarif wasn't passed or every input failed to load.
+    sarif_reports_statement_out_path = _maybe_emit_sarif_reports_statement(
+        args, image_digest=image_digest
+    )
+
     # 8. Async WORM uploads (fire-and-forget: the timed cost here is only
     # the dispatch/submission overhead, not the background upload itself)
     with _stage(stage_ns, "worm_upload"):
@@ -1009,6 +1080,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         _maybe_sign(args, slsa_provenance_out_path)
     if sbom_statement_out_path is not None:
         _maybe_sign(args, sbom_statement_out_path)
+    if sarif_reports_statement_out_path is not None:
+        _maybe_sign(args, sarif_reports_statement_out_path)
 
     # 9b. Automatically persist this run's FAILED/GATED/PASSED verdict onto
     # the just-signed envelope (see _maybe_annotate_verdict) -- best-effort,

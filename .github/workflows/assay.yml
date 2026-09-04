@@ -470,6 +470,16 @@ jobs:
             exit 1
           }
 
+          # --sarif (Grype above, plus CodeQL when its own output existed)
+          # also makes cli.main write a *third*, separate in-toto statement
+          # wrapping every raw --sarif input's own document, keyed by tool
+          # name (cli/sarif_statement.py) -- fixed-basename-sibling-of-out
+          # convention, same check --sbom's own statement above makes.
+          test -s build/sarif-reports.unsigned.json || {
+            echo "ERROR: --sarif was passed but build/sarif-reports.unsigned.json was not produced (see the mint step's own stderr WARNING above for why)" >&2
+            exit 1
+          }
+
       - name: Upload Unsigned Statements
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -477,6 +487,7 @@ jobs:
           path: |
             build/lucid-assay.unsigned.json
             build/sbom.unsigned.json
+            build/sarif-reports.unsigned.json
           if-no-files-found: error
 
   # The *only* job with id-token: write -- signs the RCS statement `build`
@@ -541,6 +552,7 @@ jobs:
       statement-files: |
         lucid-assay.unsigned.json
         sbom.unsigned.json
+        sarif-reports.unsigned.json
       subject-name: ${{ needs.build.outputs.image-ref }}
       subject-digest: ${{ needs.build.outputs.image-digest }}
 
@@ -727,4 +739,6 @@ jobs:
           path: |
             build/lucid-assay.dsse.json
             build/provenance.dsse.json
+            build/sbom.dsse.json
+            build/sarif-reports.dsse.json
           if-no-files-found: error

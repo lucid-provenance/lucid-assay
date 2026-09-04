@@ -26,11 +26,13 @@ from cli.main import (
     _ingest_sarif,
     _ingest_sbom,
     _maybe_annotate_verdict,
+    _maybe_emit_sarif_reports_statement,
     _maybe_emit_sbom_statement,
     _maybe_emit_slsa_provenance,
     _maybe_sign,
     _merge_sbom_into_sarif,
     _merge_sonar_metrics,
+    derive_sarif_reports_statement_path,
     derive_sbom_statement_path,
     derive_slsa_provenance_path,
 )
@@ -459,6 +461,73 @@ class MaybeEmitSbomStatementTests(unittest.TestCase):
         sbom_report = SbomReport(available=True, format="unknown-format", components=[], raw_document={"x": 1})
         result = _maybe_emit_sbom_statement(self._args(out), sbom_report=sbom_report, image_digest="a" * 64)
         self.assertIsNone(result)
+
+
+class DeriveSarifReportsStatementPathTests(unittest.TestCase):
+    def test_explicit_path_wins(self):
+        self.assertEqual(
+            derive_sarif_reports_statement_path("build/attestation.unsigned.json", "custom.json"), "custom.json"
+        )
+
+    def test_derives_fixed_basename_sibling_in_same_directory(self):
+        self.assertEqual(
+            derive_sarif_reports_statement_path("build/attestation.unsigned.json", None),
+            "build/sarif-reports.unsigned.json",
+        )
+
+    def test_out_basename_is_irrelevant_to_the_derived_name(self):
+        self.assertEqual(
+            derive_sarif_reports_statement_path("build/lucid-console.unsigned.json", None),
+            "build/sarif-reports.unsigned.json",
+        )
+
+    def test_no_directory_component(self):
+        self.assertEqual(
+            derive_sarif_reports_statement_path("attestation.unsigned.json", None), "sarif-reports.unsigned.json"
+        )
+
+
+class MaybeEmitSarifReportsStatementTests(unittest.TestCase):
+    def _tmp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        return d
+
+    def _args(self, out, sarif=None, **overrides):
+        base = dict(
+            out=out, sarif_reports_statement_out=None, image_ref="registry.example.com/org/svc", sarif=sarif or []
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_no_sarif_inputs_is_a_noop(self):
+        out = os.path.join(self._tmp(), "attestation.unsigned.json")
+        result = _maybe_emit_sarif_reports_statement(self._args(out, sarif=[]), image_digest="a" * 64)
+        self.assertIsNone(result)
+
+    def test_every_input_unreadable_is_a_noop(self):
+        out = os.path.join(self._tmp(), "attestation.unsigned.json")
+        result = _maybe_emit_sarif_reports_statement(
+            self._args(out, sarif=["/nonexistent/report.sarif"]), image_digest="a" * 64
+        )
+        self.assertIsNone(result)
+
+    def test_writes_a_real_sibling_statement_file(self):
+        d = self._tmp()
+        out = os.path.join(d, "attestation.unsigned.json")
+        sarif_path = _write(d, "grype.sarif", json.dumps({"runs": [{"tool": {"driver": {"name": "grype"}}}]}))
+
+        result = _maybe_emit_sarif_reports_statement(self._args(out, sarif=[sarif_path]), image_digest="a" * 64)
+
+        expected_path = os.path.join(d, "sarif-reports.unsigned.json")
+        self.assertEqual(str(result), expected_path)
+        with open(expected_path) as f:
+            written = json.load(f)
+        self.assertEqual(written["predicateType"], "https://lucidprovenance.io/attestations/sarif-reports/v1")
+        self.assertEqual(list(written["predicate"]["reports"].keys()), ["grype"])
+        self.assertEqual(
+            written["subject"], [{"name": "registry.example.com/org/svc", "digest": {"sha256": "a" * 64}}]
+        )
 
 
 class MaybeSignTests(unittest.TestCase):

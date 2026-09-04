@@ -727,4 +727,5 @@ jobs:
           path: |
             build/lucid-assay.dsse.json
             build/provenance.dsse.json
+            build/sbom.dsse.json
           if-no-files-found: error

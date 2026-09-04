@@ -359,6 +359,7 @@ def build_statement(
                     "verified": commit_author.commit_signature_verified,
                     "reason": commit_author.commit_signature_reason,
                     "signature_type": commit_author.commit_signature_type,
+                    "source_sha": commit_author.commit_signature_source_sha,
                 }
                 if commit_author is not None
                 else None

@@ -189,7 +189,10 @@ class SchemaValidationGuardTests(_TempFileMixin, unittest.TestCase):
             "repository_governance": {
                 "available": True, "linear_history_required": True,
                 "force_pushes_blocked": True, "deletions_blocked": True,
-                "commit_signature": {"available": True, "verified": True, "reason": "valid", "signature_type": "gpg"},
+                "commit_signature": {
+                    "available": True, "verified": True, "reason": "valid",
+                    "signature_type": "gpg", "source_sha": None,
+                },
             },
             "artifact": {"subject": {"name": "registry.example.com/org/svc", "digest": {"sha256": SUBJECT_DIGEST}}},
             "test_verification": {

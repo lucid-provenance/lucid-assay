@@ -1049,6 +1049,33 @@ track.
   a separate section rather than folded into Source Level 3's own
   semantics (see `parsers/commit_author.py`'s docstring). Collected by
   the same module, using the same ambient `GITHUB_TOKEN`.
+  **GitHub-web-flow merge commit walk-back**: GitHub auto-signs *every*
+  merge commit it creates through its own merge API/UI with its own
+  `web-flow` bot key, unconditionally — so on a push-triggered run after
+  a PR merge (`vcs.commit_sha` is that merge commit, not the developer's
+  own commit), crediting that signature would be a false positive: it
+  proves GitHub performed the merge, not that the author's own
+  workstation is configured for commit signing. Confirmed empirically
+  2026-09-04 — a real GitHub-web merge commit came back
+  `verified: true` via GitHub's own key while the PR's own head commit
+  (the actual human-authored content) came back `verified: false,
+  reason: "unsigned"`. `parsers/commit_author.py` detects this shape
+  (top-level `committer.login == "web-flow"` plus a >=2-parent merge —
+  a real GitHub user object, unspoofable via the commit's own free-text
+  fields) and walks back to the merge commit's second parent — the
+  actual PR branch tip — evaluating *that* commit's signature instead,
+  bounded to a small fixed number of hops (provably terminating, never
+  unbounded). `repository_governance.commit_signature.source_sha`
+  records which commit the verdict actually came from, surfaced in the
+  rendered label/detail whenever it differs from `vcs.commit_sha`. A
+  failed walk-back (transport error, or the hop bound exhausted) reports
+  `verified: null` (not determined) — it never silently falls back to
+  crediting the web-flow signature. Known residual gap: a *squash*-
+  merged commit is also web-flow-signed but has only one parent (the
+  squashed diff was never pushed as its own commit object to walk back
+  to) — doesn't affect this platform's own repos, which all merge via
+  GitHub's true 2-parent "Merge pull request", confirmed against real
+  API responses.
 - **Linear History Enforced** / **Force Pushes Blocked** / **Branch
   Deletion Blocked** — whether a `required_linear_history` /
   `non_fast_forward` / `deletion` rule (respectively) is active on the
@@ -1119,7 +1146,7 @@ Status: FAILED (SLSA Build Level 3)
 =====================================
 
 === Repository & Workstation Governance (Policy Assessment) (3/4 controls met) ===
-[✓] Cryptographic Commit Signing (verified via GPG)
+[✓] Cryptographic Commit Signing (verified via GPG on the PR's own head commit a0585b697a19, not the merge commit)
 [✓] Linear History Enforced (merge commits disallowed)
 [✓] Force Pushes Blocked (history rewrite disabled)
 [✗] Branch Deletion Blocked -- no 'deletion' rule is active on this branch

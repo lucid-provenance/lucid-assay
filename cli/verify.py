@@ -483,12 +483,20 @@ def _extract_repository_governance(predicate: Dict[str, Any]) -> List[Dict[str, 
 
 
 def _repo_gov_check_commit_signing(repo_gov: Dict[str, Any]) -> Dict[str, Any]:
-    """Cryptographic proof HEAD's own commit content wasn't altered after
-    signing -- a materially different, stronger claim than SLSA Source
-    Level 3's account-link check (see cli/parsers/commit_author.py's own
-    docstring for why the two are kept apart). The only item in this
-    section with an opt-in path into the hard gate -- see
-    --require-commit-signing."""
+    """Cryptographic proof the commit whose content this run actually
+    describes wasn't altered after signing -- a materially different,
+    stronger claim than SLSA Source Level 3's account-link check (see
+    cli/parsers/commit_author.py's own docstring for why the two are
+    kept apart). The only item in this section with an opt-in path into
+    the hard gate -- see --require-commit-signing.
+
+    `commit_signature.source_sha` (see cli/parsers/commit_author.py's
+    GitHub-web-flow merge commit walk-back) is surfaced whenever it
+    differs from the requested commit -- HEAD, on a push-triggered run
+    after a PR merge, is usually GitHub's own auto-generated,
+    auto-signed merge commit, not the human-authored content; silently
+    crediting that signature would be a false positive this check
+    exists specifically to avoid."""
     label = "Cryptographic Commit Signing"
     commit_sig = repo_gov.get("commit_signature")
     if not isinstance(commit_sig, dict):
@@ -496,13 +504,17 @@ def _repo_gov_check_commit_signing(repo_gov: Dict[str, Any]) -> Dict[str, Any]:
     if not commit_sig.get("available", False):
         return _slsa_item(label, False, "commit signature verification unavailable (see vcs.commit_author's own reason)")
 
+    source_sha = commit_sig.get("source_sha")
+    walked_back = isinstance(source_sha, str) and bool(source_sha)
+    via_pr_head = f" on the PR's own head commit {source_sha[:12]}, not the merge commit" if walked_back else ""
+
     if commit_sig.get("verified") is True:
         sig_type = commit_sig.get("signature_type")
         via = f" via {sig_type.upper()}" if isinstance(sig_type, str) and sig_type else ""
-        return _slsa_item(f"{label} (verified{via})", True)
+        return _slsa_item(f"{label} (verified{via}{via_pr_head})", True)
 
     reason = commit_sig.get("reason")
-    detail = f"commit is unsigned or unverified -- GitHub reports {reason!r}" if reason else "commit is unsigned or unverified"
+    detail = f"commit is unsigned or unverified ({reason}){via_pr_head}" if reason else f"commit is unsigned or unverified{via_pr_head}"
     return _slsa_item(label, False, detail)
 
 

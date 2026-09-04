@@ -53,12 +53,12 @@ def _repo_gov(
     }
 
 
-def _signed(sig_type="gpg") -> Dict[str, Any]:
-    return {"available": True, "verified": True, "reason": "valid", "signature_type": sig_type}
+def _signed(sig_type="gpg", source_sha=None) -> Dict[str, Any]:
+    return {"available": True, "verified": True, "reason": "valid", "signature_type": sig_type, "source_sha": source_sha}
 
 
-def _unsigned(reason="unsigned") -> Dict[str, Any]:
-    return {"available": True, "verified": False, "reason": reason, "signature_type": None}
+def _unsigned(reason="unsigned", source_sha=None) -> Dict[str, Any]:
+    return {"available": True, "verified": False, "reason": reason, "signature_type": None, "source_sha": source_sha}
 
 
 def _statement(*, repository_governance=None, rcs_value=85) -> Dict[str, Any]:
@@ -153,7 +153,7 @@ class RepoGovCheckCommitSigningTests(unittest.TestCase):
     def test_unsigned_fails_with_github_reason_quoted(self):
         result = _repo_gov_check_commit_signing(_repo_gov(commit_signature=_unsigned("unsigned")))
         self.assertFalse(result["passed"])
-        self.assertIn("'unsigned'", result["detail"])
+        self.assertIn("(unsigned)", result["detail"])
 
     def test_unsigned_with_no_reason_still_fails_without_crashing(self):
         commit_sig = _unsigned()
@@ -161,6 +161,43 @@ class RepoGovCheckCommitSigningTests(unittest.TestCase):
         result = _repo_gov_check_commit_signing(_repo_gov(commit_signature=commit_sig))
         self.assertFalse(result["passed"])
         self.assertIn("unsigned or unverified", result["detail"])
+
+    def test_verified_with_source_sha_notes_the_walk_back_in_the_label(self):
+        """source_sha set means commit_author.py walked back through a
+        GitHub-web-flow merge commit -- the label must say so, so a
+        reader isn't misled into thinking HEAD itself (often the merge
+        commit) was what got cryptographically verified."""
+        commit_sig = _signed("ssh", source_sha="a" * 40)
+        result = _repo_gov_check_commit_signing(_repo_gov(commit_signature=commit_sig))
+        self.assertTrue(result["passed"])
+        self.assertIn("verified via SSH on the PR's own head commit", result["label"])
+        self.assertIn("not the merge commit", result["label"])
+
+    def test_verified_without_source_sha_omits_the_walk_back_clause(self):
+        commit_sig = _signed("gpg", source_sha=None)
+        result = _repo_gov_check_commit_signing(_repo_gov(commit_signature=commit_sig))
+        self.assertTrue(result["passed"])
+        self.assertNotIn("PR's own head commit", result["label"])
+
+    def test_unsigned_with_source_sha_notes_the_walk_back_in_the_detail(self):
+        commit_sig = _unsigned("unsigned", source_sha="a" * 40)
+        result = _repo_gov_check_commit_signing(_repo_gov(commit_signature=commit_sig))
+        self.assertFalse(result["passed"])
+        self.assertIn("PR's own head commit", result["detail"])
+
+    def test_walk_back_failure_reason_surfaced_as_a_normal_failure(self):
+        """commit_author.py reports a failed walk-back as
+        verified=None/reason=<explanation> -- this must render as an
+        honest failure, not silently pass."""
+        commit_sig = {
+            "available": True, "verified": None,
+            "reason": "gave up walking back through GitHub-generated merge commits after 5 hops "
+                      "without reaching a non-merge commit",
+            "signature_type": None, "source_sha": "b" * 40,
+        }
+        result = _repo_gov_check_commit_signing(_repo_gov(commit_signature=commit_sig))
+        self.assertFalse(result["passed"])
+        self.assertIn("gave up walking back", result["detail"])
 
 
 class RepoGovCheckLinearHistoryTests(unittest.TestCase):

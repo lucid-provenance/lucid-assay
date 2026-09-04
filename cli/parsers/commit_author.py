@@ -40,6 +40,49 @@ directly, and parsing one out of the raw OpenPGP/SSH signature packet
 format is deliberately out of scope here; only genuinely-available data
 is reported, nothing synthesized to look more complete than it is.
 
+**GitHub-web-flow merge commit walk-back**: GitHub auto-signs *every*
+merge commit it creates through its own merge API/UI (the "Merge pull
+request" button) with its own "web-flow" bot key -- unconditionally,
+regardless of whether the human author has ever configured personal
+commit signing. Crediting that signature as `commit_signature_verified`
+would be a false positive: it proves GitHub performed the merge, not
+that the author's own workstation is set up for cryptographic signing
+(confirmed empirically 2026-09-04 -- a real GitHub-web merge commit
+came back `verified: true` via GitHub's own PGP key while the PR's own
+head commit, the actual human-authored content, came back `verified:
+false, reason: "unsigned"`). So when the requested commit looks like
+one of these (top-level `committer.login == "web-flow"` and >=2
+parents -- a real GitHub user object, not the free-text `commit.
+committer` name/email, so it can't be spoofed by an arbitrary commit
+author), `_web_flow_merge_second_parent`/`_resolve_signature_source`
+walk back through the merge commit's second parent (the actual PR
+branch tip GitHub merged in) and evaluate *that* commit's own
+`commit.verification` instead -- bounded to
+`_MAX_WEB_FLOW_WALK_BACK_HOPS` hops, a provably-terminating walk, never
+unbounded. Only the signature-related fields are affected;
+`verified_github_account`/`name`/`email`/`github_login` still describe
+the originally-requested commit (a merge commit's own `author` is
+honestly the human who merged it, not GitHub -- no walk-back needed
+there). `commit_signature_source_sha` records which commit the
+signature verdict actually came from, None when no walk-back was
+needed. A failed walk-back (transport error, or the hop bound
+exhausted) reports `commit_signature_verified=None` (not determined --
+never silently falls back to crediting the web-flow signature) with an
+explanatory `commit_signature_reason`.
+
+**Known residual gap**: a *squash*-merged commit is also web-flow-signed
+by GitHub but has only one parent (the base branch tip) -- the squashed
+diff was never pushed as its own commit object anywhere in this
+repository's history for a walk-back to reach, so
+`_web_flow_merge_second_parent` correctly returns None for it and its
+GitHub-generated signature is (still, today) credited as-is. All four
+of this platform's own repos merge PRs via GitHub's "Merge pull
+request" (true 2-parent merge commits, confirmed against real API
+responses 2026-09-04), so this gap doesn't affect them; a caller using
+squash-merge would need a different fix (e.g. resolving the PR's
+original head SHA via `GET /repos/{repo}/commits/{sha}/pulls`) which
+isn't implemented here.
+
 Hardened against (mirrors cli.parsers.github_rules -- see that
 module's docstring for the shared rationale, reused here directly
 rather than re-implemented):
@@ -71,6 +114,12 @@ from .github_rules import DEFAULT_TIMEOUT, GITHUB_API_BASE, _REPO_RE, _extract_h
 # just enough to reject an empty/malformed value before it reaches a URL.
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
+# Bounds the GitHub-web-flow merge commit walk-back (see this module's
+# docstring) -- a provably-terminating walk, never unbounded recursion up
+# a merge graph, the same "fixed bound, not a tight/unbounded loop"
+# discipline cli.oidc_signer's OIDC fetch retries already apply.
+_MAX_WEB_FLOW_WALK_BACK_HOPS = 5
+
 
 @dataclass
 class CommitAuthorReport:
@@ -93,6 +142,12 @@ class CommitAuthorReport:
     commit_signature_verified: Optional[bool] = None
     commit_signature_reason: Optional[str] = None
     commit_signature_type: Optional[str] = None
+    # The SHA the signature verdict above actually came from, when it
+    # differs from commit_sha -- set only after a GitHub-web-flow merge
+    # commit walk-back (see this module's docstring). None when no
+    # walk-back was needed (commit_sha's own signature was evaluated
+    # directly).
+    commit_signature_source_sha: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -106,6 +161,7 @@ class CommitAuthorReport:
             "commit_signature_verified": self.commit_signature_verified,
             "commit_signature_reason": self.commit_signature_reason,
             "commit_signature_type": self.commit_signature_type,
+            "commit_signature_source_sha": self.commit_signature_source_sha,
         }
 
 
@@ -161,7 +217,75 @@ def _signature_type_from_blob(signature: Any) -> Optional[str]:
     return None
 
 
-def _report_from_commit_body(body: Any, commit_sha: str) -> CommitAuthorReport:
+def _web_flow_merge_second_parent(body: Dict[str, Any]) -> Optional[str]:
+    """Returns the SHA of a GitHub-web-flow-generated merge commit's
+    second parent (the actual PR branch tip GitHub merged in) -- or None
+    if `body` isn't one. Detected via the top-level `committer` field (a
+    real GitHub user object resolved by GitHub itself, distinct from and
+    unspoofable via the free-text `commit.committer` name/email) being
+    exactly `web-flow`, GitHub's own bot identity for merges performed
+    through its merge API/UI, combined with a >=2-parent merge shape.
+    See this module's docstring for why this signal must never be
+    credited as evidence of the commit author's own signing hygiene."""
+    committer = body.get("committer")
+    if not isinstance(committer, dict) or committer.get("login") != "web-flow":
+        return None
+    parents = body.get("parents")
+    if not isinstance(parents, list) or len(parents) < 2:
+        return None
+    second = parents[1]
+    if not isinstance(second, dict):
+        return None
+    sha = second.get("sha")
+    return sha if isinstance(sha, str) and _SHA_RE.match(sha) else None
+
+
+def _resolve_signature_source(
+    repository: str, body: Dict[str, Any], headers: Dict[str, str], timeout: int
+) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
+    """Walks back through GitHub-web-flow merge commits (see
+    _web_flow_merge_second_parent) until reaching a commit whose own
+    signature genuinely reflects a human's commit-signing configuration,
+    bounded to _MAX_WEB_FLOW_WALK_BACK_HOPS hops -- a provably-
+    terminating walk, never unbounded. Returns (signature_source_body,
+    source_sha_or_None_if_no_walk_back_was_needed,
+    failure_reason_or_None). On a failure partway through (transport
+    error, unexpected shape, or the hop bound exhausted), the failure
+    reason is returned and the caller must not credit any signature seen
+    so far -- an incomplete walk proves nothing either way."""
+    current = body
+    source_sha: Optional[str] = None
+    for _ in range(_MAX_WEB_FLOW_WALK_BACK_HOPS):
+        next_sha = _web_flow_merge_second_parent(current)
+        if next_sha is None:
+            return current, source_sha, None
+        next_body, error_report = _fetch_commit_body(repository, next_sha, headers, timeout)
+        if error_report is not None:
+            return current, source_sha, (
+                f"could not walk back through a GitHub-generated merge commit to inspect the underlying "
+                f"PR head commit {next_sha}: {error_report.reason}"
+            )
+        if not isinstance(next_body, dict):
+            return current, source_sha, (
+                f"could not walk back through a GitHub-generated merge commit: unexpected response shape "
+                f"for {next_sha}"
+            )
+        current = next_body
+        source_sha = next_sha
+    return current, source_sha, (
+        f"gave up walking back through GitHub-generated merge commits after "
+        f"{_MAX_WEB_FLOW_WALK_BACK_HOPS} hops without reaching a non-merge commit"
+    )
+
+
+def _report_from_commit_body(
+    body: Any,
+    commit_sha: str,
+    *,
+    sig_source_body: Optional[Dict[str, Any]] = None,
+    sig_source_sha: Optional[str] = None,
+    walk_back_failure: Optional[str] = None,
+) -> CommitAuthorReport:
     if not isinstance(body, dict):
         return _unavailable(commit_sha, "unexpected response shape from GitHub commits API")
 
@@ -173,16 +297,28 @@ def _report_from_commit_body(body: Any, commit_sha: str) -> CommitAuthorReport:
     # The *linked GitHub account* (null unless GitHub matched the commit's
     # author email to a verified account) -- distinct from commit_obj's
     # free-text author name/email above, and the only field this check
-    # trusts as "verified".
+    # trusts as "verified". Always read off the originally-requested
+    # commit, never the walk-back target -- a merge commit's own author
+    # honestly is the human who merged it, no walk-back needed here.
     login = _as_dict(body.get("author")).get("login")
     login = login if isinstance(login, str) and login else None
 
-    verification = _as_dict(commit_obj.get("verification"))
-    signature_verified = verification.get("verified")
-    signature_verified = signature_verified if isinstance(signature_verified, bool) else None
-    signature_reason = verification.get("reason")
-    signature_reason = signature_reason if isinstance(signature_reason, str) and signature_reason else None
-    signature_type = _signature_type_from_blob(verification.get("signature"))
+    if walk_back_failure is not None:
+        # Not determined -- never silently falls back to crediting
+        # whatever signature the (possibly GitHub-generated) requested
+        # commit itself carries.
+        signature_verified: Optional[bool] = None
+        signature_reason: Optional[str] = walk_back_failure
+        signature_type: Optional[str] = None
+    else:
+        sig_body = sig_source_body if isinstance(sig_source_body, dict) else body
+        sig_commit_obj = _as_dict(sig_body.get("commit"))
+        verification = _as_dict(sig_commit_obj.get("verification"))
+        signature_verified = verification.get("verified")
+        signature_verified = signature_verified if isinstance(signature_verified, bool) else None
+        signature_reason = verification.get("reason")
+        signature_reason = signature_reason if isinstance(signature_reason, str) and signature_reason else None
+        signature_type = _signature_type_from_blob(verification.get("signature"))
 
     return CommitAuthorReport(
         available=True,
@@ -199,6 +335,7 @@ def _report_from_commit_body(body: Any, commit_sha: str) -> CommitAuthorReport:
         commit_signature_verified=signature_verified,
         commit_signature_reason=signature_reason,
         commit_signature_type=signature_type,
+        commit_signature_source_sha=sig_source_sha,
     )
 
 
@@ -239,4 +376,16 @@ def inspect_commit_author(
     if error_report is not None:
         return error_report
 
-    return _report_from_commit_body(body, commit_sha)
+    if not isinstance(body, dict):
+        return _report_from_commit_body(body, commit_sha)
+
+    sig_source_body, sig_source_sha, walk_back_failure = _resolve_signature_source(
+        repository, body, headers, timeout
+    )
+    return _report_from_commit_body(
+        body,
+        commit_sha,
+        sig_source_body=sig_source_body,
+        sig_source_sha=sig_source_sha,
+        walk_back_failure=walk_back_failure,
+    )

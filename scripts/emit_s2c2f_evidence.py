@@ -157,12 +157,26 @@ def build_predicate(repo_dir: Path, denylist_path: Path, internal_hosts: List[st
 
 def build_statement(repo_dir: Path, predicate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Wraps `predicate` as an in-toto v1 Statement. Returns None -- never
-    a statement with an empty/fabricated subject -- when this checkout has
-    no resolvable git commit SHA at all (predicate["environment"]
-    ["git_commit_sha"] is None: not a git repo, or `git` isn't on PATH);
+    a statement with an empty/fabricated subject -- when repo_dir has no
+    resolvable git commit at all (not a git repo, or `git` isn't on PATH);
     same "nothing honest to wrap, emit nothing" contract
-    cli.sbom_statement.build_sbom_statement's own docstring documents."""
-    commit_sha = predicate["environment"]["git_commit_sha"]
+    cli.sbom_statement.build_sbom_statement's own docstring documents.
+
+    Deliberately resolves its own commit_sha via `git -C repo_dir
+    rev-parse HEAD` rather than reusing predicate["environment"]
+    ["git_commit_sha"] (which prefers the ambient $GITHUB_SHA -- ground
+    truth about what the *runner's own checkout step* fetched, matching
+    cli.slsa_provenance._source_resolved_dependency's identical
+    preference, but not necessarily about `repo_dir` specifically if a
+    caller ever points --repo-dir somewhere other than the workflow's own
+    checkout). A Statement's subject digests must always describe the
+    exact same tree: computing gitCommit and gitTree from two different
+    sources (ambient env vs. repo_dir's own git state) could silently
+    produce a self-inconsistent subject if the two ever diverged. Caught
+    by tests/test_scripts_ingestion.py's build_statement tests, which run
+    against a repo_dir carrying no ambient $GITHUB_SHA relationship at
+    all."""
+    commit_sha = _git_rev_parse(repo_dir, "HEAD")
     if not commit_sha:
         return None
     repository_uri = _repository_uri(repo_dir)

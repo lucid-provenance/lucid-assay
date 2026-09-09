@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -214,11 +215,26 @@ class EmitS2C2FEvidenceTests(unittest.TestCase):
             self.assertIn("would_enforce_exit_code", predicate)
 
     def test_build_statement_none_without_a_resolvable_commit(self):
+        # build_statement() deliberately resolves its own commit_sha from
+        # repo_dir's actual git state (see its docstring) rather than
+        # predicate["environment"]["git_commit_sha"], which legitimately
+        # prefers the ambient $GITHUB_SHA regardless of repo_dir -- so this
+        # must hold even with $GITHUB_SHA set to an unrelated value in the
+        # test process's own environment (true on every real CI run).
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)  # not a git repo at all
             _write_denylist(repo / "denylist.json", [])
             predicate = build_predicate(repo, repo / "denylist.json", [])
-            self.assertIsNone(predicate["environment"]["git_commit_sha"])
+            self.assertIsNone(build_statement(repo, predicate))
+
+    def test_build_statement_ignores_unrelated_ambient_github_sha(self):
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(
+            os.environ, {"GITHUB_SHA": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}
+        ):
+            repo = Path(tmp)  # not a git repo at all -- $GITHUB_SHA must not leak into the subject
+            _write_denylist(repo / "denylist.json", [])
+            predicate = build_predicate(repo, repo / "denylist.json", [])
+            self.assertEqual(predicate["environment"]["git_commit_sha"], "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
             self.assertIsNone(build_statement(repo, predicate))
 
     def test_build_statement_carries_real_git_subject(self):

@@ -592,7 +592,11 @@ jobs:
   # here either -- reading/verifying a signature doesn't require one,
   # only minting one does.
   verify:
-    needs: attest
+    # `build` added alongside the pre-existing `attest` dependency solely
+    # so "Publish Signed Bundle to lucid-dsse-collector" below can read
+    # needs.build.outputs.image-digest -- doesn't change the DAG's actual
+    # critical path, since `attest` already depends on `build`.
+    needs: [build, attest]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -772,3 +776,67 @@ jobs:
             build/sbom.dsse.json
             build/sarif-reports.dsse.json
           if-no-files-found: error
+
+      # Publishes this run's signed bundle to lucid-dsse-collector, the
+      # ingestion gateway backing the Lucid console/PR bot (see that
+      # repo's README.md "API" section for the exact contract). Dormant
+      # by design until LUCID_DSSE_COLLECTOR_URL is set as a repo/org
+      # variable: as of 2026-09-09 no deployed, CI-reachable collector
+      # instance exists yet (only a local docker-compose dev stack does),
+      # and no repo in the platform's CI actually POSTs to one today --
+      # this step exists so that the moment an instance is deployed and
+      # the variable is set, ingestion starts working with zero further
+      # code changes, rather than needing this step written retroactively
+      # under time pressure once a deployment exists.
+      #
+      # continue-on-error: true -- ingestion is fire-and-forget from this
+      # pipeline's perspective, the same posture cli.main's own WORM
+      # upload dispatch already takes; a collector outage or misconfigured
+      # URL must never fail this pipeline's own gate.
+      #
+      # No API key/bearer/shared-secret needed: POST /api/v1/attestations
+      # takes no auth header today -- caller identity is established
+      # server-side from each envelope's own embedded Sigstore signature
+      # (lucid-dsse-collector's README.md "Cryptographic caller-identity
+      # binding"), not by this request.
+      #
+      # metadata.image_digest strips the "sha256:" scheme prefix
+      # needs.build.outputs.image-digest carries, to match the bare-hex
+      # form cli.builder normalizes the statement's own subject
+      # digest.sha256 to -- this caller-declared metadata is lower
+      # precedence than each statement's own embedded data anyway (see
+      # lucid-dsse-collector's extraction.py merge() precedence), but
+      # should still agree with it rather than carry a gratuitously
+      # different shape.
+      #
+      # MAX_ENVELOPES_PER_BUNDLE (lucid-dsse-collector's app/core/
+      # config.py) is 4 today, exactly matching the up-to-4 envelope files
+      # below -- if a 5th statement is ever added to this bundle (e.g. a
+      # future scripts/emit_s2c2f_evidence.py companion, see PR discussion
+      # on this branch), that constant needs raising first, on the
+      # collector side, before adding a 5th -F envelopes= part here.
+      - name: Publish Signed Bundle to lucid-dsse-collector
+        if: vars.LUCID_DSSE_COLLECTOR_URL != ''
+        continue-on-error: true
+        env:
+          COLLECTOR_URL: ${{ vars.LUCID_DSSE_COLLECTOR_URL }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.image-digest }}
+        run: |
+          METADATA=$(jq -n \
+            --arg repo "$REPOSITORY" \
+            --arg sha "$COMMIT_SHA" \
+            --arg ref "$REF" \
+            --arg digest "${IMAGE_DIGEST#sha256:}" \
+            '{repository: $repo, commit_sha: $sha, ref: $ref, image_digest: $digest}')
+
+          FORM_ARGS=(-F "metadata=${METADATA};type=application/json")
+          for envelope in build/lucid-assay.dsse.json build/provenance.dsse.json build/sbom.dsse.json build/sarif-reports.dsse.json; do
+            if [ -f "$envelope" ]; then
+              FORM_ARGS+=(-F "envelopes=@${envelope};type=application/json")
+            fi
+          done
+
+          curl -sSf -X POST "${COLLECTOR_URL%/}/api/v1/attestations" "${FORM_ARGS[@]}"

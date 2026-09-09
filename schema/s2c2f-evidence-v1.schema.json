@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lucidprovenance.io/attestations/s2c2f-evidence/v1",
+  "title": "S2C2F Ingestion-Control Evidence Predicate v1",
+  "description": "Non-blocking telemetry predicate emitted by scripts/emit_s2c2f_evidence.py, wrapped inside an in-toto v1 Statement (predicateType https://lucidprovenance.io/attestations/s2c2f-evidence/v1) -- NOT part of the signed lucid-assay RCS attestation predicate (schema/lucid-attestation-v1.schema.json). Captures ING-3 (L3)/ING-2 (L2)/ENF-2 (L3) evidence and environment data for pre-production S2C2F controls; see scripts/_ingestion_lib.py's module docstring for each control's honest scope/caveats.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at", "environment", "controls", "would_enforce_exit_code"],
+  "properties": {
+    "schema_version": { "const": "s2c2f-evidence/v1" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["npm_registry_config", "pip_index_url_env", "git_commit_sha", "repository", "ref"],
+      "properties": {
+        "npm_registry_config": { "type": ["string", "null"] },
+        "pip_index_url_env": { "type": ["string", "null"] },
+        "git_commit_sha": { "type": ["string", "null"] },
+        "repository": { "type": ["string", "null"] },
+        "ref": { "type": ["string", "null"] }
+      }
+    },
+    "controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ING-3", "ING-2", "ENF-2"],
+      "properties": {
+        "ING-3": { "$ref": "#/$defs/control" },
+        "ING-2": { "$ref": "#/$defs/control" },
+        "ENF-2": { "$ref": "#/$defs/control" }
+      }
+    },
+    "would_enforce_exit_code": { "type": "integer", "enum": [0, 1] }
+  },
+  "$defs": {
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "level", "status", "detail"],
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "type": "string" },
+        "level": { "type": "integer" },
+        "status": { "enum": ["PASS", "FAIL", "AUDIT"] },
+        "detail": { "type": "string" },
+        "note": { "type": "string" },
+        "evidence": { "type": "object" }
+      }
+    }
+  }
+}

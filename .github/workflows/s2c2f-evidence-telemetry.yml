@@ -1,0 +1,85 @@
+name: S2C2F Ingestion-Control Evidence (telemetry, non-blocking)
+
+# Runs scripts/emit_s2c2f_evidence.py -- pre-production scaffolding for
+# three S2C2F controls: ING-3 (Denylists, L3), ING-2 (Local Copies, L2 --
+# a second, independent measurement alongside cli/parsers/s2c2f.py's own
+# real one, see scripts/_ingestion_lib.py's module docstring for why the
+# two coexist), and ENF-2 (Curated Feeds, L3). Deliberately non-blocking:
+# `continue-on-error: true` on the evaluation step, and the job never
+# calls scripts/verify_ingestion.py's enforce mode. The point right now is
+# accumulating real, deterministic evidence of how often these controls
+# would fail -- not gating anything -- see the emitted attestation's
+# `would_enforce_exit_code` for what an eventual hard-gate flip would have
+# done on this run.
+#
+# To promote this from telemetry to a real gate later: drop
+# `continue-on-error` below and swap the `emit` step for
+# `scripts/verify-ingestion.sh` (no --dry-run/--audit-only) -- the same
+# "prove it on real runs first" progression this repo's own CLAUDE.md
+# documents for --require-slsa-build-l3 and --require-commit-signing.
+#
+# LUCID_INTERNAL_REGISTRY_HOSTS: set this repo/org variable to a
+# comma-separated list of internal registry/proxy host substrings before
+# ING-2/ENF-2 can ever report PASS -- with no internal feed configured
+# (this repo included, today), both fail closed by design; see
+# scripts/_ingestion_lib.py's own module docstring.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  s2c2f-evidence:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Grants this job ambient Sigstore OIDC so --sign below can produce a
+      # real DSSE envelope. Deliberately NOT the same isolation guarantee
+      # assay.yml's real attestation gets from lucid-attest-service's
+      # sign-client.yml (a separate, isolated reusable-workflow job whose
+      # job_workflow_ref claim is what SLSA Build Level 3 actually checks)
+      # -- this evidence makes no Build L3 claim, is non-gating, and
+      # scripts/emit_s2c2f_evidence.py falls back to an unsigned statement
+      # (never fails the job) when no ambient token is available, e.g. a
+      # fork PR run.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Sync dependencies (same locked env assay.yml uses -- gives us cli.oidc_signer's sigstore dependency)
+        run: uv sync --frozen --extra dev
+
+      - name: Emit S2C2F ingestion-control evidence (non-blocking)
+        continue-on-error: true
+        env:
+          LUCID_INTERNAL_REGISTRY_HOSTS: ${{ vars.LUCID_INTERNAL_REGISTRY_HOSTS }}
+        run: |
+          uv run --no-sync python -m scripts.emit_s2c2f_evidence \
+            --repo-dir . \
+            --out s2c2f-evidence.unsigned.json \
+            --sign
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: s2c2f-evidence
+          path: |
+            s2c2f-evidence.unsigned.json
+            s2c2f-evidence.dsse.json
+          if-no-files-found: warn
+          retention-days: 90

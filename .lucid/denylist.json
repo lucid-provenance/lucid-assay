@@ -1,0 +1,6 @@
+{
+  "_readme": "S2C2F ING-3 denylist policy artifact -- see scripts/_ingestion_lib.py's module docstring for the schema/tamper-evidence contract. Add real, sourced entries to `entries` (each requires ecosystem/name/reason; add_by/added_date are conventional), then run `scripts/verify-ingestion.sh --write-denylist-digest .lucid/denylist.json` to recompute digest_sha256 -- a hand-edited digest will fail closed as a possible-tampering FAIL, by design. Ships empty: no real denylisted package has been curated for this repo yet, and an invented entry would be a fabricated claim this project's own CLAUDE.md explicitly forbids (\"Ground Truth Only\").",
+  "schema_version": "s2c2f-denylist/v1",
+  "entries": [],
+  "digest_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+}

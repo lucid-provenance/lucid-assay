@@ -10,17 +10,27 @@ real in-toto v1 Statement (predicateType
 https://lucidprovenance.io/attestations/s2c2f-evidence/v1, matching the
 predicate-type-minting convention cli/sbom_statement.py and
 cli/sarif_statement.py already established for a companion attestation
-with no shared external schema to reuse). See
-.github/workflows/s2c2f-evidence-telemetry.yml for how this is meant to be
-wired in.
+with no shared external schema to reuse). Wired into
+.github/workflows/assay.yml's own `build` job as of 2026-09-10 (a 5th
+envelope in the same signed bundle the RCS/SBOM/SARIF statements ship
+in, signed by the same isolated attest job -- not a separate workflow's
+separate submission, which would land on a different collector row than
+the real attestation and be unrenderable in the same Console panel).
 
-Subject: two real, addressable git object identities for the exact
-checkout this evidence was collected against -- the commit SHA and the
-git tree SHA of that commit (a real "repo root digest": the content
-identity of the entire checked-out tree at HEAD, not an invented ad hoc
-hash of a directory listing). Neither is fabricated when unavailable (a
-non-git checkout, or `git` missing) -- see build_statement()'s own
-docstring for what happens then.
+Subject: the SAME container image subject every other companion
+statement in the bundle uses (--subject-name/--subject-digest, required
+-- matching cli/sbom_statement.py/cli/sarif_statement.py's own
+convention exactly), not a git-based subject of this module's own
+invention. An earlier version used {"gitCommit": ..., "gitTree": ...}
+digest keys instead -- reasonable per the in-toto *spec*, which does
+allow arbitrary digest algorithm names, but sigstore-python's own
+Statement validator enforces a materially stricter, closed set
+(sha256/384/512, sha3_256/384/512 only) and rejected it outright with
+"malformed in-toto statement" the first time this was actually signed
+for real in CI (--dry-run-sign never caught this locally: that path
+never constructs a real sigstore.dsse.Statement at all). Confirmed
+empirically before and after this fix via sigstore.dsse.Statement(...)
+directly, not just re-reading the spec.
 
 Signing: `--sign`/`--dry-run-sign` reuse cli.oidc_signer.sign_file_to_envelope
 directly -- the same file-in/file-out entry point cli.sign's own
@@ -60,7 +70,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cli.common import derive_signed_path, safe_resolve_path  # noqa: E402
 from cli.parsers.lockfiles import detect_and_parse_dependencies  # noqa: E402
-from cli.slsa_provenance import _github_repository_uri  # noqa: E402
 
 from scripts._ingestion_lib import STATUS_FAIL, run_ingestion_checks  # noqa: E402
 from scripts.verify_ingestion import _resolve_internal_hosts  # noqa: E402
@@ -84,25 +93,6 @@ def _git_rev_parse(repo_dir: Path, rev: str) -> Optional[str]:
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_dir), "rev-parse", rev],
-            capture_output=True, text=True, timeout=_GIT_TIMEOUT_SECONDS, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout.strip() or None if result.returncode == 0 else None
-
-
-def _repository_uri(repo_dir: Path) -> Optional[str]:
-    """Prefers the ambient GITHUB_REPOSITORY (cli.slsa_provenance's own
-    _github_repository_uri, reused here for the identical convention a
-    real SLSA provenance statement's own git-subject already uses),
-    falling back to `git remote get-url origin` for a local/off-CI run.
-    None -- never a fabricated placeholder -- when neither resolves."""
-    uri = _github_repository_uri()
-    if uri:
-        return uri
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_dir), "remote", "get-url", "origin"],
             capture_output=True, text=True, timeout=_GIT_TIMEOUT_SECONDS, check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -155,36 +145,20 @@ def build_predicate(repo_dir: Path, denylist_path: Path, internal_hosts: List[st
     }
 
 
-def build_statement(repo_dir: Path, predicate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Wraps `predicate` as an in-toto v1 Statement. Returns None -- never
-    a statement with an empty/fabricated subject -- when repo_dir has no
-    resolvable git commit at all (not a git repo, or `git` isn't on PATH);
-    same "nothing honest to wrap, emit nothing" contract
-    cli.sbom_statement.build_sbom_statement's own docstring documents.
-
-    Deliberately resolves its own commit_sha via `git -C repo_dir
-    rev-parse HEAD` rather than reusing predicate["environment"]
-    ["git_commit_sha"] (which prefers the ambient $GITHUB_SHA -- ground
-    truth about what the *runner's own checkout step* fetched, matching
-    cli.slsa_provenance._source_resolved_dependency's identical
-    preference, but not necessarily about `repo_dir` specifically if a
-    caller ever points --repo-dir somewhere other than the workflow's own
-    checkout). A Statement's subject digests must always describe the
-    exact same tree: computing gitCommit and gitTree from two different
-    sources (ambient env vs. repo_dir's own git state) could silently
-    produce a self-inconsistent subject if the two ever diverged. Caught
-    by tests/test_scripts_ingestion.py's build_statement tests, which run
-    against a repo_dir carrying no ambient $GITHUB_SHA relationship at
-    all."""
-    commit_sha = _git_rev_parse(repo_dir, "HEAD")
-    if not commit_sha:
-        return None
-    repository_uri = _repository_uri(repo_dir)
-    name = f"git+{repository_uri}" if repository_uri else str(repo_dir)
-    subjects = [{"name": name, "digest": {"gitCommit": commit_sha}}]
-    tree_sha = _git_rev_parse(repo_dir, "HEAD^{tree}")
-    if tree_sha:
-        subjects.append({"name": f"{name}#tree", "digest": {"gitTree": tree_sha}})
+def build_statement(subject_name: str, subject_digest: str, predicate: Dict[str, Any]) -> Dict[str, Any]:
+    """Wraps `predicate` as an in-toto v1 Statement, subject
+    [{"name": subject_name, "digest": {"sha256": subject_digest}}] --
+    the identical single-subject shape cli/sbom_statement.py's
+    build_sbom_statement and cli/sarif_statement.py's
+    build_sarif_reports_statement already use, deliberately: this
+    predicate is a companion to the primary RCS statement in the same
+    bundle, about the same build, not a different artifact needing its
+    own subject scheme. `subject_digest` is expected already normalized
+    to a clean lowercase hex digest (no "sha256:" scheme prefix) --
+    same convention those two builders' own `subject_sha256` param
+    documents; the caller strips it once, matching cli.main's own
+    --image-digest normalization."""
+    subjects = [{"name": subject_name, "digest": {"sha256": subject_digest}}]
     return {"_type": _STATEMENT_TYPE, "subject": subjects, "predicateType": _PREDICATE_TYPE, "predicate": predicate}
 
 
@@ -222,6 +196,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-dir", default=".", help="Repo checkout to evaluate (default: .)")
     parser.add_argument("--denylist", default=".lucid/denylist.json", help="Path to the ING-3 denylist policy artifact (default: .lucid/denylist.json)")
     parser.add_argument("--internal-registry", default=None, help="Comma-separated internal/curated registry host substrings; falls back to $LUCID_INTERNAL_REGISTRY_HOSTS")
+    parser.add_argument("--subject-name", required=True, help="Same subject name the primary RCS statement in this bundle uses (e.g. the image ref)")
+    parser.add_argument("--subject-digest", required=True, help="Same subject sha256 digest the primary RCS statement in this bundle uses -- a clean lowercase hex digest, no 'sha256:' prefix")
     parser.add_argument("--out", default="s2c2f-evidence.unsigned.json", help="Path for the unsigned in-toto Statement (default: s2c2f-evidence.unsigned.json)")
     parser.add_argument("--sign", action="store_true", help="Sign the statement into a real DSSE envelope via ambient Sigstore OIDC (falls back to unsigned if credentials aren't available)")
     parser.add_argument("--dry-run-sign", action="store_true", help="Write a placeholder (unsigned) DSSE envelope, same semantics as cli.main's --dry-run-sign")
@@ -234,15 +210,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     internal_hosts = _resolve_internal_hosts(args.internal_registry)
 
     predicate = build_predicate(repo_dir, Path(args.denylist), internal_hosts)
-    statement = build_statement(repo_dir, predicate)
-
-    if statement is None:
-        print("warning: no git commit SHA could be resolved for this checkout; emitting the bare predicate with no in-toto Statement wrapper", file=sys.stderr)
-        text = json.dumps(predicate, indent=2, sort_keys=True)
-        print(text)
-        if args.out:
-            safe_resolve_path(args.out).write_text(text + "\n", encoding="utf-8")
-        return 0
+    statement = build_statement(args.subject_name, args.subject_digest, predicate)
 
     text = json.dumps(statement, indent=2, sort_keys=True)
     print(text)

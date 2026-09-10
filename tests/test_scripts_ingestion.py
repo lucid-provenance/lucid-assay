@@ -190,18 +190,8 @@ class VerifyIngestionCliTests(unittest.TestCase):
             self.assertEqual(loaded["digest_sha256"], compute_denylist_digest(loaded["entries"]))
 
 
-def _init_real_git_repo(repo: Path) -> None:
-    """A real git repo with one commit -- so build_statement's subject
-    carries genuine, deterministic gitCommit/gitTree digests rather than a
-    mocked stand-in for them."""
-    import subprocess
-
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
-    (repo / "README.md").write_text("test\n")
-    subprocess.run(["git", "add", "."], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+_SUBJECT_NAME = "ghcr.io/lucid-provenance/lucid-assay:test"
+_SUBJECT_DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
 
 
 class EmitS2C2FEvidenceTests(unittest.TestCase):
@@ -214,54 +204,46 @@ class EmitS2C2FEvidenceTests(unittest.TestCase):
             self.assertEqual(set(predicate["controls"].keys()), {"ING-3", "ING-2", "ENF-2"})
             self.assertIn("would_enforce_exit_code", predicate)
 
-    def test_build_statement_none_without_a_resolvable_commit(self):
-        # build_statement() deliberately resolves its own commit_sha from
-        # repo_dir's actual git state (see its docstring) rather than
-        # predicate["environment"]["git_commit_sha"], which legitimately
-        # prefers the ambient $GITHUB_SHA regardless of repo_dir -- so this
-        # must hold even with $GITHUB_SHA set to an unrelated value in the
-        # test process's own environment (true on every real CI run).
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)  # not a git repo at all
-            _write_denylist(repo / "denylist.json", [])
-            predicate = build_predicate(repo, repo / "denylist.json", [])
-            self.assertIsNone(build_statement(repo, predicate))
+    def test_build_statement_uses_the_supplied_subject_verbatim(self):
+        # Real regression coverage for the actual bug this replaced: an
+        # earlier version built its own {"gitCommit": ..., "gitTree": ...}
+        # subject, which is valid per the in-toto *spec* but rejected
+        # outright by sigstore-python's own stricter Statement validator
+        # ("malformed in-toto statement") the first time this was signed
+        # for real in CI. build_statement() now takes the same
+        # subject_name/subject_digest every other companion statement in
+        # the bundle uses -- see test_build_statement_output_is_a_real_
+        # valid_sigstore_statement below for the actual empirical proof.
+        predicate = {"schema_version": "s2c2f-evidence/v1"}
+        statement = build_statement(_SUBJECT_NAME, _SUBJECT_DIGEST, predicate)
+        self.assertEqual(statement["_type"], "https://in-toto.io/Statement/v1")
+        self.assertEqual(statement["predicateType"], "https://lucidprovenance.io/attestations/s2c2f-evidence/v1")
+        self.assertIs(statement["predicate"], predicate)
+        self.assertEqual(statement["subject"], [{"name": _SUBJECT_NAME, "digest": {"sha256": _SUBJECT_DIGEST}}])
 
-    def test_build_statement_ignores_unrelated_ambient_github_sha(self):
-        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(
-            os.environ, {"GITHUB_SHA": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}
-        ):
-            repo = Path(tmp)  # not a git repo at all -- $GITHUB_SHA must not leak into the subject
-            _write_denylist(repo / "denylist.json", [])
-            predicate = build_predicate(repo, repo / "denylist.json", [])
-            self.assertEqual(predicate["environment"]["git_commit_sha"], "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
-            self.assertIsNone(build_statement(repo, predicate))
+    def test_build_statement_output_is_a_real_valid_sigstore_statement(self):
+        # Not a shape assertion against our own schema -- constructs the
+        # actual sigstore.dsse.Statement the real signer (attest job's
+        # sign-client.yml call) would, confirming this predicate really
+        # is signable rather than trusting a re-read of the spec. This is
+        # the exact check that would have caught the gitCommit/gitTree
+        # bug before it ever reached a real CI run.
+        from sigstore.dsse import Statement
 
-    def test_build_statement_carries_real_git_subject(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            _init_real_git_repo(repo)
-            _write_denylist(repo / "denylist.json", [])
-            predicate = build_predicate(repo, repo / "denylist.json", [])
-            statement = build_statement(repo, predicate)
-            self.assertEqual(statement["_type"], "https://in-toto.io/Statement/v1")
-            self.assertEqual(statement["predicateType"], "https://lucidprovenance.io/attestations/s2c2f-evidence/v1")
-            self.assertIs(statement["predicate"], predicate)
-            digests = [s["digest"] for s in statement["subject"]]
-            self.assertTrue(any("gitCommit" in d for d in digests))
-            self.assertTrue(any("gitTree" in d for d in digests))
-            # Real, non-fabricated 40-hex-char git object ids, not placeholders.
-            for d in digests:
-                for value in d.values():
-                    self.assertRegex(value, r"^[0-9a-f]{40}$")
+        predicate = {"schema_version": "s2c2f-evidence/v1", "controls": {}}
+        statement = build_statement(_SUBJECT_NAME, _SUBJECT_DIGEST, predicate)
+        Statement(json.dumps(statement).encode())  # raises "malformed in-toto statement" on failure
 
     def test_main_dry_run_sign_writes_a_real_dsse_envelope(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            _init_real_git_repo(repo)
             _write_denylist(repo / "denylist.json", [])
             out_path = repo / "s2c2f-evidence.unsigned.json"
-            exit_code = emit_main(["--repo-dir", str(repo), "--denylist", str(repo / "denylist.json"), "--out", str(out_path), "--dry-run-sign"])
+            exit_code = emit_main([
+                "--repo-dir", str(repo), "--denylist", str(repo / "denylist.json"),
+                "--subject-name", _SUBJECT_NAME, "--subject-digest", _SUBJECT_DIGEST,
+                "--out", str(out_path), "--dry-run-sign",
+            ])
             self.assertEqual(exit_code, 0)
             dsse_path = repo / "s2c2f-evidence.dsse.json"
             self.assertTrue(dsse_path.is_file())
@@ -270,16 +252,20 @@ class EmitS2C2FEvidenceTests(unittest.TestCase):
             import base64
             statement = json.loads(base64.b64decode(envelope["payload"]))
             self.assertEqual(statement["predicateType"], "https://lucidprovenance.io/attestations/s2c2f-evidence/v1")
+            self.assertEqual(statement["subject"], [{"name": _SUBJECT_NAME, "digest": {"sha256": _SUBJECT_DIGEST}}])
 
     def test_main_never_fails_when_sign_requested_without_ambient_credentials(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            _init_real_git_repo(repo)
             _write_denylist(repo / "denylist.json", [])
             out_path = repo / "s2c2f-evidence.unsigned.json"
             # No ambient OIDC env vars set in this test process -- --sign
             # must degrade to "unsigned only", never raise/exit non-zero.
-            exit_code = emit_main(["--repo-dir", str(repo), "--denylist", str(repo / "denylist.json"), "--out", str(out_path), "--sign"])
+            exit_code = emit_main([
+                "--repo-dir", str(repo), "--denylist", str(repo / "denylist.json"),
+                "--subject-name", _SUBJECT_NAME, "--subject-digest", _SUBJECT_DIGEST,
+                "--out", str(out_path), "--sign",
+            ])
             self.assertEqual(exit_code, 0)
             self.assertTrue(out_path.is_file())
             self.assertFalse((repo / "s2c2f-evidence.dsse.json").is_file())

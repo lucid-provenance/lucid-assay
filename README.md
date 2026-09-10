@@ -1772,6 +1772,15 @@ python3 -m pytest -n auto -v tests/
   same patch-differential scoring (newly-introduced-in-this-PR findings
   weighted more heavily) that CodeQL's already get.
 
+## Security
+
+Vulnerability reports: see [`SECURITY.md`](https://github.com/lucid-provenance/.github/blob/main/SECURITY.md)
+(org-wide default — GitHub Private Vulnerability Reporting is enabled on
+this repo). The fuller vulnerability-management and secure-SDLC policy
+governing how findings get triaged, fixed, or formally risk-accepted
+lives in [`lucid-provenance/compliance`](https://github.com/lucid-provenance/compliance)
+(private).
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).

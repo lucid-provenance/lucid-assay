@@ -537,9 +537,25 @@ jobs:
         continue-on-error: true
         env:
           LUCID_INTERNAL_REGISTRY_HOSTS: ${{ vars.LUCID_INTERNAL_REGISTRY_HOSTS }}
+          IMAGE_REF: ${{ steps.mint.outputs.image-ref }}
+          IMAGE_DIGEST: ${{ steps.mint.outputs.image-digest }}
         run: |
+          # --subject-name/--subject-digest: the SAME subject the primary
+          # RCS statement above uses (steps.mint's own outputs, within
+          # this same job -- needs.build.outputs isn't in scope here,
+          # that's for other jobs). A real, confirmed bug once used this
+          # script's own git-commit-based subject instead
+          # (gitCommit/gitTree digest keys) -- valid per the in-toto
+          # *spec*, but rejected outright by sigstore-python's own
+          # stricter Statement validator the first time this was signed
+          # for real ("malformed in-toto statement"; --dry-run-sign never
+          # caught it locally, since that path skips real Statement
+          # construction entirely). See scripts/emit_s2c2f_evidence.py's
+          # own module docstring for the full account.
           uv run --no-sync python -m scripts.emit_s2c2f_evidence \
             --repo-dir . \
+            --subject-name "$IMAGE_REF" \
+            --subject-digest "${IMAGE_DIGEST#sha256:}" \
             --out build/s2c2f-evidence.unsigned.json
 
       # attest's statement-files list is computed here, not hardcoded,

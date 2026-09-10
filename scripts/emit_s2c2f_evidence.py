@@ -10,9 +10,12 @@ real in-toto v1 Statement (predicateType
 https://lucidprovenance.io/attestations/s2c2f-evidence/v1, matching the
 predicate-type-minting convention cli/sbom_statement.py and
 cli/sarif_statement.py already established for a companion attestation
-with no shared external schema to reuse). See
-.github/workflows/s2c2f-evidence-telemetry.yml for how this is meant to be
-wired in.
+with no shared external schema to reuse). Wired into
+.github/workflows/assay.yml's own `build` job as of 2026-09-10 (a 5th
+envelope in the same signed bundle the RCS/SBOM/SARIF statements ship
+in, signed by the same isolated attest job -- not a separate workflow's
+separate submission, which would land on a different collector row than
+the real attestation and be unrenderable in the same Console panel).
 
 Subject: two real, addressable git object identities for the exact
 checkout this evidence was collected against -- the commit SHA and the

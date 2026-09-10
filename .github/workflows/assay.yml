@@ -88,6 +88,14 @@ jobs:
       # context instead (see that job's `uses:` comment).
       image-ref: ${{ steps.mint.outputs.image-ref }}
       image-digest: ${{ steps.mint.outputs.image-digest }}
+      # Dynamic, unlike the other statement-files entries below (which are
+      # hard-required -- the mint step's own test -s checks already fail
+      # this job if sbom.unsigned.json/sarif-reports.unsigned.json are
+      # missing): s2c2f-evidence.unsigned.json is telemetry, allowed to be
+      # absent, so attest's own statement-files list must never name a
+      # file that might not exist in the uploaded artifact. See "Compute
+      # statement-files list for the isolated signer" below.
+      statement-files: ${{ steps.statement-files.outputs.files }}
 
     steps:
       - name: Checkout Repository
@@ -510,6 +518,53 @@ jobs:
             exit 1
           }
 
+      # Pre-production S2C2F Level 2/3 ingestion-control telemetry
+      # (scripts/verify_ingestion.py/emit_s2c2f_evidence.py -- see those
+      # modules' own docstrings for what ING-3/ING-2/ENF-2 actually
+      # measure and their honesty caveats). Folded into this job (rather
+      # than the separate s2c2f-evidence-telemetry.yml workflow it
+      # replaces) so its statement can be signed alongside the primary
+      # RCS/SBOM/SARIF statements in the SAME isolated attest job and
+      # land in the SAME collector row -- a separate workflow's separate
+      # submission would create a disconnected row Console can't render
+      # in one panel. continue-on-error: true -- this is telemetry;
+      # ING-2/ENF-2 reporting FAIL (this repo has no internal registry
+      # configured) must never block the real attestation from
+      # publishing, and even a total generation failure here degrades to
+      # "one fewer envelope in the bundle," not a broken pipeline (see
+      # "Compute statement-files list" below).
+      - name: Generate S2C2F ingestion-control evidence (telemetry, non-blocking)
+        continue-on-error: true
+        env:
+          LUCID_INTERNAL_REGISTRY_HOSTS: ${{ vars.LUCID_INTERNAL_REGISTRY_HOSTS }}
+        run: |
+          uv run --no-sync python -m scripts.emit_s2c2f_evidence \
+            --repo-dir . \
+            --out build/s2c2f-evidence.unsigned.json
+
+      # attest's statement-files list is computed here, not hardcoded,
+      # specifically so it can omit s2c2f-evidence.unsigned.json when the
+      # step above didn't produce it -- sign-client.yml has no reason to
+      # tolerate a listed file that doesn't exist in the artifact, and
+      # this repo has no way to know whether it does.
+      - name: Compute statement-files list for the isolated signer
+        id: statement-files
+        run: |
+          FILES="lucid-assay.unsigned.json
+          sbom.unsigned.json
+          sarif-reports.unsigned.json"
+          if [ -s build/s2c2f-evidence.unsigned.json ]; then
+            FILES="$FILES
+          s2c2f-evidence.unsigned.json"
+          else
+            echo "::warning::build/s2c2f-evidence.unsigned.json was not produced; publishing the bundle without it (non-blocking telemetry)"
+          fi
+          {
+            echo "files<<STATEMENT_FILES_EOF"
+            echo "$FILES"
+            echo "STATEMENT_FILES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Upload Unsigned Statements
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -518,6 +573,7 @@ jobs:
             build/lucid-assay.unsigned.json
             build/sbom.unsigned.json
             build/sarif-reports.unsigned.json
+            build/s2c2f-evidence.unsigned.json
           if-no-files-found: error
 
   # The *only* job with id-token: write -- signs the RCS statement `build`
@@ -579,10 +635,12 @@ jobs:
     uses: lucid-provenance/lucid-attest-service/.github/workflows/sign-client.yml@231039b08b91b78788dba732a10355aafcaeaa11
     with:
       artifact-name: unsigned-statements
-      statement-files: |
-        lucid-assay.unsigned.json
-        sbom.unsigned.json
-        sarif-reports.unsigned.json
+      # Dynamic (needs.build.outputs.statement-files), not a hardcoded
+      # literal list -- see that output's own comment in the build job:
+      # s2c2f-evidence.unsigned.json is telemetry, allowed to be absent,
+      # and this list must never name a file that isn't actually in the
+      # uploaded artifact.
+      statement-files: ${{ needs.build.outputs.statement-files }}
       subject-name: ${{ needs.build.outputs.image-ref }}
       subject-digest: ${{ needs.build.outputs.image-digest }}
 
@@ -775,6 +833,7 @@ jobs:
             build/provenance.dsse.json
             build/sbom.dsse.json
             build/sarif-reports.dsse.json
+            build/s2c2f-evidence.dsse.json
           if-no-files-found: error
 
       # Publishes this run's signed bundle to lucid-dsse-collector, the
@@ -810,11 +869,9 @@ jobs:
       # different shape.
       #
       # MAX_ENVELOPES_PER_BUNDLE (lucid-dsse-collector's app/core/
-      # config.py) is 4 today, exactly matching the up-to-4 envelope files
-      # below -- if a 5th statement is ever added to this bundle (e.g. a
-      # future scripts/emit_s2c2f_evidence.py companion, see PR discussion
-      # on this branch), that constant needs raising first, on the
-      # collector side, before adding a 5th -F envelopes= part here.
+      # config.py) is 5 as of 2026-09-10, raised from 4 specifically for
+      # this 5th envelope (scripts/emit_s2c2f_evidence.py's companion
+      # statement) -- both sides landed together, not independently.
       - name: Publish Signed Bundle to lucid-dsse-collector
         if: vars.LUCID_DSSE_COLLECTOR_URL != ''
         continue-on-error: true
@@ -833,7 +890,7 @@ jobs:
             '{repository: $repo, commit_sha: $sha, ref: $ref, image_digest: $digest}')
 
           FORM_ARGS=(-F "metadata=${METADATA};type=application/json")
-          for envelope in build/lucid-assay.dsse.json build/provenance.dsse.json build/sbom.dsse.json build/sarif-reports.dsse.json; do
+          for envelope in build/lucid-assay.dsse.json build/provenance.dsse.json build/sbom.dsse.json build/sarif-reports.dsse.json build/s2c2f-evidence.dsse.json; do
             if [ -f "$envelope" ]; then
               FORM_ARGS+=(-F "envelopes=@${envelope};type=application/json")
             fi

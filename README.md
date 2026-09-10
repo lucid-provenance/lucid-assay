@@ -752,7 +752,12 @@ tools — including `parsers/sbom.py`'s own synthetic
 vulnerability-alerts API), `INV-1`
 (resolved-dependency inventory), `UPD-1` (always `not_yet_reported` — see
 above), `SCA-3` (GitHub Dependabot alerts API reachability), `INV-2`
-(`SECURITY.md` via the GitHub community-profile API), `UPD-3`
+(`SECURITY.md` present via the GitHub Contents API — the repository's own
+copy at one of GitHub's three recognized paths, or the organization's
+`.github` repo's default if the repository has none of its own; fixed
+2026-09-10 from an earlier version that read the community-profile API's
+`files.security` key, which GitHub's own REST API schema has never
+actually defined), `UPD-3`
 (a Dependabot/Renovate config file), `AUD-2`/`AUD-3` (resolved-dependency
 inventory / pkg: PURL + sha256/sha512 digest — the same hermeticity check
 `cli/verify.py`'s Dependency Materialization Evidence section's

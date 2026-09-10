@@ -423,9 +423,44 @@ class EvaluateS2C2FTests(unittest.TestCase):
 
     @patch("cli.parsers.s2c2f._github_api_status")
     @patch("cli.parsers.s2c2f._github_api_get")
-    def test_community_profile_security_md_satisfies_inv2(self, mock_get, mock_status):
+    def test_own_repo_security_md_satisfies_inv2(self, mock_get, mock_status):
+        # GitHub's community/profile response has never had a `security`
+        # key at all (confirmed against GitHub's own REST API docs) --
+        # INV-2 is checked directly via the Contents API instead. Only
+        # the repo's own root SECURITY.md exists here; the other two
+        # candidate paths (and the org .github fallback) must never be
+        # reached once the first one is found.
         mock_status.return_value = 404
-        mock_get.return_value = {"files": {"security": {"href": "https://example/SECURITY.md"}}}
+        mock_get.side_effect = lambda path, token, timeout=10: (
+            {"name": "SECURITY.md"} if path == "/repos/acme/widgets/contents/SECURITY.md" else None
+        )
+
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(),
+            repository="acme/widgets",
+            resolved_dependencies=[],
+            sarif_report=None,
+            branch_governance=_governance(),
+            token="tok",
+        )
+        self.assertEqual(_controls_by_id(report)["INV-2"].status, STATUS_MET)
+        mock_get.assert_any_call("/repos/acme/widgets/contents/SECURITY.md", "tok", 10)
+        # The org .github fallback must never be queried once the repo's
+        # own file was already found.
+        called_paths = [c.args[0] for c in mock_get.call_args_list]
+        self.assertFalse(any("acme/.github" in p for p in called_paths))
+
+    @patch("cli.parsers.s2c2f._github_api_status")
+    @patch("cli.parsers.s2c2f._github_api_get")
+    def test_org_default_security_md_satisfies_inv2_when_repo_has_none(self, mock_get, mock_status):
+        # Replicates GitHub's own org-wide default community health file
+        # fallback: acme/widgets has none of its own, but acme/.github
+        # does -- this must still report MET, the same way GitHub's own
+        # UI credits the inherited default.
+        mock_status.return_value = 404
+        mock_get.side_effect = lambda path, token, timeout=10: (
+            {"name": "SECURITY.md"} if path == "/repos/acme/.github/contents/SECURITY.md" else None
+        )
 
         report = evaluate_s2c2f(
             repo_dir=tempfile.mkdtemp(),
@@ -439,7 +474,23 @@ class EvaluateS2C2FTests(unittest.TestCase):
 
     @patch("cli.parsers.s2c2f._github_api_status")
     @patch("cli.parsers.s2c2f._github_api_get")
-    def test_community_profile_api_failure_is_not_yet_reported(self, mock_get, mock_status):
+    def test_no_security_md_anywhere_is_unmet(self, mock_get, mock_status):
+        mock_status.return_value = 404
+        mock_get.return_value = None  # every candidate path, repo and org alike, 404s
+
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(),
+            repository="acme/widgets",
+            resolved_dependencies=[],
+            sarif_report=None,
+            branch_governance=_governance(),
+            token="tok",
+        )
+        self.assertEqual(_controls_by_id(report)["INV-2"].status, STATUS_UNMET)
+
+    @patch("cli.parsers.s2c2f._github_api_status")
+    @patch("cli.parsers.s2c2f._github_api_get")
+    def test_contents_api_failure_is_not_yet_reported(self, mock_get, mock_status):
         mock_status.return_value = 404
         mock_get.side_effect = GitHubAPIError("boom", status_code=403)
 

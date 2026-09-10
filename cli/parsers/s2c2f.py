@@ -37,7 +37,7 @@ rather than re-implemented):
   - Path/URL injection via `repository` (same strict `owner/repo` allowlist)
   - Rate limits, transport failures, and non-2xx/404 responses on every
     GitHub endpoint touched here (vulnerability-alerts, dependabot/alerts,
-    community/profile) -- each control is evaluated independently, so one
+    contents) -- each control is evaluated independently, so one
     endpoint's failure never taints another control's result
   - Unreadable/non-UTF8 local config files (skipped, not raised)
 """
@@ -393,12 +393,62 @@ def _eval_sca3_eol_scans(dependabot_alerts_status: Optional[int]) -> S2C2FContro
     return _control("SCA-3", STATUS_NOT_YET_REPORTED, "GitHub Dependabot alerts API could not be reached (missing token or network failure)")
 
 
+# Fixed 2026-09-10: GitHub's GET /repos/{owner}/{repo}/community/profile
+# response's `files` object has never had a `security` key at all --
+# confirmed against a real repo with a genuine, committed SECURITY.md
+# (this repo's own) coming back with no such key in that response, then
+# against GitHub's own published REST API schema for this endpoint (only
+# code_of_conduct/code_of_conduct_file/license/contributing/readme/
+# issue_template/pull_request_template). The original
+# `files.get("security")` check this control used to run was checking a
+# field that was never real -- INV-2 could never have reported MET for
+# any repository, regardless of whether a real SECURITY.md existed.
+#
+# Fixed by replicating GitHub's own documented SECURITY.md discovery/
+# fallback logic explicitly, since no single API reports the *effective*
+# (org-default-inclusive) answer: check the repo's own three recognized
+# locations via the Contents API; if none found, check the same three
+# locations in the org's own `.github` repository (GitHub's org-wide
+# default community health file mechanism -- a repo with no SECURITY.md
+# of its own inherits the org's, and this control should credit that the
+# same way GitHub's own UI does).
+_SECURITY_MD_CANDIDATE_PATHS = ("SECURITY.md", ".github/SECURITY.md", "docs/SECURITY.md")
+
+
+def _has_security_md_at(repository: str, token: str, timeout: int) -> Optional[bool]:
+    """True if `repository` has a SECURITY.md at any of GitHub's three
+    recognized locations, False if a definitive check of all three found
+    none, None if any check couldn't complete (auth/network failure) --
+    never guesses False when a check simply didn't run."""
+    for rel_path in _SECURITY_MD_CANDIDATE_PATHS:
+        try:
+            result = _github_api_get(f"/repos/{repository}/contents/{rel_path}", token, timeout)
+        except GitHubAPIError:
+            return None
+        if result is not None:
+            return True
+    return False
+
+
+def _detect_security_md(repository: str, token: str, timeout: int) -> Optional[bool]:
+    """`repository`'s own SECURITY.md, falling back to the org's `.github`
+    repo's default the same way GitHub itself does. Propagates None
+    (couldn't determine) rather than collapsing an inconclusive org-level
+    check into a false "unmet" once the repo's own copy is confirmed
+    absent."""
+    own = _has_security_md_at(repository, token, timeout)
+    if own is not False:
+        return own  # True, or None (repo's own check itself failed)
+    org = repository.split("/", 1)[0]
+    return _has_security_md_at(f"{org}/.github", token, timeout)
+
+
 def _eval_inv2_incident_plans(security_md_present: Optional[bool]) -> S2C2FControlResult:
     if security_md_present is True:
-        return _control("INV-2", STATUS_MET, "a SECURITY.md is present (GitHub community profile)")
+        return _control("INV-2", STATUS_MET, "a SECURITY.md is present (this repository's own, or the organization's default via its .github repo)")
     if security_md_present is False:
-        return _control("INV-2", STATUS_UNMET, "no SECURITY.md was found via the GitHub community profile API")
-    return _control("INV-2", STATUS_NOT_YET_REPORTED, "the GitHub community profile API could not be reached (missing token or network failure)")
+        return _control("INV-2", STATUS_UNMET, "no SECURITY.md was found in this repository or the organization's default .github repo")
+    return _control("INV-2", STATUS_NOT_YET_REPORTED, "the GitHub Contents API could not be reached to check for a SECURITY.md (missing token or network failure)")
 
 
 def _eval_upd3_pr_alerts(repo_dir: str) -> S2C2FControlResult:
@@ -478,13 +528,7 @@ def evaluate_s2c2f(
     if resolved_token:
         vuln_alerts_status = _github_api_status(f"/repos/{repository}/vulnerability-alerts", resolved_token, timeout)
         dependabot_alerts_status = _github_api_status(f"/repos/{repository}/dependabot/alerts?per_page=1", resolved_token, timeout)
-        try:
-            profile = _github_api_get(f"/repos/{repository}/community/profile", resolved_token, timeout)
-        except GitHubAPIError:
-            profile = None
-        if isinstance(profile, dict):
-            files = profile.get("files")
-            security_md_present = bool(isinstance(files, dict) and files.get("security"))
+        security_md_present = _detect_security_md(repository, resolved_token, timeout)
 
     controls = [
         _eval_ing1_package_managers(resolved_dependencies),

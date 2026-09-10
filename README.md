@@ -1193,12 +1193,27 @@ repo governance first mirrors the code's actual physical lifecycle.
   rendered label/detail whenever it differs from `vcs.commit_sha`. A
   failed walk-back (transport error, or the hop bound exhausted) reports
   `verified: null` (not determined) — it never silently falls back to
-  crediting the web-flow signature. Known residual gap: a *squash*-
-  merged commit is also web-flow-signed but has only one parent (the
-  squashed diff was never pushed as its own commit object to walk back
-  to) — doesn't affect this platform's own repos, which all merge via
-  GitHub's true 2-parent "Merge pull request", confirmed against real
-  API responses.
+  crediting the web-flow signature. **Squash/rebase-merge correction**:
+  a *squash*- or *rebase*-merged commit is also web-flow-signed but has
+  only one parent (nothing to walk back to via the parent graph) —
+  formerly a known residual gap, assumed not to affect this platform's
+  own repos (which were assumed to all merge via a true 2-parent "Merge
+  pull request"). Confirmed *wrong* 2026-09-10: this platform's repos
+  enforce Linear History, which structurally forbids a true 2-parent
+  merge, so every real merge here is squash/rebase and this was in fact
+  the *only* case, silently crediting GitHub's signature on every merge
+  (confirmed against a real PR: the squash commit reported
+  `verified: true` via GitHub's key while the actual human-authored
+  branch tip GitHub squashed reported `verified: false,
+  reason: "unsigned"`). Now closed the same way, via a different API
+  path since squash/rebase leaves no second-parent pointer: resolves the
+  PR GitHub associates with the commit (`GET /repos/{repo}/commits/{sha}
+  /pulls`), then that PR's own retained commit list (`GET /repos/{repo}
+  /pulls/{number}/commits`) — the last entry is the real pre-squash/
+  pre-rebase branch tip — and evaluates *that* commit's signature
+  instead. Any failure along this path (no associated PR yet indexed,
+  transport/shape error, empty commit list) reports `verified: null`,
+  the same fail-closed contract as the 2-parent case.
 - **Linear History Enforced** / **Force Pushes Blocked** / **Branch
   Deletion Blocked** — whether a `required_linear_history` /
   `non_fast_forward` / `deletion` rule (respectively) is active on the

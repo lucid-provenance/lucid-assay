@@ -19,6 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cli.parsers.commit_author import (
     CommitAuthorReport,
     inspect_commit_author,
+    _fetch_associated_pr_number,
+    _fetch_pr_branch_tip_sha,
     _signature_type_from_blob,
     _web_flow_merge_second_parent,
 )
@@ -257,9 +259,11 @@ class WebFlowMergeSecondParentTests(unittest.TestCase):
         self.assertIsNone(_web_flow_merge_second_parent(body))
 
     def test_squash_merge_shape_one_parent_is_not_walked(self):
-        """Known residual gap (see commit_author.py's own docstring):
-        a squash-merged commit is also web-flow-signed but has only one
-        parent -- nothing to walk back to."""
+        """A squash-merged commit is also web-flow-signed but has only
+        one parent -- nothing for *this* parent-graph helper to walk
+        back to (see SquashOrRebaseMergeCorrectionTests below for the
+        higher-level PR-lookup fallback that actually corrects for this
+        shape, via a different API path)."""
         body = dict(_REAL_WEB_FLOW_MERGE_COMMIT, parents=[{"sha": _BASE_PARENT_SHA}])
         self.assertIsNone(_web_flow_merge_second_parent(body))
 
@@ -367,6 +371,167 @@ class WebFlowMergeCommitWalkBackTests(unittest.TestCase):
         self.assertIsNone(result.commit_signature_verified)
         self.assertIn("gave up walking back", result.commit_signature_reason)
         self.assertIn("5 hops", result.commit_signature_reason)
+
+
+# Real shapes confirmed against GitHub's actual API 2026-09-10: a real
+# GitHub-web *squash* merge (lucid-assay PR #94, commit f931d63...) --
+# this repo enforces Linear History, which structurally forbids the
+# true 2-parent merge commit WebFlowMergeCommitWalkBackTests above
+# assumes, so every real merge here takes exactly this shape. Ground
+# truth for the squash/rebase-merge correction, not guessed/synthesized:
+# f931d63 itself reports `verified: true` via GitHub's own key, while
+# the actual human-authored branch tip GitHub squashed, f8af55a...,
+# reports `verified: false, reason: "unsigned"`.
+_SQUASH_MERGE_SHA = "f931d63084ead13dd42f4606f86ac8cfc06dc207"
+_SQUASH_BASE_PARENT_SHA = "fe26426a98cb1f7b5ac711d4efb7b1279a98aedf"
+_SQUASH_PR_NUMBER = 94
+_SQUASH_PR_EARLIER_COMMIT_SHA = "e66e5cb28796aa0424667167bc3a45b658f0c405"
+_SQUASH_PR_BRANCH_TIP_SHA = "f8af55af2d8f0e01c63dc10508d375e7b6f4a372"
+
+_REAL_SQUASH_MERGE_COMMIT = {
+    "sha": _SQUASH_MERGE_SHA,
+    "parents": [{"sha": _SQUASH_BASE_PARENT_SHA}],
+    "committer": {"login": "web-flow"},
+    "author": {"login": "billwonch"},
+    "commit": {
+        "author": {"name": "billwonch", "email": "84951388+billwonch@users.noreply.github.com"},
+        "committer": {"name": "GitHub", "email": "noreply@github.com"},
+        "verification": {
+            "verified": True,
+            "reason": "valid",
+            "signature": "-----BEGIN PGP SIGNATURE-----\n\nwsFcBAABCAAQ...\n-----END PGP SIGNATURE-----\n",
+        },
+    },
+}
+_REAL_ASSOCIATED_PRS_RESPONSE = [{"number": _SQUASH_PR_NUMBER}]
+_REAL_PR_COMMITS_RESPONSE = [{"sha": _SQUASH_PR_EARLIER_COMMIT_SHA}, {"sha": _SQUASH_PR_BRANCH_TIP_SHA}]
+_REAL_SQUASH_PR_BRANCH_TIP_COMMIT_UNSIGNED = {
+    "sha": _SQUASH_PR_BRANCH_TIP_SHA,
+    "parents": [{"sha": _SQUASH_PR_EARLIER_COMMIT_SHA}],
+    "committer": {"login": "billwonch"},
+    "author": {"login": "billwonch"},
+    "commit": {
+        "author": {"name": "Bill Wonch", "email": "billwonch@outlook.com"},
+        "committer": {"name": "Bill Wonch", "email": "billwonch@outlook.com"},
+        "verification": {"verified": False, "reason": "unsigned", "signature": None},
+    },
+}
+
+
+class SquashOrRebaseMergeCorrectionTests(unittest.TestCase):
+    """inspect_commit_author()'s correction for a web-flow-signed commit
+    with no second parent to walk through -- formerly a known residual
+    gap (see commit_author.py's docstring), now closed via the
+    associated PR's own retained commit list."""
+
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_walks_back_to_the_real_pr_branch_tip_via_pr_lookup(self, mock_urlopen):
+        mock_urlopen.side_effect = _mock_response_sequence(
+            _REAL_SQUASH_MERGE_COMMIT, _REAL_ASSOCIATED_PRS_RESPONSE, _REAL_PR_COMMITS_RESPONSE,
+            _REAL_SQUASH_PR_BRANCH_TIP_COMMIT_UNSIGNED,
+        )
+        result = inspect_commit_author(_REPO, _SQUASH_MERGE_SHA, token="tok")
+
+        self.assertEqual(mock_urlopen.call_count, 4)
+        # The signature verdict reflects the real, unsigned PR branch tip
+        # -- not GitHub's own auto-signature on the squash commit itself.
+        self.assertFalse(result.commit_signature_verified)
+        self.assertEqual(result.commit_signature_reason, "unsigned")
+        self.assertEqual(result.commit_signature_source_sha, _SQUASH_PR_BRANCH_TIP_SHA)
+        # Author-identity fields are untouched -- still the originally
+        # requested (squash) commit's own, honestly-real author.
+        self.assertEqual(result.commit_sha, _SQUASH_MERGE_SHA)
+        self.assertTrue(result.verified_github_account)
+        self.assertEqual(result.github_login, "billwonch")
+
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_no_associated_pr_fails_closed(self, mock_urlopen):
+        mock_urlopen.side_effect = _mock_response_sequence(_REAL_SQUASH_MERGE_COMMIT, [])
+        result = inspect_commit_author(_REPO, _SQUASH_MERGE_SHA, token="tok")
+
+        self.assertIsNone(result.commit_signature_verified)
+        self.assertIn("no pull request associated", result.commit_signature_reason)
+        # Never falls back to crediting the squash commit's own signature.
+        self.assertIsNone(result.commit_signature_source_sha)
+
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_transport_error_resolving_associated_pr_fails_closed(self, mock_urlopen):
+        mock_urlopen.side_effect = [
+            _mock_response(_REAL_SQUASH_MERGE_COMMIT),
+            urllib.error.URLError("connection refused"),
+        ]
+        result = inspect_commit_author(_REPO, _SQUASH_MERGE_SHA, token="tok")
+
+        self.assertIsNone(result.commit_signature_verified)
+        self.assertIn("resolving the PR associated with", result.commit_signature_reason)
+        self.assertTrue(result.verified_github_account)
+
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_pr_with_no_commits_on_record_fails_closed(self, mock_urlopen):
+        mock_urlopen.side_effect = _mock_response_sequence(
+            _REAL_SQUASH_MERGE_COMMIT, _REAL_ASSOCIATED_PRS_RESPONSE, []
+        )
+        result = inspect_commit_author(_REPO, _SQUASH_MERGE_SHA, token="tok")
+
+        self.assertIsNone(result.commit_signature_verified)
+        self.assertIn("no commits on record", result.commit_signature_reason)
+
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_failure_fetching_branch_tip_body_fails_closed(self, mock_urlopen):
+        mock_urlopen.side_effect = [
+            _mock_response(_REAL_SQUASH_MERGE_COMMIT),
+            _mock_response(_REAL_ASSOCIATED_PRS_RESPONSE),
+            _mock_response(_REAL_PR_COMMITS_RESPONSE),
+            urllib.error.HTTPError(url="https://api.github.com/x", code=404, msg="Not Found", hdrs=None, fp=None),
+        ]
+        result = inspect_commit_author(_REPO, _SQUASH_MERGE_SHA, token="tok")
+
+        self.assertIsNone(result.commit_signature_verified)
+        self.assertIn("could not fetch PR #94's real branch-tip commit", result.commit_signature_reason)
+
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_ordinary_non_web_flow_single_parent_commit_is_not_redirected(self, mock_urlopen):
+        """A single-parent commit that isn't GitHub-generated (an
+        ordinary, non-merge commit) must never trigger the squash/rebase
+        fallback -- there's no GitHub auto-signature to correct for."""
+        mock_urlopen.side_effect = _mock_response_sequence(_REAL_SQUASH_PR_BRANCH_TIP_COMMIT_UNSIGNED)
+        result = inspect_commit_author(_REPO, _SQUASH_PR_BRANCH_TIP_SHA, token="tok")
+
+        self.assertEqual(mock_urlopen.call_count, 1)
+        self.assertIsNone(result.commit_signature_source_sha)
+        self.assertFalse(result.commit_signature_verified)
+
+
+class AssociatedPrLookupHelperTests(unittest.TestCase):
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_resolves_real_pr_number(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(_REAL_ASSOCIATED_PRS_RESPONSE)
+        number, error = _fetch_associated_pr_number(_REPO, _SQUASH_MERGE_SHA, {}, 10)
+        self.assertEqual(number, _SQUASH_PR_NUMBER)
+        self.assertIsNone(error)
+
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_malformed_entry_fails_closed(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(["not-a-dict"])
+        number, error = _fetch_associated_pr_number(_REPO, _SQUASH_MERGE_SHA, {}, 10)
+        self.assertIsNone(number)
+        self.assertIn("unexpected response shape", error)
+
+
+class PrBranchTipHelperTests(unittest.TestCase):
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_resolves_last_commit_as_branch_tip(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(_REAL_PR_COMMITS_RESPONSE)
+        sha, error = _fetch_pr_branch_tip_sha(_REPO, _SQUASH_PR_NUMBER, {}, 10)
+        self.assertEqual(sha, _SQUASH_PR_BRANCH_TIP_SHA)
+        self.assertIsNone(error)
+
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_malformed_sha_fails_closed(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response([{"sha": "not-hex!!"}])
+        sha, error = _fetch_pr_branch_tip_sha(_REPO, _SQUASH_PR_NUMBER, {}, 10)
+        self.assertIsNone(sha)
+        self.assertIn("unexpected response shape", error)
 
 
 class TransportErrorTests(unittest.TestCase):

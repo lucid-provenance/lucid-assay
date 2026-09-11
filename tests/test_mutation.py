@@ -38,7 +38,9 @@ from cli.mutation.python_runner import (
     _dotted_module,
     _parse_mutant_key,
     _scoped_only_mutate,
+    _touched_functions,
     _wildcard_for,
+    _wildcards_for_file,
 )
 
 
@@ -97,6 +99,88 @@ class DottedModuleAndWildcardTests(unittest.TestCase):
 
     def test_parse_mutant_key_returns_none_for_unscoped_file(self):
         self.assertIsNone(_parse_mutant_key("cli.verify.x_something__mutmut_1", ["cli/scorer.py"]))
+
+
+class TouchedFunctionsAndWildcardsTests(unittest.TestCase):
+    """_touched_functions()/_wildcards_for_file() -- see python_runner.py's
+    own docstrings for why this exists: mutmut mutates a whole touched
+    *file* regardless of how few of its lines actually changed, which is
+    what drove this repo's own real diff's kill rate down (verify.py,
+    3,663 lines, only 151 changed, still mutated in full). Narrowing to
+    just the touched *functions* is confirmed safe against a real
+    mutmut 3.7.0 install: mutmut never mutates module-level code at all
+    (only inside function bodies, via its trampoline mechanism)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo_dir = Path(self._tmp.name)
+        (self.repo_dir / "cli").mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, rel_path: str, source: str) -> None:
+        path = self.repo_dir / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+
+    def test_finds_the_function_whose_body_overlaps_a_changed_line(self):
+        self._write(
+            "cli/scorer.py",
+            "def _clamp(x):\n"
+            "    return x\n"
+            "\n\n"
+            "def _score_test_health(totals):\n"
+            "    return 1\n",
+        )
+        # Line 5 is inside _score_test_health's body only.
+        touched = _touched_functions(self.repo_dir, "cli/scorer.py", {5})
+        self.assertEqual(touched, {"_score_test_health"})
+
+    def test_returns_empty_set_for_module_level_only_changes(self):
+        self._write("cli/scorer.py", "WEIGHTS = {}\n\n\ndef f():\n    return 1\n")
+        # Line 1 is the module-level WEIGHTS assignment, outside any def.
+        touched = _touched_functions(self.repo_dir, "cli/scorer.py", {1})
+        self.assertEqual(touched, set())
+
+    def test_returns_none_when_file_cannot_be_parsed(self):
+        self._write("cli/scorer.py", "def f(:\n    broken\n")
+        self.assertIsNone(_touched_functions(self.repo_dir, "cli/scorer.py", {1}))
+
+    def test_visits_nested_and_class_methods_by_bare_name(self):
+        self._write(
+            "cli/scorer.py",
+            "class C:\n"
+            "    def method(self):\n"
+            "        return 1\n",
+        )
+        touched = _touched_functions(self.repo_dir, "cli/scorer.py", {3})
+        self.assertEqual(touched, {"method"})
+
+    def test_wildcards_for_file_builds_one_per_touched_function(self):
+        self._write(
+            "cli/scorer.py",
+            "def _clamp(x):\n"
+            "    return x\n"
+            "\n\n"
+            "def _score_test_health(totals):\n"
+            "    return 1\n",
+        )
+        wildcards = _wildcards_for_file(self.repo_dir, "cli/scorer.py", {5})
+        self.assertEqual(wildcards, ["cli.scorer.x__score_test_health__mutmut_*"])
+
+    def test_wildcards_for_file_falls_back_to_whole_file_when_lines_unknown(self):
+        self._write("cli/scorer.py", "def f():\n    return 1\n")
+        self.assertEqual(_wildcards_for_file(self.repo_dir, "cli/scorer.py", None), ["cli.scorer.*"])
+        self.assertEqual(_wildcards_for_file(self.repo_dir, "cli/scorer.py", set()), ["cli.scorer.*"])
+
+    def test_wildcards_for_file_returns_none_needed_for_module_level_only_changes(self):
+        self._write("cli/scorer.py", "WEIGHTS = {}\n")
+        self.assertEqual(_wildcards_for_file(self.repo_dir, "cli/scorer.py", {1}), [])
+
+    def test_wildcards_for_file_falls_back_to_whole_file_when_unparseable(self):
+        self._write("cli/scorer.py", "def f(:\n    broken\n")
+        self.assertEqual(_wildcards_for_file(self.repo_dir, "cli/scorer.py", {1}), ["cli.scorer.*"])
 
 
 class SkippedReportTests(unittest.TestCase):
@@ -318,6 +402,41 @@ class RunMutationTestingPythonTests(unittest.TestCase):
             self.assertIn('only_mutate = ["cli/scorer.py"]', text)
         restored = (self.repo_dir / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn('only_mutate = ["cli/*"]', restored)
+
+    def test_changed_lines_narrows_the_wildcard_to_just_the_touched_function(self):
+        # End-to-end through the real dispatcher (run_mutation_testing),
+        # not just _wildcards_for_file in isolation: setUp's cli/scorer.py
+        # has two functions, score_test_health (lines 1-2) and other
+        # (lines 5-6); self._diff() only touches lines 1-2. Confirms the
+        # real regression this closes -- before this, mutmut would mutate
+        # and test *all* of cli/scorer.py (both functions) for a diff
+        # that only touched one of them.
+        seen_run_args = []
+
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                seen_run_args.append(args)
+                _write_stats(self.repo_dir, killed=1, survived=0, total=1)
+                return _ok()
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            run_mutation_testing(str(self.repo_dir), self._diff())
+
+        self.assertEqual(len(seen_run_args), 1)
+        self.assertEqual(seen_run_args[0][1:], ["cli.scorer.x_score_test_health__mutmut_*"])
+
+    def test_module_level_only_diff_reports_no_coverable_lines_without_invoking_mutmut(self):
+        # A diff whose only changed line is module-level (outside any
+        # function) has nothing for mutmut to mutate at all (confirmed
+        # empirically -- see _touched_functions's own docstring). Must
+        # never fall through to an *unfiltered* `mutmut run` (mutmut's
+        # own "run" with zero mutant_names means "run everything").
+        (self.repo_dir / "cli" / "scorer.py").write_text("WEIGHTS = {}\n", encoding="utf-8")
+        with patch("cli.mutation.python_runner._run_mutmut") as run_mock:
+            report = run_mutation_testing(str(self.repo_dir), {"cli/scorer.py": {1}})
+        run_mock.assert_not_called()
+        self.assertEqual(report.reason_code, REASON_CODE_NO_COVERABLE_LINES)
 
 
 class ScopedOnlyMutateTests(unittest.TestCase):

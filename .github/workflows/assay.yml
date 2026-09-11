@@ -458,17 +458,28 @@ jobs:
           # repo's own pyproject.toml `only_mutate` list to just this
           # invocation's diffed files before calling mutmut, restoring the
           # original byte-for-byte after -- cutting this PR's own real total
-          # to 8,123 mutants. The remaining count is dominated by file (not
-          # line) granularity: mutmut still mutates a touched file's *entire*
-          # content, and `cli/verify.py` (3,663 lines, only 151 of them
-          # actually changed here) alone accounts for most of what's left --
-          # a further, deeper optimization (function-level scoping via this
-          # diff's own line ranges) is real but out of scope for this fix.
-          # Real measured time for this exact PR's diff, after the scoping
-          # fix, was 20m40s locally -- this value gives real headroom above
-          # that for a slower shared CI runner, without the earlier
-          # unscoped estimate (45-90+ minutes) this fix already eliminated.
-          EXTRA_ARGS+=(--mutation-testing-timeout 1800)
+          # *generated* to 8,123 mutants (generation is still whole-file,
+          # bounded by only_mutate's file list, not line-range-aware -- see
+          # below for what closes that gap). Real measured time at this
+          # stage: 20m40s locally.
+          #
+          # Second fix, same PR: generation staying whole-file meant
+          # `cli/verify.py` (3,663 lines, only 151 of them actually changed
+          # here) still had every one of its ~8,226 mutants *tested*, not
+          # just generated -- most of the real cost. `_wildcards_for_file()`
+          # now maps this diff's own changed line ranges to their enclosing
+          # functions (AST) and builds a per-function wildcard
+          # (`<module>.x_<name>__mutmut_*`) instead of a whole-file one,
+          # narrowing what gets *tested* to just the touched functions
+          # (confirmed empirically that mutmut never mutates module-level
+          # code at all, only inside function bodies, so this is a real
+          # narrowing with no coverage loss). Cut this PR's own real
+          # *tested* count from 7,716 to 3,820 and the real measured time
+          # to 7m9s. This value keeps real headroom above that for a
+          # slower shared CI runner, well below the earlier 1800s and far
+          # below the original unscoped estimate (45-90+ minutes) both
+          # fixes together eliminated.
+          EXTRA_ARGS+=(--mutation-testing-timeout 900)
 
           # CodeQL always runs (no secret dependency), but the SARIF path
           # is still guarded on existence rather than assumed -- if the

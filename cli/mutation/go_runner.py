@@ -52,7 +52,7 @@ import json
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 
 from ..patch_coverage import UnsafeGitRefError, _validate_git_ref
 from .common import LANGUAGE_GO, LanguageRunResult, REASON_CODE_NO_COVERABLE_LINES, SurvivingMutant
@@ -160,12 +160,15 @@ def run(
     timeout_seconds: int,
     max_surviving_detail: int,
     base_sha: Optional[str] = None,
+    changed_lines: Optional[Dict[str, Set[int]]] = None,
 ) -> LanguageRunResult:
     """changed_files: already filtered to real, non-test *.go files by
     the dispatcher -- used here only to short-circuit when there's
     nothing to attempt; the actual scoping is gremlins' own `--diff`,
     not a wildcard built from this list, since gremlins does its own
-    git diffing internally."""
+    git diffing internally. `changed_lines` is likewise unused here --
+    only python_runner.py narrows further to touched functions using it
+    today; accepted for the same uniform calling convention."""
     existing_files = [f for f in changed_files if (repo_dir / f).is_file()]
     if not existing_files:
         return LanguageRunResult(language=LANGUAGE_GO, status="not_configured")

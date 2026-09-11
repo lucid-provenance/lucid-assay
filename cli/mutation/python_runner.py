@@ -68,7 +68,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from .common import (
     LANGUAGE_PYTHON,
@@ -196,6 +196,60 @@ def _wildcard_for(file_path: str) -> str:
     return f"{_dotted_module(file_path)}.*"
 
 
+def _touched_functions(repo_dir: Path, file_path: str, changed_lines: Set[int]) -> Optional[Set[str]]:
+    """Returns the set of function/method names in file_path whose own
+    line range (per ast.walk -- deliberately visiting every def
+    regardless of nesting, same style _resolve_function_line already
+    uses, since mutmut itself names a mutant after its innermost
+    function's own bare name with no class/nesting qualifier) overlaps
+    changed_lines. None when the file can't be parsed -- callers must
+    fall back to the whole-file wildcard, not guess. An empty set (not
+    None) when the file parses fine but none of changed_lines fall
+    inside any function body -- confirmed empirically (2026-09-11) that
+    mutmut never mutates module-level code at all (only inside function
+    bodies, via its trampoline mechanism), so "no touched functions"
+    genuinely means "nothing here for mutmut to mutate," not a missed-
+    coverage risk. Ambiguous when two functions share a bare name (e.g.
+    same-named methods on different classes) in the same way
+    `_resolve_function_line`'s own docstring already documents -- a
+    wildcard built from one touched same-named method also matches its
+    untouched twin's mutants, since mutmut's own naming can't
+    distinguish them either; over-inclusion, not a correctness risk."""
+    try:
+        source = (repo_dir / file_path).read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=file_path)
+    except (OSError, SyntaxError, ValueError):
+        return None
+    touched: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end = node.end_lineno or node.lineno
+            if any(node.lineno <= ln <= end for ln in changed_lines):
+                touched.add(node.name)
+    return touched
+
+
+def _wildcards_for_file(repo_dir: Path, file_path: str, changed_lines: Optional[Set[int]]) -> List[str]:
+    """The narrowest set of mutmut wildcards this file's diff supports:
+    one per touched function (`<module>.x_<name>__mutmut_*`, matching
+    mutmut's own literal naming exactly -- not `<module>.x_<name>.*`,
+    since a mutant's full name has no '.' between the function name and
+    `__mutmut_N`) when changed_lines is known and the file parses
+    cleanly; the whole-file wildcard (this module's original, pre-
+    function-scoping behavior) when changed_lines is missing/empty or
+    the file can't be parsed; no wildcard at all when the file parses
+    but genuinely has nothing touched for mutmut to mutate (see
+    _touched_functions's own docstring)."""
+    if changed_lines:
+        touched = _touched_functions(repo_dir, file_path, changed_lines)
+        if touched:
+            module = _dotted_module(file_path)
+            return [f"{module}.x_{name}__mutmut_*" for name in sorted(touched)]
+        if touched is not None:
+            return []
+    return [_wildcard_for(file_path)]
+
+
 def _run_mutmut(args: List[str], *, cwd: Path, timeout_seconds: int) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "mutmut", *args],
@@ -302,22 +356,58 @@ def run(
     timeout_seconds: int,
     max_surviving_detail: int,
     base_sha: Optional[str] = None,
+    changed_lines: Optional[Dict[str, Set[int]]] = None,
 ) -> LanguageRunResult:
     """changed_files: already filtered to real, non-test *.py files by
     the dispatcher. `base_sha` is unused here -- mutmut is scoped via a
     wildcard built from changed_files, not a git diff of its own (only
     go_runner.py's gremlins integration does its own diffing) -- accepted
     for a uniform dispatcher calling convention across every runner.
-    Always returns status="ran" or "unavailable" -- Python/mutmut has no
-    "not configured" state the way Stryker/PIT do,
-    since mutmut's own source_paths auto-guess (or the target repo's own
-    [tool.mutmut] config) means there's always *something* to attempt."""
+    `changed_lines` (this diff's own per-file changed-line-number map)
+    narrows the wildcard further, from "test every mutant in this
+    touched file" down to "test only mutants in functions this diff
+    actually touched" (confirmed empirically, 2026-09-11: on this
+    feature's own real feature-landing diff, this cut a large file like
+    verify.py -- mutated in full regardless of how few of its lines
+    changed -- down to just the handful of functions this diff actually
+    touched) -- see _wildcards_for_file's own docstring; falls back to
+    the original whole-file behavior when it's None/missing for a given
+    file (an older caller, or a file this diff's own line map doesn't
+    cover for some reason -- never silently under-scope). Always returns
+    status="ran" or "unavailable" -- Python/mutmut has no "not
+    configured" state the way Stryker/PIT do, since mutmut's own
+    source_paths auto-guess (or the target repo's own [tool.mutmut]
+    config) means there's always *something* to attempt."""
     existing_files = [f for f in changed_files if (repo_dir / f).is_file()]
     if not existing_files:
         return LanguageRunResult(language=LANGUAGE_PYTHON, status="not_configured")
 
+    changed_lines = changed_lines or {}
+    wildcards = [
+        w
+        for f in existing_files
+        for w in _wildcards_for_file(repo_dir, f, changed_lines.get(f))
+    ]
+    if not wildcards:
+        # Every touched file's own changed lines fell entirely outside
+        # any function body (module-level-only changes across the
+        # board) -- mutmut has nothing to mutate for any of them
+        # (confirmed empirically, see _touched_functions's own
+        # docstring). The same "nothing here to score" contract
+        # REASON_CODE_NO_COVERABLE_LINES already gives the equivalent
+        # case mutmut itself detects further downstream (via
+        # _NO_MATCH_MARKER) -- caught here instead, before ever
+        # invoking mutmut, which would otherwise run *unfiltered*: its
+        # own `run` with zero mutant_names means "run everything in
+        # only_mutate's scope," the opposite of what an empty wildcard
+        # list here is supposed to mean.
+        return LanguageRunResult(
+            language=LANGUAGE_PYTHON, status="ran",
+            scoped_files=existing_files,
+            reason=REASON_CODE_NO_COVERABLE_LINES,
+        )
+
     _reset_mutmut_cache(repo_dir)
-    wildcards = [_wildcard_for(f) for f in existing_files]
 
     # Scoped for the *entire* generate-run-through-read-results sequence,
     # not just the "run" subcommand: every mutmut subcommand this module

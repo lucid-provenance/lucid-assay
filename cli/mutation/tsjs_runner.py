@@ -53,7 +53,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from .common import LANGUAGE_TSJS, LanguageRunResult, REASON_CODE_NO_COVERABLE_LINES, SurvivingMutant
 
@@ -165,12 +165,15 @@ def run(
     timeout_seconds: int,
     max_surviving_detail: int,
     base_sha: Optional[str] = None,
+    changed_lines: Optional[Dict[str, Set[int]]] = None,
 ) -> LanguageRunResult:
     """changed_files: already filtered to real, non-test *.ts/*.tsx/*.js/
     *.jsx/*.mjs/*.cjs files by the dispatcher. `base_sha` is unused here
     -- accepted only for a uniform dispatcher calling convention across
     every runner (only go_runner.py's gremlins integration does its own
-    git diffing)."""
+    git diffing). `changed_lines` is likewise unused here -- only
+    python_runner.py narrows further to touched functions using it
+    today; accepted for the same uniform calling convention."""
     existing_files = [f for f in changed_files if (repo_dir / f).is_file()]
     if not existing_files:
         return LanguageRunResult(language=LANGUAGE_TSJS, status="not_configured")

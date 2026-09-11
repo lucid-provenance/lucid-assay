@@ -192,7 +192,13 @@ def run_mutation_testing(
     other runner here, which is handed an already-diffed file list and
     builds its own wildcard/glob/targetClasses from it. Every runner
     receives it for a uniform calling convention regardless; the other
-    three simply never look at it."""
+    three simply never look at it. `patch_modified_lines` itself (the
+    full per-file changed-line-number map, not just the flattened file
+    list `by_language` reduces it to) is likewise handed to every runner
+    as `changed_lines` -- today only python_runner.py uses it, to narrow
+    mutation scope from a whole changed *file* down to just its touched
+    *functions* (see that module's own docstring); the other three
+    accept and ignore it, same as `base_sha`."""
     by_language = _classify_changed_files(patch_modified_lines)
     if not by_language:
         report = not_applicable_report(
@@ -216,6 +222,7 @@ def run_mutation_testing(
             timeout_seconds=timeout_seconds,
             max_surviving_detail=max_surviving_detail,
             base_sha=base_sha,
+            changed_lines=patch_modified_lines,
         )
         for language, files in by_language.items()
     ]

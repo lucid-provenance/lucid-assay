@@ -150,6 +150,7 @@ _MUTATION_TESTING_NOT_CONFIGURED: Dict[str, Any] = {
     "total_generated": 0,
     "scoped_files": [],
     "top_surviving_mutants": [],
+    "by_language": {},
     "reason": "mutation testing was not evaluated for this run",
     "reason_code": None,
 }

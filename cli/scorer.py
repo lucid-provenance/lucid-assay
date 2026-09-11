@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 
 from .mutation import (
     REASON_CODE_INSUFFICIENT_SAMPLE as _MUTATION_REASON_INSUFFICIENT_SAMPLE,
-    REASON_CODE_NO_PYTHON_CHANGES as _MUTATION_REASON_NO_PYTHON_CHANGES,
+    REASON_CODE_NO_SOURCE_CHANGES as _MUTATION_REASON_NO_SOURCE_CHANGES,
     MutationTestReport,
 )
 from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change
@@ -392,17 +392,18 @@ def score_pipeline(
     mutation_component = _score_mutation_testing(mutation_report, cluster_weighted_sum)
 
     # Fold in mutation_testing's own degraded trigger, if any.
-    # REASON_CODE_NO_PYTHON_CHANGES ("no *.py changed at all") and
-    # REASON_CODE_INSUFFICIENT_SAMPLE ("ran, too few mutants to trust")
-    # are deliberately *not* degradation triggers -- neither is a gap,
-    # just "this control genuinely had nothing/not enough to say" (see
-    # cli.mutation's module docstring). Everything else -- the real
-    # weak/decorative tiers, and the fail-closed unavailable/skipped
-    # cases -- is, namespaced the same way branch_governance/
-    # patch_coverage's reason codes already are.
+    # REASON_CODE_NO_SOURCE_CHANGES ("no source in any supported
+    # language changed at all") and REASON_CODE_INSUFFICIENT_SAMPLE
+    # ("ran, too few mutants to trust") are deliberately *not*
+    # degradation triggers -- neither is a gap, just "this control
+    # genuinely had nothing/not enough to say" (see cli.mutation's
+    # package docstring). Everything else -- the real weak/decorative
+    # tiers, and the fail-closed unavailable/skipped cases -- is,
+    # namespaced the same way branch_governance/patch_coverage's reason
+    # codes already are.
     if mutation_report is not None and mutation_report.reason_code not in (
         None,
-        _MUTATION_REASON_NO_PYTHON_CHANGES,
+        _MUTATION_REASON_NO_SOURCE_CHANGES,
         _MUTATION_REASON_INSUFFICIENT_SAMPLE,
     ):
         degraded = True

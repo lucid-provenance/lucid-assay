@@ -31,7 +31,12 @@ cli/
   parsers/s2c2f.py          # S2C2F control evaluation (subset with a real, checkable signal) -> predicate.s2c2f
   parsers/sbom.py            # CycloneDX/SPDX SBOM ingestion -> license-policy SARIF findings + resolved_dependencies
   patch_coverage.py         # git diff base...head, intersected with coverage hit maps
-  mutation.py                # diff-scoped mutmut run (*.py only) -> predicate.mutation_testing, RCS's mutation_multiplier
+  mutation/                  # diff-scoped mutation testing dispatcher -> predicate.mutation_testing, RCS's mutation_multiplier
+    __init__.py                 # classifies changed files by language, calls each runner, combines into one score
+    common.py                    # shared result shapes + the one source of truth for grading tiers
+    python_runner.py              # mutmut
+    tsjs_runner.py                  # Stryker (TypeScript/JavaScript)
+    java_runner.py                   # PIT (Java, Maven only)
   real_coverage.py           # vanity-test-aware coverage: which covered lines are only exercised by vanity tests
   hashing.py                 # SHA-256 content hashing + WORM key derivation
   scorer.py                  # pure, deterministic Release Confidence Score (RCS)
@@ -45,7 +50,9 @@ cli/
 tests/
   test_scorer.py               # adversarial edge-case tests for the RCS algorithm
   test_patch_coverage.py        # git-diff/coverage intersection + reason_code tests (real git repo)
-  test_mutation.py               # diff-scoping, multiplier tiers, and fail-closed mutmut-subprocess tests (mocked)
+  test_mutation.py               # dispatcher + mutmut runner: language classification, multiplier tiers, multi-language aggregation
+  test_mutation_tsjs.py           # Stryker runner tests (mocked subprocess, real captured report shapes)
+  test_mutation_java.py            # PIT runner tests (mocked subprocess, real captured report shapes)
   test_builder.py               # in-toto Statement assembly tests
   test_ast_inspector.py          # real/tautological/empty assertion detection tests (Python)
   test_adversarial_ast.py         # adversarial bypass suite for the Python AST visitor
@@ -214,13 +221,24 @@ produce an identical score):
 **Mutation testing multiplier (not an additive bucket).** Coverage and
 assertion counts can both be satisfied by a test that executes a line
 without ever verifying its behavior — 95% patch coverage backed by a 20%
-mutation kill rate is mostly illusory. `cli/mutation.py` diff-scopes
-[mutmut](https://mutmut.readthedocs.io/) to just the `*.py` lines
-actually changed (via the same `git diff`-derived hunk map patch coverage
-already computes — no second git invocation), and the resulting
-`mutation_score = killed / (killed + survived) × 100` **discounts the
-Test health + Patch coverage + Overall coverage subtotal above** rather
-than adding its own weighted share:
+mutation kill rate is mostly illusory. `cli/mutation/` diff-scopes a
+real mutation-testing tool per language to just the lines actually
+changed (via the same `git diff`-derived hunk map patch coverage already
+computes — no second git invocation) — **Python via
+[mutmut](https://mutmut.readthedocs.io/)**, **TypeScript/JavaScript via
+[Stryker](https://stryker-mutator.io/)**, **Java via
+[PIT](https://pitest.org/)** (Maven only; a Gradle-only Java repo gets
+`not_applicable`, disclosed, not guessed at) — and combines every
+language's real killed/survived/timeout counts into one
+`mutation_score = killed / (killed + survived) × 100` that **discounts
+the Test health + Patch coverage + Overall coverage subtotal above**
+rather than adding its own weighted share. A diff touching more than one
+language sums their raw mutant populations before grading once — a
+project with 80 killed/20 survived in Python and 2 killed/2 survived in
+newly-touched TypeScript combines to 82/104 (~79%), not an average of
+two percentages that would misleadingly wash out the smaller language's
+real weak spot. `predicate.mutation_testing.by_language` keeps every
+language's own breakdown visible for exactly that reason:
 
 | Kill rate | Grade | Multiplier |
 |---|---|---|
@@ -229,9 +247,11 @@ than adding its own weighted share:
 | < 60% | Failed | 0.50 |
 
 Two safeguards keep this from misfiring on a run that genuinely has
-nothing (or not enough) to say: a diff with **zero coverable `*.py`
-statements** changed (comment/docstring/type-annotation-only, or no
-`*.py` touched at all) is exempt — full credit, no discount, flagged
+nothing (or not enough) to say: a diff with **zero coverable statements**
+changed in any supported language (comment/docstring/type-annotation-only,
+or no `*.py`/`*.ts`/`*.tsx`/`*.js`/`*.jsx`/`*.java` touched at all, or no
+mutation-testing tool configured in the target repo for any language it
+did touch) is exempt — full credit, no discount, flagged
 `degraded` only in the "nothing to mutate" case (namespaced
 `mutation_testing:no_coverable_lines`, allowlisted for
 `--disallow-degraded` the same way `patch_coverage:no_coverable_lines`
@@ -250,10 +270,12 @@ approximating.
 
 **CLI flags:** `cli.main`'s `--skip-mutation-testing` opts out entirely
 (fail-closed, see above — not free credit), `--mutation-testing-timeout`
-(default 90s) is the outer, provably-bounded time budget for the whole
-diff-scoped mutmut run, `--mutation-testing-min-sample` (default 3) is
-the statistical floor, and `--mutation-report-out` overrides the default
-`reports/mutation/mutation-report.json` report artifact path.
+(default 90s, applied per language a diff touches — a diff spanning
+Python and Java gets up to 2× that budget, sequentially, not split
+across them) is the outer, provably-bounded time budget, `--mutation-testing-min-sample`
+(default 3) is the statistical floor, and `--mutation-report-out`
+overrides the default `reports/mutation/mutation-report.json` report
+artifact path.
 `cli.verify`'s `--require-mutation-score` (off by default, same opt-in
 shape as `--require-slsa-build-l3`/`--require-commit-signing`) folds only
 the `failed` grade into `passed`/exit code — narrower and more targeted
@@ -330,31 +352,83 @@ working-directory string. A ref or path that fails validation degrades
 exactly like a failed `git diff` would (`available=False`, or an empty
 mapping from `compute_patch_modified_lines`), never a raw crash.
 
-**`mutation.py`** runs [mutmut](https://mutmut.readthedocs.io/) scoped to
-just the `*.py` files `compute_patch_modified_lines` says actually
-changed — reusing that same already-hardened diff, not a second git
-invocation. mutmut has no built-in diff-filtering of its own (confirmed
-against its real 3.7.0 source, not assumed from its docs), so file-level
-scoping is done by passing a `mutmut run "<dotted.module>.*"` wildcard per
-changed file — a dotted-path namespacing confirmed empirically (a mutant
-in `pkg/mathy.py` surfaces as `pkg.mathy.x_<func>__mutmut_<n>`). Mutant
-generation still covers the whole configured `source_paths` (`cli/`)
-every run — cheap, AST-based, no test execution — but only the
-wildcard-matched mutants are actually *tested*, which is what keeps this
-bounded against a 1000+-test suite. The `mutants/` cache is deleted and
-rebuilt from scratch before every invocation: `mutmut export-cicd-stats`
-aggregates across its *entire* cache directory, not just what the current
-invocation tested, so a stale result from a previous, differently-scoped
-run could otherwise silently leak into this run's `mutation_score` —
-confirmed empirically, not assumed. A wildcard matching zero mutants
-(e.g. a comment/docstring-only diff) makes mutmut's own `run` raise an
-uncaught `AssertionError` — detected via that specific stderr marker (not
-any non-zero exit, which would also fire on a genuine crash) and reported
-as the zero-mutant exemption, never propagated. Top surviving-mutant
-detail (`predicate.mutation_testing.top_surviving_mutants`) carries the
-real unified diff `mutmut show` produced for each, verbatim — never a
-synthesized mutation-operator taxonomy label mutmut doesn't itself
-expose, per this project's ground-truth-only invariant.
+**`mutation/`** is a dispatcher (same shape as `parsers/ast/` below --
+one operation, several languages, reused rather than reinvented):
+`cli.mutation.run_mutation_testing()` classifies
+`compute_patch_modified_lines`'s already-hardened diff by language --
+never a second git invocation -- excludes test files by each language's
+own naming convention, hands each language's files to its own runner,
+and sums every language's real killed/survived/timeout counts into one
+score before grading once (`cli/mutation/common.py`'s
+`grade_from_score`, the single source of truth for the tiers regardless
+of which language(s) contributed).
+
+- **`python_runner.py`** (mutmut) -- scopes file-level via a
+  `mutmut run "<dotted.module>.*"` wildcard per changed file (mutmut has
+  no built-in diff-filtering of its own; confirmed against its real
+  3.7.0 source, not assumed from its docs). Mutant generation still
+  covers the whole configured `source_paths` every run -- cheap,
+  AST-based, no test execution -- but only the wildcard-matched mutants
+  are actually *tested*, which is what keeps this bounded against a
+  1000+-test suite. The `mutants/` cache is deleted and rebuilt from
+  scratch before every invocation: `mutmut export-cicd-stats` aggregates
+  across its *entire* cache directory, not just what the current
+  invocation tested, so a stale result from a previous, differently-
+  scoped run could otherwise silently leak into this run's
+  `mutation_score` -- confirmed empirically. A wildcard matching zero
+  mutants makes mutmut's own `run` raise an uncaught `AssertionError`
+  -- detected via that specific stderr marker (not any non-zero exit,
+  which would also fire on a genuine crash) and reported as the
+  zero-mutant exemption, never propagated. Surviving-mutant detail
+  carries the real unified diff `mutmut show` produced, verbatim.
+- **`tsjs_runner.py`** ([Stryker](https://stryker-mutator.io/)) -- same
+  "read the target repo's own tool config" principle as mutmut: this
+  module never injects a test-runner config of its own, it requires the
+  target repo to already carry a complete, working Stryker config (a
+  repo with none gets `not_applicable`, not a guess). Scopes via
+  `--mutate <files>` (confirmed empirically: "Found 1 of 5 file(s) to be
+  mutated"). Unlike Python, Stryker's own JSON reporter gives
+  `location.start.line` and a real `mutatorName` per mutant out of the
+  box -- no AST-based line resolution needed. `.stryker-tmp/`, its
+  sandbox working directory, is confirmed empirically to survive in the
+  target repo after a run unless cleaned explicitly -- deleted both
+  before and after every invocation (`--cleanTempDir always` plus a
+  defensive delete either side), since leaving it behind would dirty the
+  exact working tree lucid-assay's own git-diff-based provenance hashing
+  reads next.
+- **`java_runner.py`** ([PIT](https://pitest.org/), Maven only -- a
+  Gradle-only Java repo gets `not_applicable`, disclosed) -- scopes via
+  `-DtargetClasses=<fqcn1>,<fqcn2>,...` (fully-qualified class names,
+  derived from each changed file's own `package` declaration + filename).
+  **Not** PIT's `scmMutationCoverage` goal -- confirmed empirically that
+  it doesn't exist in open-source PIT (real goal list: `help,
+  mutationCoverage, report, report-aggregate, report-aggregate-module`);
+  it's gated behind PIT's commercial ArcMutate add-on. Must run as `mvn
+  clean test-compile org.pitest:pitest-maven:mutationCoverage
+  -DtargetClasses=...` -- the bare `mutationCoverage` goal alone finds
+  zero mutations (confirmed by hitting exactly that failure; `test-compile`
+  has to run first). The XML report gives `status`/`lineNumber`/`mutator`
+  (a real, fully-qualified operator class name) and a human `description`
+  (e.g. "changed conditional boundary") per mutant -- even better ground
+  truth than mutmut's bare diff, since PIT names the mutation kind
+  itself. **Cold `.m2` cache risk, disclosed not fixed here**: an
+  ephemeral CI container with no persisted `~/.m2` downloads the entire
+  plugin/dependency graph from scratch on first use and can easily blow
+  past `--mutation-testing-timeout`'s default -- the target repo's own
+  CI config needs to persist `~/.m2` the same way it already should for
+  its normal Maven build.
+
+Every runner's surviving-mutant detail
+(`predicate.mutation_testing.top_surviving_mutants`, tagged by
+`language`) carries the tool's own real evidence verbatim -- never a
+synthesized mutation-operator taxonomy label a tool doesn't itself
+expose, per this project's ground-truth-only invariant. lucid-assay's
+own published container image stays Python-only, deliberately --
+Node/JDK/Maven aren't bundled in (a missing binary degrades to
+`unavailable`, fail-closed, not a crash); most real CI runners already
+carry all three for a genuinely polyglot repo, and bundling them into
+every pure-Python user's pull would roughly 5-10x the image size for a
+capability most pulls never use.
 
 **`parsers/ast/`** is a language-agnostic registry/dispatcher for assertion
 integrity: `inspect_test_suite()` discovers test files across four
@@ -1788,11 +1862,14 @@ python3 -m cli.main \
 # Omit it to skip the vanity-test-aware "real" coverage analysis entirely.
 #
 # Diff-scoped mutation testing (see "Deterministic scoring (RCS)" above)
-# needs `mutmut` installed (`pip install -e ".[dev]"`) plus a real
-# --base-sha/--head-sha pointing at an actual git diff with changed
-# *.py lines -- the fake all-'a'/all-'b' SHAs in this example produce
-# an empty diff, so mutation testing reports grade=not_applicable and
-# applies no discount, same as any docs-only PR would. Override its
+# needs, per language a diff touches: Python -- `mutmut` installed
+# (`pip install -e ".[dev]"`); TypeScript/JavaScript -- `node`/`npx` on
+# PATH and a working Stryker config already in the target repo; Java --
+# `mvn` on PATH and a `pitest-maven` plugin already in the target repo's
+# pom.xml. All three also need a real --base-sha/--head-sha pointing at
+# an actual git diff -- the fake all-'a'/all-'b' SHAs in this example
+# produce an empty diff, so mutation testing reports grade=not_applicable
+# and applies no discount, same as any docs-only PR would. Override its
 # defaults with --skip-mutation-testing/--mutation-testing-timeout/
 # --mutation-testing-min-sample/--mutation-report-out.
 #

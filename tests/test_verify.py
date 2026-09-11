@@ -1770,6 +1770,26 @@ class FormatMutationTestingReportTests(unittest.TestCase):
         self.assertIn("[!] Test & Coverage score discounted by 15%", text)
         self.assertIn("cli/scorer.py:236 in _score_governance [survived]", text)
 
+    def test_by_language_breakdown_is_rendered_per_language(self):
+        evidence = _mutation_evidence(
+            by_language={
+                "python": {"killed": 80, "survived": 20, "timeout": 0},
+                "typescript_javascript": {"killed": 2, "survived": 2, "timeout": 0},
+            },
+        )
+        text = "\n".join(_format_mutation_testing_report(evidence))
+        self.assertIn("python: 80 killed, 20 survived, 0 timed out", text)
+        self.assertIn("typescript_javascript: 2 killed, 2 survived, 0 timed out", text)
+
+    def test_surviving_mutant_language_tag_is_rendered(self):
+        evidence = _mutation_evidence(
+            top_surviving_mutants=[
+                {"language": "java", "file": "Mathy.java", "function": "weaklyTested", "status": "survived", "line": 9, "diff": "..."},
+            ],
+        )
+        text = "\n".join(_format_mutation_testing_report(evidence))
+        self.assertIn("[java] Mathy.java:9 in weaklyTested [survived]", text)
+
     def test_null_score_renders_as_not_available_rather_than_crashing(self):
         text = "\n".join(_format_mutation_testing_report(_mutation_evidence(grade="not_applicable", mutation_score=None)))
         self.assertIn("score=n/a", text)

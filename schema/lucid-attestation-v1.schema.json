@@ -574,21 +574,21 @@
     "mutation_testing": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Diff-scoped mutation testing (cli/mutation.py, mutmut) over the cli/*.py lines actually changed in this run's diff -- the real signal release_confidence_score.components.mutation_testing's multiplier is derived from. Absent on attestations predating this field.",
+      "description": "Diff-scoped mutation testing over the source lines actually changed in this run's diff -- Python (mutmut), TypeScript/JavaScript (Stryker), and Java (PIT), combined by cli/mutation's dispatcher into one score (see `by_language` for the per-language breakdown) -- the real signal release_confidence_score.components.mutation_testing's multiplier is derived from. Absent on attestations predating this field.",
       "properties": {
-        "available": { "type": "boolean", "description": "False when mutation testing genuinely wasn't evaluated (no cli/*.py changes, or the caller opted out) -- distinct from a real run that found nothing to discount." },
+        "available": { "type": "boolean", "description": "False when mutation testing genuinely wasn't evaluated (no source changes in a supported language, no tool configured for any language touched, or the caller opted out) -- distinct from a real run that found nothing to discount." },
         "grade": { "type": "string", "enum": ["passed", "degraded", "failed", "not_applicable", "insufficient_sample"] },
         "multiplier": { "type": "number", "minimum": 0, "maximum": 1 },
-        "mutation_score": { "type": ["number", "null"], "minimum": 0, "maximum": 100, "description": "killed / (killed + survived) * 100; null when it couldn't be computed (no mutants tested, or killed+survived=0)." },
+        "mutation_score": { "type": ["number", "null"], "minimum": 0, "maximum": 100, "description": "killed / (killed + survived) * 100, summed across every language that actually ran; null when it couldn't be computed (no mutants tested, or killed+survived=0)." },
         "killed": { "type": "integer", "minimum": 0 },
         "survived": { "type": "integer", "minimum": 0 },
         "timeout": { "type": "integer", "minimum": 0 },
         "tested": { "type": "integer", "minimum": 0, "description": "killed + survived + timeout -- the real sample size, distinct from total_generated." },
-        "total_generated": { "type": "integer", "minimum": 0, "description": "Every mutant mutmut generated across its configured source_paths, including ones never selected for testing this run -- not the sample size; see `tested`." },
+        "total_generated": { "type": "integer", "minimum": 0, "description": "Every mutant the tool(s) generated across their configured scope, including ones never selected for testing this run -- not the sample size; see `tested`." },
         "scoped_files": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "The cli/*.py files this run's diff touched and mutation-tested against."
+          "description": "Every file, across every language, this run's diff touched and mutation-tested against."
         },
         "top_surviving_mutants": {
           "type": "array",
@@ -596,13 +596,29 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["file", "function", "status", "diff"],
+            "required": ["language", "file", "function", "status", "diff"],
             "properties": {
+              "language": { "type": "string", "enum": ["python", "typescript_javascript", "java"] },
               "file": { "type": "string" },
               "function": { "type": "string" },
               "status": { "type": "string", "enum": ["survived", "timeout"] },
-              "line": { "type": ["integer", "null"], "description": "Best-effort locator (AST lookup of the function's own definition) -- the diff itself, not this line number, is the ground-truth evidence for a surviving mutant." },
-              "diff": { "type": "string", "description": "The real unified diff mutmut produced for this mutant, verbatim -- never a synthesized mutation-operator taxonomy label mutmut doesn't itself expose." }
+              "line": { "type": ["integer", "null"], "description": "Python: best-effort AST lookup of the function's own definition. TypeScript/JavaScript (Stryker) and Java (PIT): the tool's own reported line number, real ground truth, not a locator. The diff/description text, not this field alone, is the primary evidence for a surviving mutant." },
+              "diff": { "type": "string", "description": "Python: the real unified diff mutmut produced for this mutant, verbatim. TypeScript/JavaScript: the tool's own mutatorName + replacement value. Java: PIT's own mutator class + human description (e.g. \"changed conditional boundary\") -- real ground truth in both cases, never a taxonomy label the tool itself doesn't expose." }
+            }
+          }
+        },
+        "by_language": {
+          "type": "object",
+          "description": "Per-language breakdown (killed/survived/timeout/total_generated/scoped_files) for every language that actually ran -- mirrors assertion_density.languages' own per-language precedent. A language with no tool configured in this repo, or that had no changed files in this diff, is simply absent here (never a fabricated zero). Absent/empty on attestations predating this field, or a single-language run that never populated it.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "killed": { "type": "integer", "minimum": 0 },
+              "survived": { "type": "integer", "minimum": 0 },
+              "timeout": { "type": "integer", "minimum": 0 },
+              "total_generated": { "type": "integer", "minimum": 0 },
+              "scoped_files": { "type": "array", "items": { "type": "string" } }
             }
           }
         },

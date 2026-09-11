@@ -1453,14 +1453,20 @@ _MUTATION_GRADE_MARK = {"passed": "✓", "degraded": "!", "failed": "✗"}
 
 def _format_mutation_testing_report(evidence: Dict[str, Any]) -> List[str]:
     """Renders the Mutation Testing section: the real kill-rate signal
-    cli/mutation.py computed and cli/scorer.py's mutation_testing
-    component discounted the Test & Coverage score by (see
-    _extract_mutation_evidence). [] (no section at all) when this
-    predicate predates the field or mutation testing wasn't evaluated for
-    this run -- same "nothing to show" convention as every other optional
-    section here. not_applicable/insufficient_sample render as a plain
-    informational line (✓-equivalent, no discount, not a pass/fail claim)
-    since neither is a real signal one way or the other."""
+    cli/mutation (Python/mutmut, TypeScript-JavaScript/Stryker, Java/PIT
+    -- combined by that package's dispatcher) computed and
+    cli/scorer.py's mutation_testing component discounted the Test &
+    Coverage score by (see _extract_mutation_evidence). [] (no section
+    at all) when this predicate predates the field or mutation testing
+    wasn't evaluated for this run -- same "nothing to show" convention
+    as every other optional section here. not_applicable/
+    insufficient_sample render as a plain informational line
+    (✓-equivalent, no discount, not a pass/fail claim) since neither is
+    a real signal one way or the other. `by_language`, when present,
+    renders as one line per language that actually ran -- absent
+    entirely on an older, single-language-only attestation, or when
+    every language's tool reported the same not_applicable/unavailable
+    state (nothing per-language worth breaking out)."""
     if not evidence:
         return []
     grade = evidence.get("grade", "not_applicable")
@@ -1469,6 +1475,15 @@ def _format_mutation_testing_report(evidence: Dict[str, Any]) -> List[str]:
     lines = [f"=== Mutation Testing (diff-scoped, grade={grade}, score={score_str}) ==="]
     mark = _MUTATION_GRADE_MARK.get(grade, "-")
     lines.append(f"[{mark}] {evidence.get('reason', '')}")
+    by_language = evidence.get("by_language")
+    if isinstance(by_language, dict) and by_language:
+        for lang, detail in sorted(by_language.items()):
+            if not isinstance(detail, dict):
+                continue
+            lines.append(
+                f"    {lang}: {detail.get('killed', 0)} killed, {detail.get('survived', 0)} survived, "
+                f"{detail.get('timeout', 0)} timed out"
+            )
     scoped_files = evidence.get("scoped_files")
     if isinstance(scoped_files, list) and scoped_files:
         lines.append(f"    scoped to: {', '.join(scoped_files)}")
@@ -1479,7 +1494,8 @@ def _format_mutation_testing_report(evidence: Dict[str, Any]) -> List[str]:
             if not isinstance(m, dict):
                 continue
             loc = f"{m.get('file')}:{m.get('line')}" if m.get("line") is not None else str(m.get("file"))
-            lines.append(f"      - {loc} in {m.get('function')} [{m.get('status')}]")
+            lang_prefix = f"[{m.get('language')}] " if m.get("language") else ""
+            lines.append(f"      - {lang_prefix}{loc} in {m.get('function')} [{m.get('status')}]")
     lines.append(_SECTION_DIVIDER)
     return lines
 

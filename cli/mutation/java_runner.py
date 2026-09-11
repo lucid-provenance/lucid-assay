@@ -164,9 +164,12 @@ def run(
     *,
     timeout_seconds: int,
     max_surviving_detail: int,
+    base_sha: Optional[str] = None,
 ) -> LanguageRunResult:
     """changed_files: already filtered to real, non-test *.java files by
-    the dispatcher."""
+    the dispatcher. `base_sha` is unused here -- accepted only for a
+    uniform dispatcher calling convention across every runner (only
+    go_runner.py's gremlins integration does its own git diffing)."""
     existing_files = [f for f in changed_files if (repo_dir / f).is_file()]
     if not existing_files:
         return LanguageRunResult(language=LANGUAGE_JAVA, status="not_configured")

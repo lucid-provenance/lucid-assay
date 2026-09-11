@@ -1043,6 +1043,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 timeout_seconds=args.mutation_testing_timeout,
                 min_sample_size=args.mutation_testing_min_sample,
                 report_out=args.mutation_report_out or str(Path(args.repo_dir) / "reports" / "mutation" / "mutation-report.json"),
+                base_sha=args.base_sha,
             )
 
     # 6. Deterministic scoring

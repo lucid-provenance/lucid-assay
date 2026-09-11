@@ -47,6 +47,7 @@ DEFAULT_MAX_SURVIVING_DETAIL = 5
 LANGUAGE_PYTHON = "python"
 LANGUAGE_TSJS = "typescript_javascript"
 LANGUAGE_JAVA = "java"
+LANGUAGE_GO = "go"
 
 
 @dataclass

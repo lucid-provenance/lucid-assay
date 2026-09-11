@@ -175,10 +175,15 @@ def run(
     *,
     timeout_seconds: int,
     max_surviving_detail: int,
+    base_sha: Optional[str] = None,
 ) -> LanguageRunResult:
     """changed_files: already filtered to real, non-test *.py files by
-    the dispatcher. Always returns status="ran" or "unavailable" --
-    Python/mutmut has no "not configured" state the way Stryker/PIT do,
+    the dispatcher. `base_sha` is unused here -- mutmut is scoped via a
+    wildcard built from changed_files, not a git diff of its own (only
+    go_runner.py's gremlins integration does its own diffing) -- accepted
+    for a uniform dispatcher calling convention across every runner.
+    Always returns status="ran" or "unavailable" -- Python/mutmut has no
+    "not configured" state the way Stryker/PIT do,
     since mutmut's own source_paths auto-guess (or the target repo's own
     [tool.mutmut] config) means there's always *something* to attempt."""
     existing_files = [f for f in changed_files if (repo_dir / f).is_file()]

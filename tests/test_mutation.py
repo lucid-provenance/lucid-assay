@@ -22,6 +22,7 @@ from cli.mutation.common import (
     MULTIPLIER_NOT_APPLICABLE,
     MULTIPLIER_PASSED,
     MULTIPLIER_UNAVAILABLE,
+    LANGUAGE_GO,
     LANGUAGE_JAVA,
     LANGUAGE_PYTHON,
     LANGUAGE_TSJS,
@@ -61,12 +62,15 @@ class ClassifyChangedFilesTests(unittest.TestCase):
             "src/app/handlers.spec.ts": {1},
             "mathy/Mathy.java": {1},
             "mathy/MathyTest.java": {1},
+            "mathy/mathy.go": {1},
+            "mathy/mathy_test.go": {1},
             "README.md": {1},
         }
         result = _classify_changed_files(changed)
         self.assertEqual(result[LANGUAGE_PYTHON], ["cli/scorer.py"])
         self.assertEqual(result[LANGUAGE_TSJS], ["src/app/handlers.ts"])
         self.assertEqual(result[LANGUAGE_JAVA], ["mathy/Mathy.java"])
+        self.assertEqual(result[LANGUAGE_GO], ["mathy/mathy.go"])
 
     def test_empty_diff_yields_empty_dict(self):
         self.assertEqual(_classify_changed_files({}), {})

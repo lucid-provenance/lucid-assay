@@ -68,10 +68,11 @@ import re
 from typing import Dict, List, Optional, Set
 
 from ..common import UnsafePathError, safe_resolve_path
-from . import java_runner, python_runner, tsjs_runner
+from . import go_runner, java_runner, python_runner, tsjs_runner
 from .common import (
     DEFAULT_MAX_SURVIVING_DETAIL,
     DEFAULT_TIMEOUT_SECONDS,
+    LANGUAGE_GO,
     LANGUAGE_JAVA,
     LANGUAGE_PYTHON,
     LANGUAGE_TSJS,
@@ -113,11 +114,14 @@ _TSJS_TEST_FILE_RE = re.compile(r"\.(test|spec)\.[jt]sx?$")
 _TSJS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 # Mirrors java_visitor.py's own discovery convention.
 _JAVA_TEST_FILE_RE = re.compile(r"^(?:.*Test|.*Tests|.*TestCase)\.java$")
+# Mirrors go_visitor.py's own discovery convention.
+_GO_TEST_FILE_RE = re.compile(r"^.*_test\.go$")
 
 _RUNNERS = {
     LANGUAGE_PYTHON: python_runner.run,
     LANGUAGE_TSJS: tsjs_runner.run,
     LANGUAGE_JAVA: java_runner.run,
+    LANGUAGE_GO: go_runner.run,
 }
 
 
@@ -140,6 +144,11 @@ def _is_java_test_path(file_path: str) -> bool:
     return bool(_JAVA_TEST_FILE_RE.match(name))
 
 
+def _is_go_test_path(file_path: str) -> bool:
+    name = file_path.replace("\\", "/").split("/")[-1]
+    return bool(_GO_TEST_FILE_RE.match(name))
+
+
 def _classify_changed_files(patch_modified_lines: Dict[str, Set[int]]) -> Dict[str, List[str]]:
     """The already-computed diff (patch_coverage.compute_patch_modified_lines,
     repo-root-relative paths), split by language and stripped of test
@@ -156,6 +165,8 @@ def _classify_changed_files(patch_modified_lines: Dict[str, Set[int]]) -> Dict[s
             by_language.setdefault(LANGUAGE_TSJS, []).append(f)
         elif f.endswith(".java") and not _is_java_test_path(f):
             by_language.setdefault(LANGUAGE_JAVA, []).append(f)
+        elif f.endswith(".go") and not _is_go_test_path(f):
+            by_language.setdefault(LANGUAGE_GO, []).append(f)
     return by_language
 
 
@@ -174,11 +185,18 @@ def run_mutation_testing(
     min_sample_size: int = MUTATION_MIN_SAMPLE_SIZE_DEFAULT,
     max_surviving_detail: int = DEFAULT_MAX_SURVIVING_DETAIL,
     report_out: Optional[str] = None,
+    base_sha: Optional[str] = None,
 ) -> MutationTestReport:
+    """`base_sha` is only actually consumed by go_runner.py -- gremlins
+    does its own git diffing internally via `--diff <ref>`, unlike every
+    other runner here, which is handed an already-diffed file list and
+    builds its own wildcard/glob/targetClasses from it. Every runner
+    receives it for a uniform calling convention regardless; the other
+    three simply never look at it."""
     by_language = _classify_changed_files(patch_modified_lines)
     if not by_language:
         report = not_applicable_report(
-            "no *.py/*.ts/*.tsx/*.js/*.jsx/*.java source changed in this diff "
+            "no *.py/*.ts/*.tsx/*.js/*.jsx/*.java/*.go source changed in this diff "
             "(mutation testing not applicable)"
         )
         _write_report(report, report_out)
@@ -193,7 +211,11 @@ def run_mutation_testing(
 
     results: List[LanguageRunResult] = [
         _RUNNERS[language](
-            safe_repo_dir, files, timeout_seconds=timeout_seconds, max_surviving_detail=max_surviving_detail
+            safe_repo_dir,
+            files,
+            timeout_seconds=timeout_seconds,
+            max_surviving_detail=max_surviving_detail,
+            base_sha=base_sha,
         )
         for language, files in by_language.items()
     ]

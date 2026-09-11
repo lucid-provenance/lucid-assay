@@ -598,12 +598,12 @@
             "additionalProperties": false,
             "required": ["language", "file", "function", "status", "diff"],
             "properties": {
-              "language": { "type": "string", "enum": ["python", "typescript_javascript", "java"] },
+              "language": { "type": "string", "enum": ["python", "typescript_javascript", "java", "go"] },
               "file": { "type": "string" },
               "function": { "type": "string" },
               "status": { "type": "string", "enum": ["survived", "timeout"] },
               "line": { "type": ["integer", "null"], "description": "Python: best-effort AST lookup of the function's own definition. TypeScript/JavaScript (Stryker) and Java (PIT): the tool's own reported line number, real ground truth, not a locator. The diff/description text, not this field alone, is the primary evidence for a surviving mutant." },
-              "diff": { "type": "string", "description": "Python: the real unified diff mutmut produced for this mutant, verbatim. TypeScript/JavaScript: the tool's own mutatorName + replacement value. Java: PIT's own mutator class + human description (e.g. \"changed conditional boundary\") -- real ground truth in both cases, never a taxonomy label the tool itself doesn't expose." }
+              "diff": { "type": "string", "description": "Python: the real unified diff mutmut produced for this mutant, verbatim. TypeScript/JavaScript: the tool's own mutatorName + replacement value. Java: PIT's own mutator class + human description (e.g. \"changed conditional boundary\"). Go: gremlins' own mutation type + file:line:column. Real ground truth in every case, never a taxonomy label the tool itself doesn't expose." }
             }
           }
         },

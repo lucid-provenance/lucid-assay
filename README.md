@@ -37,6 +37,7 @@ cli/
     python_runner.py              # mutmut
     tsjs_runner.py                  # Stryker (TypeScript/JavaScript)
     java_runner.py                   # PIT (Java, Maven only)
+    go_runner.py                       # gremlins (Go)
   real_coverage.py           # vanity-test-aware coverage: which covered lines are only exercised by vanity tests
   hashing.py                 # SHA-256 content hashing + WORM key derivation
   scorer.py                  # pure, deterministic Release Confidence Score (RCS)
@@ -53,6 +54,7 @@ tests/
   test_mutation.py               # dispatcher + mutmut runner: language classification, multiplier tiers, multi-language aggregation
   test_mutation_tsjs.py           # Stryker runner tests (mocked subprocess, real captured report shapes)
   test_mutation_java.py            # PIT runner tests (mocked subprocess, real captured report shapes)
+  test_mutation_go.py               # gremlins runner tests (mocked subprocess, real captured report shapes)
   test_builder.py               # in-toto Statement assembly tests
   test_ast_inspector.py          # real/tautological/empty assertion detection tests (Python)
   test_adversarial_ast.py         # adversarial bypass suite for the Python AST visitor
@@ -224,11 +226,13 @@ without ever verifying its behavior — 95% patch coverage backed by a 20%
 mutation kill rate is mostly illusory. `cli/mutation/` diff-scopes a
 real mutation-testing tool per language to just the lines actually
 changed (via the same `git diff`-derived hunk map patch coverage already
-computes — no second git invocation) — **Python via
-[mutmut](https://mutmut.readthedocs.io/)**, **TypeScript/JavaScript via
-[Stryker](https://stryker-mutator.io/)**, **Java via
-[PIT](https://pitest.org/)** (Maven only; a Gradle-only Java repo gets
-`not_applicable`, disclosed, not guessed at) — and combines every
+computes for Python/TypeScript/JavaScript/Java — no second git
+invocation; Go's own tool does its own git diffing internally instead,
+see below) — **Python via [mutmut](https://mutmut.readthedocs.io/)**,
+**TypeScript/JavaScript via [Stryker](https://stryker-mutator.io/)**,
+**Java via [PIT](https://pitest.org/)** (Maven only; a Gradle-only Java
+repo gets `not_applicable`, disclosed, not guessed at), **Go via
+[gremlins](https://gremlins.dev/)** — and combines every
 language's real killed/survived/timeout counts into one
 `mutation_score = killed / (killed + survived) × 100` that **discounts
 the Test health + Patch coverage + Overall coverage subtotal above**
@@ -249,7 +253,7 @@ language's own breakdown visible for exactly that reason:
 Two safeguards keep this from misfiring on a run that genuinely has
 nothing (or not enough) to say: a diff with **zero coverable statements**
 changed in any supported language (comment/docstring/type-annotation-only,
-or no `*.py`/`*.ts`/`*.tsx`/`*.js`/`*.jsx`/`*.java` touched at all, or no
+or no `*.py`/`*.ts`/`*.tsx`/`*.js`/`*.jsx`/`*.java`/`*.go` touched at all, or no
 mutation-testing tool configured in the target repo for any language it
 did touch) is exempt — full credit, no discount, flagged
 `degraded` only in the "nothing to mutate" case (namespaced
@@ -417,6 +421,22 @@ of which language(s) contributed).
   past `--mutation-testing-timeout`'s default -- the target repo's own
   CI config needs to persist `~/.m2` the same way it already should for
   its normal Maven build.
+- **`go_runner.py`** ([gremlins](https://gremlins.dev/)) -- chosen over
+  a flashier-README 5-star fork (`jonbaldie/go-mutesting`, marketing
+  `--changed-since` and an "agentic JSON" report) the same way PIT was
+  chosen over an unverified ArcMutate claim: real community adoption
+  (400+ stars, active releases) over an unproven README. Unlike every
+  other runner here, gremlins does its own git diffing internally --
+  `gremlins unleash . --diff <base_sha>` (confirmed empirically: a
+  mutant outside the diff range reports `status: "SKIPPED"` in the JSON
+  report; earlier docs claiming no path argument and no diff mode at
+  all were stale, superseded by a real `go install ...@latest`), so this
+  is the only runner that needs `base_sha` at all rather than a
+  changed-file list. `"NOT COVERED"` (a genuinely-reached but
+  insufficiently-asserted branch, confirmed against a real
+  `go test -coverprofile` showing partial coverage on the same line,
+  not a gremlins quirk) folds into `survived` for scoring, the same
+  "escaped detection" signal `"LIVED"` is, not a lesser one.
 
 Every runner's surviving-mutant detail
 (`predicate.mutation_testing.top_surviving_mutants`, tagged by
@@ -424,9 +444,9 @@ Every runner's surviving-mutant detail
 synthesized mutation-operator taxonomy label a tool doesn't itself
 expose, per this project's ground-truth-only invariant. lucid-assay's
 own published container image stays Python-only, deliberately --
-Node/JDK/Maven aren't bundled in (a missing binary degrades to
+Node/JDK/Maven/Go aren't bundled in (a missing binary degrades to
 `unavailable`, fail-closed, not a crash); most real CI runners already
-carry all three for a genuinely polyglot repo, and bundling them into
+carry all four for a genuinely polyglot repo, and bundling them into
 every pure-Python user's pull would roughly 5-10x the image size for a
 capability most pulls never use.
 
@@ -1866,7 +1886,8 @@ python3 -m cli.main \
 # (`pip install -e ".[dev]"`); TypeScript/JavaScript -- `node`/`npx` on
 # PATH and a working Stryker config already in the target repo; Java --
 # `mvn` on PATH and a `pitest-maven` plugin already in the target repo's
-# pom.xml. All three also need a real --base-sha/--head-sha pointing at
+# pom.xml; Go -- `gremlins` on PATH and a `go.mod` at the repo root. All
+# four also need a real --base-sha/--head-sha pointing at
 # an actual git diff -- the fake all-'a'/all-'b' SHAs in this example
 # produce an empty diff, so mutation testing reports grade=not_applicable
 # and applies no discount, same as any docs-only PR would. Override its

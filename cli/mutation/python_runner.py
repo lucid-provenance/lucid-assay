@@ -68,7 +68,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Tuple
 
 from .common import (
     LANGUAGE_PYTHON,
@@ -79,35 +79,85 @@ from .common import (
 
 _NO_MATCH_MARKER = "Filtered for specific mutants, but nothing matches"
 _MUTANT_KEY_RE = re.compile(r"^x_(?P<func>.+)__mutmut_\d+$")
-_RESULT_LINE_RE = re.compile(r"^\s*(?P<key>\S+):\s*(?P<status>\S+)\s*$")
 
-# Anchors on the [tool.mutmut] table header and captures everything up to
-# the next top-level table header (or end of file) -- so an `only_mutate`
-# key belonging to some *other* table is never touched.
-_TOOL_MUTMUT_SECTION_RE = re.compile(r"(?ms)^\[tool\.mutmut\]\s*$(?P<body>.*?)(?=^\[|\Z)")
-_ONLY_MUTATE_LINE_RE = re.compile(r"(?m)^only_mutate\s*=\s*\[[^\]]*\]\s*$")
+
+def _parse_result_line(line: str) -> Optional[Tuple[str, str]]:
+    """Parses one `mutmut results` output line ("  <key>: <status>") into
+    (key, status), or None when the line doesn't have that shape. A plain
+    split, not a regex -- SonarQube flagged an earlier regex-based version
+    of this (`_RESULT_LINE_RE`) for superlinear backtracking risk; a split
+    has no such risk and is exactly as precise for this fixed, simple
+    format (mutmut keys are dotted Python identifiers, which structurally
+    never contain ':', so splitting on the first one is unambiguous)."""
+    key, sep, status = line.strip().partition(":")
+    key = key.strip()
+    status = status.strip()
+    if not sep or not key or not status or " " in key or " " in status:
+        return None
+    return key, status
+
+
+def _find_tool_mutmut_section(lines: List[str]) -> Optional[Tuple[int, int]]:
+    """Returns the (start, end) line-index span (end exclusive) of the
+    [tool.mutmut] table's body -- the lines after its own header line, up
+    to (not including) the next top-level table header or end of file.
+    None when no [tool.mutmut] header line exists. A plain line scan, not
+    a regex -- SonarQube flagged an earlier regex-based version of this
+    section-finder for an implicit-operator-precedence code smell; a
+    scan has no such ambiguity and is exactly as precise for this fixed,
+    line-oriented TOML shape (see _build_scoped_pyproject_text's own
+    docstring for the one real behavior difference this implies)."""
+    header_index = next((i for i, line in enumerate(lines) if line.strip() == "[tool.mutmut]"), None)
+    if header_index is None:
+        return None
+    end = len(lines)
+    for i in range(header_index + 1, len(lines)):
+        if lines[i].strip().startswith("["):
+            end = i
+            break
+    return header_index + 1, end
+
+
+def _is_only_mutate_assignment(line: str) -> bool:
+    """True for a real `only_mutate = [...]` TOML array assignment
+    written entirely on this one line -- a plain string check, not a
+    regex, see _find_tool_mutmut_section's own docstring for why."""
+    stripped = line.strip()
+    if not stripped.startswith("only_mutate"):
+        return False
+    rest = stripped[len("only_mutate"):].lstrip()
+    if not rest.startswith("="):
+        return False
+    value = rest[1:].lstrip()
+    return value.startswith("[") and value.endswith("]")
 
 
 def _build_scoped_pyproject_text(original_text: str, existing_files: List[str]) -> Optional[str]:
     """Returns pyproject.toml's text with only_mutate narrowed to just
     existing_files, or None when it can't be done with confidence (no
     [tool.mutmut] table, or not exactly one only_mutate assignment inside
-    it) -- callers must fall back to the original, unscoped-but-correct
-    text rather than guess. json.dumps is used for TOML string quoting: a
+    it, written on a single line -- a multi-line array is deliberately
+    not handled, since this repo's own config (and every real config seen
+    so far) writes it on one line; falling back to unscoped-but-correct
+    behavior for the rare exception is the same safe contract every
+    other "can't confidently narrow" case here already follows) --
+    callers must fall back to the original, unscoped-but-correct text
+    rather than guess. json.dumps is used for TOML string quoting: a
     plain file path (this function's only input) never hits a case where
     JSON's and TOML's basic-string escaping rules diverge."""
-    section_match = _TOOL_MUTMUT_SECTION_RE.search(original_text)
-    if section_match is None:
+    lines = original_text.splitlines(keepends=True)
+    section = _find_tool_mutmut_section(lines)
+    if section is None:
         return None
-    body = section_match.group("body")
-    matches = list(_ONLY_MUTATE_LINE_RE.finditer(body))
-    if len(matches) != 1:
+    start, end = section
+    only_mutate_indices = [i for i in range(start, end) if _is_only_mutate_assignment(lines[i])]
+    if len(only_mutate_indices) != 1:
         return None
+    idx = only_mutate_indices[0]
     scoped_list = ", ".join(json.dumps(f) for f in existing_files)
-    new_line = f"only_mutate = [{scoped_list}]"
-    new_body = body[: matches[0].start()] + new_line + body[matches[0].end():]
-    start, end = section_match.span("body")
-    return original_text[:start] + new_body + original_text[end:]
+    newline = "\n" if lines[idx].endswith("\n") else ""
+    lines[idx] = f"only_mutate = [{scoped_list}]{newline}"
+    return "".join(lines)
 
 
 @contextmanager
@@ -217,12 +267,13 @@ def _collect_surviving_detail(
 
     candidates: List[tuple] = []
     for line in proc.stdout.splitlines():
-        m = _RESULT_LINE_RE.match(line)
-        if not m or m.group("status") not in ("survived", "timeout"):
+        parsed = _parse_result_line(line)
+        if parsed is None or parsed[1] not in ("survived", "timeout"):
             continue
-        resolved = _parse_mutant_key(m.group("key"), scoped_files)
+        key, status = parsed
+        resolved = _parse_mutant_key(key, scoped_files)
         if resolved is not None:
-            candidates.append((m.group("key"), m.group("status"), *resolved))
+            candidates.append((key, status, *resolved))
 
     detail: List[SurvivingMutant] = []
     for key, status, file_path, func_name in candidates[:max_detail]:

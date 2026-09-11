@@ -430,11 +430,31 @@ jobs:
               echo "ERROR: BASE_SHA resolved but PR_NUMBER did not; refusing to mint with inconsistent PR context" >&2
               exit 1
             fi
-            EXTRA_ARGS=(--base-sha "$BASE_SHA" --pr-number "$PR_NUMBER")
+            EXTRA_ARGS+=(--base-sha "$BASE_SHA" --pr-number "$PR_NUMBER")
           elif [ "$EVENT_NAME" = "pull_request" ]; then
             echo "ERROR: github.event.pull_request.base.sha was empty on a pull_request event; refusing to guess a base commit" >&2
             exit 1
           fi
+
+          # cli.main's own --mutation-testing-timeout default (90s) is sized
+          # for a typical PR's diff on a local dev machine, not a large
+          # feature-landing diff on a shared GitHub Actions runner. Confirmed
+          # empirically on this repo's own PR #96 (the mutation-testing
+          # feature itself, ~534 changed lines across ~10 files): mutmut hit
+          # the 90s ceiling and reported the whole language `unavailable`,
+          # which --disallow-degraded then correctly (fail-closed) blocked
+          # on, since "unavailable" isn't an allowlisted degraded reason.
+          # This override raises CI's own budget well past that observed
+          # failure without touching the library default that local/small-
+          # diff runs still rely on. Mutant *generation* cost is roughly
+          # diff-size-independent (~22s for this repo's whole `cli/`
+          # package, measured locally); mutant *testing* cost scales with
+          # how many mutants the touched files produce, compounded here by
+          # a shared runner being slower than local dev hardware -- if this
+          # ever gets tight again, the real fix is scoping mutmut's own
+          # generation to just the changed files/dirs, not just raising this
+          # number further.
+          EXTRA_ARGS+=(--mutation-testing-timeout 600)
 
           # CodeQL always runs (no secret dependency), but the SARIF path
           # is still guarded on existence rather than assumed -- if the

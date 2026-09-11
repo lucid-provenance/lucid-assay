@@ -79,7 +79,20 @@
             "email": { "type": ["string", "null"] },
             "github_login": { "type": ["string", "null"] },
             "verified_github_account": { "type": "boolean" },
-            "reason": { "type": "string" }
+            "reason": { "type": "string" },
+            "commit_signature_verified": {
+              "type": ["boolean", "null"],
+              "description": "A genuinely stronger claim than verified_github_account: whether this exact commit carries a cryptographic signature (GPG/SSH) GitHub itself verified. Null when not determined -- unavailable, not captured, or a GitHub-web-flow merge/squash/rebase walk-back that exhausted its hop limit -- never treated as a confirmed pass. See cli/parsers/commit_author.py's module docstring for the merge/squash/rebase walk-back this reflects."
+            },
+            "commit_signature_reason": { "type": ["string", "null"] },
+            "commit_signature_type": {
+              "type": ["string", "null"],
+              "description": "Inferred from the raw PEM signature header (e.g. \"gpg\"/\"ssh\") since GitHub's commits API exposes no parsed key-ID/fingerprint field. Null when no signature was evaluated."
+            },
+            "commit_signature_source_sha": {
+              "type": ["string", "null"],
+              "description": "The commit whose own signature this verdict actually describes. Null when the originally-requested commit's own signature was evaluated directly; set to a different SHA when that commit was a GitHub-web-flow-generated merge/squash/rebase commit and this walked back to the real pre-merge branch tip instead."
+            }
           },
           "required": ["available", "commit_sha", "verified_github_account", "reason"]
         }

@@ -492,11 +492,26 @@ jobs:
           # code at all, only inside function bodies, so this is a real
           # narrowing with no coverage loss). Cut this PR's own real
           # *tested* count from 7,716 to 3,820 and the real measured time
-          # to 7m9s. This value keeps real headroom above that for a
-          # slower shared CI runner, well below the earlier 1800s and far
-          # below the original unscoped estimate (45-90+ minutes) both
-          # fixes together eliminated.
-          EXTRA_ARGS+=(--mutation-testing-timeout 900)
+          # to 7m9s (reconfirmed 6m6s on a later commit in the same PR --
+          # stable, not a one-off).
+          #
+          # 900s (set from that 7m9s number) still wasn't enough in real
+          # CI -- confirmed on two separate commits/runs. Local timing
+          # reflects heavy parallelism this dev machine has that a
+          # standard-tier shared GitHub Actions runner (2-4 cores) does
+          # not -- one local run's own `user` CPU-time (88-103 minutes)
+          # compressed into ~6-7 minutes of wall-clock makes the actual
+          # multi-core factor visible directly. Rather than keep tuning
+          # this number in small increments across repeated CI round-
+          # trips, this is a deliberately generous ceiling -- a merge-
+          # blocking gate timing out under real, variable CI hardware is
+          # worse than the job simply taking longer. Revisit downward
+          # once a real CI run's own elapsed time is known (check the
+          # Mint Unsigned Lucid Attestation step's own --debug stage-
+          # timing output, not the separate verify job, which only reads
+          # an already-built envelope and never runs mutation testing
+          # itself).
+          EXTRA_ARGS+=(--mutation-testing-timeout 3000)
 
           # CodeQL always runs (no secret dependency), but the SARIF path
           # is still guarded on existence rather than assumed -- if the

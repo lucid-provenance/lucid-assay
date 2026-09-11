@@ -440,21 +440,35 @@ jobs:
           # for a typical PR's diff on a local dev machine, not a large
           # feature-landing diff on a shared GitHub Actions runner. Confirmed
           # empirically on this repo's own PR #96 (the mutation-testing
-          # feature itself, ~534 changed lines across ~10 files): mutmut hit
-          # the 90s ceiling and reported the whole language `unavailable`,
-          # which --disallow-degraded then correctly (fail-closed) blocked
-          # on, since "unavailable" isn't an allowlisted degraded reason.
-          # This override raises CI's own budget well past that observed
-          # failure without touching the library default that local/small-
-          # diff runs still rely on. Mutant *generation* cost is roughly
-          # diff-size-independent (~22s for this repo's whole `cli/`
-          # package, measured locally); mutant *testing* cost scales with
-          # how many mutants the touched files produce, compounded here by
-          # a shared runner being slower than local dev hardware -- if this
-          # ever gets tight again, the real fix is scoping mutmut's own
-          # generation to just the changed files/dirs, not just raising this
-          # number further.
-          EXTRA_ARGS+=(--mutation-testing-timeout 600)
+          # feature itself, ~584 changed lines across the 10 real non-test
+          # *.py files it touches): mutmut hit the 90s ceiling and reported
+          # the whole language `unavailable`, which --disallow-degraded then
+          # correctly (fail-closed) blocked on, since "unavailable" isn't an
+          # allowlisted degraded reason. A first bump to 600s (confirmed via
+          # this same PR's own real CI run) still wasn't enough -- root
+          # cause turned out to be `cli/mutation/python_runner.py`'s own
+          # generation scope: mutmut's CLI has no per-invocation scoping
+          # flag at all (confirmed against `mutmut run --help`), so every
+          # invocation regenerated mutants for the target repo's *entire*
+          # `only_mutate` glob (this repo's own `cli/*`) regardless of diff
+          # size -- 16,366 total mutants for this PR's diff, of which only
+          # 6,191 belonged to the actually-changed files (an untouched file,
+          # `sarif.py`, alone contributed 1,950). Fixed at the source (same
+          # PR): `python_runner.py` now temporarily narrows the target
+          # repo's own pyproject.toml `only_mutate` list to just this
+          # invocation's diffed files before calling mutmut, restoring the
+          # original byte-for-byte after -- cutting this PR's own real total
+          # to 8,123 mutants. The remaining count is dominated by file (not
+          # line) granularity: mutmut still mutates a touched file's *entire*
+          # content, and `cli/verify.py` (3,663 lines, only 151 of them
+          # actually changed here) alone accounts for most of what's left --
+          # a further, deeper optimization (function-level scoping via this
+          # diff's own line ranges) is real but out of scope for this fix.
+          # Real measured time for this exact PR's diff, after the scoping
+          # fix, was 20m40s locally -- this value gives real headroom above
+          # that for a slower shared CI runner, without the earlier
+          # unscoped estimate (45-90+ minutes) this fix already eliminated.
+          EXTRA_ARGS+=(--mutation-testing-timeout 1800)
 
           # CodeQL always runs (no secret dependency), but the SARIF path
           # is still guarded on existence rather than assumed -- if the

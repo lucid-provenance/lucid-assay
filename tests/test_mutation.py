@@ -34,8 +34,10 @@ from cli.mutation.common import (
 )
 from cli.mutation.python_runner import (
     _NO_MATCH_MARKER,
+    _build_scoped_pyproject_text,
     _dotted_module,
     _parse_mutant_key,
+    _scoped_only_mutate,
     _wildcard_for,
 )
 
@@ -286,6 +288,123 @@ class RunMutationTestingPythonTests(unittest.TestCase):
         with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
             report = run_mutation_testing(str(self.repo_dir), self._diff())
         self.assertEqual(report.survived, 1)
+
+    def test_pyproject_only_mutate_is_scoped_during_the_run_and_restored_after(self):
+        # See python_runner.py's own "Hardened against" docstring: mutmut
+        # has no per-invocation generation-scoping flag, so this repo's
+        # own real pyproject.toml is temporarily narrowed for the whole
+        # generate/run/read-results sequence, then restored.
+        (self.repo_dir / "pyproject.toml").write_text(
+            '[tool.mutmut]\nsource_paths = ["cli"]\nonly_mutate = ["cli/*"]\n',
+            encoding="utf-8",
+        )
+        seen_during_run = []
+
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                seen_during_run.append((self.repo_dir / "pyproject.toml").read_text(encoding="utf-8"))
+                _write_stats(self.repo_dir, killed=1, survived=0, total=1)
+                return _ok()
+            # export-cicd-stats/results/show, if any -- also see the
+            # narrowed config, not the original.
+            seen_during_run.append((self.repo_dir / "pyproject.toml").read_text(encoding="utf-8"))
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            run_mutation_testing(str(self.repo_dir), self._diff())
+
+        self.assertTrue(seen_during_run, "expected at least one mutmut invocation")
+        for text in seen_during_run:
+            self.assertIn('only_mutate = ["cli/scorer.py"]', text)
+        restored = (self.repo_dir / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('only_mutate = ["cli/*"]', restored)
+
+
+class ScopedOnlyMutateTests(unittest.TestCase):
+    """_scoped_only_mutate()/_build_scoped_pyproject_text() in isolation --
+    see python_runner.py's own "Hardened against" docstring for why this
+    exists: mutmut's own CLI has no per-invocation generation-scoping
+    flag, only the target repo's static pyproject.toml only_mutate list,
+    confirmed empirically against a real mutmut 3.7.0 install."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo_dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_pyproject(self, text: str) -> str:
+        (self.repo_dir / "pyproject.toml").write_text(text, encoding="utf-8")
+        return text
+
+    def test_rewrites_only_the_tool_mutmut_only_mutate_line(self):
+        original = self._write_pyproject(
+            '[tool.other]\n'
+            'only_mutate = ["should-not-touch/*"]\n'
+            '\n'
+            '[tool.mutmut]\n'
+            'source_paths = ["cli", "scripts"]\n'
+            'only_mutate = ["cli/*"]\n'
+            'pytest_add_cli_args_test_selection = ["tests"]\n'
+            '\n'
+            '[tool.another]\n'
+            'key = 1\n'
+        )
+        with _scoped_only_mutate(self.repo_dir, ["cli/foo.py", "cli/bar.py"]):
+            rewritten = (self.repo_dir / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('only_mutate = ["cli/foo.py", "cli/bar.py"]', rewritten)
+        # The unrelated [tool.other] table's own only_mutate-shaped key
+        # must never be touched -- confirms section-anchoring, not a
+        # blind first-match-anywhere-in-the-file replace.
+        self.assertIn('[tool.other]\nonly_mutate = ["should-not-touch/*"]', rewritten)
+        self.assertIn('source_paths = ["cli", "scripts"]', rewritten)
+        self.assertIn('[tool.another]\nkey = 1', rewritten)
+        self.assertNotIn('"cli/*"', rewritten)
+
+    def test_restores_original_text_on_success(self):
+        original = self._write_pyproject(
+            '[tool.mutmut]\nonly_mutate = ["cli/*"]\n'
+        )
+        with _scoped_only_mutate(self.repo_dir, ["cli/foo.py"]):
+            pass
+        self.assertEqual((self.repo_dir / "pyproject.toml").read_text(encoding="utf-8"), original)
+
+    def test_restores_original_text_even_on_exception(self):
+        original = self._write_pyproject(
+            '[tool.mutmut]\nonly_mutate = ["cli/*"]\n'
+        )
+        with self.assertRaises(RuntimeError):
+            with _scoped_only_mutate(self.repo_dir, ["cli/foo.py"]):
+                raise RuntimeError("boom")
+        self.assertEqual((self.repo_dir / "pyproject.toml").read_text(encoding="utf-8"), original)
+
+    def test_missing_pyproject_is_a_silent_noop(self):
+        # No pyproject.toml written at all in this test.
+        with _scoped_only_mutate(self.repo_dir, ["cli/foo.py"]):
+            self.assertFalse((self.repo_dir / "pyproject.toml").exists())
+
+    def test_no_tool_mutmut_table_is_a_noop_not_a_guess(self):
+        original = self._write_pyproject("[tool.other]\nkey = 1\n")
+        with _scoped_only_mutate(self.repo_dir, ["cli/foo.py"]):
+            unchanged = (self.repo_dir / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertEqual(unchanged, original)
+
+    def test_ambiguous_multiple_only_mutate_lines_is_a_noop_not_a_guess(self):
+        # Two only_mutate assignments in the same table is invalid TOML in
+        # spirit and not something this module should ever guess how to
+        # resolve -- fall back to the unscoped-but-correct original.
+        original = self._write_pyproject(
+            '[tool.mutmut]\n'
+            'only_mutate = ["cli/*"]\n'
+            'only_mutate = ["cli/other/*"]\n'
+        )
+        with _scoped_only_mutate(self.repo_dir, ["cli/foo.py"]):
+            unchanged = (self.repo_dir / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertEqual(unchanged, original)
+
+    def test_build_scoped_text_returns_none_when_no_confident_match(self):
+        self.assertIsNone(_build_scoped_pyproject_text("[tool.other]\nkey = 1\n", ["cli/foo.py"]))
 
 
 class CombineResultsMultiLanguageTests(unittest.TestCase):

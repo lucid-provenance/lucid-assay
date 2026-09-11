@@ -36,6 +36,27 @@ Hardened against:
     dispatcher already resolves repo_dir via common.safe_resolve_path()
     once, before calling any runner -- this module receives an
     already-safe Path, not a raw string.
+  - Whole-package generation cost that grows forever, independent of any
+    single diff's size: confirmed empirically (2026-09-11, this feature's
+    own PR landing itself) that `mutmut run "<wildcard>.*"` only restricts
+    which *already-generated* mutants get *tested* -- generation itself is
+    driven entirely by the target repo's static, on-disk `only_mutate`
+    config (mutmut's own `run --help` has no per-invocation scoping flag
+    at all), so every single invocation regenerates mutants for that
+    *whole* glob (e.g. this repo's own `cli/*`) regardless of how small
+    the current diff is. On this repo's own real feature-landing diff (8
+    changed files) this meant 16,366 total mutants generated across the
+    whole `cli/` tree, of which only 6,191 (38%) belonged to the actual
+    diff -- an untouched file (`sarif.py`) alone contributed 1,950.
+    `_scoped_only_mutate()` closes this by temporarily narrowing the
+    target repo's own `pyproject.toml` `[tool.mutmut]` `only_mutate` list
+    to just this invocation's own diffed files before calling mutmut,
+    restoring the original file byte-for-byte afterward (success or
+    exception) -- never leaves the target repo's real config modified.
+    Falls back to a no-op (unscoped, slower but still correct) when the
+    file can't be confidently, narrowly rewritten -- this is a performance
+    optimization, never allowed to risk corrupting a target repo's real
+    config to save time.
 """
 from __future__ import annotations
 
@@ -45,8 +66,9 @@ import re
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterator, List, Optional
 
 from .common import (
     LANGUAGE_PYTHON,
@@ -58,6 +80,59 @@ from .common import (
 _NO_MATCH_MARKER = "Filtered for specific mutants, but nothing matches"
 _MUTANT_KEY_RE = re.compile(r"^x_(?P<func>.+)__mutmut_\d+$")
 _RESULT_LINE_RE = re.compile(r"^\s*(?P<key>\S+):\s*(?P<status>\S+)\s*$")
+
+# Anchors on the [tool.mutmut] table header and captures everything up to
+# the next top-level table header (or end of file) -- so an `only_mutate`
+# key belonging to some *other* table is never touched.
+_TOOL_MUTMUT_SECTION_RE = re.compile(r"(?ms)^\[tool\.mutmut\]\s*$(?P<body>.*?)(?=^\[|\Z)")
+_ONLY_MUTATE_LINE_RE = re.compile(r"(?m)^only_mutate\s*=\s*\[[^\]]*\]\s*$")
+
+
+def _build_scoped_pyproject_text(original_text: str, existing_files: List[str]) -> Optional[str]:
+    """Returns pyproject.toml's text with only_mutate narrowed to just
+    existing_files, or None when it can't be done with confidence (no
+    [tool.mutmut] table, or not exactly one only_mutate assignment inside
+    it) -- callers must fall back to the original, unscoped-but-correct
+    text rather than guess. json.dumps is used for TOML string quoting: a
+    plain file path (this function's only input) never hits a case where
+    JSON's and TOML's basic-string escaping rules diverge."""
+    section_match = _TOOL_MUTMUT_SECTION_RE.search(original_text)
+    if section_match is None:
+        return None
+    body = section_match.group("body")
+    matches = list(_ONLY_MUTATE_LINE_RE.finditer(body))
+    if len(matches) != 1:
+        return None
+    scoped_list = ", ".join(json.dumps(f) for f in existing_files)
+    new_line = f"only_mutate = [{scoped_list}]"
+    new_body = body[: matches[0].start()] + new_line + body[matches[0].end():]
+    start, end = section_match.span("body")
+    return original_text[:start] + new_body + original_text[end:]
+
+
+@contextmanager
+def _scoped_only_mutate(repo_dir: Path, existing_files: List[str]) -> Iterator[None]:
+    """Temporarily narrows the target repo's own pyproject.toml
+    [tool.mutmut] only_mutate list to just this invocation's diffed files
+    -- see this module's own "Hardened against" docstring for why this
+    exists. Restores the original file byte-for-byte on exit, success or
+    exception. A no-op (yields without any modification) when the file is
+    unreadable or can't be confidently, narrowly rewritten."""
+    pyproject_path = repo_dir / "pyproject.toml"
+    try:
+        original_text = pyproject_path.read_text(encoding="utf-8")
+    except OSError:
+        yield
+        return
+    scoped_text = _build_scoped_pyproject_text(original_text, existing_files)
+    if scoped_text is None or scoped_text == original_text:
+        yield
+        return
+    pyproject_path.write_text(scoped_text, encoding="utf-8")
+    try:
+        yield
+    finally:
+        pyproject_path.write_text(original_text, encoding="utf-8")
 
 
 def _dotted_module(file_path: str) -> str:
@@ -193,6 +268,30 @@ def run(
     _reset_mutmut_cache(repo_dir)
     wildcards = [_wildcard_for(f) for f in existing_files]
 
+    # Scoped for the *entire* generate-run-through-read-results sequence,
+    # not just the "run" subcommand: every mutmut subcommand this module
+    # calls (run/export-cicd-stats/results/show) is its own subprocess that
+    # independently reloads pyproject.toml (confirmed empirically -- each
+    # calls Config.ensure_loaded() on startup), so restoring the original,
+    # unscoped file before those later calls could hand them a config
+    # inconsistent with what was actually generated.
+    with _scoped_only_mutate(repo_dir, existing_files):
+        return _run_scoped(
+            repo_dir, existing_files, wildcards,
+            timeout_seconds=timeout_seconds, max_surviving_detail=max_surviving_detail,
+        )
+
+
+def _run_scoped(
+    repo_dir: Path,
+    existing_files: List[str],
+    wildcards: List[str],
+    *,
+    timeout_seconds: int,
+    max_surviving_detail: int,
+) -> LanguageRunResult:
+    """The generate/run/read-results sequence proper, factored out of run()
+    so the pyproject.toml scoping context manager can wrap it as a whole."""
     try:
         run_proc = _run_mutmut(["run", *wildcards], cwd=repo_dir, timeout_seconds=timeout_seconds)
     except subprocess.TimeoutExpired:

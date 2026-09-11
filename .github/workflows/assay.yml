@@ -36,6 +36,23 @@ on:
         type: boolean
         default: true
 
+# Cancels a now-stale run of the *same* trigger kind for the *same*
+# branch/PR when a newer commit supersedes it (e.g. three quick pushes to
+# one feature branch no longer leave two stale runs burning CI minutes
+# alongside the current one). Deliberately keyed by github.event_name,
+# not just the branch/PR alone: this workflow's own run-name comment
+# above already established that `on.push` and `on.pull_request` fire
+# *independently* on the same commit whenever a feature branch has an
+# open PR, and that's intentional, not redundant -- a shared group would
+# have one of those two legitimate parallel runs cancel the other
+# instead of only ever cancelling a superseded *older commit's* run of
+# the same kind. `github.event.pull_request.number` (not `github.ref`,
+# which is the synthetic "<number>/merge" ref on a pull_request event)
+# groups a PR's own synchronize-triggered runs together across pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 # `push` fires with no PR context of its own (no base sha, no PR number) --
 # unlike a `pull_request` event's own fields. Without recovering it, every
 # push-triggered run (a merge landing on `main`, or a plain feature-branch

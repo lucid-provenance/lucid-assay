@@ -804,8 +804,6 @@ class ScorerFailClosedIntegrationTests(unittest.TestCase):
                 available=True, line_rate=0.95, lines_changed=10, lines_covered=9, reason="ok"
             ),
             overall_line_rate=0.9,
-            total_assertions=20,
-            total_test_functions=10,
             pr_present=True,
             approvers_count=2,
             required_approvals=2,

@@ -219,8 +219,7 @@ class SchemaValidationGuardTests(_TempFileMixin, unittest.TestCase):
                         "weight": 0.2, "raw_score": 100.0, "weighted_score": 20.0, "reason": "ok", "available": True,
                     }
                     for name in (
-                        "test_health", "patch_coverage", "overall_coverage",
-                        "assertion_integrity", "governance",
+                        "test_health", "patch_coverage", "overall_coverage", "governance",
                     )
                 },
             },

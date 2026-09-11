@@ -15,6 +15,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from .mutation import MutationTestReport
 from .parsers.commit_author import CommitAuthorReport
 from .parsers.coverage import CoverageReport
 from .parsers.github_rules import BranchGovernanceReport
@@ -133,6 +134,33 @@ def _build_s2c2f_block(s2c2f: Optional["S2C2FReport"]) -> Dict[str, Any]:
     return s2c2f.as_dict()
 
 
+# predicate.mutation_testing when the caller didn't pass a
+# MutationTestReport at all (every caller predating this field) -- same
+# explicit "not configured" contract as _S2C2F_NOT_CONFIGURED /
+# _REAL_COVERAGE_TRACK_UNAVAILABLE above, not an omitted key.
+_MUTATION_TESTING_NOT_CONFIGURED: Dict[str, Any] = {
+    "available": False,
+    "grade": "not_applicable",
+    "multiplier": 1.0,
+    "mutation_score": None,
+    "killed": 0,
+    "survived": 0,
+    "timeout": 0,
+    "tested": 0,
+    "total_generated": 0,
+    "scoped_files": [],
+    "top_surviving_mutants": [],
+    "reason": "mutation testing was not evaluated for this run",
+    "reason_code": None,
+}
+
+
+def _build_mutation_testing_block(mutation_report: Optional["MutationTestReport"]) -> Dict[str, Any]:
+    if mutation_report is None:
+        return dict(_MUTATION_TESTING_NOT_CONFIGURED)
+    return mutation_report.as_dict()
+
+
 def build_statement(
     *,
     subject_name: str,
@@ -173,6 +201,7 @@ def build_statement(
     valid_test_functions: int = 0,
     real_coverage: Optional[RealCoverageResult] = None,
     s2c2f: Optional[S2C2FReport] = None,
+    mutation_report: Optional[MutationTestReport] = None,
 ) -> Dict[str, Any]:
     """Returns a dict matching the lifecycle/v0.1 predicate schema, wrapped
     in a standard in-toto Statement envelope."""
@@ -474,12 +503,21 @@ def build_statement(
         # attestation, or S2C2F evaluation was skipped for this run) are
         # both explicit, honest states -- never a guessed compliance claim.
         "s2c2f": _build_s2c2f_block(s2c2f),
+        # Diff-scoped mutation testing (cli/mutation.py) -- the real
+        # signal release_confidence_score.components.mutation_testing's
+        # multiplier is derived from, plus detail (scoped_files,
+        # top_surviving_mutants) that doesn't fit the generic
+        # ScoreComponent shape. See that component's own `reason` for the
+        # plain-English discount explanation.
+        "mutation_testing": _build_mutation_testing_block(mutation_report),
         "release_confidence_score": {
             "value": rcs.value,
             "algorithm_version": rcs.algorithm_version,
             "components": {k: v.as_dict() for k, v in rcs.components.items()},
             "degraded": rcs.degraded,
             "degraded_reasons": rcs.degraded_reasons,
+            "mutation_multiplier": round(rcs.mutation_multiplier, 4),
+            "pre_multiplier_cluster_score": round(rcs.pre_multiplier_cluster_score, 2),
             "computed_at": _now_iso(),
         },
     }

@@ -35,11 +35,13 @@ from cli.verify import (
     _evaluate_slsa_l3,
     _extract_cert_ref,
     _extract_dependency_evidence,
+    _extract_mutation_evidence,
     _extract_rekor_info,
     _extract_s2c2f_controls,
     _format_assay_health_report,
     _format_coverage_line,
     _format_dependency_governance_report,
+    _format_mutation_testing_report,
     _format_pct,
     _format_s2c2f_report,
     _format_signing_report,
@@ -84,6 +86,7 @@ def _statement(
     s2c2f=None,
     resolved_dependencies=None,
     sbom=None,
+    mutation_testing=None,
 ):
     rcs_block = {
         "value": rcs_value,
@@ -109,6 +112,8 @@ def _statement(
         predicate["resolved_dependencies"] = resolved_dependencies
     if sbom is not None:
         predicate["artifact"] = {"sbom": sbom}
+    if mutation_testing is not None:
+        predicate["mutation_testing"] = mutation_testing
     return {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [
@@ -233,6 +238,34 @@ class VerifyDsseAttestationTests(unittest.TestCase):
 
         self.assertTrue(result.passed, result.violations)
         self.assertFalse(any("disallow-degraded" in v for v in result.violations))
+
+    def test_disallow_degraded_allows_sole_mutation_no_coverable_lines_cause(self):
+        # A diff that changed cli/*.py files but mutmut generated zero
+        # mutants for them (comment/docstring/type-annotation-only) is
+        # the same kind of unavoidable, benign state as the docs-only
+        # patch-coverage case above -- not a real gap.
+        envelope = _envelope(_statement(
+            degraded=True, degraded_reasons=["mutation_testing:no_coverable_lines"]
+        ))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+
+        self.assertTrue(result.passed, result.violations)
+        self.assertFalse(any("disallow-degraded" in v for v in result.violations))
+
+    def test_disallow_degraded_still_blocks_other_mutation_reasons(self):
+        # weak_assertion_coverage/decorative_coverage/unavailable/skipped
+        # are all real, fixable gaps (or an opted-out control) -- none of
+        # them belongs in the allowed-degraded-reasons set.
+        for reason in (
+            "mutation_testing:weak_assertion_coverage",
+            "mutation_testing:decorative_coverage",
+            "mutation_testing:unavailable",
+            "mutation_testing:skipped",
+        ):
+            envelope = _envelope(_statement(degraded=True, degraded_reasons=[reason]))
+            result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+            self.assertFalse(result.passed, f"{reason} should still block --disallow-degraded")
 
     def test_disallow_degraded_allows_both_exempted_causes_together(self):
         # The exact real-world scenario this test guards: a docs-only PR
@@ -1672,6 +1705,103 @@ class FormatDependencyGovernanceReportTests(unittest.TestCase):
         items = [_dependency_check_sbom(None)]
         text = "\n".join(_format_dependency_governance_report(items))
         self.assertIn("[✗] Canonical SBOM Attached -- predicate.artifact.sbom is absent -- no --sbom was ingested", text)
+
+
+def _mutation_evidence(**overrides) -> Dict[str, Any]:
+    evidence = {
+        "available": True,
+        "grade": "passed",
+        "multiplier": 1.0,
+        "mutation_score": 90.0,
+        "killed": 9,
+        "survived": 1,
+        "timeout": 0,
+        "tested": 10,
+        "total_generated": 10,
+        "scoped_files": ["cli/scorer.py"],
+        "top_surviving_mutants": [],
+        "reason": "no discount -- 90% mutation kill rate (10 mutant(s) tested)",
+        "reason_code": None,
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+class ExtractMutationEvidenceTests(unittest.TestCase):
+
+    def test_missing_field_returns_empty_dict(self):
+        self.assertEqual(_extract_mutation_evidence({}), {})
+
+    def test_non_dict_field_treated_as_absent(self):
+        self.assertEqual(_extract_mutation_evidence({"mutation_testing": "nope"}), {})
+
+    def test_well_formed_field_is_passed_through_verbatim(self):
+        evidence = _mutation_evidence()
+        self.assertEqual(_extract_mutation_evidence({"mutation_testing": evidence}), evidence)
+
+
+class FormatMutationTestingReportTests(unittest.TestCase):
+
+    def test_empty_evidence_renders_no_section_at_all(self):
+        self.assertEqual(_format_mutation_testing_report({}), [])
+
+    def test_header_names_grade_and_score(self):
+        text = "\n".join(_format_mutation_testing_report(_mutation_evidence(grade="passed", mutation_score=90.0)))
+        self.assertIn("=== Mutation Testing (diff-scoped, grade=passed, score=90%) ===", text)
+
+    def test_no_status_line_rendered(self):
+        # Purely informational like the Dependency Materialization
+        # Evidence section -- no cumulative PASSED/FAILED Status line.
+        text = "\n".join(_format_mutation_testing_report(_mutation_evidence()))
+        self.assertNotIn("Status:", text)
+
+    def test_degraded_reason_and_surviving_mutants_are_rendered(self):
+        evidence = _mutation_evidence(
+            grade="degraded",
+            mutation_score=68.0,
+            survived=5,
+            killed=11,
+            reason="Test & Coverage score discounted by 15% due to 68% Mutation Kill Rate (5 surviving mutant(s))",
+            top_surviving_mutants=[
+                {"file": "cli/scorer.py", "function": "_score_governance", "status": "survived", "line": 236, "diff": "..."},
+            ],
+        )
+        text = "\n".join(_format_mutation_testing_report(evidence))
+        self.assertIn("[!] Test & Coverage score discounted by 15%", text)
+        self.assertIn("cli/scorer.py:236 in _score_governance [survived]", text)
+
+    def test_null_score_renders_as_not_available_rather_than_crashing(self):
+        text = "\n".join(_format_mutation_testing_report(_mutation_evidence(grade="not_applicable", mutation_score=None)))
+        self.assertIn("score=n/a", text)
+
+
+class RequireMutationScoreGateTests(unittest.TestCase):
+    """--require-mutation-score: opt-in, off by default, same shape as
+    --require-commit-signing -- only the 'failed' grade blocks."""
+
+    def test_off_by_default_even_with_a_failed_grade(self):
+        statement = _statement(mutation_testing=_mutation_evidence(grade="failed", mutation_score=20.0))
+        result = verify_dsse_attestation(_envelope(statement), min_rcs=0, dry_run=True)
+        self.assertTrue(result.passed)
+
+    def test_failed_grade_blocks_when_flag_is_set(self):
+        statement = _statement(mutation_testing=_mutation_evidence(grade="failed", mutation_score=20.0))
+        result = verify_dsse_attestation(_envelope(statement), min_rcs=0, dry_run=True, require_mutation_score=True)
+        self.assertFalse(result.passed)
+        self.assertTrue(any("require-mutation-score" in v for v in result.violations))
+
+    def test_degraded_grade_does_not_block_the_flag_alone(self):
+        # The weak/degraded tier already blocks --disallow-degraded by
+        # default (its reason_code isn't in _ALLOWED_DEGRADED_REASONS) --
+        # --require-mutation-score is deliberately narrower than that,
+        # targeting only the confirmed-decorative "failed" tier.
+        statement = _statement(mutation_testing=_mutation_evidence(grade="degraded", mutation_score=68.0))
+        result = verify_dsse_attestation(_envelope(statement), min_rcs=0, dry_run=True, require_mutation_score=True)
+        self.assertTrue(result.passed)
+
+    def test_no_mutation_evidence_at_all_does_not_block(self):
+        result = verify_dsse_attestation(_envelope(_statement()), min_rcs=0, dry_run=True, require_mutation_score=True)
+        self.assertTrue(result.passed)
 
 
 class DependencyGovernanceIntegrationTests(unittest.TestCase):

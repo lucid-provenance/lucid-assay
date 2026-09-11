@@ -593,7 +593,7 @@ class SchemaComplianceAndSignatureTests(unittest.TestCase):
 
         rcs = score_pipeline(
             test_totals=test_totals, patch_coverage=patch_coverage, overall_line_rate=coverage.overall_line_rate,
-            total_assertions=20, total_test_functions=10, pr_present=True, approvers_count=2,
+            pr_present=True, approvers_count=2,
             required_approvals=2, review_state="approved", branch_governance=branch_governance,
             sarif_report=sarif_report,
         )
@@ -865,6 +865,12 @@ class SubjectFlagsTests(unittest.TestCase):
                 "--repository", "o/r",
                 "--branch", "main",
                 "--skip-perf-budget-check",
+                # Not testing mutation testing here -- and this subprocess's
+                # cwd is the real repo checkout (needed for a real git
+                # context), so without this it would write a real
+                # reports/mutation/mutation-report.json into this repo's
+                # own working tree as an unwanted side effect.
+                "--skip-mutation-testing",
                 "--out", out_path,
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

@@ -533,16 +533,19 @@
         "components": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["test_health", "patch_coverage", "overall_coverage", "assertion_integrity", "governance"],
+          "required": ["test_health", "patch_coverage", "overall_coverage", "governance"],
           "properties": {
             "test_health": { "$ref": "#/$defs/scoreComponent" },
             "patch_coverage": { "$ref": "#/$defs/scoreComponent" },
             "overall_coverage": { "$ref": "#/$defs/scoreComponent" },
-            "assertion_integrity": { "$ref": "#/$defs/scoreComponent" },
             "governance": { "$ref": "#/$defs/scoreComponent" },
             "static_analysis": {
               "$ref": "#/$defs/scoreComponent",
               "description": "Not in `required`: absent on attestations predating the SARIF static-analysis component (cli/scorer.py WEIGHTS)."
+            },
+            "mutation_testing": {
+              "$ref": "#/$defs/mutationScoreComponent",
+              "description": "Not in `required`: absent on attestations predating cli/mutation.py. Retired `assertion_integrity`'s slot -- weight is always 0.0 by construction, since this component discounts the test_health/patch_coverage/overall_coverage cluster via release_confidence_score.mutation_multiplier rather than adding its own weighted share; weighted_score here carries the signed point delta the multiplier caused (can legitimately be negative -- see $defs/mutationScoreComponent, distinct from the generic scoreComponent every other component uses). See predicate.mutation_testing for the full detail (scoped_files, top_surviving_mutants) this compact form doesn't carry."
             }
           }
         },
@@ -554,9 +557,57 @@
         "degraded_reasons": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Which independent trigger(s) caused degraded=true (e.g. no_pr_context, sarif_unavailable, a namespaced branch_governance:<reason_code> / patch_coverage:<reason_code>). Empty when degraded=false. Absent/malformed on an attestation predating this field -- cli/verify.py's --disallow-degraded treats that as non-exempt."
+          "description": "Which independent trigger(s) caused degraded=true (e.g. no_pr_context, sarif_unavailable, a namespaced branch_governance:<reason_code> / patch_coverage:<reason_code> / mutation_testing:<reason_code>). Empty when degraded=false. Absent/malformed on an attestation predating this field -- cli/verify.py's --disallow-degraded treats that as non-exempt."
+        },
+        "mutation_multiplier": {
+          "type": "number", "minimum": 0, "maximum": 1,
+          "description": "The multiplier release_confidence_score.value's test_health/patch_coverage/overall_coverage subtotal was discounted by (1.0 = no discount). Absent on attestations predating cli/mutation.py."
+        },
+        "pre_multiplier_cluster_score": {
+          "type": "number", "minimum": 0,
+          "description": "The test_health/patch_coverage/overall_coverage weighted subtotal *before* mutation_multiplier was applied -- lets an auditor reconstruct the discount rather than reverse-engineering it from value alone. Absent on attestations predating cli/mutation.py."
         },
         "computed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "mutation_testing": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Diff-scoped mutation testing (cli/mutation.py, mutmut) over the cli/*.py lines actually changed in this run's diff -- the real signal release_confidence_score.components.mutation_testing's multiplier is derived from. Absent on attestations predating this field.",
+      "properties": {
+        "available": { "type": "boolean", "description": "False when mutation testing genuinely wasn't evaluated (no cli/*.py changes, or the caller opted out) -- distinct from a real run that found nothing to discount." },
+        "grade": { "type": "string", "enum": ["passed", "degraded", "failed", "not_applicable", "insufficient_sample"] },
+        "multiplier": { "type": "number", "minimum": 0, "maximum": 1 },
+        "mutation_score": { "type": ["number", "null"], "minimum": 0, "maximum": 100, "description": "killed / (killed + survived) * 100; null when it couldn't be computed (no mutants tested, or killed+survived=0)." },
+        "killed": { "type": "integer", "minimum": 0 },
+        "survived": { "type": "integer", "minimum": 0 },
+        "timeout": { "type": "integer", "minimum": 0 },
+        "tested": { "type": "integer", "minimum": 0, "description": "killed + survived + timeout -- the real sample size, distinct from total_generated." },
+        "total_generated": { "type": "integer", "minimum": 0, "description": "Every mutant mutmut generated across its configured source_paths, including ones never selected for testing this run -- not the sample size; see `tested`." },
+        "scoped_files": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "The cli/*.py files this run's diff touched and mutation-tested against."
+        },
+        "top_surviving_mutants": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["file", "function", "status", "diff"],
+            "properties": {
+              "file": { "type": "string" },
+              "function": { "type": "string" },
+              "status": { "type": "string", "enum": ["survived", "timeout"] },
+              "line": { "type": ["integer", "null"], "description": "Best-effort locator (AST lookup of the function's own definition) -- the diff itself, not this line number, is the ground-truth evidence for a surviving mutant." },
+              "diff": { "type": "string", "description": "The real unified diff mutmut produced for this mutant, verbatim -- never a synthesized mutation-operator taxonomy label mutmut doesn't itself expose." }
+            }
+          }
+        },
+        "reason": { "type": "string" },
+        "reason_code": { "type": ["string", "null"] }
       }
     }
   },
@@ -576,6 +627,19 @@
           "default": true,
           "description": "False when this control was never actually evaluated for this run (e.g. static_analysis with no --sarif configured) -- raw_score/weighted_score still carry the scoring policy's baseline (never penalizing an opt-in control that wasn't asked to run), but a consumer must not read that baseline number as a real measurement. True for every component that ran a real check, whether it passed or not."
         }
+      }
+    },
+    "mutationScoreComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Same shape as scoreComponent, except weighted_score is a signed delta ((multiplier - 1.0) * the test_health/patch_coverage/overall_coverage cluster's own weighted subtotal), not a 0-100 weighted share -- mutation_testing discounts that cluster rather than adding its own additive weight (weight is always 0.0 here, by construction). Confirmed empirically (a real end-to-end run) that reusing scoreComponent's weighted_score minimum:0 constraint here falsely flags a legitimate negative discount as a schema violation.",
+      "required": ["weight", "raw_score", "weighted_score", "reason", "available"],
+      "properties": {
+        "weight": { "type": "number", "const": 0 },
+        "raw_score": { "type": "number", "minimum": 0, "maximum": 100 },
+        "weighted_score": { "type": "number", "minimum": -100, "maximum": 100 },
+        "reason": { "type": "string" },
+        "available": { "type": "boolean", "default": true }
       }
     },
     "realCoverageTrack": {

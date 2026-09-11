@@ -64,8 +64,6 @@ def _base_kwargs(**overrides):
             test_totals=test_totals,
             patch_coverage=patch_coverage,
             overall_line_rate=coverage.overall_line_rate,
-            total_assertions=total_assertions,
-            total_test_functions=total_test_functions,
             pr_present=pr_number is not None,
             approvers_count=len(pr_approvers),
             required_approvals=pr_required_approvals,

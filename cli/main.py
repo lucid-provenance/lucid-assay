@@ -45,6 +45,7 @@ from .parsers.sbom import (
     parse_sbom_file,
     sbom_components_to_resolved_dependencies,
 )
+from .mutation import run_mutation_testing, skipped_report as skipped_mutation_report
 from .patch_coverage import compute_patch_coverage, compute_patch_modified_lines
 from .real_coverage import CoverageTrackResult, RealCoverageResult, compute_real_coverage
 from .sarif_statement import build_sarif_reports_statement
@@ -835,6 +836,36 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--skip-perf-budget-check", action="store_true")
     p.add_argument(
+        "--skip-mutation-testing",
+        action="store_true",
+        help="skip diff-scoped mutation testing (cli/mutation.py) entirely for this run -- e.g. fast local "
+        "iteration, or mutmut not installed. Fails closed like any other unavailable control: this does not "
+        "default to full credit, it applies the same non-punitive-but-not-free multiplier as a genuinely weak "
+        "mutation score (see cli.mutation.skipped_report).",
+    )
+    p.add_argument(
+        "--mutation-testing-timeout",
+        type=int,
+        default=90,
+        dest="mutation_testing_timeout",
+        help="outer, provably-bounded time budget in seconds for the whole diff-scoped mutmut run (default: 90)",
+    )
+    p.add_argument(
+        "--mutation-testing-min-sample",
+        type=int,
+        default=3,
+        dest="mutation_testing_min_sample",
+        help="minimum number of mutants actually tested (killed+survived+timeout) before the tiered multiplier "
+        "applies at all -- below this, grade is 'insufficient_sample' and no discount is applied (default: 3)",
+    )
+    p.add_argument(
+        "--mutation-report-out",
+        default=None,
+        dest="mutation_report_out",
+        help="output path for the full structured mutation-testing report (default: a fixed "
+        "reports/mutation/mutation-report.json under --repo-dir)",
+    )
+    p.add_argument(
         "--debug",
         action="store_true",
         help="emit a high-resolution per-stage timing breakdown (parsing, diff/patch "
@@ -995,6 +1026,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         valid_test_functions = ast_metrics.valid_test_functions
         ast_languages = {lang: m.as_dict() for lang, m in ast_metrics.languages.items()}
 
+    # 5b. Diff-scoped mutation testing (see cli/mutation.py). Feeds
+    # score_pipeline() below as a multiplier over the test_health/
+    # patch_coverage/overall_coverage cluster, not an additive component
+    # -- must run before step 6, not after. --skip-mutation-testing never
+    # defaults to full credit (see cli.mutation.skipped_report's own
+    # fail-closed contract).
+    with _stage(stage_ns, "mutation_testing"):
+        if args.skip_mutation_testing:
+            mutation_report = skipped_mutation_report()
+        else:
+            mutation_modified_lines = compute_patch_modified_lines(args.base_sha, args.head_sha, args.repo_dir)
+            mutation_report = run_mutation_testing(
+                args.repo_dir,
+                mutation_modified_lines,
+                timeout_seconds=args.mutation_testing_timeout,
+                min_sample_size=args.mutation_testing_min_sample,
+                report_out=args.mutation_report_out or str(Path(args.repo_dir) / "reports" / "mutation" / "mutation-report.json"),
+            )
+
     # 6. Deterministic scoring
     pr_approvers = [a.strip() for a in args.pr_approvers.split(",") if a.strip()]
     with _stage(stage_ns, "rcs_scoring"):
@@ -1002,8 +1052,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             test_totals=test_totals,
             patch_coverage=patch_cov,
             overall_line_rate=coverage.overall_line_rate,
-            total_assertions=total_assertions,
-            total_test_functions=total_test_functions,
             pr_present=args.pr_number is not None,
             approvers_count=len(pr_approvers),
             required_approvals=args.pr_required_approvals,
@@ -1012,7 +1060,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             overall_coverage_min=args.overall_coverage_min,
             branch_governance=branch_governance,
             sarif_report=sarif_report,
-            ast_skipped_test_functions=ast_skipped,
+            mutation_report=mutation_report,
         )
 
     # 6b. Lockfile dependency detection (see _detect_lockfile_dependencies)
@@ -1071,6 +1119,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             real_coverage=real_coverage,
             s2c2f=s2c2f_report,
             sbom=_build_sbom_artifact_block(sbom_report, sbom_report_sha),
+            mutation_report=mutation_report,
         )
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0

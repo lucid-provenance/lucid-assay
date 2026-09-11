@@ -30,6 +30,12 @@ dev = [
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.0.0",
     "jsonschema>=4.0.0",
+    # Diff-scoped mutation testing (cli/mutation.py). Pinned to the 3.x
+    # line confirmed empirically during that module's development
+    # (export-cicd-stats/results/show CLI shape, dotted mutant-key
+    # namespacing) -- a future major bump needs the same empirical
+    # re-verification before widening this range.
+    "mutmut>=3.7.0,<4.0.0",
 ]
 
 [project.urls]
@@ -68,3 +74,27 @@ schema = ["*.json"]
 # purpose to exercise zero-assertion/tautology detection. Excluded from
 # collection by directory basename.
 norecursedirs = ["ast_assertions", ".git", ".venv", "node_modules", "build", "dist"]
+
+[tool.mutmut]
+# cli/mutation.py generates mutants for cli/ every invocation (cheap,
+# AST-based, no test execution) but only *tests* the ones a per-
+# invocation `mutmut run "<dotted.module>.*"` wildcard selects -- see
+# that module's own docstring. Without source_paths set here, mutmut
+# can't guess where the code to mutate is at all and raises
+# FileNotFoundError before ever reaching the wildcard filter (confirmed
+# empirically: this was missing during this feature's own development
+# and the real end-to-end verification run caught it).
+#
+# scripts/ and schema/ are in source_paths (copied into mutmut's
+# mutants/ working copy alongside cli/) but *not* mutated (only_mutate
+# scopes real mutation to cli/* alone) -- confirmed empirically that
+# omitting either breaks mutmut's own baseline test run from inside
+# mutants/: it copies tests/ too (per pytest_add_cli_args_test_selection
+# below), and (1) tests/test_scripts_ingestion.py imports
+# scripts._ingestion_lib, (2) several tests (e.g. test_builder.py's own
+# _SCHEMA_PATH) resolve schema/lucid-attestation-v1.schema.json via a
+# path relative to the test file's own __file__, which then resolves
+# under mutants/ instead of the real repo root.
+source_paths = ["cli", "scripts", "schema"]
+only_mutate = ["cli/*"]
+pytest_add_cli_args_test_selection = ["tests"]

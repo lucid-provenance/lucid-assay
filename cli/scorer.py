@@ -11,6 +11,15 @@ Hardened against:
     points as a confirmed unreviewed-bypass finding, so there is no score
     incentive to suppress branch governance data (only `degraded` differed
     before -- unverified governance now costs real points too)
+  - Decorative coverage: test_health/patch_coverage/overall_coverage can
+    all be satisfied by a test that executes a line without ever
+    verifying its behavior. `mutation_testing` (see cli.mutation) is a
+    *multiplier* over that cluster's weighted subtotal, not an additive
+    bucket -- 95% patch coverage backed by a 20% mutation kill rate reads
+    as mostly illusory, and RCS says so. Skipping mutation testing must
+    never default to full credit, or "don't run it" becomes the easiest
+    way to game the control meant to stop gaming (see
+    `_score_mutation_testing`).
 """
 from __future__ import annotations
 
@@ -18,6 +27,11 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from .mutation import (
+    REASON_CODE_INSUFFICIENT_SAMPLE as _MUTATION_REASON_INSUFFICIENT_SAMPLE,
+    REASON_CODE_NO_CLI_CHANGES as _MUTATION_REASON_NO_CLI_CHANGES,
+    MutationTestReport,
+)
 from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change
 from .parsers.junit import TestTotals
 from .parsers.sarif import SarifSummaryReport
@@ -37,15 +51,31 @@ DEGRADED_REASON_SARIF_UNAVAILABLE = "sarif_unavailable"
 DEGRADED_REASON_BRANCH_GOVERNANCE_UNVERIFIED = "branch_governance_unverified"
 DEGRADED_REASON_BRANCH_GOVERNANCE_BYPASS = "branch_governance_bypass_permitted"
 
+# `assertion_integrity` (an AST-density proxy) was retired as a scored
+# bucket in favor of `mutation_testing` -- a real signal instead of a
+# proxy for the same question ("do the assertions actually assert
+# something"). See cli.mutation / _score_mutation_testing. The AST
+# engine's own tautology/mock-typo/density diagnostics keep running
+# unchanged; they surface as the informational predicate.assertion_density
+# block (cli.builder) instead of a WEIGHTS component now.
 WEIGHTS = {
-    "test_health": 0.35,
+    "test_health": 0.30,
     "patch_coverage": 0.20,
     "overall_coverage": 0.15,
-    "assertion_integrity": 0.10,
-    "governance": 0.15,
-    "static_analysis": 0.05,
+    "governance": 0.20,
+    "static_analysis": 0.15,
 }
 assert math.isclose(sum(WEIGHTS.values()), 1.0, abs_tol=1e-9), "RCS weights must sum to 1.0"
+
+# cli.mutation.run_mutation_testing() already computes grade/multiplier/
+# reason -- scorer.py is a *consumer* of that MutationTestReport, not a
+# second place that re-derives the tiers, so there is exactly one source
+# of truth for "what mutation_score maps to what multiplier".
+DEGRADED_REASON_MUTATION_TESTING_PREFIX = "mutation_testing"
+# grade values that mean "a real gap, not just an inapplicable/low-signal
+# run" -- these are the ones whose reason_code gets folded into
+# RCSResult.degraded_reasons (namespaced "mutation_testing:<reason_code>").
+_MUTATION_DEGRADED_GRADES = frozenset({"degraded", "failed"})
 
 PATCH_COVERAGE_MIN_DEFAULT = 0.80
 OVERALL_COVERAGE_MIN_DEFAULT = 0.60
@@ -112,6 +142,16 @@ class RCSResult:
     # occur (each trigger appends at most once), so a list is the simplest
     # shape that round-trips cleanly through JSON.
     degraded_reasons: List[str] = field(default_factory=list)
+    # Full transparency for the mutation_testing multiplier's effect (see
+    # _score_mutation_testing): the raw multiplier applied, and the
+    # test_health/patch_coverage/overall_coverage weighted subtotal it was
+    # applied to, *before* the discount -- an auditor can reconstruct
+    # `pre_multiplier_cluster_score * mutation_multiplier +
+    # components["mutation_testing"].weighted_score` and see it land back
+    # on the discounted cluster contribution, rather than having to
+    # reverse-engineer the effect from `value` alone.
+    mutation_multiplier: float = 1.0
+    pre_multiplier_cluster_score: float = 0.0
 
     def as_dict(self) -> Dict:
         return {
@@ -120,6 +160,8 @@ class RCSResult:
             "components": {k: v.as_dict() for k, v in self.components.items()},
             "degraded": self.degraded,
             "degraded_reasons": self.degraded_reasons,
+            "mutation_multiplier": round(self.mutation_multiplier, 4),
+            "pre_multiplier_cluster_score": round(self.pre_multiplier_cluster_score, 2),
         }
 
 
@@ -181,29 +223,30 @@ def _score_overall_coverage(overall_line_rate: float, overall_min: float) -> Sco
     return ScoreComponent(w, raw, raw * w, reason)
 
 
-def _score_assertion_integrity(
-    total_assertions: int, total_test_functions: int, ast_skipped_test_functions: int = 0
+def _score_mutation_testing(
+    mutation_report: Optional[MutationTestReport], cluster_weighted_sum: float
 ) -> ScoreComponent:
-    w = WEIGHTS["assertion_integrity"]
+    """mutation_testing is not an additive WEIGHTS bucket -- its weight is
+    0.0 by construction, and its `weighted_score` instead carries the
+    signed point *delta* the multiplier causes against the
+    test_health/patch_coverage/overall_coverage cluster
+    (`(multiplier - 1.0) * cluster_weighted_sum`). This keeps
+    score_pipeline()'s `total_weighted = sum(c.weighted_score for c in
+    components.values())` reduction true with no special-casing of the
+    final sum, while raw_score still carries the real mutation_score (or
+    0 when one couldn't be computed) for display."""
+    w = 0.0
 
-    if total_test_functions <= 0 or total_assertions < 0:
-        if total_test_functions <= 0 and ast_skipped_test_functions > 0:
-            # Distinct from "genuinely no tests": the suite has
-            # ast_skipped_test_functions test(s), all of them
-            # skipped/disabled -- an auditor reading the signed reason
-            # string should see that, not a claim that no tests exist.
-            reason = (
-                f"no non-skipped test functions to compute assertion density from "
-                f"({ast_skipped_test_functions} skipped/disabled)"
-            )
-        else:
-            reason = "no test functions to compute assertion density from"
-        return ScoreComponent(w, 0.0, 0.0, reason)
+    if mutation_report is None:
+        # Every caller predating this field (or one that never wired
+        # cli.mutation in at all) -- same "not evaluated, not penalized"
+        # contract as static_analysis's own "no --sarif configured" case.
+        return ScoreComponent(w, 0.0, 0.0, "mutation testing was not evaluated for this run", available=False)
 
-    density = total_assertions / total_test_functions
-    raw = _clamp((density / ASSERTION_DENSITY_TARGET) * 100.0)
-    reason = f"density={density:.2f} assertions/test (target={ASSERTION_DENSITY_TARGET})"
-    return ScoreComponent(w, raw, raw * w, reason)
+    multiplier = mutation_report.multiplier
+    delta = (multiplier - 1.0) * cluster_weighted_sum
+    raw = mutation_report.mutation_score if mutation_report.mutation_score is not None else 0.0
+    return ScoreComponent(w, raw, delta, mutation_report.reason, available=mutation_report.available)
 
 
 def _score_governance(
@@ -300,8 +343,6 @@ def score_pipeline(
     test_totals: TestTotals,
     patch_coverage: PatchCoverageResult,
     overall_line_rate: float,
-    total_assertions: int,
-    total_test_functions: int,
     pr_present: bool,
     approvers_count: int = 0,
     required_approvals: int = 0,
@@ -310,7 +351,7 @@ def score_pipeline(
     overall_coverage_min: float = OVERALL_COVERAGE_MIN_DEFAULT,
     branch_governance: Optional[BranchGovernanceReport] = None,
     sarif_report: Optional[SarifSummaryReport] = None,
-    ast_skipped_test_functions: int = 0,
+    mutation_report: Optional[MutationTestReport] = None,
 ) -> RCSResult:
     degraded = False
     degraded_reasons: List[str] = []
@@ -340,13 +381,32 @@ def score_pipeline(
             degraded_reasons.append(DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE)
 
     overall_component = _score_overall_coverage(overall_line_rate, overall_coverage_min)
-    assertion_component = _score_assertion_integrity(
-        total_assertions, total_test_functions, ast_skipped_test_functions
-    )
     governance_component = _score_governance(
         pr_present, approvers_count, required_approvals, review_state, branch_governance
     )
     static_analysis_component = _score_sarif_findings(sarif_report)
+
+    cluster_weighted_sum = (
+        test_health.weighted_score + patch_component.weighted_score + overall_component.weighted_score
+    )
+    mutation_component = _score_mutation_testing(mutation_report, cluster_weighted_sum)
+
+    # Fold in mutation_testing's own degraded trigger, if any.
+    # REASON_CODE_NO_CLI_CHANGES ("no cli/*.py changed at all") and
+    # REASON_CODE_INSUFFICIENT_SAMPLE ("ran, too few mutants to trust")
+    # are deliberately *not* degradation triggers -- neither is a gap,
+    # just "this control genuinely had nothing/not enough to say" (see
+    # cli.mutation's module docstring). Everything else -- the real
+    # weak/decorative tiers, and the fail-closed unavailable/skipped
+    # cases -- is, namespaced the same way branch_governance/
+    # patch_coverage's reason codes already are.
+    if mutation_report is not None and mutation_report.reason_code not in (
+        None,
+        _MUTATION_REASON_NO_CLI_CHANGES,
+        _MUTATION_REASON_INSUFFICIENT_SAMPLE,
+    ):
+        degraded = True
+        degraded_reasons.append(f"{DEGRADED_REASON_MUTATION_TESTING_PREFIX}:{mutation_report.reason_code}")
 
     if not pr_present:
         degraded = True
@@ -381,7 +441,7 @@ def score_pipeline(
         "test_health": test_health,
         "patch_coverage": patch_component,
         "overall_coverage": overall_component,
-        "assertion_integrity": assertion_component,
+        "mutation_testing": mutation_component,
         "governance": governance_component,
         "static_analysis": static_analysis_component,
     }
@@ -395,4 +455,6 @@ def score_pipeline(
         components=components,
         degraded=degraded,
         degraded_reasons=degraded_reasons,
+        mutation_multiplier=mutation_report.multiplier if mutation_report is not None else 1.0,
+        pre_multiplier_cluster_score=cluster_weighted_sum,
     )

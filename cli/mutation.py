@@ -1,12 +1,36 @@
 """
-Diff-scoped mutation testing: mutates only the `cli/*.py` lines that
-actually changed in this diff (via mutmut) and reports a real kill-rate
-signal that `cli.scorer` folds into RCS as a *multiplier* -- not a scored
-bucket -- over the test_health/patch_coverage/overall_coverage cluster.
-Coverage and assertion density can both be satisfied by a test that
-executes a line without ever verifying its behavior; mutation testing is
-the check on whether that's actually happening, so a 95%-covered diff
-with a 20% mutation kill rate reads as decorative, not solid.
+Diff-scoped mutation testing: mutates only the `*.py` lines that actually
+changed in this diff (via mutmut) and reports a real kill-rate signal
+that `cli.scorer` folds into RCS as a *multiplier* -- not a scored bucket
+-- over the test_health/patch_coverage/overall_coverage cluster. Coverage
+and assertion density can both be satisfied by a test that executes a
+line without ever verifying its behavior; mutation testing is the check
+on whether that's actually happening, so a 95%-covered diff with a 20%
+mutation kill rate reads as decorative, not solid.
+
+Scoped to any changed `*.py` file, repo-root-relative -- deliberately
+**not** gated to lucid-assay's own `cli/` layout. lucid-assay is a
+generic tool other repos run against their own checkout (lucid-console,
+lucid-dsse-collector, lucid-attest-service all invoke it in their own
+CI, per `.github/workflows/assay.yml` in each) -- a directory-name filter
+here would silently do nothing for every one of them. mutmut itself
+already resolves `source_paths`/`only_mutate` from *that* repo's own
+`pyproject.toml`/`setup.cfg` (every subprocess call below runs with
+`cwd=repo_dir`, never lucid-assay's own), so this module only needs to
+hand it the right wildcards -- it doesn't need to know the target repo's
+layout itself. Test files are excluded from the wildcard set (mutating
+test code is never meaningful, for any repo) via a naming-convention
+heuristic (`test_*.py`/`*_test.py`, or anywhere under a `tests`/`test`
+directory) -- deliberately a heuristic, not a claim of certainty; a repo
+whose tests don't match it just gets a wildcard mutmut's own
+`only_mutate` will filter out anyway, not a crash.
+
+Mutation testing itself is Python-only (mutmut can't mutate Go/
+TypeScript/Java) -- a real, disclosed limitation of this specific tool
+choice, not a bug. A non-Python diff, or a Python diff in a repo mutmut
+has no source_paths configured for, both resolve to the same honest
+`not_applicable`/zero-mutant-exemption outcomes below, never a fabricated
+score.
 
 Not a `parsers/*` module (which stay pure/side-effect-free by design --
 see CLAUDE.md's "Module boundary discipline"): running mutmut means
@@ -83,7 +107,7 @@ MULTIPLIER_DEGRADED = 0.85
 MULTIPLIER_FAILED = 0.50
 # Unavailable/skip both use the same non-punitive-but-not-free multiplier
 # as the "weak" tier -- see the module docstring's fail-closed note.
-# "Not applicable" (no cli/*.py changed at all, a zero-mutant
+# "Not applicable" (no *.py changed at all, a zero-mutant
 # comment/docstring-only diff, or too small a sample to trust) is the one
 # family of outcomes that gets full credit, since none of those is a
 # control anyone dodged.
@@ -94,13 +118,21 @@ REASON_CODE_WEAK = "weak_assertion_coverage"
 REASON_CODE_DECORATIVE = "decorative_coverage"
 REASON_CODE_UNAVAILABLE = "unavailable"
 REASON_CODE_SKIPPED = "skipped"
-REASON_CODE_NO_CLI_CHANGES = "no_cli_changes"
+REASON_CODE_NO_PYTHON_CHANGES = "no_python_changes"
 REASON_CODE_NO_COVERABLE_LINES = "no_coverable_lines"
 REASON_CODE_INSUFFICIENT_SAMPLE = "insufficient_sample"
 
 DEFAULT_TIMEOUT_SECONDS = 90
 DEFAULT_MAX_SURVIVING_DETAIL = 5
-MUTATION_SOURCE_PREFIX = "cli/"
+
+# Naming-convention heuristic for "this .py file is a test, not source" --
+# mutating test code is never meaningful, for any repo (not just this
+# one). Deliberately a heuristic, not a claim of certainty: a repo whose
+# tests don't match this just gets a wildcard mutmut's own source_paths/
+# only_mutate config (read from *that* repo, not lucid-assay's own) will
+# filter out anyway -- see the module docstring.
+_TEST_DIR_NAMES = {"tests", "test"}
+_TEST_FILE_RE = re.compile(r"^test_.*\.py$|^.*_test\.py$")
 
 _NO_MATCH_MARKER = "Filtered for specific mutants, but nothing matches"
 _MUTANT_KEY_RE = re.compile(r"^x_(?P<func>.+)__mutmut_\d+$")
@@ -170,7 +202,7 @@ class MutationTestReport:
         }
 
 
-def _not_applicable_report(reason: str, reason_code: str = REASON_CODE_NO_CLI_CHANGES) -> MutationTestReport:
+def _not_applicable_report(reason: str, reason_code: str = REASON_CODE_NO_PYTHON_CHANGES) -> MutationTestReport:
     return MutationTestReport(
         available=False,
         grade="not_applicable",
@@ -209,15 +241,24 @@ def skipped_report(reason: str = "mutation testing skipped via --skip-mutation-t
     return _unavailable_report(reason, REASON_CODE_SKIPPED)
 
 
+def _is_test_path(file_path: str) -> bool:
+    parts = file_path.replace("\\", "/").split("/")
+    if any(p in _TEST_DIR_NAMES for p in parts[:-1]):
+        return True
+    return bool(_TEST_FILE_RE.match(parts[-1]))
+
+
 def select_changed_python_files(patch_modified_lines: Dict[str, Set[int]]) -> List[str]:
     """Filters the already-computed diff (patch_coverage.compute_patch_modified_lines,
-    repo-root-relative paths) down to `cli/*.py` files -- "new code only,
-    assay logic", never tests/ or schema/. Deterministic order (sorted)
-    so wildcard argv order, and therefore mutmut's own stable-sort output,
-    doesn't vary run to run."""
+    repo-root-relative paths) down to real, non-test `*.py` source files --
+    "new code only", wherever it lives in the repo (see the module
+    docstring for why this is deliberately not gated to any particular
+    directory name). Deterministic order (sorted) so wildcard argv order,
+    and therefore mutmut's own stable-sort output, doesn't vary run to
+    run."""
     return sorted(
         f for f in patch_modified_lines
-        if f.startswith(MUTATION_SOURCE_PREFIX) and f.endswith(".py")
+        if f.endswith(".py") and not _is_test_path(f)
     )
 
 
@@ -361,7 +402,7 @@ def run_mutation_testing(
     scoped_files = select_changed_python_files(patch_modified_lines)
     if not scoped_files:
         report = _not_applicable_report(
-            "no cli/*.py source changed in this diff (mutation testing not applicable)"
+            "no *.py source changed in this diff (mutation testing not applicable)"
         )
         _write_report(report, report_out)
         return report
@@ -376,7 +417,7 @@ def run_mutation_testing(
     existing_files = [f for f in scoped_files if (safe_repo_dir / f).is_file()]
     if not existing_files:
         report = _not_applicable_report(
-            "no cli/*.py source changed in this diff (mutation testing not applicable)"
+            "no *.py source changed in this diff (mutation testing not applicable)"
         )
         _write_report(report, report_out)
         return report
@@ -398,7 +439,7 @@ def run_mutation_testing(
     if run_proc.returncode != 0:
         if _NO_MATCH_MARKER in (run_proc.stderr or ""):
             report = _not_applicable_report(
-                "no coverable statements in the changed cli/*.py lines "
+                "no coverable statements in the changed *.py lines "
                 "(comment/docstring/type-annotation-only diff)",
                 REASON_CODE_NO_COVERABLE_LINES,
             )
@@ -429,7 +470,7 @@ def run_mutation_testing(
 
     if tested == 0:
         report = _not_applicable_report(
-            "no coverable statements in the changed cli/*.py lines "
+            "no coverable statements in the changed *.py lines "
             "(comment/docstring/type-annotation-only diff)",
             REASON_CODE_NO_COVERABLE_LINES,
         )

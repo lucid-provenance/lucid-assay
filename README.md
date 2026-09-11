@@ -31,7 +31,7 @@ cli/
   parsers/s2c2f.py          # S2C2F control evaluation (subset with a real, checkable signal) -> predicate.s2c2f
   parsers/sbom.py            # CycloneDX/SPDX SBOM ingestion -> license-policy SARIF findings + resolved_dependencies
   patch_coverage.py         # git diff base...head, intersected with coverage hit maps
-  mutation.py                # diff-scoped mutmut run (cli/*.py only) -> predicate.mutation_testing, RCS's mutation_multiplier
+  mutation.py                # diff-scoped mutmut run (*.py only) -> predicate.mutation_testing, RCS's mutation_multiplier
   real_coverage.py           # vanity-test-aware coverage: which covered lines are only exercised by vanity tests
   hashing.py                 # SHA-256 content hashing + WORM key derivation
   scorer.py                  # pure, deterministic Release Confidence Score (RCS)
@@ -215,7 +215,7 @@ produce an identical score):
 assertion counts can both be satisfied by a test that executes a line
 without ever verifying its behavior — 95% patch coverage backed by a 20%
 mutation kill rate is mostly illusory. `cli/mutation.py` diff-scopes
-[mutmut](https://mutmut.readthedocs.io/) to just the `cli/*.py` lines
+[mutmut](https://mutmut.readthedocs.io/) to just the `*.py` lines
 actually changed (via the same `git diff`-derived hunk map patch coverage
 already computes — no second git invocation), and the resulting
 `mutation_score = killed / (killed + survived) × 100` **discounts the
@@ -229,9 +229,9 @@ than adding its own weighted share:
 | < 60% | Failed | 0.50 |
 
 Two safeguards keep this from misfiring on a run that genuinely has
-nothing (or not enough) to say: a diff with **zero coverable `cli/*.py`
+nothing (or not enough) to say: a diff with **zero coverable `*.py`
 statements** changed (comment/docstring/type-annotation-only, or no
-`cli/*.py` touched at all) is exempt — full credit, no discount, flagged
+`*.py` touched at all) is exempt — full credit, no discount, flagged
 `degraded` only in the "nothing to mutate" case (namespaced
 `mutation_testing:no_coverable_lines`, allowlisted for
 `--disallow-degraded` the same way `patch_coverage:no_coverable_lines`
@@ -331,7 +331,7 @@ exactly like a failed `git diff` would (`available=False`, or an empty
 mapping from `compute_patch_modified_lines`), never a raw crash.
 
 **`mutation.py`** runs [mutmut](https://mutmut.readthedocs.io/) scoped to
-just the `cli/*.py` files `compute_patch_modified_lines` says actually
+just the `*.py` files `compute_patch_modified_lines` says actually
 changed — reusing that same already-hardened diff, not a second git
 invocation. mutmut has no built-in diff-filtering of its own (confirmed
 against its real 3.7.0 source, not assumed from its docs), so file-level
@@ -1149,7 +1149,7 @@ Policy gates:
   on GitHub Free, where branch rulesets simply aren't supported at any
   token scope), `patch_coverage:no_coverable_lines` (a docs/config-only
   diff with no code for patch coverage to be missing over), and
-  `mutation_testing:no_coverable_lines` (a diff that touched `cli/*.py`
+  `mutation_testing:no_coverable_lines` (a diff that touched `*.py`
   but mutmut generated zero mutants for it — comment/docstring/type-
   annotation-only). Any other cause present — a real governance gap,
   missing PR context, a broken SARIF input, a genuinely weak/decorative/
@@ -1790,7 +1790,7 @@ python3 -m cli.main \
 # Diff-scoped mutation testing (see "Deterministic scoring (RCS)" above)
 # needs `mutmut` installed (`pip install -e ".[dev]"`) plus a real
 # --base-sha/--head-sha pointing at an actual git diff with changed
-# cli/*.py lines -- the fake all-'a'/all-'b' SHAs in this example produce
+# *.py lines -- the fake all-'a'/all-'b' SHAs in this example produce
 # an empty diff, so mutation testing reports grade=not_applicable and
 # applies no discount, same as any docs-only PR would. Override its
 # defaults with --skip-mutation-testing/--mutation-testing-timeout/

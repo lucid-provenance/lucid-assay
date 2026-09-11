@@ -193,13 +193,13 @@ class RCSScorerTests(unittest.TestCase):
         self.assertLess(skipped.value, clean.value)
         self.assertEqual(skipped.degraded_reasons, [f"{DEGRADED_REASON_MUTATION_TESTING_PREFIX}:skipped"])
 
-    def test_zero_cli_changes_and_insufficient_sample_are_not_degraded(self):
+    def test_zero_python_changes_and_insufficient_sample_are_not_degraded(self):
         no_changes = score_pipeline(**_base_kwargs(
             mutation_report=_mutation_report(
                 available=False, grade="not_applicable", multiplier=1.0, mutation_score=None,
                 killed=0, survived=0, timeout=0, total_generated=0,
-                reason="no cli/*.py source changed in this diff (mutation testing not applicable)",
-                reason_code="no_cli_changes",
+                reason="no *.py source changed in this diff (mutation testing not applicable)",
+                reason_code="no_python_changes",
             ),
         ))
         insufficient = score_pipeline(**_base_kwargs(
@@ -223,7 +223,7 @@ class RCSScorerTests(unittest.TestCase):
             mutation_report=_mutation_report(
                 available=False, grade="not_applicable", multiplier=1.0, mutation_score=None,
                 killed=0, survived=0, timeout=0, total_generated=3,
-                reason="no coverable statements in the changed cli/*.py lines (comment/docstring/type-annotation-only diff)",
+                reason="no coverable statements in the changed *.py lines (comment/docstring/type-annotation-only diff)",
                 reason_code="no_coverable_lines",
             ),
         ))

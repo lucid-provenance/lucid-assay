@@ -240,7 +240,7 @@ class VerifyDsseAttestationTests(unittest.TestCase):
         self.assertFalse(any("disallow-degraded" in v for v in result.violations))
 
     def test_disallow_degraded_allows_sole_mutation_no_coverable_lines_cause(self):
-        # A diff that changed cli/*.py files but mutmut generated zero
+        # A diff that changed *.py files but mutmut generated zero
         # mutants for them (comment/docstring/type-annotation-only) is
         # the same kind of unavoidable, benign state as the docs-only
         # patch-coverage case above -- not a real gap.

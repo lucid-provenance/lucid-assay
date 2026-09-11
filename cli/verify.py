@@ -198,7 +198,7 @@ class EnvelopeTooLargeError(Exception):
 #   - a docs/config-only diff with zero coverable changed lines -- there's
 #     no code in the diff for patch coverage to be missing over (see
 #     cli.patch_coverage.REASON_CODE_NO_COVERABLE_LINES)
-#   - a diff that changed cli/*.py files but mutmut generated zero
+#   - a diff that changed *.py files but mutmut generated zero
 #     mutants for the changed lines (comment/docstring/type-annotation-
 #     only hunks -- nothing executable actually changed, see
 #     cli.mutation.REASON_CODE_NO_COVERABLE_LINES). Note this is the same

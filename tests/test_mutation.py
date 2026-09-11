@@ -17,7 +17,7 @@ from cli.mutation import (
     MULTIPLIER_PASSED,
     MULTIPLIER_UNAVAILABLE,
     REASON_CODE_INSUFFICIENT_SAMPLE,
-    REASON_CODE_NO_CLI_CHANGES,
+    REASON_CODE_NO_PYTHON_CHANGES,
     REASON_CODE_NO_COVERABLE_LINES,
     REASON_CODE_SKIPPED,
     _NO_MATCH_MARKER,
@@ -102,14 +102,34 @@ class RunMutationTestingTests(unittest.TestCase):
     def _diff(self):
         return {"cli/scorer.py": {1, 2}}
 
-    def test_no_cli_py_changes_short_circuits_without_invoking_mutmut(self):
+    def test_no_python_changes_short_circuits_without_invoking_mutmut(self):
         with patch("cli.mutation._run_mutmut") as run_mock:
             report = run_mutation_testing(str(self.repo_dir), {"README.md": {1}})
         run_mock.assert_not_called()
         self.assertFalse(report.available)
         self.assertEqual(report.grade, "not_applicable")
         self.assertEqual(report.multiplier, MULTIPLIER_NOT_APPLICABLE)
-        self.assertEqual(report.reason_code, REASON_CODE_NO_CLI_CHANGES)
+        self.assertEqual(report.reason_code, REASON_CODE_NO_PYTHON_CHANGES)
+
+    def test_scope_is_not_gated_to_any_particular_directory_name(self):
+        # The real bug this guards against: lucid-assay is a generic tool
+        # other repos run against their own checkout, so a hardcoded
+        # "cli/" prefix would silently do nothing for every one of them.
+        self.assertEqual(
+            select_changed_python_files({"src/app/handlers.py": {1}, "README.md": {1}}),
+            ["src/app/handlers.py"],
+        )
+
+    def test_test_files_are_excluded_from_scope_regardless_of_directory(self):
+        self.assertEqual(
+            select_changed_python_files({
+                "cli/scorer.py": {1},
+                "tests/test_scorer.py": {1},
+                "src/app/test_handlers.py": {1},
+                "src/app/handlers_test.py": {1},
+            }),
+            ["cli/scorer.py"],
+        )
 
     def test_unsafe_repo_dir_is_refused_and_reported_unavailable(self):
         with patch("cli.mutation.safe_resolve_path", side_effect=UnsafePathError("bad path")):

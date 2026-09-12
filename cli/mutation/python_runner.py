@@ -57,15 +57,71 @@ Hardened against:
     file can't be confidently, narrowly rewritten -- this is a performance
     optimization, never allowed to risk corrupting a target repo's real
     config to save time.
+  - Mutmut invoked via `sys.executable` (this process's own interpreter)
+    cannot ever see a *target* repo's own runtime/test dependencies: for
+    every caller except lucid-assay's own dogfooding (where the "target"
+    repo genuinely is this interpreter's own environment), `sys.executable`
+    is `_assay/.venv`'s own isolated Python in CI -- pinned to lucid-assay's
+    own dependency set (mutmut, pytest, sigstore, ...), never the calling
+    repo's own (fastapi, sqlalchemy, whatever). Mutmut's internal pytest
+    run then fails to even *collect* the target's test files
+    (`ModuleNotFoundError: No module named 'fastapi'`) -- and since pytest
+    prints a collection error to stdout, not stderr, the failure used to
+    surface as a blank `mutmut run failed (exit 1): )` with the real cause
+    silently dropped (see the second bullet below). Confirmed empirically,
+    2026-09-12, lucid-dsse-collector's own real CI run -- the first real
+    mutation-testing run for any caller other than lucid-assay itself,
+    which is exactly why this was never caught by this feature's own
+    landing verification (that measurement ran locally, not through a
+    genuinely isolated `_assay/.venv`-equivalent). `_run_mutmut()` now
+    shells out through `uv run --with mutmut==<pinned version> --no-sync`
+    instead: `--no-sync` reuses the target repo's own already-synced
+    `.venv` exactly as CI (or a real dev workflow) left it -- confirmed
+    every current caller's CI runs its own `uv sync --frozen --extra dev`
+    earlier in the same job, before mutation testing ever runs -- rather
+    than triggering a surprise re-resolve of that repo's own lockfile, and
+    `--with` layers just mutmut on top as an ephemeral, uv-resolved
+    addition, never written into the target's own pyproject.toml/uv.lock.
+    Relies on `cwd=cwd` (already set below) for uv's own cwd-based project
+    discovery -- the same convention every caller's own CI already uses
+    elsewhere (`cd _assay && uv run --no-sync ...`), not an explicit
+    `--project` flag. Requires the target repo to itself be a real uv
+    project (a `pyproject.toml` uv can resolve against) -- true for every
+    current caller with mutation testing actually enabled; a caller with no
+    `pyproject.toml` at all needs one before turning this on.
+  - The dropped-stdout diagnostics gap above, independently: `run_proc`'s
+    reason string used to read only `.stderr` -- correct for an uncaught
+    Python exception (goes to stderr by default) but blank for a pytest
+    collection failure or any other tool output mutmut itself prints to
+    stdout. Falls back to stdout only when stderr is empty, so an existing
+    stderr-carrying failure's message is unchanged.
+
+Known equivalent mutants (confirmed via a real mutmut run against this
+module's own diff, 2026-09-12 -- 175/178 real mutants killed, 98%; the
+remaining 3 are these, deliberately not chased further, per CLAUDE.md's
+own "never chase provably-equivalent mutants" convention):
+  - `_NO_MATCH_MARKER in (run_proc.stderr or "")` with the `""` fallback
+    replaced by any other string: the fallback's only role is "don't
+    crash the `in` check on a None stderr" -- `_NO_MATCH_MARKER` is never
+    expected to appear inside either fallback value in any real
+    invocation, so no test can observe a difference between them without
+    contriving a meaningless scenario.
+  - `stats_path.read_text(encoding="utf-8")` with `encoding=None`
+    (platform-default) or `encoding="UTF-8"` (different case): on any
+    real CI/dev environment running a UTF-8 locale (universal in
+    practice today), `read_text`'s platform-default encoding resolves to
+    UTF-8 regardless, and codec name lookup is case-insensitive -- both
+    variants behave identically to the real code for every JSON payload
+    mutmut itself ever writes here.
 """
 from __future__ import annotations
 
 import ast
+import importlib.metadata
 import json
 import re
 import shutil
 import subprocess
-import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
@@ -250,9 +306,20 @@ def _wildcards_for_file(repo_dir: Path, file_path: str, changed_lines: Optional[
     return [_wildcard_for(file_path)]
 
 
+# The version of mutmut *this* process has installed -- lucid-assay's own
+# pinned dev dependency (pyproject.toml's `mutmut>=3.7.0,<4.0.0`). Read
+# dynamically rather than duplicating the pin as a second hardcoded string
+# that could drift out of sync with it.
+_MUTMUT_VERSION = importlib.metadata.version("mutmut")
+
+
 def _run_mutmut(args: List[str], *, cwd: Path, timeout_seconds: int) -> subprocess.CompletedProcess:
+    """See this module's own "Hardened against" docstring (the
+    `sys.executable` bullet) for why this is `uv run --with
+    mutmut==<pinned version> --no-sync python -m mutmut <args>`, not a
+    direct `[sys.executable, "-m", "mutmut", *args]` invocation."""
     return subprocess.run(
-        [sys.executable, "-m", "mutmut", *args],
+        ["uv", "run", "--with", f"mutmut=={_MUTMUT_VERSION}", "--no-sync", "python", "-m", "mutmut", *args],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -452,9 +519,14 @@ def _run_scoped(
                 scoped_files=existing_files,
                 reason=REASON_CODE_NO_COVERABLE_LINES,
             )
+        # stderr first (an uncaught Python exception's traceback lands
+        # there by default); stdout only as a fallback, for a tool failure
+        # (e.g. a pytest collection error) that prints to stdout instead --
+        # see this module's own "Hardened against" docstring.
+        error_detail = (run_proc.stderr or "").strip() or (run_proc.stdout or "").strip()
         return LanguageRunResult(
             language=LANGUAGE_PYTHON, status="unavailable",
-            reason=f"mutmut run failed (exit {run_proc.returncode}): {(run_proc.stderr or '').strip()[:300]}",
+            reason=f"mutmut run failed (exit {run_proc.returncode}): {error_detail[:300]}",
         )
 
     try:

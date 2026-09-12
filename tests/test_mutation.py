@@ -41,6 +41,7 @@ from cli.mutation.python_runner import (
     _touched_functions,
     _wildcard_for,
     _wildcards_for_file,
+    run as python_runner_run,
 )
 
 
@@ -193,6 +194,285 @@ class SkippedReportTests(unittest.TestCase):
         self.assertEqual(report.reason_code, REASON_CODE_SKIPPED)
 
 
+class RunMutmutSubprocessInvocationTests(unittest.TestCase):
+    """Locks in the real subprocess argv _run_mutmut() constructs -- see
+    python_runner.py's own "Hardened against" docstring (the
+    `sys.executable` bullet) for why this is `uv run --with
+    mutmut==<pinned version> --no-sync python -m mutmut <args>`, not a
+    direct `[sys.executable, "-m", "mutmut", *args]` invocation: the
+    latter can never see a *target* repo's own runtime/test dependencies
+    (confirmed empirically, 2026-09-12, lucid-dsse-collector's own real
+    CI run -- a ModuleNotFoundError on the target's own fastapi)."""
+
+    def test_invokes_uv_run_with_the_pinned_mutmut_version_and_no_sync(self):
+        from cli.mutation.python_runner import _MUTMUT_VERSION, _run_mutmut
+
+        with patch("cli.mutation.python_runner.subprocess.run") as run_mock:
+            run_mock.return_value = _ok()
+            _run_mutmut(["run", "cli.scorer.*"], cwd=Path("/tmp/some-repo"), timeout_seconds=30)
+
+        run_mock.assert_called_once()
+        argv, kwargs = run_mock.call_args.args[0], run_mock.call_args.kwargs
+        self.assertEqual(
+            argv,
+            ["uv", "run", "--with", f"mutmut=={_MUTMUT_VERSION}", "--no-sync", "python", "-m", "mutmut", "run", "cli.scorer.*"],
+        )
+        # cwd is what makes uv's own project discovery (and mutmut's own
+        # relative-path pyproject.toml lookup) resolve against the target
+        # repo, not an explicit --project flag -- see the docstring.
+        self.assertEqual(kwargs["cwd"], Path("/tmp/some-repo"))
+        self.assertEqual(kwargs["timeout"], 30)
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+        # assertIs, not assertFalse -- subprocess.run itself treats
+        # check=None identically to check=False (both falsy), so a plain
+        # truthiness assertion can't tell them apart; assertIs pins the
+        # literal value actually written in source.
+        self.assertIs(kwargs["check"], False)
+
+    def test_mutmut_version_is_read_dynamically_not_hardcoded_a_second_time(self):
+        import importlib.metadata
+
+        from cli.mutation.python_runner import _MUTMUT_VERSION
+
+        self.assertEqual(_MUTMUT_VERSION, importlib.metadata.version("mutmut"))
+
+
+def _recording_side_effect(calls, responses):
+    """A `_run_mutmut` side_effect that records every call's (args, cwd,
+    timeout_seconds) into `calls` and returns/raises whatever `responses`
+    maps that call's subcommand (args[0]) to -- a subprocess.CompletedProcess
+    to return, or an Exception instance to raise. Any subcommand not in
+    `responses` gets a bare `_ok()`."""
+
+    def side_effect(args, *, cwd, timeout_seconds):
+        calls.append((tuple(args), cwd, timeout_seconds))
+        resp = responses.get(args[0])
+        if isinstance(resp, Exception):
+            raise resp
+        return resp if resp is not None else _ok()
+
+    return side_effect
+
+
+class PythonRunnerRunDirectFieldTests(unittest.TestCase):
+    """Calls cli.mutation.python_runner.run() directly (not through
+    run_mutation_testing()'s combining/grading layer) and asserts on the
+    exact LanguageRunResult fields it returns -- the combining layer
+    (cli.mutation.__init__._combine_results) lossily projects most of
+    these into a single free-text `reason` string, which makes several
+    real field-level mutations (a None value, a wrong dict key, a missing
+    kwarg silently defaulting) invisible to a test that only inspects the
+    combined MutationTestReport. Real survivors found via a genuine
+    mutmut run against this module (2026-09-12, lucid-dsse-collector PR
+    #59's own CI first exercised _run_scoped at this granularity) --
+    every test below targets one specific surviving mutant's exact shape,
+    not a guess at what might matter."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo_dir = Path(self._tmp.name)
+        (self.repo_dir / "cli").mkdir()
+        (self.repo_dir / "cli" / "scorer.py").write_text(
+            "def score_test_health(totals):\n    return 1\n\n\ndef other():\n    return 2\n",
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, *, timeout_seconds=30, max_surviving_detail=5):
+        return python_runner_run(
+            self.repo_dir, ["cli/scorer.py"],
+            timeout_seconds=timeout_seconds, max_surviving_detail=max_surviving_detail,
+            changed_lines={"cli/scorer.py": {1, 2}},
+        )
+
+    def test_run_and_export_cicd_stats_calls_receive_the_real_cwd_and_timeout(self):
+        calls: List[tuple] = []
+        _write_stats(self.repo_dir, killed=1, total=1)
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=_recording_side_effect(calls, {})):
+            self._run(timeout_seconds=42)
+        run_call = next(c for c in calls if c[0][0] == "run")
+        stats_call = next(c for c in calls if c[0][0] == "export-cicd-stats")
+        self.assertEqual(run_call[1], self.repo_dir)
+        self.assertEqual(run_call[2], 42)
+        self.assertEqual(stats_call[1], self.repo_dir)
+        self.assertEqual(stats_call[2], 42)
+
+    def test_timeout_expired_reports_exact_language_status_and_reason(self):
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                raise subprocess.TimeoutExpired(cmd=args, timeout=timeout_seconds)
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run(timeout_seconds=17)
+        self.assertEqual(result.language, LANGUAGE_PYTHON)
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.reason, "mutmut exceeded the 17s time budget")
+
+    def test_oserror_reports_exact_language_status_and_reason(self):
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                raise OSError("no such file: mutmut")
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run()
+        self.assertEqual(result.language, LANGUAGE_PYTHON)
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.reason, "mutmut could not be invoked: no such file: mutmut")
+
+    def test_no_match_marker_exemption_reports_exact_language_status_scoped_files_and_reason(self):
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                return _ok(returncode=1, stderr=f"AssertionError: {_NO_MATCH_MARKER}")
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run()
+        self.assertEqual(result.language, LANGUAGE_PYTHON)
+        self.assertEqual(result.status, "ran")
+        self.assertEqual(result.scoped_files, ["cli/scorer.py"])
+        self.assertEqual(result.reason, REASON_CODE_NO_COVERABLE_LINES)
+
+    def test_general_run_failure_prefers_stderr_verbatim(self):
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                return _ok(returncode=1, stdout="ignored stdout", stderr="the real stderr reason")
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run()
+        self.assertEqual(result.language, LANGUAGE_PYTHON)
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.reason, "mutmut run failed (exit 1): the real stderr reason")
+
+    def test_general_run_failure_falls_back_to_stdout_verbatim_when_stderr_empty(self):
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                return _ok(returncode=1, stdout="the real stdout reason", stderr="")
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run()
+        self.assertEqual(result.reason, "mutmut run failed (exit 1): the real stdout reason")
+
+    def test_general_run_failure_with_both_streams_empty_yields_no_fabricated_placeholder(self):
+        # Pins the literal fallback ("") for both `or` defaults -- a
+        # mutated fallback constant (e.g. "XXXX") would leak into this
+        # exact reason text, since neither stream has real content to
+        # short-circuit to.
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                return _ok(returncode=1, stdout="", stderr="")
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run()
+        self.assertEqual(result.reason, "mutmut run failed (exit 1): ")
+
+    def test_general_run_failure_truncates_error_detail_at_exactly_300_chars(self):
+        long_stderr = "x" * 305
+
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                return _ok(returncode=1, stderr=long_stderr)
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run()
+        self.assertEqual(result.reason, f"mutmut run failed (exit 1): {'x' * 300}")
+
+    def test_stats_read_failure_reports_exact_language_status_and_reason(self):
+        # "run" succeeds but never actually writes mutmut-cicd-stats.json
+        # (the mocked "export-cicd-stats" call is a no-op) -- the
+        # subsequent read genuinely fails (FileNotFoundError, an OSError).
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=lambda args, **kw: _ok()):
+            result = self._run()
+        self.assertEqual(result.language, LANGUAGE_PYTHON)
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.reason, "mutmut ran but its results could not be read")
+
+    def test_stats_dict_reads_the_real_distinct_value_for_every_key(self):
+        # Four distinct, nonzero values -- a key-name typo (wrong dict
+        # key) falls back to each field's own 0 default instead of the
+        # real value, which this would catch immediately. Written inside
+        # the mocked "run" call, not before it -- run() itself deletes
+        # any pre-existing mutants/ dir (_reset_mutmut_cache) before ever
+        # reaching _run_scoped, so a stats file written beforehand would
+        # just be wiped before this code gets to read it.
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                _write_stats(self.repo_dir, killed=3, survived=5, timeout=7, total=99)
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run()
+        self.assertEqual(result.killed, 3)
+        self.assertEqual(result.survived, 5)
+        self.assertEqual(result.timeout, 7)
+        self.assertEqual(result.total_generated, 99)
+
+    def test_stats_dict_missing_every_key_defaults_to_zero_not_none_or_one(self):
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                stats_path = self.repo_dir / "mutants" / "mutmut-cicd-stats.json"
+                stats_path.parent.mkdir(parents=True, exist_ok=True)
+                stats_path.write_text("{}", encoding="utf-8")
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run()
+        self.assertEqual(result.status, "ran")
+        self.assertEqual(result.killed, 0)
+        self.assertEqual(result.survived, 0)
+        self.assertEqual(result.timeout, 0)
+        self.assertEqual(result.total_generated, 0)
+
+    def test_surviving_detail_is_capped_to_the_real_max_detail_not_unbounded(self):
+        results_lines = "\n".join(
+            f"    cli.scorer.x_score_test_health__mutmut_{i}: survived" for i in range(3)
+        )
+        calls: List[tuple] = []
+
+        def side_effect(args, *, cwd, timeout_seconds):
+            calls.append((tuple(args), timeout_seconds))
+            if args[0] == "run":
+                _write_stats(self.repo_dir, killed=1, survived=3, total=4)
+            elif args[0] == "results":
+                return _ok(stdout=results_lines)
+            elif args[0] == "show":
+                return _ok(stdout="--- a\n+++ b\n")
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run(timeout_seconds=64, max_surviving_detail=2)
+        # 3 real survivors found, capped to the real max_surviving_detail
+        # (2) -- max_detail=None (list[:None]) would silently return all
+        # 3 uncapped instead.
+        self.assertEqual(len(result.surviving_mutants), 2)
+        # _collect_surviving_detail's own "results"/"show" calls must get
+        # the real timeout_seconds threaded through, not a mutated None.
+        results_call = next(c for c in calls if c[0][0] == "results")
+        show_call = next(c for c in calls if c[0][0] == "show")
+        self.assertEqual(results_call[1], 64)
+        self.assertEqual(show_call[1], 64)
+
+    def test_final_result_carries_the_real_timeout_total_generated_and_scoped_files(self):
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                _write_stats(self.repo_dir, killed=2, survived=0, timeout=9, total=11)
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run()
+        self.assertEqual(result.timeout, 9)
+        self.assertEqual(result.total_generated, 11)
+        self.assertEqual(result.scoped_files, ["cli/scorer.py"])
+
+
 class RunMutationTestingPythonTests(unittest.TestCase):
     """End-to-end through run_mutation_testing() -- single-language
     (Python-only) diffs, exercising the dispatcher + python_runner
@@ -316,6 +596,33 @@ class RunMutationTestingPythonTests(unittest.TestCase):
         self.assertFalse(report.available)
         self.assertEqual(report.multiplier, MULTIPLIER_UNAVAILABLE)
         self.assertNotEqual(report.reason_code, REASON_CODE_NO_COVERABLE_LINES)
+
+    def test_a_failed_run_with_empty_stderr_falls_back_to_stdout_in_the_reason(self):
+        # A pytest collection error (e.g. the target repo's own runtime
+        # dependency isn't importable) prints to stdout, not stderr -- the
+        # reason string must not go blank just because stderr is empty.
+        # Confirmed empirically, 2026-09-12: lucid-dsse-collector's own
+        # real CI run hit exactly this shape.
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                return _ok(returncode=1, stdout="ModuleNotFoundError: No module named 'fastapi'", stderr="")
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            report = run_mutation_testing(str(self.repo_dir), self._diff())
+        self.assertFalse(report.available)
+        self.assertIn("ModuleNotFoundError: No module named 'fastapi'", report.reason)
+
+    def test_a_failed_run_prefers_stderr_over_stdout_when_both_are_present(self):
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                return _ok(returncode=1, stdout="some incidental progress output", stderr="the real crash reason")
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            report = run_mutation_testing(str(self.repo_dir), self._diff())
+        self.assertIn("the real crash reason", report.reason)
+        self.assertNotIn("some incidental progress output", report.reason)
 
     def test_surviving_mutant_detail_is_collected_and_capped(self):
         def side_effect(args, *, cwd, timeout_seconds):

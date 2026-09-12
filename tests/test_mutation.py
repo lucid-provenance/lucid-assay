@@ -193,6 +193,46 @@ class SkippedReportTests(unittest.TestCase):
         self.assertEqual(report.reason_code, REASON_CODE_SKIPPED)
 
 
+class RunMutmutSubprocessInvocationTests(unittest.TestCase):
+    """Locks in the real subprocess argv _run_mutmut() constructs -- see
+    python_runner.py's own "Hardened against" docstring (the
+    `sys.executable` bullet) for why this is `uv run --with
+    mutmut==<pinned version> --no-sync python -m mutmut <args>`, not a
+    direct `[sys.executable, "-m", "mutmut", *args]` invocation: the
+    latter can never see a *target* repo's own runtime/test dependencies
+    (confirmed empirically, 2026-09-12, lucid-dsse-collector's own real
+    CI run -- a ModuleNotFoundError on the target's own fastapi)."""
+
+    def test_invokes_uv_run_with_the_pinned_mutmut_version_and_no_sync(self):
+        from cli.mutation.python_runner import _MUTMUT_VERSION, _run_mutmut
+
+        with patch("cli.mutation.python_runner.subprocess.run") as run_mock:
+            run_mock.return_value = _ok()
+            _run_mutmut(["run", "cli.scorer.*"], cwd=Path("/tmp/some-repo"), timeout_seconds=30)
+
+        run_mock.assert_called_once()
+        argv, kwargs = run_mock.call_args.args[0], run_mock.call_args.kwargs
+        self.assertEqual(
+            argv,
+            ["uv", "run", "--with", f"mutmut=={_MUTMUT_VERSION}", "--no-sync", "python", "-m", "mutmut", "run", "cli.scorer.*"],
+        )
+        # cwd is what makes uv's own project discovery (and mutmut's own
+        # relative-path pyproject.toml lookup) resolve against the target
+        # repo, not an explicit --project flag -- see the docstring.
+        self.assertEqual(kwargs["cwd"], Path("/tmp/some-repo"))
+        self.assertEqual(kwargs["timeout"], 30)
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+        self.assertFalse(kwargs["check"])
+
+    def test_mutmut_version_is_read_dynamically_not_hardcoded_a_second_time(self):
+        import importlib.metadata
+
+        from cli.mutation.python_runner import _MUTMUT_VERSION
+
+        self.assertEqual(_MUTMUT_VERSION, importlib.metadata.version("mutmut"))
+
+
 class RunMutationTestingPythonTests(unittest.TestCase):
     """End-to-end through run_mutation_testing() -- single-language
     (Python-only) diffs, exercising the dispatcher + python_runner
@@ -316,6 +356,33 @@ class RunMutationTestingPythonTests(unittest.TestCase):
         self.assertFalse(report.available)
         self.assertEqual(report.multiplier, MULTIPLIER_UNAVAILABLE)
         self.assertNotEqual(report.reason_code, REASON_CODE_NO_COVERABLE_LINES)
+
+    def test_a_failed_run_with_empty_stderr_falls_back_to_stdout_in_the_reason(self):
+        # A pytest collection error (e.g. the target repo's own runtime
+        # dependency isn't importable) prints to stdout, not stderr -- the
+        # reason string must not go blank just because stderr is empty.
+        # Confirmed empirically, 2026-09-12: lucid-dsse-collector's own
+        # real CI run hit exactly this shape.
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                return _ok(returncode=1, stdout="ModuleNotFoundError: No module named 'fastapi'", stderr="")
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            report = run_mutation_testing(str(self.repo_dir), self._diff())
+        self.assertFalse(report.available)
+        self.assertIn("ModuleNotFoundError: No module named 'fastapi'", report.reason)
+
+    def test_a_failed_run_prefers_stderr_over_stdout_when_both_are_present(self):
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                return _ok(returncode=1, stdout="some incidental progress output", stderr="the real crash reason")
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            report = run_mutation_testing(str(self.repo_dir), self._diff())
+        self.assertIn("the real crash reason", report.reason)
+        self.assertNotIn("some incidental progress output", report.reason)
 
     def test_surviving_mutant_detail_is_collected_and_capped(self):
         def side_effect(args, *, cwd, timeout_seconds):

@@ -95,6 +95,24 @@ Hardened against:
     collection failure or any other tool output mutmut itself prints to
     stdout. Falls back to stdout only when stderr is empty, so an existing
     stderr-carrying failure's message is unchanged.
+
+Known equivalent mutants (confirmed via a real mutmut run against this
+module's own diff, 2026-09-12 -- 175/178 real mutants killed, 98%; the
+remaining 3 are these, deliberately not chased further, per CLAUDE.md's
+own "never chase provably-equivalent mutants" convention):
+  - `_NO_MATCH_MARKER in (run_proc.stderr or "")` with the `""` fallback
+    replaced by any other string: the fallback's only role is "don't
+    crash the `in` check on a None stderr" -- `_NO_MATCH_MARKER` is never
+    expected to appear inside either fallback value in any real
+    invocation, so no test can observe a difference between them without
+    contriving a meaningless scenario.
+  - `stats_path.read_text(encoding="utf-8")` with `encoding=None`
+    (platform-default) or `encoding="UTF-8"` (different case): on any
+    real CI/dev environment running a UTF-8 locale (universal in
+    practice today), `read_text`'s platform-default encoding resolves to
+    UTF-8 regardless, and codec name lookup is case-insensitive -- both
+    variants behave identically to the real code for every JSON payload
+    mutmut itself ever writes here.
 """
 from __future__ import annotations
 

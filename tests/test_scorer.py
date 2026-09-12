@@ -20,6 +20,7 @@ from cli.scorer import (
     DEGRADED_REASON_NO_PR_CONTEXT,
     DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE,
     DEGRADED_REASON_SARIF_UNAVAILABLE,
+    _score_mutation_testing,
 )
 
 
@@ -192,6 +193,48 @@ class RCSScorerTests(unittest.TestCase):
         self.assertEqual(skipped.mutation_multiplier, weak.mutation_multiplier)
         self.assertLess(skipped.value, clean.value)
         self.assertEqual(skipped.degraded_reasons, [f"{DEGRADED_REASON_MUTATION_TESTING_PREFIX}:skipped"])
+
+    def test_score_mutation_testing_computes_the_exact_signed_delta(self):
+        # Direct, exact-arithmetic test of _score_mutation_testing()'s own
+        # `delta = (multiplier - 1.0) * cluster_weighted_sum` -- the
+        # existing score_pipeline()-level tests above only ever assert
+        # relative properties (weak.value < clean.value,
+        # mutation_multiplier ~= 0.85), which a sign-flip/operator-swap/
+        # wrong-constant mutant on that one line can still satisfy. This
+        # pins the exact numeric output for a few real multiplier tiers.
+        report = _mutation_report(grade="degraded", multiplier=0.85, mutation_score=68.0, reason_code="weak_assertion_coverage")
+        component = _score_mutation_testing(report, cluster_weighted_sum=80.0)
+        self.assertAlmostEqual(component.weighted_score, -12.0)  # (0.85 - 1.0) * 80.0
+        self.assertEqual(component.weight, 0.0)
+        self.assertEqual(component.raw_score, 68.0)
+        self.assertEqual(component.reason, report.reason)
+        self.assertTrue(component.available)
+
+    def test_score_mutation_testing_full_multiplier_yields_zero_delta(self):
+        report = _mutation_report(grade="passed", multiplier=1.0, mutation_score=95.0)
+        component = _score_mutation_testing(report, cluster_weighted_sum=80.0)
+        self.assertEqual(component.weighted_score, 0.0)
+
+    def test_score_mutation_testing_severe_multiplier_computes_exact_delta(self):
+        report = _mutation_report(grade="failed", multiplier=0.50, mutation_score=20.0, reason_code="decorative_coverage")
+        component = _score_mutation_testing(report, cluster_weighted_sum=80.0)
+        self.assertAlmostEqual(component.weighted_score, -40.0)  # (0.50 - 1.0) * 80.0
+
+    def test_score_mutation_testing_delta_scales_with_cluster_weighted_sum(self):
+        # Pins the multiplication itself, independent of the multiplier
+        # tier tests above -- a different cluster_weighted_sum must
+        # produce a proportionally different delta.
+        report = _mutation_report(grade="degraded", multiplier=0.85, mutation_score=68.0, reason_code="weak_assertion_coverage")
+        component = _score_mutation_testing(report, cluster_weighted_sum=40.0)
+        self.assertAlmostEqual(component.weighted_score, -6.0)  # (0.85 - 1.0) * 40.0
+
+    def test_score_mutation_testing_none_report_ignores_cluster_weighted_sum(self):
+        # No report -> zero delta regardless of cluster_weighted_sum,
+        # confirming the None branch short-circuits before the
+        # multiplier arithmetic runs at all.
+        component = _score_mutation_testing(None, cluster_weighted_sum=999.0)
+        self.assertEqual(component.weighted_score, 0.0)
+        self.assertFalse(component.available)
 
     def test_zero_source_changes_and_insufficient_sample_are_not_degraded(self):
         no_changes = score_pipeline(**_base_kwargs(

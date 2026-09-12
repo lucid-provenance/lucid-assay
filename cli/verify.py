@@ -198,19 +198,32 @@ class EnvelopeTooLargeError(Exception):
 #   - a docs/config-only diff with zero coverable changed lines -- there's
 #     no code in the diff for patch coverage to be missing over (see
 #     cli.patch_coverage.REASON_CODE_NO_COVERABLE_LINES)
+#   - a diff that changed *.py files but mutmut generated zero
+#     mutants for the changed lines (comment/docstring/type-annotation-
+#     only hunks -- nothing executable actually changed, see
+#     cli.mutation.REASON_CODE_NO_COVERABLE_LINES). Note this is the same
+#     literal reason_code string as patch_coverage's own
+#     no_coverable_lines above, but namespaced under "mutation_testing:"
+#     instead of "patch_coverage:" -- they are independent triggers that
+#     happen to share a name for the same underlying idea.
 # Deliberately duplicated here as literals rather than imported from
-# cli.scorer/cli.parsers.github_rules/cli.patch_coverage: this module
-# verifies only the decoded JSON predicate, with no dependency on the
-# pipeline's Python types, and these strings are a stable, versioned part
-# of the attestation's own schema (predicate.release_confidence_score.
+# cli.scorer/cli.parsers.github_rules/cli.patch_coverage/cli.mutation: this
+# module verifies only the decoded JSON predicate, with no dependency on
+# the pipeline's Python types, and these strings are a stable, versioned
+# part of the attestation's own schema (predicate.release_confidence_score.
 # degraded_reasons), not an implementation detail of those modules. If any
 # of those modules' construction of these strings changes, this set must
 # be updated to match. A degraded run is only exempted from
 # --disallow-degraded when *every* entry in degraded_reasons is a member
-# of this set -- any other cause present still blocks.
+# of this set -- any other cause present still blocks. Notably absent:
+# mutation_testing:weak_assertion_coverage / decorative_coverage /
+# unavailable / skipped -- all four are real, fixable gaps (or a control
+# someone opted out of), not unavoidable platform limitations, so they
+# still block by design.
 _ALLOWED_DEGRADED_REASONS = frozenset({
     "branch_governance:platform_unsupported_tier",
     "patch_coverage:no_coverable_lines",
+    "mutation_testing:no_coverable_lines",
 })
 
 
@@ -262,6 +275,17 @@ class VerificationResult:
     # commit-signing item, which --require-commit-signing can opt into
     # gating (see verify_dsse_attestation).
     repository_governance_items: List[Dict[str, Any]] = field(default_factory=list)
+    # predicate.mutation_testing, verbatim (cli/mutation.py) -- the real
+    # signal release_confidence_score.components.mutation_testing's
+    # multiplier was derived from, plus top-surviving-mutant detail that
+    # doesn't fit the generic scoreComponent shape. {} when this
+    # predicate predates the field or mutation testing wasn't evaluated
+    # for this run. Purely informational by default; --require-mutation-score
+    # opts into folding grade=="failed" specifically into passed/exit
+    # code (same opt-in shape as --require-commit-signing) -- a narrower,
+    # dedicated gate than --disallow-degraded, which would also block on
+    # every *other* unrelated degraded reason at once.
+    mutation_evidence: Dict[str, Any] = field(default_factory=dict)
     # The signed envelope's own _rekor.logIndex/logUrl (cli/oidc_signer.py)
     # -- not part of the signed predicate (see _extract_rekor_info's
     # docstring for why). Both None on --dry-run-sign or an envelope
@@ -341,6 +365,7 @@ class VerificationResult:
             "s2c2f_controls": self.s2c2f_controls,
             "dependency_governance_items": self.dependency_governance_items,
             "repository_governance_items": self.repository_governance_items,
+            "mutation_evidence": self.mutation_evidence,
             "rekor_log_index": self.rekor_log_index,
             "rekor_log_url": self.rekor_log_url,
             "source_highest_level": self.source_highest_level,
@@ -644,6 +669,20 @@ def _dependency_check_sbom(sbom: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if isinstance(component_count, int) and not isinstance(component_count, bool):
         detail += f", {component_count} components"
     return _slsa_item(f"{label} ({detail})", True)
+
+
+def _extract_mutation_evidence(predicate: Dict[str, Any]) -> Dict[str, Any]:
+    """predicate.mutation_testing, verbatim (cli/mutation.py) -- for
+    display purposes only, same defensive contract as _extract_metrics:
+    returns {} (not a fabricated shape) when the field is missing or
+    malformed, so the renderer can tell "no mutation testing was
+    evaluated" apart from a genuine, empty-but-present result. This is
+    deliberately not folded into a checklist the way
+    _extract_dependency_evidence/_extract_s2c2f_controls are -- there's
+    exactly one signal here (mutation_score/grade), not a set of
+    independent pass/fail items."""
+    evidence = predicate.get("mutation_testing")
+    return evidence if isinstance(evidence, dict) else {}
 
 
 def _extract_rekor_info(envelope: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
@@ -1409,6 +1448,58 @@ def _format_dependency_governance_report(items: List[Dict[str, Any]]) -> List[st
     return lines
 
 
+_MUTATION_GRADE_MARK = {"passed": "✓", "degraded": "!", "failed": "✗"}
+
+
+def _format_mutation_testing_report(evidence: Dict[str, Any]) -> List[str]:
+    """Renders the Mutation Testing section: the real kill-rate signal
+    cli/mutation (Python/mutmut, TypeScript-JavaScript/Stryker, Java/PIT
+    -- combined by that package's dispatcher) computed and
+    cli/scorer.py's mutation_testing component discounted the Test &
+    Coverage score by (see _extract_mutation_evidence). [] (no section
+    at all) when this predicate predates the field or mutation testing
+    wasn't evaluated for this run -- same "nothing to show" convention
+    as every other optional section here. not_applicable/
+    insufficient_sample render as a plain informational line
+    (✓-equivalent, no discount, not a pass/fail claim) since neither is
+    a real signal one way or the other. `by_language`, when present,
+    renders as one line per language that actually ran -- absent
+    entirely on an older, single-language-only attestation, or when
+    every language's tool reported the same not_applicable/unavailable
+    state (nothing per-language worth breaking out)."""
+    if not evidence:
+        return []
+    grade = evidence.get("grade", "not_applicable")
+    score = evidence.get("mutation_score")
+    score_str = f"{score:.0f}%" if isinstance(score, (int, float)) else "n/a"
+    lines = [f"=== Mutation Testing (diff-scoped, grade={grade}, score={score_str}) ==="]
+    mark = _MUTATION_GRADE_MARK.get(grade, "-")
+    lines.append(f"[{mark}] {evidence.get('reason', '')}")
+    by_language = evidence.get("by_language")
+    if isinstance(by_language, dict) and by_language:
+        for lang, detail in sorted(by_language.items()):
+            if not isinstance(detail, dict):
+                continue
+            lines.append(
+                f"    {lang}: {detail.get('killed', 0)} killed, {detail.get('survived', 0)} survived, "
+                f"{detail.get('timeout', 0)} timed out"
+            )
+    scoped_files = evidence.get("scoped_files")
+    if isinstance(scoped_files, list) and scoped_files:
+        lines.append(f"    scoped to: {', '.join(scoped_files)}")
+    surviving = evidence.get("top_surviving_mutants")
+    if isinstance(surviving, list) and surviving:
+        lines.append(f"    top surviving mutant(s) ({len(surviving)} shown):")
+        for m in surviving:
+            if not isinstance(m, dict):
+                continue
+            loc = f"{m.get('file')}:{m.get('line')}" if m.get("line") is not None else str(m.get("file"))
+            lang_prefix = f"[{m.get('language')}] " if m.get("language") else ""
+            lines.append(f"      - {lang_prefix}{loc} in {m.get('function')} [{m.get('status')}]")
+    lines.append(_SECTION_DIVIDER)
+    return lines
+
+
 def _format_signing_report(result: "VerificationResult") -> List[str]:
     """Renders the CD/signing summary: Sigstore identity verification
     (result.identity_status/identity_detail, already computed by
@@ -1957,6 +2048,7 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
         "dependency_governance": {
             "items": result.dependency_governance_items,
         },
+        "mutation_testing": result.mutation_evidence,
         "repository_governance": {
             "items": result.repository_governance_items,
         },
@@ -2644,6 +2736,7 @@ class _StatementDerivedFields:
     s2c2f_controls: List[Dict[str, Any]]
     dependency_governance_items: List[Dict[str, Any]]
     repository_governance_items: List[Dict[str, Any]]
+    mutation_evidence: Dict[str, Any]
     schema_validation_status: str
     predicate: Dict[str, Any]
 
@@ -2657,6 +2750,7 @@ def _evaluate_decoded_statement(
     require_digest: Optional[str],
     disallow_degraded: bool,
     require_commit_signing: bool,
+    require_mutation_score: bool,
 ) -> _StatementDerivedFields:
     """The former body of verify_dsse_attestation()'s `if statement is not
     None:` block, extracted verbatim -- see _StatementDerivedFields' own
@@ -2708,6 +2802,7 @@ def _evaluate_decoded_statement(
     s2c2f_controls = _extract_s2c2f_controls(predicate)
     dependency_governance_items = _extract_dependency_evidence(predicate)
     repository_governance_items = _extract_repository_governance(predicate)
+    mutation_evidence = _extract_mutation_evidence(predicate)
 
     # --require-commit-signing: same opt-in-gate shape as
     # --require-slsa-build-l3 (see that flag's own handling), but
@@ -2727,6 +2822,22 @@ def _evaluate_decoded_statement(
                 "--require-commit-signing was set, but HEAD's commit is not cryptographically signed/verified "
                 "(see the Repository & Workstation Governance section above for the exact reason)"
             )
+
+    # --require-mutation-score: same opt-in-gate shape as
+    # --require-commit-signing above -- folds only the "failed" grade
+    # (decorative/illusory coverage) into passed/exit code. An absent
+    # mutation_evidence (predicate predates cli/mutation.py, or mutation
+    # testing wasn't evaluated for this run) is treated as "not failed"
+    # here, not gated -- this flag targets a confirmed low kill rate
+    # specifically, not "no mutation data was ever produced" (that's
+    # --disallow-degraded's territory instead, via
+    # mutation_testing:unavailable/skipped not being in
+    # _ALLOWED_DEGRADED_REASONS).
+    if require_mutation_score and mutation_evidence.get("grade") == "failed":
+        violations.append(
+            f"--require-mutation-score was set, but mutation testing graded 'failed' "
+            f"({mutation_evidence.get('reason', 'decorative test coverage')})"
+        )
 
     gate_violations, gate_warnings = _evaluate_policy_gates(
         rcs_value=rcs_value,
@@ -2752,6 +2863,7 @@ def _evaluate_decoded_statement(
         s2c2f_controls=s2c2f_controls,
         dependency_governance_items=dependency_governance_items,
         repository_governance_items=repository_governance_items,
+        mutation_evidence=mutation_evidence,
         schema_validation_status=schema_validation_status,
         predicate=predicate,
     )
@@ -2773,6 +2885,7 @@ def verify_dsse_attestation(
     slsa_statement: Optional[Dict[str, Any]] = None,
     require_slsa_build_l3: bool = False,
     require_commit_signing: bool = False,
+    require_mutation_score: bool = False,
 ) -> VerificationResult:
     """Validates a DSSE envelope's structure, decodes its in-toto Statement
     payload, best-effort verifies the Sigstore signing identity, and enforces
@@ -2800,6 +2913,11 @@ def verify_dsse_attestation(
     specifically into `passed`/exit code -- opt-in, off by default. The
     other three items in that section (branch-ruleset hygiene) have no
     such opt-in path today; setting this flag does not gate on them.
+
+    `require_mutation_score`, when True, folds predicate.mutation_testing's
+    grade=="failed" outcome (decorative/illusory test coverage) into
+    `passed`/exit code -- opt-in, off by default, same shape as
+    `require_commit_signing`.
 
     Orchestrates (see each helper's own docstring for its contract):
       _decode_envelope_statement     -- structure + payload decode
@@ -2829,6 +2947,7 @@ def verify_dsse_attestation(
         "expected_ref": expected_ref,
         "require_slsa_build_l3": require_slsa_build_l3,
         "require_commit_signing": require_commit_signing,
+        "require_mutation_score": require_mutation_score,
     }
 
     if not isinstance(envelope, dict):
@@ -2853,6 +2972,7 @@ def verify_dsse_attestation(
     s2c2f_controls: List[Dict[str, Any]] = []
     dependency_governance_items: List[Dict[str, Any]] = []
     repository_governance_items: List[Dict[str, Any]] = []
+    mutation_evidence: Dict[str, Any] = {}
     schema_validation_status = "skipped"
 
     predicate: Dict[str, Any] = {}
@@ -2865,6 +2985,7 @@ def verify_dsse_attestation(
             require_digest=require_digest,
             disallow_degraded=disallow_degraded,
             require_commit_signing=require_commit_signing,
+            require_mutation_score=require_mutation_score,
         )
         rcs_value = fields.rcs_value
         degraded = fields.degraded
@@ -2876,6 +2997,7 @@ def verify_dsse_attestation(
         s2c2f_controls = fields.s2c2f_controls
         dependency_governance_items = fields.dependency_governance_items
         repository_governance_items = fields.repository_governance_items
+        mutation_evidence = fields.mutation_evidence
         schema_validation_status = fields.schema_validation_status
         predicate = fields.predicate
 
@@ -2942,6 +3064,7 @@ def verify_dsse_attestation(
         s2c2f_controls=s2c2f_controls,
         dependency_governance_items=dependency_governance_items,
         repository_governance_items=repository_governance_items,
+        mutation_evidence=mutation_evidence,
         rekor_log_index=rekor_log_index,
         rekor_log_url=rekor_log_url,
         schema_validation_status=schema_validation_status,
@@ -2974,7 +3097,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="Verify a lucid-assay DSSE in-toto attestation envelope against admission policy gates.",
     )
     p.add_argument("envelope", help="path to the signed DSSE envelope JSON file")
-    p.add_argument("--min-rcs", type=int, default=0, help="minimum acceptable RCS score (default: 0)")
+    p.add_argument(
+        "--min-rcs",
+        type=int,
+        default=0,
+        help="minimum acceptable RCS score (default: 0)",
+    )
     p.add_argument(
         "--require-digest",
         default=None,
@@ -2990,8 +3118,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="skip Sigstore identity verification entirely (offline mode, no network calls)",
     )
-    p.add_argument("--cert-identity", default=None, help="expected Sigstore signing identity (certificate SAN)")
-    p.add_argument("--cert-oidc-issuer", default=None, help="expected OIDC issuer for the signing identity")
+    p.add_argument(
+        "--cert-identity",
+        default=None,
+        help="expected Sigstore signing identity (certificate SAN)",
+    )
+    p.add_argument(
+        "--cert-oidc-issuer",
+        default=None,
+        help="expected OIDC issuer for the signing identity",
+    )
     p.add_argument(
         "--expected-issuer",
         default=None,
@@ -3019,7 +3155,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--slsa-envelope",
         default=None,
-        dest="slsa_envelope",
         help="path to a second, SLSA v1.0 provenance-shaped DSSE envelope; when given alongside the "
         "primary envelope, the SLSA Source Track (from the primary envelope's vcs/branch_governance) "
         "and SLSA Build Track (from this one) are both evaluated together as one unified report",
@@ -3027,7 +3162,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--require-slsa-build-l3",
         action="store_true",
-        dest="require_slsa_build_l3",
         help="fail the gate if this run does not fully (cumulatively) satisfy SLSA Build Level 3 -- "
         "off by default: it genuinely passes today when a caller supplies --subject-name/"
         "--subject-digest (confirmed against real CI runs, 2026-09-03), but that's still an opt-in "
@@ -3036,10 +3170,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--require-commit-signing",
         action="store_true",
-        dest="require_commit_signing",
         help="fail the gate if HEAD's commit is not cryptographically signed/verified (Repository & "
         "Workstation Governance section's Cryptographic Commit Signing item only -- the section's "
         "other three, branch-ruleset-hygiene items have no gate path yet) -- off by default",
+    )
+    p.add_argument(
+        "--require-mutation-score",
+        action="store_true",
+        help="fail the gate if predicate.mutation_testing graded 'failed' (decorative/illusory test "
+        "coverage) -- off by default, same opt-in shape as --require-commit-signing. The weaker "
+        "'degraded' tier already blocks --disallow-degraded by default (its reason_code isn't in "
+        "the allowed-degraded-reasons set); this flag lets a caller gate on 'failed' specifically "
+        "without also enabling --disallow-degraded's broader blast radius",
     )
     p.add_argument(
         "--format",
@@ -3062,7 +3204,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--write-verdict",
         action="store_true",
-        dest="write_verdict",
         help="persist this call's computed FAILED/GATED/PASSED verdict (plus rcs_value/degraded/SLSA "
         "highest-level/gate_params -- see _build_verdict_envelope_block) as an unsigned '_verdict' "
         "sibling field on the envelope -- same trust tier as the envelope's existing '_rekor'/"
@@ -3073,7 +3214,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--verdict-out",
         default=None,
-        dest="verdict_out",
         help="output path for --write-verdict (default: overwrite the input envelope file in place, "
         "so the same file can be re-uploaded to the ingestion API with its verdict attached)",
     )
@@ -3142,6 +3282,8 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
     SLSA track), Source Track (SLSA Source, Levels 1-4), SLSA Build Track
     (Levels 1-3), Dependency Materialization Evidence
     (_format_dependency_governance_report, when any evidence was found),
+    Mutation Testing (_format_mutation_testing_report, when
+    predicate.mutation_testing was evaluated for this run),
     the S2C2F Compliance Matrix (_format_s2c2f_report, when any
     controls were evaluated), CD / Signing (_format_signing_report --
     Sigstore identity + Rekor log entry), Assay Health & Governance
@@ -3197,6 +3339,11 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
     if dependency_lines:
         lines.append("")
         lines.extend(dependency_lines)
+
+    mutation_lines = _format_mutation_testing_report(result.mutation_evidence)
+    if mutation_lines:
+        lines.append("")
+        lines.extend(mutation_lines)
 
     s2c2f_lines = _format_s2c2f_report(result.s2c2f_controls)
     if s2c2f_lines:
@@ -3500,6 +3647,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         slsa_statement=slsa_statement,
         require_slsa_build_l3=args.require_slsa_build_l3,
         require_commit_signing=args.require_commit_signing,
+        require_mutation_score=args.require_mutation_score,
     )
 
     if _resolve_output_format(args) == "json":

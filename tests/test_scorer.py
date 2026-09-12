@@ -8,6 +8,7 @@ from cli.parsers.github_rules import BranchGovernanceReport, REASON_CODE_PLATFOR
 from cli.parsers.junit import TestTotals
 from cli.parsers.sarif import SarifSummaryReport
 from cli.patch_coverage import PatchCoverageResult, REASON_CODE_NO_COVERABLE_LINES
+from cli.mutation import MutationTestReport
 from cli.scorer import (
     score_pipeline,
     WEIGHTS,
@@ -15,10 +16,30 @@ from cli.scorer import (
     BRANCH_GOVERNANCE_UNVERIFIED_PENALTY,
     DEGRADED_REASON_BRANCH_GOVERNANCE_BYPASS,
     DEGRADED_REASON_BRANCH_GOVERNANCE_UNVERIFIED,
+    DEGRADED_REASON_MUTATION_TESTING_PREFIX,
     DEGRADED_REASON_NO_PR_CONTEXT,
     DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE,
     DEGRADED_REASON_SARIF_UNAVAILABLE,
+    _score_mutation_testing,
 )
+
+
+def _mutation_report(**overrides) -> MutationTestReport:
+    kwargs = dict(
+        available=True,
+        grade="passed",
+        multiplier=1.0,
+        mutation_score=90.0,
+        killed=9,
+        survived=1,
+        timeout=0,
+        total_generated=10,
+        reason="no discount -- 90% mutation kill rate (10 mutant(s) tested)",
+        reason_code=None,
+        scoped_files=["cli/scorer.py"],
+    )
+    kwargs.update(overrides)
+    return MutationTestReport(**kwargs)
 
 
 def _clean_branch_governance(**overrides) -> BranchGovernanceReport:
@@ -42,8 +63,6 @@ def _base_kwargs(**overrides):
         test_totals=TestTotals(tests=100, passed=100, failed=0, errored=0, skipped=0, duration_ms=1000, flaky_retries=0),
         patch_coverage=PatchCoverageResult(available=True, line_rate=0.95, lines_changed=40, lines_covered=38, reason="ok"),
         overall_line_rate=0.85,
-        total_assertions=200,
-        total_test_functions=100,
         pr_present=True,
         approvers_count=2,
         required_approvals=2,
@@ -110,9 +129,150 @@ class RCSScorerTests(unittest.TestCase):
         self.assertEqual(result.components["governance"].raw_score, 50.0)
         self.assertTrue(result.degraded)
 
-    def test_zero_test_functions_floors_assertion_integrity(self):
-        result = score_pipeline(**_base_kwargs(total_assertions=0, total_test_functions=0))
-        self.assertEqual(result.components["assertion_integrity"].raw_score, 0.0)
+    def test_no_mutation_report_does_not_discount_or_penalize(self):
+        # Every caller predating cli.mutation.py (mutation_report=None,
+        # the _base_kwargs default) -- "not evaluated", not "failed".
+        result = score_pipeline(**_base_kwargs())
+        self.assertFalse(result.components["mutation_testing"].available)
+        self.assertEqual(result.components["mutation_testing"].weighted_score, 0.0)
+        self.assertFalse(result.degraded)
+
+    def test_high_mutation_score_applies_no_discount(self):
+        result = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(grade="passed", multiplier=1.0, mutation_score=90.0),
+        ))
+        self.assertEqual(result.mutation_multiplier, 1.0)
+        self.assertEqual(result.components["mutation_testing"].weighted_score, 0.0)
+        self.assertFalse(result.degraded)
+
+    def test_weak_mutation_score_discounts_cluster_and_flags_degraded(self):
+        clean = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(grade="passed", multiplier=1.0, mutation_score=90.0),
+        ))
+        weak = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(
+                grade="degraded", multiplier=0.85, mutation_score=68.0, survived=5, killed=11, total_generated=16,
+                reason="Test & Coverage score discounted by 15% due to 68% Mutation Kill Rate (5 surviving mutant(s))",
+                reason_code="weak_assertion_coverage",
+            ),
+        ))
+        self.assertLess(weak.value, clean.value)
+        self.assertTrue(weak.degraded)
+        self.assertEqual(weak.degraded_reasons, [f"{DEGRADED_REASON_MUTATION_TESTING_PREFIX}:weak_assertion_coverage"])
+        self.assertAlmostEqual(weak.mutation_multiplier, 0.85)
+
+    def test_decorative_mutation_score_applies_the_severe_discount(self):
+        weak = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(grade="degraded", multiplier=0.85, mutation_score=68.0, reason_code="weak_assertion_coverage"),
+        ))
+        decorative = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(
+                grade="failed", multiplier=0.50, mutation_score=20.0, survived=8, killed=2, total_generated=10,
+                reason_code="decorative_coverage",
+            ),
+        ))
+        self.assertLess(decorative.value, weak.value)
+        self.assertEqual(decorative.degraded_reasons, [f"{DEGRADED_REASON_MUTATION_TESTING_PREFIX}:decorative_coverage"])
+
+    def test_skipped_mutation_testing_never_scores_better_than_weak(self):
+        # The actual anti-gaming case: opting out must not be a free way
+        # to dodge the very control meant to stop gaming.
+        weak = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(grade="degraded", multiplier=0.85, mutation_score=68.0, reason_code="weak_assertion_coverage"),
+        ))
+        skipped = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(
+                available=False, grade="degraded", multiplier=0.85, mutation_score=None,
+                killed=0, survived=0, timeout=0, total_generated=0,
+                reason="mutation testing skipped via --skip-mutation-testing", reason_code="skipped",
+            ),
+        ))
+        clean = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(grade="passed", multiplier=1.0, mutation_score=95.0),
+        ))
+        self.assertEqual(skipped.mutation_multiplier, weak.mutation_multiplier)
+        self.assertLess(skipped.value, clean.value)
+        self.assertEqual(skipped.degraded_reasons, [f"{DEGRADED_REASON_MUTATION_TESTING_PREFIX}:skipped"])
+
+    def test_score_mutation_testing_computes_the_exact_signed_delta(self):
+        # Direct, exact-arithmetic test of _score_mutation_testing()'s own
+        # `delta = (multiplier - 1.0) * cluster_weighted_sum` -- the
+        # existing score_pipeline()-level tests above only ever assert
+        # relative properties (weak.value < clean.value,
+        # mutation_multiplier ~= 0.85), which a sign-flip/operator-swap/
+        # wrong-constant mutant on that one line can still satisfy. This
+        # pins the exact numeric output for a few real multiplier tiers.
+        report = _mutation_report(grade="degraded", multiplier=0.85, mutation_score=68.0, reason_code="weak_assertion_coverage")
+        component = _score_mutation_testing(report, cluster_weighted_sum=80.0)
+        self.assertAlmostEqual(component.weighted_score, -12.0)  # (0.85 - 1.0) * 80.0
+        self.assertEqual(component.weight, 0.0)
+        self.assertEqual(component.raw_score, 68.0)
+        self.assertEqual(component.reason, report.reason)
+        self.assertTrue(component.available)
+
+    def test_score_mutation_testing_full_multiplier_yields_zero_delta(self):
+        report = _mutation_report(grade="passed", multiplier=1.0, mutation_score=95.0)
+        component = _score_mutation_testing(report, cluster_weighted_sum=80.0)
+        self.assertEqual(component.weighted_score, 0.0)
+
+    def test_score_mutation_testing_severe_multiplier_computes_exact_delta(self):
+        report = _mutation_report(grade="failed", multiplier=0.50, mutation_score=20.0, reason_code="decorative_coverage")
+        component = _score_mutation_testing(report, cluster_weighted_sum=80.0)
+        self.assertAlmostEqual(component.weighted_score, -40.0)  # (0.50 - 1.0) * 80.0
+
+    def test_score_mutation_testing_delta_scales_with_cluster_weighted_sum(self):
+        # Pins the multiplication itself, independent of the multiplier
+        # tier tests above -- a different cluster_weighted_sum must
+        # produce a proportionally different delta.
+        report = _mutation_report(grade="degraded", multiplier=0.85, mutation_score=68.0, reason_code="weak_assertion_coverage")
+        component = _score_mutation_testing(report, cluster_weighted_sum=40.0)
+        self.assertAlmostEqual(component.weighted_score, -6.0)  # (0.85 - 1.0) * 40.0
+
+    def test_score_mutation_testing_none_report_ignores_cluster_weighted_sum(self):
+        # No report -> zero delta regardless of cluster_weighted_sum,
+        # confirming the None branch short-circuits before the
+        # multiplier arithmetic runs at all.
+        component = _score_mutation_testing(None, cluster_weighted_sum=999.0)
+        self.assertEqual(component.weighted_score, 0.0)
+        self.assertFalse(component.available)
+
+    def test_zero_source_changes_and_insufficient_sample_are_not_degraded(self):
+        no_changes = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(
+                available=False, grade="not_applicable", multiplier=1.0, mutation_score=None,
+                killed=0, survived=0, timeout=0, total_generated=0,
+                reason="no *.py source changed in this diff (mutation testing not applicable)",
+                reason_code="no_source_changes",
+            ),
+        ))
+        insufficient = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(
+                grade="insufficient_sample", multiplier=1.0, mutation_score=0.0,
+                killed=0, survived=1, timeout=0, total_generated=1,
+                reason="sample too small (1 mutant(s) tested, need >= 3) to apply a confidence discount",
+                reason_code="insufficient_sample",
+            ),
+        ))
+        self.assertFalse(no_changes.degraded)
+        self.assertFalse(insufficient.degraded)
+        self.assertEqual(no_changes.mutation_multiplier, 1.0)
+        self.assertEqual(insufficient.mutation_multiplier, 1.0)
+
+    def test_no_coverable_lines_is_degraded_but_full_credit(self):
+        # Mirrors patch_coverage:no_coverable_lines -- a docs/comment-only
+        # diff must not take any real penalty, but is still flagged
+        # degraded (see _ALLOWED_DEGRADED_REASONS in cli.verify).
+        result = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(
+                available=False, grade="not_applicable", multiplier=1.0, mutation_score=None,
+                killed=0, survived=0, timeout=0, total_generated=3,
+                reason="no coverable statements in the changed *.py lines (comment/docstring/type-annotation-only diff)",
+                reason_code="no_coverable_lines",
+            ),
+        ))
+        self.assertTrue(result.degraded)
+        self.assertEqual(result.degraded_reasons, [f"{DEGRADED_REASON_MUTATION_TESTING_PREFIX}:no_coverable_lines"])
+        self.assertEqual(result.mutation_multiplier, 1.0)
 
     def test_score_is_deterministic_and_bounded(self):
         r1 = score_pipeline(**_base_kwargs())

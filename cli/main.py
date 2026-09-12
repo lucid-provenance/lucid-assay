@@ -45,6 +45,7 @@ from .parsers.sbom import (
     parse_sbom_file,
     sbom_components_to_resolved_dependencies,
 )
+from .mutation import run_mutation_testing, skipped_report as skipped_mutation_report
 from .patch_coverage import compute_patch_coverage, compute_patch_modified_lines
 from .real_coverage import CoverageTrackResult, RealCoverageResult, compute_real_coverage
 from .sarif_statement import build_sarif_reports_statement
@@ -699,7 +700,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--junit-xml", required=True)
     p.add_argument("--coverage-format", choices=["cobertura", "lcov", "jacoco"], default="cobertura")
-    p.add_argument("--coverage-report", required=True, dest="coverage_report")
+    p.add_argument("--coverage-report", required=True)
     p.add_argument(
         "--image-ref",
         default=None,
@@ -733,7 +734,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--repository", required=True)
     p.add_argument("--branch", required=True)
     p.add_argument("--pr-number", type=int, default=None)
-    p.add_argument("--pr-approvers", default="", help="comma-separated handles")
+    p.add_argument(
+        "--pr-approvers",
+        default="",
+        help="comma-separated handles",
+    )
     p.add_argument("--pr-required-approvals", type=int, default=0)
     p.add_argument("--pr-review-state", default="not_applicable")
     p.add_argument(
@@ -765,7 +770,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--license-curations",
         default=None,
-        dest="license_curations",
         help="path to a JSON file of human-reviewed license exceptions, keyed by PURL (exact-with-"
         "version, or name-only to apply across every version) to {\"asserted_license\", \"evidence\", "
         "\"curator\", \"date\"?} -- see cli/parsers/sbom.py's load_license_curations(). Rescues an "
@@ -778,7 +782,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--sonar-metrics",
         default=None,
-        dest="sonar_metrics",
         help="path to a SonarQube 'api/measures/component' JSON export; merges quality-gate/cognitive-complexity/"
         "technical-debt metrics into the SonarQube tool's extensions when a --sarif input didn't already embed "
         "them (requires at least one --sarif input to attach to)",
@@ -786,7 +789,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--coverage-contexts",
         default=None,
-        dest="coverage_contexts",
         help="path to a `coverage json --show-contexts` export (collected with `--cov-context=test`, e.g. "
         "`pytest --cov=... --cov-context=test`) -- when given, computes vanity-test-aware 'real' coverage "
         "(cli/real_coverage.py): how much of the reported total/patch coverage is exercised only by tests "
@@ -796,14 +798,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--patch-coverage-min", type=float, default=0.80)
     p.add_argument("--overall-coverage-min", type=float, default=0.60)
-    p.add_argument("--min-rcs", type=int, default=0, help="Minimum acceptable RCS score threshold")
+    p.add_argument(
+        "--min-rcs",
+        type=int,
+        default=0,
+        help="Minimum acceptable RCS score threshold",
+    )
     p.add_argument("--out", default="attestation.unsigned.json")
-    p.add_argument("--sign", action="store_true", help="perform keyless Sigstore signing")
-    p.add_argument("--dry-run-sign", action="store_true", help="simulate DSSE envelope creation without OIDC")
+    p.add_argument(
+        "--sign",
+        action="store_true",
+        help="perform keyless Sigstore signing",
+    )
+    p.add_argument(
+        "--dry-run-sign",
+        action="store_true",
+        help="simulate DSSE envelope creation without OIDC",
+    )
     p.add_argument(
         "--emit-slsa-provenance",
         action="store_true",
-        dest="emit_slsa_provenance",
         help="additionally emit a second, separate in-toto Statement shaped as real SLSA v1.0 provenance "
         "(predicateType https://slsa.dev/provenance/v1) alongside lucid-assay's own RCS predicate -- see "
         "cli/slsa_provenance.py. Populated only from real ambient GitHub Actions context (GITHUB_REPOSITORY/"
@@ -813,14 +827,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--slsa-provenance-out",
         default=None,
-        dest="slsa_provenance_out",
         help="output path for the --emit-slsa-provenance statement (default: derived from --out, e.g. "
         "attestation.slsa-provenance.unsigned.json)",
     )
     p.add_argument(
         "--sbom-statement-out",
         default=None,
-        dest="sbom_statement_out",
         help="output path for the --sbom companion in-toto statement (see cli/sbom_statement.py; default: "
         "a fixed-basename sibling of --out in the same directory, e.g. build/attestation.unsigned.json -> "
         "build/sbom.unsigned.json). A no-op when --sbom wasn't passed or failed to parse.",
@@ -828,12 +840,38 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--sarif-reports-statement-out",
         default=None,
-        dest="sarif_reports_statement_out",
         help="output path for the --sarif companion in-toto statement (see cli/sarif_statement.py; default: "
         "a fixed-basename sibling of --out in the same directory, e.g. build/attestation.unsigned.json -> "
         "build/sarif-reports.unsigned.json). A no-op when --sarif wasn't passed or every input failed to load.",
     )
     p.add_argument("--skip-perf-budget-check", action="store_true")
+    p.add_argument(
+        "--skip-mutation-testing",
+        action="store_true",
+        help="skip diff-scoped mutation testing (cli/mutation.py) entirely for this run -- e.g. fast local "
+        "iteration, or mutmut not installed. Fails closed like any other unavailable control: this does not "
+        "default to full credit, it applies the same non-punitive-but-not-free multiplier as a genuinely weak "
+        "mutation score (see cli.mutation.skipped_report).",
+    )
+    p.add_argument(
+        "--mutation-testing-timeout",
+        type=int,
+        default=90,
+        help="outer, provably-bounded time budget in seconds for the whole diff-scoped mutmut run (default: 90)",
+    )
+    p.add_argument(
+        "--mutation-testing-min-sample",
+        type=int,
+        default=3,
+        help="minimum number of mutants actually tested (killed+survived+timeout) before the tiered multiplier "
+        "applies at all -- below this, grade is 'insufficient_sample' and no discount is applied (default: 3)",
+    )
+    p.add_argument(
+        "--mutation-report-out",
+        default=None,
+        help="output path for the full structured mutation-testing report (default: a fixed "
+        "reports/mutation/mutation-report.json under --repo-dir)",
+    )
     p.add_argument(
         "--debug",
         action="store_true",
@@ -995,6 +1033,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         valid_test_functions = ast_metrics.valid_test_functions
         ast_languages = {lang: m.as_dict() for lang, m in ast_metrics.languages.items()}
 
+    # 5b. Diff-scoped mutation testing (see cli/mutation.py). Feeds
+    # score_pipeline() below as a multiplier over the test_health/
+    # patch_coverage/overall_coverage cluster, not an additive component
+    # -- must run before step 6, not after. --skip-mutation-testing never
+    # defaults to full credit (see cli.mutation.skipped_report's own
+    # fail-closed contract).
+    with _stage(stage_ns, "mutation_testing"):
+        if args.skip_mutation_testing:
+            mutation_report = skipped_mutation_report()
+        else:
+            mutation_modified_lines = compute_patch_modified_lines(args.base_sha, args.head_sha, args.repo_dir)
+            mutation_report = run_mutation_testing(
+                args.repo_dir,
+                mutation_modified_lines,
+                timeout_seconds=args.mutation_testing_timeout,
+                min_sample_size=args.mutation_testing_min_sample,
+                report_out=args.mutation_report_out or str(Path(args.repo_dir) / "reports" / "mutation" / "mutation-report.json"),
+                base_sha=args.base_sha,
+            )
+
     # 6. Deterministic scoring
     pr_approvers = [a.strip() for a in args.pr_approvers.split(",") if a.strip()]
     with _stage(stage_ns, "rcs_scoring"):
@@ -1002,8 +1060,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             test_totals=test_totals,
             patch_coverage=patch_cov,
             overall_line_rate=coverage.overall_line_rate,
-            total_assertions=total_assertions,
-            total_test_functions=total_test_functions,
             pr_present=args.pr_number is not None,
             approvers_count=len(pr_approvers),
             required_approvals=args.pr_required_approvals,
@@ -1012,7 +1068,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             overall_coverage_min=args.overall_coverage_min,
             branch_governance=branch_governance,
             sarif_report=sarif_report,
-            ast_skipped_test_functions=ast_skipped,
+            mutation_report=mutation_report,
         )
 
     # 6b. Lockfile dependency detection (see _detect_lockfile_dependencies)
@@ -1071,6 +1127,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             real_coverage=real_coverage,
             s2c2f=s2c2f_report,
             sbom=_build_sbom_artifact_block(sbom_report, sbom_report_sha),
+            mutation_report=mutation_report,
         )
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0

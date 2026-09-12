@@ -31,6 +31,13 @@ cli/
   parsers/s2c2f.py          # S2C2F control evaluation (subset with a real, checkable signal) -> predicate.s2c2f
   parsers/sbom.py            # CycloneDX/SPDX SBOM ingestion -> license-policy SARIF findings + resolved_dependencies
   patch_coverage.py         # git diff base...head, intersected with coverage hit maps
+  mutation/                  # diff-scoped mutation testing dispatcher -> predicate.mutation_testing, RCS's mutation_multiplier
+    __init__.py                 # classifies changed files by language, calls each runner, combines into one score
+    common.py                    # shared result shapes + the one source of truth for grading tiers
+    python_runner.py              # mutmut
+    tsjs_runner.py                  # Stryker (TypeScript/JavaScript)
+    java_runner.py                   # PIT (Java, Maven only)
+    go_runner.py                       # gremlins (Go)
   real_coverage.py           # vanity-test-aware coverage: which covered lines are only exercised by vanity tests
   hashing.py                 # SHA-256 content hashing + WORM key derivation
   scorer.py                  # pure, deterministic Release Confidence Score (RCS)
@@ -44,6 +51,10 @@ cli/
 tests/
   test_scorer.py               # adversarial edge-case tests for the RCS algorithm
   test_patch_coverage.py        # git-diff/coverage intersection + reason_code tests (real git repo)
+  test_mutation.py               # dispatcher + mutmut runner: language classification, multiplier tiers, multi-language aggregation
+  test_mutation_tsjs.py           # Stryker runner tests (mocked subprocess, real captured report shapes)
+  test_mutation_java.py            # PIT runner tests (mocked subprocess, real captured report shapes)
+  test_mutation_go.py               # gremlins runner tests (mocked subprocess, real captured report shapes)
   test_builder.py               # in-toto Statement assembly tests
   test_ast_inspector.py          # real/tautological/empty assertion detection tests (Python)
   test_adversarial_ast.py         # adversarial bypass suite for the Python AST visitor
@@ -196,18 +207,85 @@ actual code path rather than reintroducing one just to time it.
 
 ## Deterministic scoring (RCS)
 
-`cli/scorer.py` computes a weighted rollup of **six** components (pure
-function of its inputs — no I/O, no clock/randomness beyond the `reason`
-strings, so identical inputs always produce an identical score):
+`cli/scorer.py` computes a weighted rollup of **five** additive components
+plus one multiplier (pure function of its inputs — no I/O, no
+clock/randomness beyond the `reason` strings, so identical inputs always
+produce an identical score):
 
 | Component | Weight | Edge case handling |
 |---|---|---|
-| Test health | 35% | `pass_rate = passed / (passed+failed+errored)`. Zero executed tests **floors to 0** with an explicit reason distinguishing "all skipped" from "broken/bypassed gate" (never a neutral default — a broken test gate is a strong negative signal). Flaky retries (same `classname`+`name` seen more than once, final attempt passed) penalize 4pts/case, capped at −30, without being able to zero the run outright. |
+| Test health | 30% | `pass_rate = passed / (passed+failed+errored)`. Zero executed tests **floors to 0** with an explicit reason distinguishing "all skipped" from "broken/bypassed gate" (never a neutral default — a broken test gate is a strong negative signal). Flaky retries (same `classname`+`name` seen more than once, final attempt passed) penalize 4pts/case, capped at −30, without being able to zero the run outright. |
 | Patch coverage | 20% | Line-rate over just the lines touched by `git diff base...head`, intersected with the coverage report's hit map. Unavailable (no base SHA, or a docs/config-only diff with zero coverable changed lines) **falls back to overall coverage × 0.70**, and flags the whole result `degraded: true` — a proxy signal can never outscore the real measurement it's standing in for. A docs/config-only diff is tagged with its own `reason_code` (`no_coverable_lines`), since there's no code in it for coverage to be missing over — see `--disallow-degraded` below. |
 | Overall coverage | 15% | Straight line-rate vs. configurable threshold (default 0.60). |
-| Assertion integrity | 10% | `assertions / test_functions` normalized against a target density (1.5), capped at 100; zero test functions floors to 0. Fed by the multi-language AST engine (below), which filters out tautological/empty assertions — and excludes skipped/disabled tests entirely, from every supported language — before counting. |
-| Governance | 15% | No PR/MR context scores a **neutral 50**, not full credit, and flags `degraded`. `changes_requested` and unresolved zeroes the component outright; a required-approvals count of 0 caps at 60 (flagged as a weak control). Independently, a **live GitHub branch-governance check** docks −35pts if it finds the branch would let the same change land unreviewed regardless of this PR's own state (see below) — **and docks the same −35pts if that check couldn't run at all** (missing/invalid `GITHUB_TOKEN`, API failure, or GitHub's own plan/visibility feature gate on rulesets), so omitting the token is never a cheaper way to dodge the penalty than a confirmed bypass. |
-| Static analysis (SARIF) | 5% | No `--sarif` configured → full 100 (a control that was never invoked isn't penalized). Configured but unreadable/corrupt → −25pts, fails closed. Otherwise: **new-in-patch errors** cost 25pts each, **new-in-patch warnings** 5pts each, **pre-existing/legacy errors** cost only 2pts each capped at −15 total — gates hard on regressions *introduced by this diff* without making a legacy-heavy repo unshippable on day one. |
+| Governance | 20% | No PR/MR context scores a **neutral 50**, not full credit, and flags `degraded`. `changes_requested` and unresolved zeroes the component outright; a required-approvals count of 0 caps at 60 (flagged as a weak control). Independently, a **live GitHub branch-governance check** docks −35pts if it finds the branch would let the same change land unreviewed regardless of this PR's own state (see below) — **and docks the same −35pts if that check couldn't run at all** (missing/invalid `GITHUB_TOKEN`, API failure, or GitHub's own plan/visibility feature gate on rulesets), so omitting the token is never a cheaper way to dodge the penalty than a confirmed bypass. |
+| Static analysis (SARIF) | 15% | No `--sarif` configured → full 100 (a control that was never invoked isn't penalized). Configured but unreadable/corrupt → −25pts, fails closed. Otherwise: **new-in-patch errors** cost 25pts each, **new-in-patch warnings** 5pts each, **pre-existing/legacy errors** cost only 2pts each capped at −15 total — gates hard on regressions *introduced by this diff* without making a legacy-heavy repo unshippable on day one. |
+
+**Mutation testing multiplier (not an additive bucket).** Coverage and
+assertion counts can both be satisfied by a test that executes a line
+without ever verifying its behavior — 95% patch coverage backed by a 20%
+mutation kill rate is mostly illusory. `cli/mutation/` diff-scopes a
+real mutation-testing tool per language to just the lines actually
+changed (via the same `git diff`-derived hunk map patch coverage already
+computes for Python/TypeScript/JavaScript/Java — no second git
+invocation; Go's own tool does its own git diffing internally instead,
+see below) — **Python via [mutmut](https://mutmut.readthedocs.io/)**,
+**TypeScript/JavaScript via [Stryker](https://stryker-mutator.io/)**,
+**Java via [PIT](https://pitest.org/)** (Maven only; a Gradle-only Java
+repo gets `not_applicable`, disclosed, not guessed at), **Go via
+[gremlins](https://gremlins.dev/)** — and combines every
+language's real killed/survived/timeout counts into one
+`mutation_score = killed / (killed + survived) × 100` that **discounts
+the Test health + Patch coverage + Overall coverage subtotal above**
+rather than adding its own weighted share. A diff touching more than one
+language sums their raw mutant populations before grading once — a
+project with 80 killed/20 survived in Python and 2 killed/2 survived in
+newly-touched TypeScript combines to 82/104 (~79%), not an average of
+two percentages that would misleadingly wash out the smaller language's
+real weak spot. `predicate.mutation_testing.by_language` keeps every
+language's own breakdown visible for exactly that reason:
+
+| Kill rate | Grade | Multiplier |
+|---|---|---|
+| ≥ 80% | Passed | 1.0 (no discount) |
+| 60–79% | Degraded | 0.85 |
+| < 60% | Failed | 0.50 |
+
+Two safeguards keep this from misfiring on a run that genuinely has
+nothing (or not enough) to say: a diff with **zero coverable statements**
+changed in any supported language (comment/docstring/type-annotation-only,
+or no `*.py`/`*.ts`/`*.tsx`/`*.js`/`*.jsx`/`*.java`/`*.go` touched at all, or no
+mutation-testing tool configured in the target repo for any language it
+did touch) is exempt — full credit, no discount, flagged
+`degraded` only in the "nothing to mutate" case (namespaced
+`mutation_testing:no_coverable_lines`, allowlisted for
+`--disallow-degraded` the same way `patch_coverage:no_coverable_lines`
+is) — and a sample below `--mutation-testing-min-sample` (default 3
+mutants actually tested) grades `insufficient_sample` and also applies no
+discount, since one surviving mutant out of one generated isn't a real
+signal. **Skipping mutation testing (`--skip-mutation-testing`) or a
+genuine tool failure/timeout never defaults to full credit** — both apply
+the same 0.85 multiplier as the weak tier, fail-closed, so opting out is
+never the cheap way to dodge the control meant to stop exactly that. The
+retired `assertion_integrity` component's AST-density diagnostics (below)
+still run and still surface in the predicate — just as an informational
+`predicate.assertion_density` block now, not a scored component; mutation
+testing is the real version of what that density figure was only ever
+approximating.
+
+**CLI flags:** `cli.main`'s `--skip-mutation-testing` opts out entirely
+(fail-closed, see above — not free credit), `--mutation-testing-timeout`
+(default 90s, applied per language a diff touches — a diff spanning
+Python and Java gets up to 2× that budget, sequentially, not split
+across them) is the outer, provably-bounded time budget, `--mutation-testing-min-sample`
+(default 3) is the statistical floor, and `--mutation-report-out`
+overrides the default `reports/mutation/mutation-report.json` report
+artifact path.
+`cli.verify`'s `--require-mutation-score` (off by default, same opt-in
+shape as `--require-slsa-build-l3`/`--require-commit-signing`) folds only
+the `failed` grade into `passed`/exit code — narrower and more targeted
+than `--disallow-degraded`, which the Degraded tier already blocks by
+default regardless (its reason code isn't in the allowed-degraded-reasons
+set above).
 
 Every component's `reason` string is embedded verbatim in the predicate's
 `release_confidence_score.components[*].reason` — an auditor reading the
@@ -220,11 +298,13 @@ trigger(s) fired (`patch_coverage_unavailable` / a namespaced
 `patch_coverage:<reason_code>` for a specific known cause,
 `no_pr_context`, `sarif_unavailable`, `branch_governance_unverified` / a
 namespaced `branch_governance:<reason_code>` when the governance check
-identifies a specific known cause, or
-`branch_governance_bypass_permitted`) — a run can be degraded for more
-than one reason at once, and each shows up as its own entry, not a
-single opaque flag. NaN/Inf arithmetic anywhere in the pipeline clamps
-to the score floor rather than propagating.
+identifies a specific known cause,
+`branch_governance_bypass_permitted`, or a namespaced
+`mutation_testing:<weak_assertion_coverage|decorative_coverage|unavailable|skipped|no_coverable_lines>`)
+— a run can be degraded for more than one reason at once, and each shows
+up as its own entry, not a single opaque flag. NaN/Inf arithmetic
+anywhere in the pipeline clamps to the score floor rather than
+propagating.
 
 Run the edge-case suite:
 
@@ -275,6 +355,100 @@ real a subprocess argument as the argv list, not just an incidental
 working-directory string. A ref or path that fails validation degrades
 exactly like a failed `git diff` would (`available=False`, or an empty
 mapping from `compute_patch_modified_lines`), never a raw crash.
+
+**`mutation/`** is a dispatcher (same shape as `parsers/ast/` below --
+one operation, several languages, reused rather than reinvented):
+`cli.mutation.run_mutation_testing()` classifies
+`compute_patch_modified_lines`'s already-hardened diff by language --
+never a second git invocation -- excludes test files by each language's
+own naming convention, hands each language's files to its own runner,
+and sums every language's real killed/survived/timeout counts into one
+score before grading once (`cli/mutation/common.py`'s
+`grade_from_score`, the single source of truth for the tiers regardless
+of which language(s) contributed).
+
+- **`python_runner.py`** (mutmut) -- scopes file-level via a
+  `mutmut run "<dotted.module>.*"` wildcard per changed file (mutmut has
+  no built-in diff-filtering of its own; confirmed against its real
+  3.7.0 source, not assumed from its docs). Mutant generation still
+  covers the whole configured `source_paths` every run -- cheap,
+  AST-based, no test execution -- but only the wildcard-matched mutants
+  are actually *tested*, which is what keeps this bounded against a
+  1000+-test suite. The `mutants/` cache is deleted and rebuilt from
+  scratch before every invocation: `mutmut export-cicd-stats` aggregates
+  across its *entire* cache directory, not just what the current
+  invocation tested, so a stale result from a previous, differently-
+  scoped run could otherwise silently leak into this run's
+  `mutation_score` -- confirmed empirically. A wildcard matching zero
+  mutants makes mutmut's own `run` raise an uncaught `AssertionError`
+  -- detected via that specific stderr marker (not any non-zero exit,
+  which would also fire on a genuine crash) and reported as the
+  zero-mutant exemption, never propagated. Surviving-mutant detail
+  carries the real unified diff `mutmut show` produced, verbatim.
+- **`tsjs_runner.py`** ([Stryker](https://stryker-mutator.io/)) -- same
+  "read the target repo's own tool config" principle as mutmut: this
+  module never injects a test-runner config of its own, it requires the
+  target repo to already carry a complete, working Stryker config (a
+  repo with none gets `not_applicable`, not a guess). Scopes via
+  `--mutate <files>` (confirmed empirically: "Found 1 of 5 file(s) to be
+  mutated"). Unlike Python, Stryker's own JSON reporter gives
+  `location.start.line` and a real `mutatorName` per mutant out of the
+  box -- no AST-based line resolution needed. `.stryker-tmp/`, its
+  sandbox working directory, is confirmed empirically to survive in the
+  target repo after a run unless cleaned explicitly -- deleted both
+  before and after every invocation (`--cleanTempDir always` plus a
+  defensive delete either side), since leaving it behind would dirty the
+  exact working tree lucid-assay's own git-diff-based provenance hashing
+  reads next.
+- **`java_runner.py`** ([PIT](https://pitest.org/), Maven only -- a
+  Gradle-only Java repo gets `not_applicable`, disclosed) -- scopes via
+  `-DtargetClasses=<fqcn1>,<fqcn2>,...` (fully-qualified class names,
+  derived from each changed file's own `package` declaration + filename).
+  **Not** PIT's `scmMutationCoverage` goal -- confirmed empirically that
+  it doesn't exist in open-source PIT (real goal list: `help,
+  mutationCoverage, report, report-aggregate, report-aggregate-module`);
+  it's gated behind PIT's commercial ArcMutate add-on. Must run as `mvn
+  clean test-compile org.pitest:pitest-maven:mutationCoverage
+  -DtargetClasses=...` -- the bare `mutationCoverage` goal alone finds
+  zero mutations (confirmed by hitting exactly that failure; `test-compile`
+  has to run first). The XML report gives `status`/`lineNumber`/`mutator`
+  (a real, fully-qualified operator class name) and a human `description`
+  (e.g. "changed conditional boundary") per mutant -- even better ground
+  truth than mutmut's bare diff, since PIT names the mutation kind
+  itself. **Cold `.m2` cache risk, disclosed not fixed here**: an
+  ephemeral CI container with no persisted `~/.m2` downloads the entire
+  plugin/dependency graph from scratch on first use and can easily blow
+  past `--mutation-testing-timeout`'s default -- the target repo's own
+  CI config needs to persist `~/.m2` the same way it already should for
+  its normal Maven build.
+- **`go_runner.py`** ([gremlins](https://gremlins.dev/)) -- chosen over
+  a flashier-README 5-star fork (`jonbaldie/go-mutesting`, marketing
+  `--changed-since` and an "agentic JSON" report) the same way PIT was
+  chosen over an unverified ArcMutate claim: real community adoption
+  (400+ stars, active releases) over an unproven README. Unlike every
+  other runner here, gremlins does its own git diffing internally --
+  `gremlins unleash . --diff <base_sha>` (confirmed empirically: a
+  mutant outside the diff range reports `status: "SKIPPED"` in the JSON
+  report; earlier docs claiming no path argument and no diff mode at
+  all were stale, superseded by a real `go install ...@latest`), so this
+  is the only runner that needs `base_sha` at all rather than a
+  changed-file list. `"NOT COVERED"` (a genuinely-reached but
+  insufficiently-asserted branch, confirmed against a real
+  `go test -coverprofile` showing partial coverage on the same line,
+  not a gremlins quirk) folds into `survived` for scoring, the same
+  "escaped detection" signal `"LIVED"` is, not a lesser one.
+
+Every runner's surviving-mutant detail
+(`predicate.mutation_testing.top_surviving_mutants`, tagged by
+`language`) carries the tool's own real evidence verbatim -- never a
+synthesized mutation-operator taxonomy label a tool doesn't itself
+expose, per this project's ground-truth-only invariant. lucid-assay's
+own published container image stays Python-only, deliberately --
+Node/JDK/Maven/Go aren't bundled in (a missing binary degrades to
+`unavailable`, fail-closed, not a crash); most real CI runners already
+carry all four for a genuinely polyglot repo, and bundling them into
+every pure-Python user's pull would roughly 5-10x the image size for a
+capability most pulls never use.
 
 **`parsers/ast/`** is a language-agnostic registry/dispatcher for assertion
 integrity: `inspect_test_suite()` discovers test files across four
@@ -341,9 +515,10 @@ a different signal than one that ran and asserted nothing.
 **Scoring note:** skip detection is new for Python too (the single-language
 engine this replaced had none). A repo whose Python suite uses
 `@pytest.mark.skip`/`@unittest.skip*` will now compute a different
-`assertion_integrity` component than before this change — skipped tests no
-longer drag the density average down (or, previously, silently inflate it
-if a disabled test's dead body still contained real-looking assertions).
+`assertion_density.density_ratio` than before this change — skipped tests
+no longer drag the density average down (or, previously, silently inflate
+it if a disabled test's dead body still contained real-looking
+assertions).
 This is intentional and disclosed here, not a regression: a test that
 never ran shouldn't count either way. If every test function in scope is
 skipped, `total_test_functions` is `0` and the component's `reason`
@@ -1066,11 +1241,15 @@ Policy gates:
   one of a small, deliberate allowlist of known, unavoidable states —
   currently `branch_governance:platform_unsupported_tier` (a private repo
   on GitHub Free, where branch rulesets simply aren't supported at any
-  token scope) and `patch_coverage:no_coverable_lines` (a docs/config-only
-  diff with no code for patch coverage to be missing over). Any other
-  cause present — a real governance gap, missing PR context, a broken
-  SARIF input, or `degraded_reasons` missing/malformed entirely (e.g. an
-  older attestation predating this field) — still blocks. `degraded`
+  token scope), `patch_coverage:no_coverable_lines` (a docs/config-only
+  diff with no code for patch coverage to be missing over), and
+  `mutation_testing:no_coverable_lines` (a diff that touched `*.py`
+  but mutmut generated zero mutants for it — comment/docstring/type-
+  annotation-only). Any other cause present — a real governance gap,
+  missing PR context, a broken SARIF input, a genuinely weak/decorative/
+  unavailable/skipped mutation score, or `degraded_reasons` missing/
+  malformed entirely (e.g. an older attestation predating this field) —
+  still blocks. `degraded`
   itself is schema-optional (defaults to `false` for *display* when a
   predicate omits it — that default is documented in
   `schema/lucid-attestation-v1.schema.json`, not a guess) — but
@@ -1701,6 +1880,19 @@ python3 -m cli.main \
 #   pytest --cov=cli --cov-context=test --cov-report=xml:build/coverage.xml tests/
 #   coverage json --show-contexts -o build/coverage-contexts.json
 # Omit it to skip the vanity-test-aware "real" coverage analysis entirely.
+#
+# Diff-scoped mutation testing (see "Deterministic scoring (RCS)" above)
+# needs, per language a diff touches: Python -- `mutmut` installed
+# (`pip install -e ".[dev]"`); TypeScript/JavaScript -- `node`/`npx` on
+# PATH and a working Stryker config already in the target repo; Java --
+# `mvn` on PATH and a `pitest-maven` plugin already in the target repo's
+# pom.xml; Go -- `gremlins` on PATH and a `go.mod` at the repo root. All
+# four also need a real --base-sha/--head-sha pointing at
+# an actual git diff -- the fake all-'a'/all-'b' SHAs in this example
+# produce an empty diff, so mutation testing reports grade=not_applicable
+# and applies no discount, same as any docs-only PR would. Override its
+# defaults with --skip-mutation-testing/--mutation-testing-timeout/
+# --mutation-testing-min-sample/--mutation-report-out.
 #
 # --image-ref/--image-digest above name a container image subject -- for
 # a pipeline whose actual output isn't one (a zip-based Lambda deploy, a

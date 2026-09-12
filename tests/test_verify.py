@@ -17,6 +17,7 @@ from cli.verify import (
     EXIT_POLICY_VIOLATION,
     GITHUB_ACTIONS_OIDC_ISSUER,
     SLSA_PROVENANCE_PREDICATE_TYPE,
+    _SECTION_DIVIDER,
     TRUSTED_HOSTED_BUILDER_IDS,
     VerificationResult,
     main,
@@ -35,12 +36,17 @@ from cli.verify import (
     _evaluate_slsa_l3,
     _extract_cert_ref,
     _extract_dependency_evidence,
+    _extract_mutation_evidence,
     _extract_rekor_info,
     _extract_s2c2f_controls,
+    _pem_to_der_b64,
     _format_assay_health_report,
     _format_coverage_line,
     _format_dependency_governance_report,
+    _format_gate_params,
+    _format_mutation_testing_report,
     _format_pct,
+    _format_vcs_lines,
     _format_s2c2f_report,
     _format_signing_report,
     _format_real_coverage_summary,
@@ -84,6 +90,7 @@ def _statement(
     s2c2f=None,
     resolved_dependencies=None,
     sbom=None,
+    mutation_testing=None,
 ):
     rcs_block = {
         "value": rcs_value,
@@ -109,6 +116,8 @@ def _statement(
         predicate["resolved_dependencies"] = resolved_dependencies
     if sbom is not None:
         predicate["artifact"] = {"sbom": sbom}
+    if mutation_testing is not None:
+        predicate["mutation_testing"] = mutation_testing
     return {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [
@@ -233,6 +242,34 @@ class VerifyDsseAttestationTests(unittest.TestCase):
 
         self.assertTrue(result.passed, result.violations)
         self.assertFalse(any("disallow-degraded" in v for v in result.violations))
+
+    def test_disallow_degraded_allows_sole_mutation_no_coverable_lines_cause(self):
+        # A diff that changed *.py files but mutmut generated zero
+        # mutants for them (comment/docstring/type-annotation-only) is
+        # the same kind of unavoidable, benign state as the docs-only
+        # patch-coverage case above -- not a real gap.
+        envelope = _envelope(_statement(
+            degraded=True, degraded_reasons=["mutation_testing:no_coverable_lines"]
+        ))
+
+        result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+
+        self.assertTrue(result.passed, result.violations)
+        self.assertFalse(any("disallow-degraded" in v for v in result.violations))
+
+    def test_disallow_degraded_still_blocks_other_mutation_reasons(self):
+        # weak_assertion_coverage/decorative_coverage/unavailable/skipped
+        # are all real, fixable gaps (or an opted-out control) -- none of
+        # them belongs in the allowed-degraded-reasons set.
+        for reason in (
+            "mutation_testing:weak_assertion_coverage",
+            "mutation_testing:decorative_coverage",
+            "mutation_testing:unavailable",
+            "mutation_testing:skipped",
+        ):
+            envelope = _envelope(_statement(degraded=True, degraded_reasons=[reason]))
+            result = verify_dsse_attestation(envelope, min_rcs=0, disallow_degraded=True, dry_run=True)
+            self.assertFalse(result.passed, f"{reason} should still block --disallow-degraded")
 
     def test_disallow_degraded_allows_both_exempted_causes_together(self):
         # The exact real-world scenario this test guards: a docs-only PR
@@ -1110,6 +1147,105 @@ class EnvelopeToBundleJsonTests(unittest.TestCase):
             reconstructed["mediaType"], "application/vnd.dev.sigstore.bundle.v0.3+json"
         )
 
+    def test_legacy_reconstruction_full_structure_with_rekor_present(self):
+        # Every key name and value the legacy fallback builds, pinned
+        # exactly -- not just mediaType -- including the nested
+        # verificationMaterial.tlogEntries shape only present when both
+        # logIndex and logId are.
+        cert_pem = _fake_cert_pem()
+        expected_cert_b64 = _pem_to_der_b64(cert_pem)
+        envelope = _envelope(_statement(), signatures=[{"sig": "c2ln", "certificate": cert_pem}])
+        envelope["payload"] = "cGF5bG9hZA=="
+        envelope["payloadType"] = "application/vnd.in-toto+json"
+        envelope["_rekor"] = {"logIndex": 42, "logId": "deadbeef"}
+
+        reconstructed = json.loads(_envelope_to_bundle_json(envelope))
+
+        self.assertEqual(
+            reconstructed,
+            {
+                "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+                "verificationMaterial": {
+                    "certificate": {"rawBytes": expected_cert_b64},
+                    "tlogEntries": [{"logIndex": 42, "logId": {"keyId": "deadbeef"}}],
+                },
+                "dsseEnvelope": {
+                    "payload": "cGF5bG9hZA==",
+                    "payloadType": "application/vnd.in-toto+json",
+                    "signatures": [{"sig": "c2ln"}],
+                },
+            },
+        )
+
+    def test_legacy_reconstruction_omits_tlog_entries_without_rekor_info(self):
+        envelope = _envelope(_statement(), signatures=[{"sig": "c2ln", "certificate": _fake_cert_pem()}])
+        # No "_rekor" key at all.
+
+        reconstructed = json.loads(_envelope_to_bundle_json(envelope))
+
+        self.assertNotIn("tlogEntries", reconstructed["verificationMaterial"])
+
+    def test_legacy_reconstruction_omits_tlog_entries_when_only_log_index_present(self):
+        # Pins the `and` (not `or`) in `if log_index is not None and log_id`
+        # -- a real logIndex with no logId must not synthesize a bogus
+        # tlogEntries entry.
+        envelope = _envelope(_statement(), signatures=[{"sig": "c2ln", "certificate": _fake_cert_pem()}])
+        envelope["_rekor"] = {"logIndex": 42}
+
+        reconstructed = json.loads(_envelope_to_bundle_json(envelope))
+
+        self.assertNotIn("tlogEntries", reconstructed["verificationMaterial"])
+
+    def test_legacy_reconstruction_omits_tlog_entries_when_only_log_id_present(self):
+        envelope = _envelope(_statement(), signatures=[{"sig": "c2ln", "certificate": _fake_cert_pem()}])
+        envelope["_rekor"] = {"logId": "deadbeef"}
+
+        reconstructed = json.loads(_envelope_to_bundle_json(envelope))
+
+        self.assertNotIn("tlogEntries", reconstructed["verificationMaterial"])
+
+    def test_legacy_reconstruction_omits_tlog_entries_when_log_index_is_falsy_zero(self):
+        # Pins `is not None` (not a truthiness check) -- a real logIndex of
+        # 0 is a valid transparency-log index, not "missing".
+        envelope = _envelope(_statement(), signatures=[{"sig": "c2ln", "certificate": _fake_cert_pem()}])
+        envelope["_rekor"] = {"logIndex": 0, "logId": "deadbeef"}
+
+        reconstructed = json.loads(_envelope_to_bundle_json(envelope))
+
+        self.assertIn("tlogEntries", reconstructed["verificationMaterial"])
+        self.assertEqual(
+            reconstructed["verificationMaterial"]["tlogEntries"],
+            [{"logIndex": 0, "logId": {"keyId": "deadbeef"}}],
+        )
+
+    def test_legacy_reconstruction_missing_payload_and_payload_type_default_to_empty_string(self):
+        envelope = _envelope(_statement(), signatures=[{"sig": "c2ln", "certificate": _fake_cert_pem()}])
+        del envelope["payload"]
+        del envelope["payloadType"]
+
+        reconstructed = json.loads(_envelope_to_bundle_json(envelope))
+
+        self.assertEqual(reconstructed["dsseEnvelope"]["payload"], "")
+        self.assertEqual(reconstructed["dsseEnvelope"]["payloadType"], "")
+
+    def test_legacy_reconstruction_missing_sig_key_defaults_to_empty_string(self):
+        envelope = _envelope(_statement(), signatures=[{"certificate": _fake_cert_pem()}])
+
+        reconstructed = json.loads(_envelope_to_bundle_json(envelope))
+
+        self.assertEqual(reconstructed["dsseEnvelope"]["signatures"], [{"sig": ""}])
+
+    def test_empty_dict_embedded_bundle_falls_back_to_legacy_reconstruction(self):
+        # Pins `and sigstore_bundle` (not just `isinstance(..., dict)`) --
+        # an empty dict is technically a dict but not a usable bundle.
+        envelope = _envelope(_statement(), signatures=[{"sig": "c2ln", "certificate": _fake_cert_pem()}])
+        envelope["_sigstore_bundle"] = {}
+
+        reconstructed = json.loads(_envelope_to_bundle_json(envelope))
+
+        self.assertEqual(reconstructed["mediaType"], "application/vnd.dev.sigstore.bundle.v0.3+json")
+        self.assertEqual(reconstructed["dsseEnvelope"]["signatures"], [{"sig": "c2ln"}])
+
 
 class DescribeActualCertClaimsTests(unittest.TestCase):
     """Coverage for the human-readable actual-claims summary printed to
@@ -1674,6 +1810,357 @@ class FormatDependencyGovernanceReportTests(unittest.TestCase):
         self.assertIn("[✗] Canonical SBOM Attached -- predicate.artifact.sbom is absent -- no --sbom was ingested", text)
 
 
+def _mutation_evidence(**overrides) -> Dict[str, Any]:
+    evidence = {
+        "available": True,
+        "grade": "passed",
+        "multiplier": 1.0,
+        "mutation_score": 90.0,
+        "killed": 9,
+        "survived": 1,
+        "timeout": 0,
+        "tested": 10,
+        "total_generated": 10,
+        "scoped_files": ["cli/scorer.py"],
+        "top_surviving_mutants": [],
+        "reason": "no discount -- 90% mutation kill rate (10 mutant(s) tested)",
+        "reason_code": None,
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+class FormatVcsLinesTests(unittest.TestCase):
+    """Structural line assertions (exact strings), not substring `in`
+    checks -- a mutation to a literal prefix or field key survives a loose
+    assertIn check just as easily as it survives no test at all."""
+
+    def test_empty_vcs_is_the_single_unavailable_line(self):
+        self.assertEqual(
+            _format_vcs_lines({}),
+            ["Repository:    unavailable (no predicate.vcs block in this statement)"],
+        )
+        self.assertEqual(_format_vcs_lines(None), _format_vcs_lines({}))
+
+    def test_full_vcs_block_renders_exact_base_lines(self):
+        vcs = {"repository": "org/repo", "provider": "github", "branch": "main", "commit_sha": "a" * 40}
+        self.assertEqual(
+            _format_vcs_lines(vcs),
+            [
+                "Repository:    org/repo (github)",
+                "Branch:        main",
+                "Commit:        " + "a" * 40,
+            ],
+        )
+
+    def test_missing_fields_render_as_dash(self):
+        self.assertEqual(
+            _format_vcs_lines({"repository": "org/repo"}),
+            [
+                "Repository:    org/repo (-)",
+                "Branch:        -",
+                "Commit:        -",
+            ],
+        )
+
+    def test_base_commit_sha_appends_a_fourth_line_only_when_present(self):
+        vcs = {"repository": "r", "provider": "p", "branch": "b", "commit_sha": "c", "base_commit_sha": "d" * 40}
+        lines = _format_vcs_lines(vcs)
+        self.assertEqual(lines[-1], "Base commit:   " + "d" * 40)
+        self.assertEqual(len(lines), 4)
+
+    def test_falsy_base_commit_sha_appends_nothing(self):
+        vcs = {"repository": "r", "provider": "p", "branch": "b", "commit_sha": "c", "base_commit_sha": ""}
+        self.assertEqual(len(_format_vcs_lines(vcs)), 3)
+
+    def test_pull_request_with_number_appends_exact_line(self):
+        vcs = {
+            "repository": "r", "provider": "p", "branch": "b", "commit_sha": "c",
+            "pull_request": {"number": 42, "target_branch": "main"},
+        }
+        lines = _format_vcs_lines(vcs)
+        self.assertEqual(lines[-1], "Pull Request:  #42 -> main")
+        self.assertEqual(len(lines), 4)
+
+    def test_pull_request_number_zero_still_renders_a_line(self):
+        # Pins `is not None` (not a truthiness check) -- PR #0 is a real,
+        # if unusual, value, not "absent".
+        vcs = {
+            "repository": "r", "provider": "p", "branch": "b", "commit_sha": "c",
+            "pull_request": {"number": 0, "target_branch": "main"},
+        }
+        self.assertEqual(_format_vcs_lines(vcs)[-1], "Pull Request:  #0 -> main")
+
+    def test_pull_request_missing_target_branch_defaults_to_dash(self):
+        vcs = {
+            "repository": "r", "provider": "p", "branch": "b", "commit_sha": "c",
+            "pull_request": {"number": 7},
+        }
+        self.assertEqual(_format_vcs_lines(vcs)[-1], "Pull Request:  #7 -> -")
+
+    def test_pull_request_absent_appends_no_line(self):
+        vcs = {"repository": "r", "provider": "p", "branch": "b", "commit_sha": "c"}
+        self.assertEqual(len(_format_vcs_lines(vcs)), 3)
+
+    def test_pull_request_not_a_dict_is_treated_as_absent(self):
+        vcs = {"repository": "r", "provider": "p", "branch": "b", "commit_sha": "c", "pull_request": "not-a-dict"}
+        self.assertEqual(len(_format_vcs_lines(vcs)), 3)
+
+
+class FormatGateParamsTests(unittest.TestCase):
+
+    def test_none_returns_empty_list(self):
+        self.assertEqual(_format_gate_params(None), [])
+
+    def test_empty_dict_returns_empty_list(self):
+        self.assertEqual(_format_gate_params({}), [])
+
+    def test_base_gate_line_is_exact(self):
+        gp = {
+            "min_rcs": 65, "disallow_degraded": True, "require_digest": "sha256:" + "a" * 64,
+            "require_slsa_build_l3": False, "dry_run": True,
+        }
+        self.assertEqual(
+            _format_gate_params(gp),
+            [
+                "Gate:          min_rcs=65 disallow_degraded=True require_digest=sha256:"
+                + "a" * 64
+                + " require_slsa_build_l3=False dry_run=True"
+            ],
+        )
+
+    def test_missing_fields_render_as_python_none(self):
+        lines = _format_gate_params({"min_rcs": 0})
+        self.assertEqual(
+            lines[0],
+            "Gate:          min_rcs=0 disallow_degraded=None require_digest=None "
+            "require_slsa_build_l3=None dry_run=None",
+        )
+
+    def test_identity_pin_line_appears_only_when_cert_identity_or_issuer_set(self):
+        self.assertEqual(len(_format_gate_params({"min_rcs": 0})), 1)
+
+        lines = _format_gate_params({"min_rcs": 0, "cert_identity": "https://example/workflow.yml"})
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[1], "Identity pin:  cert_identity=https://example/workflow.yml cert_oidc_issuer=-")
+
+        lines = _format_gate_params({"min_rcs": 0, "cert_oidc_issuer": "https://issuer.example"})
+        self.assertEqual(lines[1], "Identity pin:  cert_identity=- cert_oidc_issuer=https://issuer.example")
+
+    def test_expected_line_appears_only_when_any_of_the_three_set(self):
+        self.assertEqual(len(_format_gate_params({"min_rcs": 0})), 1)
+
+        lines = _format_gate_params({"min_rcs": 0, "expected_repository": "org/repo"})
+        self.assertEqual(lines[1], "Expected:      repository=org/repo workflow=- ref=-")
+
+        lines = _format_gate_params({"min_rcs": 0, "expected_workflow": "CI"})
+        self.assertEqual(lines[1], "Expected:      repository=- workflow=CI ref=-")
+
+        lines = _format_gate_params({"min_rcs": 0, "expected_ref": "refs/heads/main"})
+        self.assertEqual(lines[1], "Expected:      repository=- workflow=- ref=refs/heads/main")
+
+    def test_all_three_optional_lines_present_together_in_order(self):
+        gp = {
+            "min_rcs": 0,
+            "cert_identity": "id", "cert_oidc_issuer": "issuer",
+            "expected_repository": "org/repo", "expected_workflow": "CI", "expected_ref": "refs/heads/main",
+        }
+        lines = _format_gate_params(gp)
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[0].startswith("Gate:          "))
+        self.assertTrue(lines[1].startswith("Identity pin:  "))
+        self.assertTrue(lines[2].startswith("Expected:      "))
+
+
+class ExtractMutationEvidenceTests(unittest.TestCase):
+
+    def test_missing_field_returns_empty_dict(self):
+        self.assertEqual(_extract_mutation_evidence({}), {})
+
+    def test_non_dict_field_treated_as_absent(self):
+        self.assertEqual(_extract_mutation_evidence({"mutation_testing": "nope"}), {})
+
+    def test_well_formed_field_is_passed_through_verbatim(self):
+        evidence = _mutation_evidence()
+        self.assertEqual(_extract_mutation_evidence({"mutation_testing": evidence}), evidence)
+
+
+class FormatMutationTestingReportTests(unittest.TestCase):
+
+    def test_empty_evidence_renders_no_section_at_all(self):
+        self.assertEqual(_format_mutation_testing_report({}), [])
+
+    def test_header_names_grade_and_score(self):
+        lines = _format_mutation_testing_report(_mutation_evidence(grade="passed", mutation_score=90.0))
+        self.assertEqual(lines[0], "=== Mutation Testing (diff-scoped, grade=passed, score=90%) ===")
+        self.assertEqual(lines[1], f"[✓] {_mutation_evidence()['reason']}")
+        self.assertEqual(lines[-1], _SECTION_DIVIDER)
+
+    def test_each_real_grade_maps_to_its_own_exact_mark(self):
+        for grade, mark in {"passed": "✓", "degraded": "!", "failed": "✗"}.items():
+            lines = _format_mutation_testing_report(_mutation_evidence(grade=grade))
+            self.assertTrue(lines[1].startswith(f"[{mark}] "), lines[1])
+
+    def test_unknown_grade_falls_back_to_a_dash_mark(self):
+        lines = _format_mutation_testing_report(_mutation_evidence(grade="not_applicable"))
+        self.assertTrue(lines[1].startswith("[-] "), lines[1])
+
+    def test_no_status_line_rendered(self):
+        # Purely informational like the Dependency Materialization
+        # Evidence section -- no cumulative PASSED/FAILED Status line.
+        lines = _format_mutation_testing_report(_mutation_evidence())
+        self.assertFalse(any(line.startswith("Status:") for line in lines))
+
+    def test_degraded_reason_and_surviving_mutant_line_are_exact(self):
+        evidence = _mutation_evidence(
+            grade="degraded",
+            mutation_score=68.0,
+            survived=5,
+            killed=11,
+            scoped_files=[],
+            reason="Test & Coverage score discounted by 15% due to 68% Mutation Kill Rate (5 surviving mutant(s))",
+            top_surviving_mutants=[
+                {"file": "cli/scorer.py", "function": "_score_governance", "status": "survived", "line": 236, "diff": "..."},
+            ],
+        )
+        lines = _format_mutation_testing_report(evidence)
+        self.assertEqual(
+            lines[1],
+            "[!] Test & Coverage score discounted by 15% due to 68% Mutation Kill Rate (5 surviving mutant(s))",
+        )
+        self.assertEqual(lines[2], "    top surviving mutant(s) (1 shown):")
+        self.assertEqual(lines[3], "      - cli/scorer.py:236 in _score_governance [survived]")
+
+    def test_surviving_mutant_with_no_line_number_omits_the_colon(self):
+        evidence = _mutation_evidence(
+            top_surviving_mutants=[
+                {"file": "cli/scorer.py", "function": "f", "status": "survived", "line": None, "diff": "..."},
+            ],
+        )
+        lines = _format_mutation_testing_report(evidence)
+        self.assertEqual(lines[-2], "      - cli/scorer.py in f [survived]")
+
+    def test_by_language_breakdown_lines_are_exact_and_sorted(self):
+        evidence = _mutation_evidence(
+            by_language={
+                "typescript_javascript": {"killed": 2, "survived": 2, "timeout": 0},
+                "python": {"killed": 80, "survived": 20, "timeout": 1},
+            },
+        )
+        lines = _format_mutation_testing_report(evidence)
+        # sorted(by_language.items()) -- python before typescript_javascript
+        self.assertEqual(lines[2], "    python: 80 killed, 20 survived, 1 timed out")
+        self.assertEqual(lines[3], "    typescript_javascript: 2 killed, 2 survived, 0 timed out")
+
+    def test_scoped_files_line_is_exact(self):
+        evidence = _mutation_evidence(scoped_files=["cli/scorer.py", "cli/verify.py"])
+        lines = _format_mutation_testing_report(evidence)
+        self.assertIn("    scoped to: cli/scorer.py, cli/verify.py", lines)
+
+    def test_empty_scoped_files_renders_no_line(self):
+        evidence = _mutation_evidence(scoped_files=[])
+        lines = _format_mutation_testing_report(evidence)
+        self.assertFalse(any(line.startswith("    scoped to:") for line in lines))
+
+    def test_surviving_mutant_language_tag_is_rendered_exactly(self):
+        evidence = _mutation_evidence(
+            top_surviving_mutants=[
+                {"language": "java", "file": "Mathy.java", "function": "weaklyTested", "status": "survived", "line": 9, "diff": "..."},
+            ],
+        )
+        lines = _format_mutation_testing_report(evidence)
+        self.assertEqual(lines[-2], "      - [java] Mathy.java:9 in weaklyTested [survived]")
+
+    def test_surviving_mutant_with_no_language_omits_the_tag(self):
+        evidence = _mutation_evidence(
+            top_surviving_mutants=[
+                {"file": "cli/scorer.py", "function": "f", "status": "survived", "line": 1, "diff": "..."},
+            ],
+        )
+        lines = _format_mutation_testing_report(evidence)
+        self.assertEqual(lines[-2], "      - cli/scorer.py:1 in f [survived]")
+
+    def test_missing_grade_key_defaults_to_not_applicable(self):
+        # A non-empty dict missing "grade" entirely (not the [] short
+        # circuit for an empty/absent evidence block).
+        lines = _format_mutation_testing_report({"reason": "x"})
+        self.assertTrue(lines[0].startswith("=== Mutation Testing (diff-scoped, grade=not_applicable, "), lines[0])
+
+    def test_missing_reason_key_defaults_to_empty_string(self):
+        lines = _format_mutation_testing_report({"grade": "passed"})
+        self.assertEqual(lines[1], "[✓] ")
+
+    def test_non_dict_truthy_by_language_is_not_iterated(self):
+        # Pins `and` (not `or`) in `isinstance(by_language, dict) and
+        # by_language` -- a non-dict truthy value must never reach
+        # `.items()`.
+        evidence = _mutation_evidence(by_language=["not", "a", "dict"])
+        lines = _format_mutation_testing_report(evidence)  # must not raise
+        self.assertFalse(any("killed" in line for line in lines))
+
+    def test_non_dict_language_entry_is_skipped_not_fatal(self):
+        evidence = _mutation_evidence(
+            by_language={
+                "garbage": "not-a-dict",
+                "python": {"killed": 1, "survived": 0, "timeout": 0},
+            },
+        )
+        lines = _format_mutation_testing_report(evidence)
+        self.assertIn("    python: 1 killed, 0 survived, 0 timed out", lines)
+
+    def test_non_list_truthy_surviving_mutants_is_not_iterated(self):
+        # Pins `and` (not `or`) in `isinstance(surviving, list) and
+        # surviving` -- a non-list truthy value (e.g. a bare int) must
+        # never reach the `for m in surviving:` loop, which would raise.
+        evidence = _mutation_evidence(top_surviving_mutants=42)
+        lines = _format_mutation_testing_report(evidence)  # must not raise
+        self.assertFalse(any("shown):" in line for line in lines))
+
+    def test_non_dict_surviving_mutant_entry_is_skipped_not_fatal(self):
+        evidence = _mutation_evidence(
+            scoped_files=[],
+            top_surviving_mutants=[
+                "not-a-dict",
+                {"file": "cli/scorer.py", "function": "f", "status": "survived", "line": 1, "diff": "..."},
+            ],
+        )
+        lines = _format_mutation_testing_report(evidence)
+        self.assertEqual(lines[-2], "      - cli/scorer.py:1 in f [survived]")
+
+    def test_null_score_renders_as_not_available_rather_than_crashing(self):
+        text = "\n".join(_format_mutation_testing_report(_mutation_evidence(grade="not_applicable", mutation_score=None)))
+        self.assertIn("score=n/a", text)
+
+
+class RequireMutationScoreGateTests(unittest.TestCase):
+    """--require-mutation-score: opt-in, off by default, same shape as
+    --require-commit-signing -- only the 'failed' grade blocks."""
+
+    def test_off_by_default_even_with_a_failed_grade(self):
+        statement = _statement(mutation_testing=_mutation_evidence(grade="failed", mutation_score=20.0))
+        result = verify_dsse_attestation(_envelope(statement), min_rcs=0, dry_run=True)
+        self.assertTrue(result.passed)
+
+    def test_failed_grade_blocks_when_flag_is_set(self):
+        statement = _statement(mutation_testing=_mutation_evidence(grade="failed", mutation_score=20.0))
+        result = verify_dsse_attestation(_envelope(statement), min_rcs=0, dry_run=True, require_mutation_score=True)
+        self.assertFalse(result.passed)
+        self.assertTrue(any("require-mutation-score" in v for v in result.violations))
+
+    def test_degraded_grade_does_not_block_the_flag_alone(self):
+        # The weak/degraded tier already blocks --disallow-degraded by
+        # default (its reason_code isn't in _ALLOWED_DEGRADED_REASONS) --
+        # --require-mutation-score is deliberately narrower than that,
+        # targeting only the confirmed-decorative "failed" tier.
+        statement = _statement(mutation_testing=_mutation_evidence(grade="degraded", mutation_score=68.0))
+        result = verify_dsse_attestation(_envelope(statement), min_rcs=0, dry_run=True, require_mutation_score=True)
+        self.assertTrue(result.passed)
+
+    def test_no_mutation_evidence_at_all_does_not_block(self):
+        result = verify_dsse_attestation(_envelope(_statement()), min_rcs=0, dry_run=True, require_mutation_score=True)
+        self.assertTrue(result.passed)
+
+
 class DependencyGovernanceIntegrationTests(unittest.TestCase):
     """End-to-end via verify_dsse_attestation(): confirms the Dependency
     Materialization Evidence section actually reaches the shared
@@ -1713,6 +2200,114 @@ class DependencyGovernanceIntegrationTests(unittest.TestCase):
         # item still renders so a reader sees the gap explicitly).
         self.assertEqual(len(payload["dependency_governance"]["items"]), 3)
         json.dumps(payload)  # must remain JSON-serializable end to end
+
+
+class BuildVerifyJsonPayloadTests(unittest.TestCase):
+    """Direct structural assertions on the --format json payload -- exact
+    key sets at every level, not just that a couple of fields are present,
+    since a mutated/typo'd key name survives a loose assertIn just as
+    easily as no test at all."""
+
+    def _payload(self, **statement_overrides):
+        envelope = _envelope(_statement(**statement_overrides))
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        return _build_verify_json_payload(result)
+
+    def test_top_level_keys_are_exact(self):
+        payload = self._payload()
+        self.assertEqual(
+            set(payload.keys()),
+            {
+                "version", "verified", "verdict", "verdict_word",
+                "source_highest_level", "build_highest_level",
+                "envelope", "run_identity", "gate_params",
+                "source", "slsa", "release_confidence_score", "test_coverage",
+                "static_analysis", "s2c2f", "dependency_governance",
+                "mutation_testing", "repository_governance", "identity",
+                "signing", "violations", "warnings",
+            },
+        )
+
+    def test_envelope_block_keys_and_values_are_exact(self):
+        statement = _statement()
+        envelope = _envelope(statement)
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        payload = _build_verify_json_payload(result)
+        self.assertEqual(set(payload["envelope"].keys()), {"statement_type", "predicate_type", "subject"})
+        self.assertEqual(payload["envelope"]["statement_type"], "https://in-toto.io/Statement/v1")
+        # The real subject list round-trips verbatim -- not a key-typo'd
+        # `.get("SUBJECT")`/`.get(None)` silently falling back to [].
+        self.assertEqual(payload["envelope"]["subject"], statement["subject"])
+
+    def test_envelope_subject_falls_back_to_empty_list_when_not_a_list(self):
+        envelope = _envelope(_statement())
+        envelope["payload"] = base64.b64encode(
+            json.dumps({**json.loads(base64.b64decode(envelope["payload"])), "subject": "not-a-list"}).encode()
+        ).decode()
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        payload = _build_verify_json_payload(result)
+        self.assertEqual(payload["envelope"]["subject"], [])
+
+    def test_source_and_slsa_block_keys_are_exact(self):
+        payload = self._payload()
+        self.assertEqual(set(payload["source"].keys()), {"level_1", "level_2", "level_3", "level_4"})
+        self.assertEqual(set(payload["slsa"].keys()), {"level_1", "level_2", "level_3"})
+
+    def test_release_confidence_score_block_keys_are_exact(self):
+        payload = self._payload()
+        self.assertEqual(
+            set(payload["release_confidence_score"].keys()),
+            {"score", "degraded", "degraded_field_present", "degraded_reasons", "components"},
+        )
+
+    def test_degraded_reasons_falls_back_to_empty_list_when_none(self):
+        payload = self._payload(degraded_reasons=_DEGRADED_REASONS_OMITTED)
+        self.assertEqual(payload["release_confidence_score"]["degraded_reasons"], [])
+
+    def test_degraded_reasons_passes_through_when_present(self):
+        payload = self._payload(degraded=True, degraded_reasons=["patch_coverage:no_coverable_lines"])
+        self.assertEqual(
+            payload["release_confidence_score"]["degraded_reasons"], ["patch_coverage:no_coverable_lines"]
+        )
+
+    def test_verdict_word_falls_back_to_the_exact_failed_string_when_falsy(self):
+        # verdict_word defaults to "" on a directly-constructed
+        # VerificationResult (verify_dsse_attestation() itself always
+        # populates a real FAILED/GATED/PASSED word, so this exercises the
+        # payload builder's own defensive fallback in isolation).
+        result = VerificationResult(passed=False)
+        self.assertEqual(result.verdict_word, "")
+        payload = _build_verify_json_payload(result)
+        self.assertEqual(payload["verdict_word"], "FAILED")
+
+    def test_verdict_word_passes_through_verbatim_when_present(self):
+        result = VerificationResult(passed=True, verdict_word="PASSED")
+        payload = _build_verify_json_payload(result)
+        self.assertEqual(payload["verdict_word"], "PASSED")
+
+    def test_static_analysis_s2c2f_dependency_repo_governance_block_keys(self):
+        payload = self._payload()
+        self.assertEqual(set(payload["static_analysis"].keys()), {"tools"})
+        self.assertEqual(set(payload["s2c2f"].keys()), {"controls"})
+        self.assertEqual(set(payload["dependency_governance"].keys()), {"items"})
+        self.assertEqual(set(payload["repository_governance"].keys()), {"items"})
+
+    def test_identity_and_signing_block_keys_are_exact(self):
+        payload = self._payload()
+        self.assertEqual(set(payload["identity"].keys()), {"status", "detail"})
+        self.assertEqual(set(payload["signing"].keys()), {"rekor_log_index", "rekor_log_url"})
+
+    def test_run_identity_is_the_real_extraction_not_a_stub(self):
+        # Pins `_extract_run_identity(result.statement)`, not e.g.
+        # `_extract_run_identity(None)` -- a real repository name embedded
+        # in the statement's own predicate.vcs must actually surface here;
+        # _extract_run_identity(None) would produce vcs={} regardless.
+        statement = _statement()
+        statement["predicate"]["vcs"] = {"repository": "org/real-repo", "provider": "github"}
+        envelope = _envelope(statement)
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        payload = _build_verify_json_payload(result)
+        self.assertEqual(payload["run_identity"]["vcs"]["repository"], "org/real-repo")
 
 
 class SlsaInvocationOriginTests(unittest.TestCase):
@@ -2317,6 +2912,122 @@ class VerifyDsseAttestationTestCoverageIntegrationTests(unittest.TestCase):
         self.assertIn("test_coverage", payload)
         self.assertEqual(payload["test_coverage"]["assertion_density"]["valid_test_functions"], 142)
         json.dumps(payload)  # must stay JSON-serializable end to end
+
+
+class ParseArgsTests(unittest.TestCase):
+    """Direct tests of parse_args() itself -- previously imported but
+    never actually called anywhere in this file (main() was only ever
+    exercised through subprocess-shaped argv lists passed straight to
+    main(), never parse_args() in isolation). Focuses on the real
+    behavioral surface (defaults, dest names, required/choices/type) --
+    not help text wording, which nobody diffs character-by-character in
+    practice and isn't a real test-quality gap the way a wrong default or
+    dest is."""
+
+    def test_envelope_is_required(self):
+        with self.assertRaises(SystemExit) as ctx:
+            parse_args([])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_all_defaults(self):
+        args = parse_args(["envelope.json"])
+        self.assertEqual(args.envelope, "envelope.json")
+        self.assertEqual(args.min_rcs, 0)
+        self.assertIsNone(args.require_digest)
+        self.assertFalse(args.disallow_degraded)
+        self.assertFalse(args.dry_run)
+        self.assertIsNone(args.cert_identity)
+        self.assertIsNone(args.cert_oidc_issuer)
+        self.assertIsNone(args.expected_issuer)
+        self.assertIsNone(args.expected_repository)
+        self.assertIsNone(args.expected_workflow)
+        self.assertIsNone(args.expected_ref)
+        self.assertIsNone(args.slsa_envelope)
+        self.assertFalse(args.require_slsa_build_l3)
+        self.assertFalse(args.require_commit_signing)
+        self.assertFalse(args.require_mutation_score)
+        self.assertEqual(args.format, "text")
+        self.assertFalse(args.json_output)
+        self.assertFalse(args.write_verdict)
+        self.assertIsNone(args.verdict_out)
+
+    def test_dest_names_on_the_namespace(self):
+        args = parse_args(["envelope.json"])
+        for dest in (
+            "slsa_envelope", "require_slsa_build_l3", "require_commit_signing",
+            "require_mutation_score", "json_output", "write_verdict", "verdict_out",
+        ):
+            self.assertTrue(hasattr(args, dest), f"missing expected dest: {dest}")
+
+    def test_min_rcs_parses_as_int(self):
+        args = parse_args(["envelope.json", "--min-rcs", "65"])
+        self.assertEqual(args.min_rcs, 65)
+
+    def test_min_rcs_rejects_non_integer(self):
+        with self.assertRaises(SystemExit) as ctx:
+            parse_args(["envelope.json", "--min-rcs", "not-an-int"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_each_boolean_flag_flips_only_when_passed(self):
+        flag_to_dest = {
+            "--disallow-degraded": "disallow_degraded",
+            "--dry-run": "dry_run",
+            "--require-slsa-build-l3": "require_slsa_build_l3",
+            "--require-commit-signing": "require_commit_signing",
+            "--require-mutation-score": "require_mutation_score",
+            "--json": "json_output",
+            "--write-verdict": "write_verdict",
+        }
+        for flag, dest in flag_to_dest.items():
+            with self.subTest(flag=flag):
+                self.assertFalse(getattr(parse_args(["envelope.json"]), dest))
+                self.assertTrue(getattr(parse_args(["envelope.json", flag]), dest))
+
+    def test_format_accepts_each_real_choice(self):
+        for value in ("text", "json"):
+            args = parse_args(["envelope.json", "--format", value])
+            self.assertEqual(args.format, value)
+
+    def test_format_rejects_an_invalid_choice(self):
+        with self.assertRaises(SystemExit) as ctx:
+            parse_args(["envelope.json", "--format", "yaml"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_format_short_flag_is_equivalent_to_the_long_flag(self):
+        args = parse_args(["envelope.json", "-f", "json"])
+        self.assertEqual(args.format, "json")
+
+    def test_json_flag_is_independent_of_format_flag(self):
+        # --json (deprecated alias) sets its own dest, json_output --
+        # never format itself, which stays at its own default.
+        args = parse_args(["envelope.json", "--json"])
+        self.assertTrue(args.json_output)
+        self.assertEqual(args.format, "text")
+
+    def test_string_valued_flags_pass_through_exactly(self):
+        args = parse_args(
+            [
+                "envelope.json",
+                "--require-digest", "sha256:" + "a" * 64,
+                "--cert-identity", "https://github.com/org/repo/.github/workflows/ci.yml@refs/heads/main",
+                "--cert-oidc-issuer", "https://token.actions.githubusercontent.com",
+                "--expected-issuer", "https://custom-issuer.example.com",
+                "--expected-repository", "org/repo",
+                "--expected-workflow", "CI",
+                "--expected-ref", "refs/heads/main",
+                "--slsa-envelope", "slsa.dsse.json",
+                "--verdict-out", "verdict.json",
+            ]
+        )
+        self.assertEqual(args.require_digest, "sha256:" + "a" * 64)
+        self.assertEqual(args.cert_identity, "https://github.com/org/repo/.github/workflows/ci.yml@refs/heads/main")
+        self.assertEqual(args.cert_oidc_issuer, "https://token.actions.githubusercontent.com")
+        self.assertEqual(args.expected_issuer, "https://custom-issuer.example.com")
+        self.assertEqual(args.expected_repository, "org/repo")
+        self.assertEqual(args.expected_workflow, "CI")
+        self.assertEqual(args.expected_ref, "refs/heads/main")
+        self.assertEqual(args.slsa_envelope, "slsa.dsse.json")
+        self.assertEqual(args.verdict_out, "verdict.json")
 
 
 if __name__ == "__main__":

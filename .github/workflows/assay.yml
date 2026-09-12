@@ -36,6 +36,23 @@ on:
         type: boolean
         default: true
 
+# Cancels a now-stale run of the *same* trigger kind for the *same*
+# branch/PR when a newer commit supersedes it (e.g. three quick pushes to
+# one feature branch no longer leave two stale runs burning CI minutes
+# alongside the current one). Deliberately keyed by github.event_name,
+# not just the branch/PR alone: this workflow's own run-name comment
+# above already established that `on.push` and `on.pull_request` fire
+# *independently* on the same commit whenever a feature branch has an
+# open PR, and that's intentional, not redundant -- a shared group would
+# have one of those two legitimate parallel runs cancel the other
+# instead of only ever cancelling a superseded *older commit's* run of
+# the same kind. `github.event.pull_request.number` (not `github.ref`,
+# which is the synthetic "<number>/merge" ref on a pull_request event)
+# groups a PR's own synchronize-triggered runs together across pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 # `push` fires with no PR context of its own (no base sha, no PR number) --
 # unlike a `pull_request` event's own fields. Without recovering it, every
 # push-triggered run (a merge landing on `main`, or a plain feature-branch
@@ -430,11 +447,71 @@ jobs:
               echo "ERROR: BASE_SHA resolved but PR_NUMBER did not; refusing to mint with inconsistent PR context" >&2
               exit 1
             fi
-            EXTRA_ARGS=(--base-sha "$BASE_SHA" --pr-number "$PR_NUMBER")
+            EXTRA_ARGS+=(--base-sha "$BASE_SHA" --pr-number "$PR_NUMBER")
           elif [ "$EVENT_NAME" = "pull_request" ]; then
             echo "ERROR: github.event.pull_request.base.sha was empty on a pull_request event; refusing to guess a base commit" >&2
             exit 1
           fi
+
+          # cli.main's own --mutation-testing-timeout default (90s) is sized
+          # for a typical PR's diff on a local dev machine, not a large
+          # feature-landing diff on a shared GitHub Actions runner. Confirmed
+          # empirically on this repo's own PR #96 (the mutation-testing
+          # feature itself, ~584 changed lines across the 10 real non-test
+          # *.py files it touches): mutmut hit the 90s ceiling and reported
+          # the whole language `unavailable`, which --disallow-degraded then
+          # correctly (fail-closed) blocked on, since "unavailable" isn't an
+          # allowlisted degraded reason. A first bump to 600s (confirmed via
+          # this same PR's own real CI run) still wasn't enough -- root
+          # cause turned out to be `cli/mutation/python_runner.py`'s own
+          # generation scope: mutmut's CLI has no per-invocation scoping
+          # flag at all (confirmed against `mutmut run --help`), so every
+          # invocation regenerated mutants for the target repo's *entire*
+          # `only_mutate` glob (this repo's own `cli/*`) regardless of diff
+          # size -- 16,366 total mutants for this PR's diff, of which only
+          # 6,191 belonged to the actually-changed files (an untouched file,
+          # `sarif.py`, alone contributed 1,950). Fixed at the source (same
+          # PR): `python_runner.py` now temporarily narrows the target
+          # repo's own pyproject.toml `only_mutate` list to just this
+          # invocation's diffed files before calling mutmut, restoring the
+          # original byte-for-byte after -- cutting this PR's own real total
+          # *generated* to 8,123 mutants (generation is still whole-file,
+          # bounded by only_mutate's file list, not line-range-aware -- see
+          # below for what closes that gap). Real measured time at this
+          # stage: 20m40s locally.
+          #
+          # Second fix, same PR: generation staying whole-file meant
+          # `cli/verify.py` (3,663 lines, only 151 of them actually changed
+          # here) still had every one of its ~8,226 mutants *tested*, not
+          # just generated -- most of the real cost. `_wildcards_for_file()`
+          # now maps this diff's own changed line ranges to their enclosing
+          # functions (AST) and builds a per-function wildcard
+          # (`<module>.x_<name>__mutmut_*`) instead of a whole-file one,
+          # narrowing what gets *tested* to just the touched functions
+          # (confirmed empirically that mutmut never mutates module-level
+          # code at all, only inside function bodies, so this is a real
+          # narrowing with no coverage loss). Cut this PR's own real
+          # *tested* count from 7,716 to 3,820 and the real measured time
+          # to 7m9s (reconfirmed 6m6s on a later commit in the same PR --
+          # stable, not a one-off).
+          #
+          # 900s (set from that 7m9s number) still wasn't enough in real
+          # CI -- confirmed on two separate commits/runs. Local timing
+          # reflects heavy parallelism this dev machine has that a
+          # standard-tier shared GitHub Actions runner (2-4 cores) does
+          # not -- one local run's own `user` CPU-time (88-103 minutes)
+          # compressed into ~6-7 minutes of wall-clock makes the actual
+          # multi-core factor visible directly. Rather than keep tuning
+          # this number in small increments across repeated CI round-
+          # trips, this is a deliberately generous ceiling -- a merge-
+          # blocking gate timing out under real, variable CI hardware is
+          # worse than the job simply taking longer. Revisit downward
+          # once a real CI run's own elapsed time is known (check the
+          # Mint Unsigned Lucid Attestation step's own --debug stage-
+          # timing output, not the separate verify job, which only reads
+          # an already-built envelope and never runs mutation testing
+          # itself).
+          EXTRA_ARGS+=(--mutation-testing-timeout 3000)
 
           # CodeQL always runs (no secret dependency), but the SARIF path
           # is still guarded on existence rather than assumed -- if the

@@ -79,7 +79,20 @@
             "email": { "type": ["string", "null"] },
             "github_login": { "type": ["string", "null"] },
             "verified_github_account": { "type": "boolean" },
-            "reason": { "type": "string" }
+            "reason": { "type": "string" },
+            "commit_signature_verified": {
+              "type": ["boolean", "null"],
+              "description": "A genuinely stronger claim than verified_github_account: whether this exact commit carries a cryptographic signature (GPG/SSH) GitHub itself verified. Null when not determined -- unavailable, not captured, or a GitHub-web-flow merge/squash/rebase walk-back that exhausted its hop limit -- never treated as a confirmed pass. See cli/parsers/commit_author.py's module docstring for the merge/squash/rebase walk-back this reflects."
+            },
+            "commit_signature_reason": { "type": ["string", "null"] },
+            "commit_signature_type": {
+              "type": ["string", "null"],
+              "description": "Inferred from the raw PEM signature header (e.g. \"gpg\"/\"ssh\") since GitHub's commits API exposes no parsed key-ID/fingerprint field. Null when no signature was evaluated."
+            },
+            "commit_signature_source_sha": {
+              "type": ["string", "null"],
+              "description": "The commit whose own signature this verdict actually describes. Null when the originally-requested commit's own signature was evaluated directly; set to a different SHA when that commit was a GitHub-web-flow-generated merge/squash/rebase commit and this walked back to the real pre-merge branch tip instead."
+            }
           },
           "required": ["available", "commit_sha", "verified_github_account", "reason"]
         }
@@ -533,16 +546,19 @@
         "components": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["test_health", "patch_coverage", "overall_coverage", "assertion_integrity", "governance"],
+          "required": ["test_health", "patch_coverage", "overall_coverage", "governance"],
           "properties": {
             "test_health": { "$ref": "#/$defs/scoreComponent" },
             "patch_coverage": { "$ref": "#/$defs/scoreComponent" },
             "overall_coverage": { "$ref": "#/$defs/scoreComponent" },
-            "assertion_integrity": { "$ref": "#/$defs/scoreComponent" },
             "governance": { "$ref": "#/$defs/scoreComponent" },
             "static_analysis": {
               "$ref": "#/$defs/scoreComponent",
               "description": "Not in `required`: absent on attestations predating the SARIF static-analysis component (cli/scorer.py WEIGHTS)."
+            },
+            "mutation_testing": {
+              "$ref": "#/$defs/mutationScoreComponent",
+              "description": "Not in `required`: absent on attestations predating cli/mutation.py. Retired `assertion_integrity`'s slot -- weight is always 0.0 by construction, since this component discounts the test_health/patch_coverage/overall_coverage cluster via release_confidence_score.mutation_multiplier rather than adding its own weighted share; weighted_score here carries the signed point delta the multiplier caused (can legitimately be negative -- see $defs/mutationScoreComponent, distinct from the generic scoreComponent every other component uses). See predicate.mutation_testing for the full detail (scoped_files, top_surviving_mutants) this compact form doesn't carry."
             }
           }
         },
@@ -554,9 +570,73 @@
         "degraded_reasons": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Which independent trigger(s) caused degraded=true (e.g. no_pr_context, sarif_unavailable, a namespaced branch_governance:<reason_code> / patch_coverage:<reason_code>). Empty when degraded=false. Absent/malformed on an attestation predating this field -- cli/verify.py's --disallow-degraded treats that as non-exempt."
+          "description": "Which independent trigger(s) caused degraded=true (e.g. no_pr_context, sarif_unavailable, a namespaced branch_governance:<reason_code> / patch_coverage:<reason_code> / mutation_testing:<reason_code>). Empty when degraded=false. Absent/malformed on an attestation predating this field -- cli/verify.py's --disallow-degraded treats that as non-exempt."
+        },
+        "mutation_multiplier": {
+          "type": "number", "minimum": 0, "maximum": 1,
+          "description": "The multiplier release_confidence_score.value's test_health/patch_coverage/overall_coverage subtotal was discounted by (1.0 = no discount). Absent on attestations predating cli/mutation.py."
+        },
+        "pre_multiplier_cluster_score": {
+          "type": "number", "minimum": 0,
+          "description": "The test_health/patch_coverage/overall_coverage weighted subtotal *before* mutation_multiplier was applied -- lets an auditor reconstruct the discount rather than reverse-engineering it from value alone. Absent on attestations predating cli/mutation.py."
         },
         "computed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "mutation_testing": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Diff-scoped mutation testing over the source lines actually changed in this run's diff -- Python (mutmut), TypeScript/JavaScript (Stryker), and Java (PIT), combined by cli/mutation's dispatcher into one score (see `by_language` for the per-language breakdown) -- the real signal release_confidence_score.components.mutation_testing's multiplier is derived from. Absent on attestations predating this field.",
+      "properties": {
+        "available": { "type": "boolean", "description": "False when mutation testing genuinely wasn't evaluated (no source changes in a supported language, no tool configured for any language touched, or the caller opted out) -- distinct from a real run that found nothing to discount." },
+        "grade": { "type": "string", "enum": ["passed", "degraded", "failed", "not_applicable", "insufficient_sample"] },
+        "multiplier": { "type": "number", "minimum": 0, "maximum": 1 },
+        "mutation_score": { "type": ["number", "null"], "minimum": 0, "maximum": 100, "description": "killed / (killed + survived) * 100, summed across every language that actually ran; null when it couldn't be computed (no mutants tested, or killed+survived=0)." },
+        "killed": { "type": "integer", "minimum": 0 },
+        "survived": { "type": "integer", "minimum": 0 },
+        "timeout": { "type": "integer", "minimum": 0 },
+        "tested": { "type": "integer", "minimum": 0, "description": "killed + survived + timeout -- the real sample size, distinct from total_generated." },
+        "total_generated": { "type": "integer", "minimum": 0, "description": "Every mutant the tool(s) generated across their configured scope, including ones never selected for testing this run -- not the sample size; see `tested`." },
+        "scoped_files": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Every file, across every language, this run's diff touched and mutation-tested against."
+        },
+        "top_surviving_mutants": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["language", "file", "function", "status", "diff"],
+            "properties": {
+              "language": { "type": "string", "enum": ["python", "typescript_javascript", "java", "go"] },
+              "file": { "type": "string" },
+              "function": { "type": "string" },
+              "status": { "type": "string", "enum": ["survived", "timeout"] },
+              "line": { "type": ["integer", "null"], "description": "Python: best-effort AST lookup of the function's own definition. TypeScript/JavaScript (Stryker) and Java (PIT): the tool's own reported line number, real ground truth, not a locator. The diff/description text, not this field alone, is the primary evidence for a surviving mutant." },
+              "diff": { "type": "string", "description": "Python: the real unified diff mutmut produced for this mutant, verbatim. TypeScript/JavaScript: the tool's own mutatorName + replacement value. Java: PIT's own mutator class + human description (e.g. \"changed conditional boundary\"). Go: gremlins' own mutation type + file:line:column. Real ground truth in every case, never a taxonomy label the tool itself doesn't expose." }
+            }
+          }
+        },
+        "by_language": {
+          "type": "object",
+          "description": "Per-language breakdown (killed/survived/timeout/total_generated/scoped_files) for every language that actually ran -- mirrors assertion_density.languages' own per-language precedent. A language with no tool configured in this repo, or that had no changed files in this diff, is simply absent here (never a fabricated zero). Absent/empty on attestations predating this field, or a single-language run that never populated it.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "killed": { "type": "integer", "minimum": 0 },
+              "survived": { "type": "integer", "minimum": 0 },
+              "timeout": { "type": "integer", "minimum": 0 },
+              "total_generated": { "type": "integer", "minimum": 0 },
+              "scoped_files": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "reason": { "type": "string" },
+        "reason_code": { "type": ["string", "null"] }
       }
     }
   },
@@ -576,6 +656,19 @@
           "default": true,
           "description": "False when this control was never actually evaluated for this run (e.g. static_analysis with no --sarif configured) -- raw_score/weighted_score still carry the scoring policy's baseline (never penalizing an opt-in control that wasn't asked to run), but a consumer must not read that baseline number as a real measurement. True for every component that ran a real check, whether it passed or not."
         }
+      }
+    },
+    "mutationScoreComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Same shape as scoreComponent, except weighted_score is a signed delta ((multiplier - 1.0) * the test_health/patch_coverage/overall_coverage cluster's own weighted subtotal), not a 0-100 weighted share -- mutation_testing discounts that cluster rather than adding its own additive weight (weight is always 0.0 here, by construction). Confirmed empirically (a real end-to-end run) that reusing scoreComponent's weighted_score minimum:0 constraint here falsely flags a legitimate negative discount as a schema violation.",
+      "required": ["weight", "raw_score", "weighted_score", "reason", "available"],
+      "properties": {
+        "weight": { "type": "number", "const": 0 },
+        "raw_score": { "type": "number", "minimum": 0, "maximum": 100 },
+        "weighted_score": { "type": "number", "minimum": -100, "maximum": 100 },
+        "reason": { "type": "string" },
+        "available": { "type": "boolean", "default": true }
       }
     },
     "realCoverageTrack": {

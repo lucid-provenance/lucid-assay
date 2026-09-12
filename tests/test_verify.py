@@ -2202,6 +2202,114 @@ class DependencyGovernanceIntegrationTests(unittest.TestCase):
         json.dumps(payload)  # must remain JSON-serializable end to end
 
 
+class BuildVerifyJsonPayloadTests(unittest.TestCase):
+    """Direct structural assertions on the --format json payload -- exact
+    key sets at every level, not just that a couple of fields are present,
+    since a mutated/typo'd key name survives a loose assertIn just as
+    easily as no test at all."""
+
+    def _payload(self, **statement_overrides):
+        envelope = _envelope(_statement(**statement_overrides))
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        return _build_verify_json_payload(result)
+
+    def test_top_level_keys_are_exact(self):
+        payload = self._payload()
+        self.assertEqual(
+            set(payload.keys()),
+            {
+                "version", "verified", "verdict", "verdict_word",
+                "source_highest_level", "build_highest_level",
+                "envelope", "run_identity", "gate_params",
+                "source", "slsa", "release_confidence_score", "test_coverage",
+                "static_analysis", "s2c2f", "dependency_governance",
+                "mutation_testing", "repository_governance", "identity",
+                "signing", "violations", "warnings",
+            },
+        )
+
+    def test_envelope_block_keys_and_values_are_exact(self):
+        statement = _statement()
+        envelope = _envelope(statement)
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        payload = _build_verify_json_payload(result)
+        self.assertEqual(set(payload["envelope"].keys()), {"statement_type", "predicate_type", "subject"})
+        self.assertEqual(payload["envelope"]["statement_type"], "https://in-toto.io/Statement/v1")
+        # The real subject list round-trips verbatim -- not a key-typo'd
+        # `.get("SUBJECT")`/`.get(None)` silently falling back to [].
+        self.assertEqual(payload["envelope"]["subject"], statement["subject"])
+
+    def test_envelope_subject_falls_back_to_empty_list_when_not_a_list(self):
+        envelope = _envelope(_statement())
+        envelope["payload"] = base64.b64encode(
+            json.dumps({**json.loads(base64.b64decode(envelope["payload"])), "subject": "not-a-list"}).encode()
+        ).decode()
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        payload = _build_verify_json_payload(result)
+        self.assertEqual(payload["envelope"]["subject"], [])
+
+    def test_source_and_slsa_block_keys_are_exact(self):
+        payload = self._payload()
+        self.assertEqual(set(payload["source"].keys()), {"level_1", "level_2", "level_3", "level_4"})
+        self.assertEqual(set(payload["slsa"].keys()), {"level_1", "level_2", "level_3"})
+
+    def test_release_confidence_score_block_keys_are_exact(self):
+        payload = self._payload()
+        self.assertEqual(
+            set(payload["release_confidence_score"].keys()),
+            {"score", "degraded", "degraded_field_present", "degraded_reasons", "components"},
+        )
+
+    def test_degraded_reasons_falls_back_to_empty_list_when_none(self):
+        payload = self._payload(degraded_reasons=_DEGRADED_REASONS_OMITTED)
+        self.assertEqual(payload["release_confidence_score"]["degraded_reasons"], [])
+
+    def test_degraded_reasons_passes_through_when_present(self):
+        payload = self._payload(degraded=True, degraded_reasons=["patch_coverage:no_coverable_lines"])
+        self.assertEqual(
+            payload["release_confidence_score"]["degraded_reasons"], ["patch_coverage:no_coverable_lines"]
+        )
+
+    def test_verdict_word_falls_back_to_the_exact_failed_string_when_falsy(self):
+        # verdict_word defaults to "" on a directly-constructed
+        # VerificationResult (verify_dsse_attestation() itself always
+        # populates a real FAILED/GATED/PASSED word, so this exercises the
+        # payload builder's own defensive fallback in isolation).
+        result = VerificationResult(passed=False)
+        self.assertEqual(result.verdict_word, "")
+        payload = _build_verify_json_payload(result)
+        self.assertEqual(payload["verdict_word"], "FAILED")
+
+    def test_verdict_word_passes_through_verbatim_when_present(self):
+        result = VerificationResult(passed=True, verdict_word="PASSED")
+        payload = _build_verify_json_payload(result)
+        self.assertEqual(payload["verdict_word"], "PASSED")
+
+    def test_static_analysis_s2c2f_dependency_repo_governance_block_keys(self):
+        payload = self._payload()
+        self.assertEqual(set(payload["static_analysis"].keys()), {"tools"})
+        self.assertEqual(set(payload["s2c2f"].keys()), {"controls"})
+        self.assertEqual(set(payload["dependency_governance"].keys()), {"items"})
+        self.assertEqual(set(payload["repository_governance"].keys()), {"items"})
+
+    def test_identity_and_signing_block_keys_are_exact(self):
+        payload = self._payload()
+        self.assertEqual(set(payload["identity"].keys()), {"status", "detail"})
+        self.assertEqual(set(payload["signing"].keys()), {"rekor_log_index", "rekor_log_url"})
+
+    def test_run_identity_is_the_real_extraction_not_a_stub(self):
+        # Pins `_extract_run_identity(result.statement)`, not e.g.
+        # `_extract_run_identity(None)` -- a real repository name embedded
+        # in the statement's own predicate.vcs must actually surface here;
+        # _extract_run_identity(None) would produce vcs={} regardless.
+        statement = _statement()
+        statement["predicate"]["vcs"] = {"repository": "org/real-repo", "provider": "github"}
+        envelope = _envelope(statement)
+        result = verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+        payload = _build_verify_json_payload(result)
+        self.assertEqual(payload["run_identity"]["vcs"]["repository"], "org/real-repo")
+
+
 class SlsaInvocationOriginTests(unittest.TestCase):
     """_slsa_invocation_origin() extracts runDetails.metadata.invocationId
     -- the CI run URL slsa_provenance.py's _invocation_metadata() already

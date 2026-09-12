@@ -700,7 +700,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--junit-xml", required=True)
     p.add_argument("--coverage-format", choices=["cobertura", "lcov", "jacoco"], default="cobertura")
-    p.add_argument("--coverage-report", required=True, dest="coverage_report")
+    p.add_argument("--coverage-report", required=True)
     p.add_argument(
         "--image-ref",
         default=None,
@@ -734,7 +734,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--repository", required=True)
     p.add_argument("--branch", required=True)
     p.add_argument("--pr-number", type=int, default=None)
-    p.add_argument("--pr-approvers", default="", help="comma-separated handles")
+    p.add_argument(
+        "--pr-approvers",
+        default="",
+        help="comma-separated handles",
+    )
     p.add_argument("--pr-required-approvals", type=int, default=0)
     p.add_argument("--pr-review-state", default="not_applicable")
     p.add_argument(
@@ -766,7 +770,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--license-curations",
         default=None,
-        dest="license_curations",
         help="path to a JSON file of human-reviewed license exceptions, keyed by PURL (exact-with-"
         "version, or name-only to apply across every version) to {\"asserted_license\", \"evidence\", "
         "\"curator\", \"date\"?} -- see cli/parsers/sbom.py's load_license_curations(). Rescues an "
@@ -779,7 +782,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--sonar-metrics",
         default=None,
-        dest="sonar_metrics",
         help="path to a SonarQube 'api/measures/component' JSON export; merges quality-gate/cognitive-complexity/"
         "technical-debt metrics into the SonarQube tool's extensions when a --sarif input didn't already embed "
         "them (requires at least one --sarif input to attach to)",
@@ -787,7 +789,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--coverage-contexts",
         default=None,
-        dest="coverage_contexts",
         help="path to a `coverage json --show-contexts` export (collected with `--cov-context=test`, e.g. "
         "`pytest --cov=... --cov-context=test`) -- when given, computes vanity-test-aware 'real' coverage "
         "(cli/real_coverage.py): how much of the reported total/patch coverage is exercised only by tests "
@@ -797,14 +798,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--patch-coverage-min", type=float, default=0.80)
     p.add_argument("--overall-coverage-min", type=float, default=0.60)
-    p.add_argument("--min-rcs", type=int, default=0, help="Minimum acceptable RCS score threshold")
+    p.add_argument(
+        "--min-rcs",
+        type=int,
+        default=0,
+        help="Minimum acceptable RCS score threshold",
+    )
     p.add_argument("--out", default="attestation.unsigned.json")
-    p.add_argument("--sign", action="store_true", help="perform keyless Sigstore signing")
-    p.add_argument("--dry-run-sign", action="store_true", help="simulate DSSE envelope creation without OIDC")
+    p.add_argument(
+        "--sign",
+        action="store_true",
+        help="perform keyless Sigstore signing",
+    )
+    p.add_argument(
+        "--dry-run-sign",
+        action="store_true",
+        help="simulate DSSE envelope creation without OIDC",
+    )
     p.add_argument(
         "--emit-slsa-provenance",
         action="store_true",
-        dest="emit_slsa_provenance",
         help="additionally emit a second, separate in-toto Statement shaped as real SLSA v1.0 provenance "
         "(predicateType https://slsa.dev/provenance/v1) alongside lucid-assay's own RCS predicate -- see "
         "cli/slsa_provenance.py. Populated only from real ambient GitHub Actions context (GITHUB_REPOSITORY/"
@@ -814,14 +827,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--slsa-provenance-out",
         default=None,
-        dest="slsa_provenance_out",
         help="output path for the --emit-slsa-provenance statement (default: derived from --out, e.g. "
         "attestation.slsa-provenance.unsigned.json)",
     )
     p.add_argument(
         "--sbom-statement-out",
         default=None,
-        dest="sbom_statement_out",
         help="output path for the --sbom companion in-toto statement (see cli/sbom_statement.py; default: "
         "a fixed-basename sibling of --out in the same directory, e.g. build/attestation.unsigned.json -> "
         "build/sbom.unsigned.json). A no-op when --sbom wasn't passed or failed to parse.",
@@ -829,7 +840,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--sarif-reports-statement-out",
         default=None,
-        dest="sarif_reports_statement_out",
         help="output path for the --sarif companion in-toto statement (see cli/sarif_statement.py; default: "
         "a fixed-basename sibling of --out in the same directory, e.g. build/attestation.unsigned.json -> "
         "build/sarif-reports.unsigned.json). A no-op when --sarif wasn't passed or every input failed to load.",
@@ -847,21 +857,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--mutation-testing-timeout",
         type=int,
         default=90,
-        dest="mutation_testing_timeout",
         help="outer, provably-bounded time budget in seconds for the whole diff-scoped mutmut run (default: 90)",
     )
     p.add_argument(
         "--mutation-testing-min-sample",
         type=int,
         default=3,
-        dest="mutation_testing_min_sample",
         help="minimum number of mutants actually tested (killed+survived+timeout) before the tiered multiplier "
         "applies at all -- below this, grade is 'insufficient_sample' and no discount is applied (default: 3)",
     )
     p.add_argument(
         "--mutation-report-out",
         default=None,
-        dest="mutation_report_out",
         help="output path for the full structured mutation-testing report (default: a fixed "
         "reports/mutation/mutation-report.json under --repo-dir)",
     )

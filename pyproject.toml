@@ -98,3 +98,26 @@ norecursedirs = ["ast_assertions", ".git", ".venv", "node_modules", "build", "di
 source_paths = ["cli", "scripts", "schema"]
 only_mutate = ["cli/*"]
 pytest_add_cli_args_test_selection = ["tests"]
+
+# Excludes argparse help=/description=/prog= string text from mutation --
+# confirmed empirically (mutmut/mutation/pragma_handling.py's
+# do_not_mutate_patterns, real 3.7.0 source) that this is a line-level
+# regex match against raw source, and _should_mutate_node/
+# _skip_node_and_children key off each individual AST node's own start
+# line -- so on this codebase's one-kwarg-per-line add_argument() style,
+# these patterns hit only the help/description/prog string-literal lines
+# themselves, never a sibling default=/choices=/dest=/required=/type= kwarg
+# a few lines above or below in the same multi-line call (verified: those
+# stayed mutated and killed after adding this). Case-flip/"XXtextXX"-wrap
+# mutations on CLI help wording are not a real test-quality gap the way a
+# wrong default/choices/required/type is -- nobody diffs `--help` output
+# character-by-character in practice, and parse_args() doesn't even expose
+# the ArgumentParser object for a test to assert against without a
+# refactor. This was cluttering parse_args()'s own mutation score with
+# unkillable-by-design noise rather than real survivors.
+do_not_mutate_patterns = [
+    '^\s*help=',
+    '^\s*description=',
+    '^\s*prog=',
+    '^\s*f?"[^"]*",?\s*$',  # bare continuation lines of an implicitly-concatenated multi-line help/description string
+]

@@ -3097,7 +3097,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="Verify a lucid-assay DSSE in-toto attestation envelope against admission policy gates.",
     )
     p.add_argument("envelope", help="path to the signed DSSE envelope JSON file")
-    p.add_argument("--min-rcs", type=int, default=0, help="minimum acceptable RCS score (default: 0)")
+    p.add_argument(
+        "--min-rcs",
+        type=int,
+        default=0,
+        help="minimum acceptable RCS score (default: 0)",
+    )
     p.add_argument(
         "--require-digest",
         default=None,
@@ -3113,8 +3118,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="skip Sigstore identity verification entirely (offline mode, no network calls)",
     )
-    p.add_argument("--cert-identity", default=None, help="expected Sigstore signing identity (certificate SAN)")
-    p.add_argument("--cert-oidc-issuer", default=None, help="expected OIDC issuer for the signing identity")
+    p.add_argument(
+        "--cert-identity",
+        default=None,
+        help="expected Sigstore signing identity (certificate SAN)",
+    )
+    p.add_argument(
+        "--cert-oidc-issuer",
+        default=None,
+        help="expected OIDC issuer for the signing identity",
+    )
     p.add_argument(
         "--expected-issuer",
         default=None,
@@ -3142,7 +3155,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--slsa-envelope",
         default=None,
-        dest="slsa_envelope",
         help="path to a second, SLSA v1.0 provenance-shaped DSSE envelope; when given alongside the "
         "primary envelope, the SLSA Source Track (from the primary envelope's vcs/branch_governance) "
         "and SLSA Build Track (from this one) are both evaluated together as one unified report",
@@ -3150,7 +3162,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--require-slsa-build-l3",
         action="store_true",
-        dest="require_slsa_build_l3",
         help="fail the gate if this run does not fully (cumulatively) satisfy SLSA Build Level 3 -- "
         "off by default: it genuinely passes today when a caller supplies --subject-name/"
         "--subject-digest (confirmed against real CI runs, 2026-09-03), but that's still an opt-in "
@@ -3159,7 +3170,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--require-commit-signing",
         action="store_true",
-        dest="require_commit_signing",
         help="fail the gate if HEAD's commit is not cryptographically signed/verified (Repository & "
         "Workstation Governance section's Cryptographic Commit Signing item only -- the section's "
         "other three, branch-ruleset-hygiene items have no gate path yet) -- off by default",
@@ -3167,7 +3177,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--require-mutation-score",
         action="store_true",
-        dest="require_mutation_score",
         help="fail the gate if predicate.mutation_testing graded 'failed' (decorative/illusory test "
         "coverage) -- off by default, same opt-in shape as --require-commit-signing. The weaker "
         "'degraded' tier already blocks --disallow-degraded by default (its reason_code isn't in "
@@ -3195,7 +3204,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--write-verdict",
         action="store_true",
-        dest="write_verdict",
         help="persist this call's computed FAILED/GATED/PASSED verdict (plus rcs_value/degraded/SLSA "
         "highest-level/gate_params -- see _build_verdict_envelope_block) as an unsigned '_verdict' "
         "sibling field on the envelope -- same trust tier as the envelope's existing '_rekor'/"
@@ -3206,7 +3214,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--verdict-out",
         default=None,
-        dest="verdict_out",
         help="output path for --write-verdict (default: overwrite the input envelope file in place, "
         "so the same file can be re-uploaded to the ingestion API with its verdict attached)",
     )

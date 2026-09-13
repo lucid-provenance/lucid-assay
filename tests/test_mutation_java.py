@@ -9,7 +9,14 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cli.mutation.common import LANGUAGE_JAVA, REASON_CODE_NO_COVERABLE_LINES
-from cli.mutation.java_runner import _fully_qualified_class_name, _parse_report, _pitest_configured, run
+from cli.mutation.java_runner import (
+    _find_report_paths,
+    _fully_qualified_class_name,
+    _merge_java_results,
+    _parse_report,
+    _pitest_configured,
+    run,
+)
 
 _POM_WITH_PITEST = """<project>
   <build><plugins><plugin>
@@ -72,6 +79,32 @@ class PitestConfigDetectionTests(unittest.TestCase):
             finally:
                 os.chmod(pom, 0o644)  # restore so tempdir cleanup can delete it
 
+    def test_plugin_declared_only_in_a_child_module_is_still_configured(self):
+        """Found via code review 2026-09-13: a real multi-module Maven
+        reactor commonly declares pitest-maven in a child module's own
+        pom.xml, not the root aggregator -- the original root-only check
+        would have silently reported not_configured for this, the norm
+        for any non-trivial Maven project."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pom.xml").write_text("<project><modules><module>module-a</module></modules></project>", encoding="utf-8")
+            module_dir = root / "module-a"
+            module_dir.mkdir()
+            (module_dir / "pom.xml").write_text(_POM_WITH_PITEST, encoding="utf-8")
+            self.assertTrue(_pitest_configured(root))
+
+    def test_marker_inside_a_target_directory_is_ignored(self):
+        # A previous build's own copied/generated content under target/
+        # (a shaded jar's exploded contents, a vendored dependency pom,
+        # ...) must never itself register as "pitest is configured here."
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pom.xml").write_text("<project></project>", encoding="utf-8")
+            stray_dir = root / "target" / "classes" / "some-dependency"
+            stray_dir.mkdir(parents=True)
+            (stray_dir / "pom.xml").write_text(_POM_WITH_PITEST, encoding="utf-8")
+            self.assertFalse(_pitest_configured(root))
+
 
 class FullyQualifiedClassNameTests(unittest.TestCase):
 
@@ -133,6 +166,51 @@ class RunTests(unittest.TestCase):
         run_mock.assert_not_called()
         self.assertEqual(result.status, "not_configured")
         self.assertEqual(result.language, LANGUAGE_JAVA)
+
+    def test_mvn_succeeds_but_no_report_anywhere_is_unavailable_with_exact_reason(self):
+        # A real gap this run() end-to-end path never had a test for --
+        # distinct from _parse_report's own "found but unreadable" case.
+        with patch("cli.mutation.java_runner._run_mvn", side_effect=lambda a, **k: _ok()):
+            result = run(self.repo_dir, self._diff_files(), timeout_seconds=90, max_surviving_detail=5)
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.reason, "pitest ran but no mutations.xml report was found anywhere under the repo")
+
+    def test_real_multi_module_layout_combines_both_modules_reports(self):
+        """Found via code review 2026-09-13: a genuine multi-module Maven
+        reactor writes one mutations.xml per module actually mutated,
+        under that module's own target/ -- not a single report at the
+        repo root. This is the end-to-end shape that used to fail closed
+        on every invocation against a real multi-module project."""
+        def side_effect(args, *, cwd, timeout_seconds):
+            for module in ("module-a", "module-b"):
+                report_dir = self.repo_dir / module / "target" / "pit-reports"
+                report_dir.mkdir(parents=True)
+                (report_dir / "mutations.xml").write_text(_MUTATIONS_XML, encoding="utf-8")
+            return _ok()
+
+        with patch("cli.mutation.java_runner._run_mvn", side_effect=side_effect):
+            result = run(self.repo_dir, self._diff_files(), timeout_seconds=90, max_surviving_detail=5)
+        self.assertEqual(result.status, "ran")
+        # _MUTATIONS_XML has 1 killed + 1 survived; two modules' worth.
+        self.assertEqual(result.killed, 2)
+        self.assertEqual(result.survived, 2)
+        self.assertEqual(len(result.surviving_mutants), 2)
+
+    def test_one_unparseable_module_report_fails_the_whole_run_closed(self):
+        # A corrupt report from one module must never be silently
+        # dropped in favor of reporting only the modules that parsed.
+        def side_effect(args, *, cwd, timeout_seconds):
+            good_dir = self.repo_dir / "module-a" / "target" / "pit-reports"
+            good_dir.mkdir(parents=True)
+            (good_dir / "mutations.xml").write_text(_MUTATIONS_XML, encoding="utf-8")
+            bad_dir = self.repo_dir / "module-b" / "target" / "pit-reports"
+            bad_dir.mkdir(parents=True)
+            (bad_dir / "mutations.xml").write_text("<not><valid</xml", encoding="utf-8")
+            return _ok()
+
+        with patch("cli.mutation.java_runner._run_mvn", side_effect=side_effect):
+            result = run(self.repo_dir, self._diff_files(), timeout_seconds=90, max_surviving_detail=5)
+        self.assertEqual(result.status, "unavailable")
 
     def test_real_report_is_parsed_into_killed_survived_with_ground_truth_operator(self):
         # Real shape confirmed empirically against a live PIT 1.19.0
@@ -543,6 +621,83 @@ class ParseReportTests(unittest.TestCase):
         self.assertEqual(result.language, LANGUAGE_JAVA)
         self.assertEqual(result.reason, REASON_CODE_NO_COVERABLE_LINES)
         self.assertEqual(result.scoped_files, ["mathy.Mathy"])
+
+
+class FindReportPathsTests(unittest.TestCase):
+    def test_finds_the_single_module_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_dir = root / "target" / "pit-reports"
+            report_dir.mkdir(parents=True)
+            (report_dir / "mutations.xml").write_text(_MUTATIONS_XML, encoding="utf-8")
+            self.assertEqual(_find_report_paths(root), [report_dir / "mutations.xml"])
+
+    def test_finds_every_module_in_a_multi_module_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for module in ("module-a", "module-b"):
+                report_dir = root / module / "target" / "pit-reports"
+                report_dir.mkdir(parents=True)
+                path = report_dir / "mutations.xml"
+                path.write_text(_MUTATIONS_XML, encoding="utf-8")
+                paths.append(path)
+            self.assertEqual(_find_report_paths(root), sorted(paths))
+
+    def test_none_found_returns_empty_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(_find_report_paths(Path(tmp)), [])
+
+
+class MergeJavaResultsTests(unittest.TestCase):
+    def test_sums_counts_and_concatenates_surviving_mutants_across_results(self):
+        from cli.mutation.common import LanguageRunResult, SurvivingMutant
+
+        m1 = SurvivingMutant(language=LANGUAGE_JAVA, file="A.java", function="f", status="survived", diff="x")
+        m2 = SurvivingMutant(language=LANGUAGE_JAVA, file="B.java", function="g", status="survived", diff="y")
+        r1 = LanguageRunResult(
+            language=LANGUAGE_JAVA, status="ran", killed=1, survived=1, timeout=0,
+            total_generated=2, surviving_mutants=[m1],
+        )
+        r2 = LanguageRunResult(
+            language=LANGUAGE_JAVA, status="ran", killed=2, survived=1, timeout=1,
+            total_generated=4, surviving_mutants=[m2],
+        )
+        merged = _merge_java_results([r1, r2], ["A.java", "B.java"], max_detail=5)
+        self.assertEqual(merged.status, "ran")
+        self.assertEqual(merged.killed, 3)
+        self.assertEqual(merged.survived, 2)
+        self.assertEqual(merged.timeout, 1)
+        self.assertEqual(merged.total_generated, 6)
+        self.assertEqual(merged.surviving_mutants, [m1, m2])
+
+    def test_truncates_combined_surviving_mutants_to_max_detail(self):
+        from cli.mutation.common import LanguageRunResult, SurvivingMutant
+
+        mutants = [
+            SurvivingMutant(language=LANGUAGE_JAVA, file=f"{i}.java", function="f", status="survived", diff="x")
+            for i in range(3)
+        ]
+        r1 = LanguageRunResult(language=LANGUAGE_JAVA, status="ran", survived=3, total_generated=3, surviving_mutants=mutants)
+        merged = _merge_java_results([r1], [], max_detail=2)
+        self.assertEqual(len(merged.surviving_mutants), 2)
+
+    def test_any_unavailable_result_fails_the_whole_merge_closed(self):
+        from cli.mutation.common import LanguageRunResult
+
+        good = LanguageRunResult(language=LANGUAGE_JAVA, status="ran", killed=5, total_generated=5)
+        bad = LanguageRunResult(language=LANGUAGE_JAVA, status="unavailable", reason="module-b report could not be read")
+        merged = _merge_java_results([good, bad], [], max_detail=5)
+        self.assertEqual(merged.status, "unavailable")
+        self.assertEqual(merged.reason, "module-b report could not be read")
+
+    def test_zero_total_mutations_across_all_results_is_the_exemption(self):
+        from cli.mutation.common import LanguageRunResult
+
+        r1 = LanguageRunResult(language=LANGUAGE_JAVA, status="ran", total_generated=0)
+        merged = _merge_java_results([r1], ["A.java"], max_detail=5)
+        self.assertEqual(merged.reason, REASON_CODE_NO_COVERABLE_LINES)
+        self.assertEqual(merged.scoped_files, ["A.java"])
 
 
 if __name__ == "__main__":

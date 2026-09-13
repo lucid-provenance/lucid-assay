@@ -233,7 +233,24 @@ def _normalize_sarif_path(uri: str) -> str:
     """Normalize a SARIF `artifactLocation.uri` for cross-referencing
     against git-diff-derived patch_modified_lines keys (repo-root-relative,
     e.g. "cli/verify.py"). Strips a `file://` scheme, percent-decodes, then
-    collapses `./`/`../` segments the same way cli.patch_coverage does."""
+    collapses `./`/`../` segments and neutralizes any absolute-path/
+    traversal prefix -- this value is never used to open a file (this
+    module only ever uses it as a dict-lookup key against
+    patch_modified_lines, see _lookup_modified_lines), but it's still
+    never allowed to keep looking like an absolute or `..`-prefixed path.
+
+    Backslashes are normalized to `/` before any of that -- fixed
+    2026-09-13 (code review): a SARIF tool that ran on Windows can
+    legitimately emit a backslash-separated URI (e.g.
+    "..\\..\\etc\\shadow"), and this code always runs on POSIX CI
+    runners, where `os.sep` is `/` and `os.path.normpath` doesn't treat
+    `\\` as a separator at all -- the traversal-stripping loop below
+    only ever stripped a leading `/`, silently leaving a leading `..\\`
+    sequence completely intact. Confirmed by direct trace-through, not
+    assumed: forward-slash-only traversal payloads (e.g.
+    "../../../../etc/passwd") were already being neutralized correctly
+    by the existing loop before this fix -- this closes the one real gap
+    found alongside that check, not a previously-broken case."""
     p = uri.strip().strip('"').strip("'")
     if p.startswith("file://"):
         p = p[len("file://"):]
@@ -241,13 +258,16 @@ def _normalize_sarif_path(uri: str) -> str:
         p = urllib.parse.unquote(p)
     except (ValueError, UnicodeDecodeError):
         pass
+    p = p.replace("\\", "/")
     # Guard against traversal - os.path.normpath on "../../etc/passwd" is still "../../etc/passwd"
     # We want to ensure it doesn't escape the repo root if interpreted as relative.
     p = os.path.normpath(p)
-    # If it's absolute (starts with / or \ after normpath), strip it to make it relative.
-    # If it still has ../ at the beginning, it's a traversal attempt or outside repo.
-    while p.startswith("..") or p.startswith(os.sep):
-        p = p.lstrip(".").lstrip(os.sep)
+    # If it's absolute (starts with / after normpath -- backslashes are
+    # already gone by now, so os.sep alone is no longer platform-fragile),
+    # strip it to make it relative. If it still has ../ at the beginning,
+    # it's a traversal attempt or outside repo.
+    while p.startswith("..") or p.startswith("/"):
+        p = p.lstrip(".").lstrip("/")
     return p
 
 
@@ -422,12 +442,23 @@ def _extract_int_metric(bag: Dict[str, Any], in_keys: Tuple[str, ...]) -> Option
     the next alias; a present value that raises on numeric coercion stops
     the search entirely with no value -- mirrors the exact control flow of
     the inline loop this was extracted from, alias-skip vs. hard-stop
-    included."""
+    included.
+
+    A string value has its thousands-separator commas stripped before
+    coercion -- fixed 2026-09-13 (code review): a real SonarQube export
+    shape can format a metric as `"1,000"`, which `float()` has always
+    rejected outright (raising ValueError, silently dropping the metric
+    via the hard-stop below) despite being an unambiguous, real number.
+    Never applied to an already-numeric value (int/float), where a comma
+    could never legitimately appear anyway."""
     for in_key in in_keys:
         if in_key not in bag or bag[in_key] is None:
             continue
+        raw = bag[in_key]
+        if isinstance(raw, str):
+            raw = raw.replace(",", "")
         try:
-            fval = float(bag[in_key])
+            fval = float(raw)
             if not math.isfinite(fval):
                 continue
             return max(0, int(fval))  # Clamp to non-negative

@@ -63,6 +63,16 @@ class _TempGitRepo:
             ["git", "rev-parse", "HEAD"], cwd=self.path, capture_output=True, text=True, check=True
         ).stdout.strip()
 
+    def commit_lines(self, filename: str, lines: list) -> str:
+        with open(os.path.join(self.path, filename), "a") as f:
+            for line in lines:
+                f.write(line + "\n")
+        _git(["add", "."], self.path)
+        _git(["commit", "-q", "-m", "lines"], self.path)
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.path, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
 
 _EMPTY_COVERAGE = CoverageReport(overall_line_rate=0.9, overall_branch_rate=0.8, files={})
 
@@ -91,6 +101,48 @@ class ComputePatchCoverageReasonCodeTests(unittest.TestCase):
 
         self.assertFalse(result.available)
         self.assertIsNone(result.reason_code)
+
+
+class ParseDiffAmbiguousPlusPlusPlusLineTests(unittest.TestCase):
+    """Found via code review 2026-09-13: an added source line whose own
+    content starts with '++ ' (a real, plausible C/C++/Java
+    prefix-increment style, e.g. `++ i;`) becomes `+++ i;` once diffed --
+    indistinguishable from a real `+++ b/<path>` file header by prefix
+    alone. Against a *real* git repo (not a hand-written diff string --
+    real `git diff --unified=0` output is what this must actually parse
+    correctly), not just this one ambiguous line but every line after it
+    in the same hunk used to be silently dropped once current_file reset
+    to None."""
+
+    def test_an_added_line_starting_with_plus_plus_does_not_corrupt_tracking(self):
+        with _TempGitRepo() as repo:
+            head_sha = repo.commit_lines("app.py", ["++ i", "real_change = 1"])
+            changed = compute_patch_modified_lines(repo.base_sha, head_sha, repo.path)
+
+        self.assertIn("app.py", changed)
+        # Both the ambiguous line and the real one after it must be
+        # tracked -- the bug this closes would have dropped both once
+        # current_file was wrongly reset to None on the first one.
+        self.assertEqual(len(changed["app.py"]), 2)
+
+    def test_lines_in_a_second_file_after_the_ambiguous_line_are_still_tracked(self):
+        # The real regression risk: state corruption in one file's hunk
+        # bleeding into every file that follows it in the same diff.
+        with _TempGitRepo() as repo:
+            with open(os.path.join(repo.path, "app.py"), "a") as f:
+                f.write("++ i\n")
+            with open(os.path.join(repo.path, "second.py"), "w") as f:
+                f.write("def baz():\n    return 3\n")
+            _git(["add", "."], repo.path)
+            _git(["commit", "-q", "-m", "two files"], repo.path)
+            head_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo.path, capture_output=True, text=True, check=True
+            ).stdout.strip()
+            changed = compute_patch_modified_lines(repo.base_sha, head_sha, repo.path)
+
+        self.assertIn("app.py", changed)
+        self.assertIn("second.py", changed)
+        self.assertEqual(len(changed["second.py"]), 2)
 
     def test_covered_code_change_has_no_reason_code(self):
         coverage = CoverageReport(

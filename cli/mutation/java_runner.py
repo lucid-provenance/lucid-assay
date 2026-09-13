@@ -43,6 +43,24 @@ Hardened against:
     not a persistent cross-invocation cache the way mutmut's mutants/
     was -- `mvn clean` at the front of every invocation here guarantees
     a fresh target/ regardless.
+  - A real multi-module Maven layout, fixed 2026-09-13 (code review):
+    both `_pitest_configured()` and the report lookup used to assume a
+    single-module (or root-only) project -- checking only the root
+    pom.xml for the pitest-maven marker, and reading only
+    repo_dir/target/pit-reports/mutations.xml. A genuine multi-module
+    reactor build (the Maven norm for anything non-trivial) declares the
+    plugin in a child module's own pom.xml and writes that module's
+    report under its own target/, not the aggregator root's -- this
+    runner silently reported not_configured or failed closed with
+    "report could not be read" on every single invocation against one.
+    `_pitest_configured()` now searches every pom.xml under repo_dir
+    (excluding `target/`) for the marker; report discovery now globs
+    every `pit-reports/mutations.xml` found anywhere under repo_dir and
+    merges the results (`_find_report_paths`/`_merge_java_results`) --
+    the same glob pattern matches both the single- and multi-module
+    shape uniformly, no special-casing needed. Any one module's report
+    failing to parse still fails the whole run closed, never silently
+    reporting on only the modules that happened to succeed.
 """
 from __future__ import annotations
 
@@ -57,18 +75,36 @@ from .common import LANGUAGE_JAVA, LanguageRunResult, REASON_CODE_NO_COVERABLE_L
 _PACKAGE_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.MULTILINE)
 _PITEST_PLUGIN_MARKER = "pitest-maven"
 _NO_MUTATIONS_MARKER = "No mutations found"
-_REPORT_PATH = ("target", "pit-reports", "mutations.xml")
 
 
 def _pitest_configured(repo_dir: Path) -> bool:
+    """True when the pitest-maven plugin is declared in the root pom.xml
+    or any real module's own pom.xml -- not just the root. Found via
+    code review 2026-09-13: the original root-only check meant a real
+    multi-module Maven project (the norm for anything non-trivial) was
+    silently treated as not_configured whenever the plugin was declared
+    only in a child module's own pom.xml rather than the root aggregator
+    -- a very common real layout. Still requires a root pom.xml to exist
+    regardless (mvn -B ... itself needs one to run at all); this only
+    widens where the *marker string* can be found, not whether Maven's
+    own reactor build is possible. Excludes anything under a `target/`
+    directory -- never a source pom.xml, and it's exactly where a
+    previous build's own copied/generated content (a shaded/assembled
+    jar's exploded contents, a dependency's own vendored pom, ...) could
+    otherwise produce a false positive or waste a scan on a large tree."""
     pom = repo_dir / "pom.xml"
     if not pom.is_file():
         return False
-    try:
-        text = pom.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    return _PITEST_PLUGIN_MARKER in text
+    for candidate in repo_dir.rglob("pom.xml"):
+        if "target" in candidate.relative_to(repo_dir).parts:
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if _PITEST_PLUGIN_MARKER in text:
+            return True
+    return False
 
 
 def _fully_qualified_class_name(repo_dir: Path, file_path: str) -> Optional[str]:
@@ -158,6 +194,66 @@ def _parse_report(report_path: Path, scoped_classes: List[str], max_detail: int)
     )
 
 
+def _find_report_paths(repo_dir: Path) -> List[Path]:
+    """Every module's own mutations.xml under repo_dir -- a real
+    multi-module Maven reactor build writes one per module PIT actually
+    ran against, not a single report at the repo root. Found via code
+    review 2026-09-13: the previous hardcoded
+    repo_dir/target/pit-reports/mutations.xml path only ever matched a
+    single-module (or root-only) project; a real multi-module layout
+    writes each module's own report under
+    <module>/target/pit-reports/mutations.xml instead, and this runner
+    failed closed on every single invocation against one.
+    Path.rglob()'s implicit `**/` prefix matches both shapes uniformly --
+    no need to special-case single- vs. multi-module. Sorted for
+    deterministic ordering (surviving-mutant detail order, and which
+    result "wins" is never ambiguous run to run)."""
+    return sorted(repo_dir.rglob("pit-reports/mutations.xml"))
+
+
+def _merge_java_results(
+    results: List[LanguageRunResult], scoped_classes: List[str], max_detail: int
+) -> LanguageRunResult:
+    """Combines one LanguageRunResult per discovered mutations.xml (one
+    per Maven module PIT actually ran against) into a single combined
+    result -- the same "sum everything, grade once" contract
+    cli.mutation's own dispatcher already applies across languages, one
+    level down within Java's own multi-module case. Any single module's
+    own unavailable result (its report failed to parse) fails the whole
+    run closed rather than silently reporting on only the modules that
+    happened to succeed -- a corrupt/partial report from one module is
+    exactly the state that must never be reported as if the others
+    already tell the whole story."""
+    for r in results:
+        if r.status == "unavailable":
+            return r
+    killed = sum(r.killed for r in results)
+    survived = sum(r.survived for r in results)
+    timeout_ct = sum(r.timeout for r in results)
+    total_generated = sum(r.total_generated for r in results)
+    surviving: List[SurvivingMutant] = []
+    for r in results:
+        surviving.extend(r.surviving_mutants)
+    surviving = surviving[:max_detail]
+
+    if killed + survived + timeout_ct == 0:
+        return LanguageRunResult(
+            language=LANGUAGE_JAVA, status="ran",
+            scoped_files=scoped_classes, reason=REASON_CODE_NO_COVERABLE_LINES,
+        )
+
+    return LanguageRunResult(
+        language=LANGUAGE_JAVA,
+        status="ran",
+        killed=killed,
+        survived=survived,
+        timeout=timeout_ct,
+        total_generated=total_generated,
+        scoped_files=scoped_classes,
+        surviving_mutants=surviving,
+    )
+
+
 def run(
     repo_dir: Path,
     changed_files: List[str],
@@ -220,5 +316,11 @@ def run(
             reason=f"pitest run failed (exit {proc.returncode}): {combined_output.strip()[-300:]}",
         )
 
-    report_path = repo_dir.joinpath(*_REPORT_PATH)
-    return _parse_report(report_path, existing_files, max_surviving_detail)
+    report_paths = _find_report_paths(repo_dir)
+    if not report_paths:
+        return LanguageRunResult(
+            language=LANGUAGE_JAVA, status="unavailable",
+            reason="pitest ran but no mutations.xml report was found anywhere under the repo",
+        )
+    results = [_parse_report(p, existing_files, max_surviving_detail) for p in report_paths]
+    return _merge_java_results(results, existing_files, max_surviving_detail)

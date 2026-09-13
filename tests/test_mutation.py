@@ -34,13 +34,16 @@ from cli.mutation.common import (
 )
 from cli.mutation.python_runner import (
     _NO_MATCH_MARKER,
+    _STOPPING_EARLY_MARKER,
     _build_scoped_pyproject_text,
     _dotted_module,
-    _is_source_paths_assignment,
+    _find_source_paths_value_text,
     _is_within_source_paths,
     _parse_mutant_key,
+    _parse_toml_string_array,
     _read_source_paths,
     _scoped_only_mutate,
+    _source_paths_assignment_start,
     _touched_functions,
     _wildcard_for,
     _wildcards_for_file,
@@ -363,6 +366,24 @@ class PythonRunnerRunDirectFieldTests(unittest.TestCase):
         def side_effect(args, *, cwd, timeout_seconds):
             if args[0] == "run":
                 return _ok(returncode=1, stderr=f"AssertionError: {_NO_MATCH_MARKER}")
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run()
+        self.assertEqual(result.language, LANGUAGE_PYTHON)
+        self.assertEqual(result.status, "ran")
+        self.assertEqual(result.scoped_files, ["cli/scorer.py"])
+        self.assertEqual(result.reason, REASON_CODE_NO_COVERABLE_LINES)
+
+    def test_stopping_early_marker_on_stdout_is_the_same_exemption_as_no_match_marker(self):
+        """Defense-in-depth backstop, added 2026-09-13: this marker is
+        mutmut's own "generated zero mutants at all" message, on stdout
+        -- a different shape than _NO_MATCH_MARKER (stderr, "wildcard
+        matched nothing among many generated mutants"), same correct
+        outcome either way."""
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                return _ok(returncode=1, stdout=f"...\n{_STOPPING_EARLY_MARKER}\n")
             return _ok()
 
         with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
@@ -915,29 +936,82 @@ class IsWithinSourcePathsTests(unittest.TestCase):
         self.assertTrue(_is_within_source_paths("cli/main.py", ["cli/main.py"]))
 
 
-class IsSourcePathsAssignmentTests(unittest.TestCase):
-    """Direct tests, not just through _read_source_paths -- that
-    function's own redundant re-parse-and-json.loads fail-safe masks a
-    couple of real mutations in this predicate alone (a malformed line
-    this returns True for still fails json.loads independently, so the
-    end-to-end behavior stays correct either way -- real defense in
-    depth, but it means these two specific mutations need a direct test
-    to actually kill)."""
+class SourcePathsAssignmentStartTests(unittest.TestCase):
+    """Direct tests of _source_paths_assignment_start -- renamed
+    2026-09-13 (was _is_source_paths_assignment) alongside a real
+    behavior change: this now only detects where a source_paths
+    assignment *starts*, not whether its array closes on the same line
+    -- that's _find_source_paths_value_text's own job now, since a
+    real, TOML-legal multi-line array must be supported."""
 
     def test_true_for_a_real_single_line_assignment(self):
-        self.assertTrue(_is_source_paths_assignment('source_paths = ["app"]'))
+        self.assertTrue(_source_paths_assignment_start('source_paths = ["app"]'))
 
     def test_false_for_a_key_that_merely_starts_with_source_paths(self):
-        self.assertFalse(_is_source_paths_assignment('source_pathsx = ["app"]'))
+        self.assertFalse(_source_paths_assignment_start('source_pathsx = ["app"]'))
 
-    def test_false_for_a_value_missing_its_closing_bracket(self):
-        self.assertFalse(_is_source_paths_assignment('source_paths = ["app"'))
+    def test_true_for_a_value_missing_its_closing_bracket(self):
+        # Changed from the old _is_source_paths_assignment's behavior:
+        # this is now exactly the shape a genuine multi-line array's
+        # opening line has, and must be detected as a real assignment
+        # start for _find_source_paths_value_text to then join it.
+        self.assertTrue(_source_paths_assignment_start('source_paths = ["app"'))
 
     def test_false_for_a_value_missing_its_opening_bracket(self):
-        self.assertFalse(_is_source_paths_assignment('source_paths = "app"]'))
+        self.assertFalse(_source_paths_assignment_start('source_paths = "app"]'))
 
     def test_false_for_an_unrelated_line(self):
-        self.assertFalse(_is_source_paths_assignment('only_mutate = ["app/*"]'))
+        self.assertFalse(_source_paths_assignment_start('only_mutate = ["app/*"]'))
+
+
+class ParseTomlStringArrayTests(unittest.TestCase):
+    """Direct tests of the narrow TOML string-array literal parser that
+    replaced json.loads() 2026-09-13 -- found via code review that
+    json.loads() silently rejected several TOML-legal forms (single-
+    quoted strings, a trailing comma), reopening the exact PR #98 crash
+    _read_source_paths exists to prevent for any repo formatting its
+    config that way."""
+
+    def test_double_quoted_strings(self):
+        self.assertEqual(_parse_toml_string_array('["app", "cli"]'), ["app", "cli"])
+
+    def test_single_quoted_strings(self):
+        self.assertEqual(_parse_toml_string_array("['app', 'cli']"), ["app", "cli"])
+
+    def test_mixed_quote_styles(self):
+        self.assertEqual(_parse_toml_string_array("""["app", 'cli']"""), ["app", "cli"])
+
+    def test_trailing_comma(self):
+        self.assertEqual(_parse_toml_string_array('["app", "cli",]'), ["app", "cli"])
+
+    def test_multiline_text_with_trailing_comma(self):
+        self.assertEqual(
+            _parse_toml_string_array('[\n    "app",\n    "cli",\n]'), ["app", "cli"]
+        )
+
+    def test_empty_array(self):
+        self.assertEqual(_parse_toml_string_array("[]"), [])
+
+    def test_single_element(self):
+        self.assertEqual(_parse_toml_string_array('["app"]'), ["app"])
+
+    def test_escaped_double_quote_and_backslash(self):
+        self.assertEqual(_parse_toml_string_array(r'["a\"b", "c\\d"]'), ['a"b', "c\\d"])
+
+    def test_no_surrounding_brackets_returns_none(self):
+        self.assertIsNone(_parse_toml_string_array('"app", "cli"'))
+
+    def test_non_string_element_returns_none(self):
+        self.assertIsNone(_parse_toml_string_array('["app", 1]'))
+
+    def test_unterminated_string_returns_none(self):
+        self.assertIsNone(_parse_toml_string_array('["app]'))
+
+    def test_unrecognized_escape_returns_none(self):
+        self.assertIsNone(_parse_toml_string_array(r'["a\nb"]'))
+
+    def test_junk_between_elements_returns_none(self):
+        self.assertIsNone(_parse_toml_string_array('["app" junk "cli"]'))
 
 
 class ReadSourcePathsTests(unittest.TestCase):
@@ -993,8 +1067,33 @@ class ReadSourcePathsTests(unittest.TestCase):
         self._write_pyproject('[tool.mutmut]\nsource_pathsx = ["app"]\n')
         self.assertIsNone(_read_source_paths(self.repo_dir))
 
-    def test_a_value_missing_its_closing_bracket_is_not_a_single_line_match(self):
+    def test_an_unclosed_array_that_swallows_the_next_real_assignment_fails_closed(self):
+        # Not a well-formed multi-line array -- source_paths' own bracket
+        # never actually closes before EOF/the table ends, so the greedy
+        # line-join reaches into `only_mutate`'s own line looking for a
+        # "]"; parsing that joined, bogus text as a string array correctly
+        # fails (the line "only_mutate = [...]" doesn't start with a
+        # quote), so this still resolves to None -- fails closed, never a
+        # silently-wrong partial list.
         self._write_pyproject('[tool.mutmut]\nsource_paths = ["app"\nonly_mutate = ["app/*"]\n')
+        self.assertIsNone(_read_source_paths(self.repo_dir))
+
+    def test_reads_single_quoted_strings(self):
+        self._write_pyproject("[tool.mutmut]\nsource_paths = ['app', 'cli']\n")
+        self.assertEqual(_read_source_paths(self.repo_dir), ["app", "cli"])
+
+    def test_reads_an_array_with_a_trailing_comma(self):
+        self._write_pyproject('[tool.mutmut]\nsource_paths = ["app", "cli",]\n')
+        self.assertEqual(_read_source_paths(self.repo_dir), ["app", "cli"])
+
+    def test_reads_a_genuine_multiline_array(self):
+        self._write_pyproject(
+            '[tool.mutmut]\nsource_paths = [\n    "app",\n    "cli",\n]\nonly_mutate = ["app/*"]\n'
+        )
+        self.assertEqual(_read_source_paths(self.repo_dir), ["app", "cli"])
+
+    def test_multiline_array_never_closed_before_the_table_ends_returns_none(self):
+        self._write_pyproject('[tool.mutmut]\nsource_paths = [\n    "app",\n')
         self.assertIsNone(_read_source_paths(self.repo_dir))
 
 

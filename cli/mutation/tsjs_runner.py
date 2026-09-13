@@ -34,6 +34,19 @@ Hardened against:
   - Unsafe/unresolvable repo_dir: the dispatcher already resolves
     repo_dir via common.safe_resolve_path() once, before calling any
     runner -- this module receives an already-safe Path.
+  - Silently granting full credit on a missing report, fixed 2026-09-13
+    (code review): a customized `jsonReporter.fileName` (the JSON
+    reporter's output path is config-file-only -- no CLI override
+    exists, confirmed against Stryker's own docs) meant the hardcoded
+    default report path could go unread while Stryker had genuinely run
+    and mutated real code -- previously misread as "nothing to mutate"
+    and scored at full credit purely because the file wasn't where this
+    module assumed. `_resolve_report_path()` now reads a JSON-format
+    config's own override when present; when the report still can't be
+    found (a JS/CJS config this module can't safely evaluate), the
+    result is `unavailable` (fail-closed), never full credit -- a real
+    "nothing mutable here" result only ever comes from actually reading
+    a report and finding it empty, never from failing to find one.
 
 Confirmed empirically, not assumed from docs (real scratch npm+Stryker
 10.0.0 project, this session): `--mutate <glob>` correctly scopes mutant
@@ -80,6 +93,40 @@ def _stryker_configured(repo_dir: Path) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(data, dict) and "stryker" in data
+
+
+def _resolve_report_path(repo_dir: Path) -> Path:
+    """Resolves where Stryker's JSON reporter actually writes its report
+    -- Stryker's own default ("reports/mutation/mutation.json", matching
+    _DEFAULT_REPORT_PATH) unless the target's own config overrides
+    `jsonReporter.fileName`. Found via code review 2026-09-13 and
+    confirmed against Stryker's own docs: there is no CLI flag to
+    override this setting -- `--reporters json` (this module's own CLI
+    override) only controls *which* reporters run, never a given
+    reporter's own output path, which is config-file-only. Best-effort:
+    only a JSON-format config (`stryker.conf.json`/`.stryker.conf.json`)
+    can be read safely here; a `.mjs`/`.cjs`/`.js` config would require
+    executing arbitrary JavaScript to evaluate, which this module will
+    never do. Falls back to the documented default when no JSON config
+    overrides it, or when the config is JS-based -- see run()'s own
+    fail-closed handling for what happens when the resolved path still
+    isn't where the real report landed."""
+    for name in ("stryker.conf.json", ".stryker.conf.json"):
+        config_path = repo_dir / name
+        if not config_path.is_file():
+            continue
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        json_reporter = data.get("jsonReporter")
+        if isinstance(json_reporter, dict):
+            file_name = json_reporter.get("fileName")
+            if isinstance(file_name, str) and file_name:
+                return repo_dir / file_name
+    return repo_dir.joinpath(*_DEFAULT_REPORT_PATH)
 
 
 def _reset_stryker_sandbox(repo_dir: Path) -> None:
@@ -206,17 +253,34 @@ def _run_and_collect(
             language=LANGUAGE_TSJS, status="unavailable", reason=f"stryker could not be invoked: {e}"
         )
 
-    report_path = repo_dir.joinpath(*_DEFAULT_REPORT_PATH)
+    report_path = _resolve_report_path(repo_dir)
     try:
         report = json.loads(report_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         if proc.returncode == 0:
-            # Ran clean but produced no report at all -- treat as the
-            # zero-mutant case (nothing mutable in the scoped files),
-            # not a tool failure.
+            # Changed 2026-09-13 (code review): this used to assume a
+            # missing report plus a clean exit meant "nothing mutable in
+            # the scoped files" and granted full credit
+            # (REASON_CODE_NO_COVERABLE_LINES) -- wrong, and dangerously
+            # so, whenever Stryker genuinely ran, mutated real code, and
+            # simply wrote its report to a path _resolve_report_path
+            # couldn't determine (a JS/CJS config overriding
+            # jsonReporter.fileName -- Stryker's CLI has no flag to
+            # override this, confirmed empirically, so a non-JSON
+            # config's real path can't be known without executing
+            # arbitrary JS, which this module never will). A genuinely
+            # empty scope is still handled correctly and separately, by
+            # _collect_from_report finding a real, readable report whose
+            # relevant files/mutants are actually empty -- that's a
+            # verified signal. An unreadable report is not a signal at
+            # all, and must never be treated as one. Failing closed here
+            # is strictly the safer direction: the worst case is a real
+            # repo discounted (x0.85) for something this code couldn't
+            # verify, never a real weak spot silently scored as if it
+            # didn't exist.
             return LanguageRunResult(
-                language=LANGUAGE_TSJS, status="ran",
-                scoped_files=existing_files, reason=REASON_CODE_NO_COVERABLE_LINES,
+                language=LANGUAGE_TSJS, status="unavailable",
+                reason=f"stryker ran but its report at {report_path} could not be found or read",
             )
         return LanguageRunResult(
             language=LANGUAGE_TSJS, status="unavailable",

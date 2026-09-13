@@ -94,5 +94,46 @@ class AdversarialSarifTests(unittest.TestCase):
         report = parse_sarif_file(path)
         self.assertEqual(report.tools[0].extensions["sonarqube"]["cognitive_complexity"], 0)
 
+    def test_backslash_path_traversal_matching(self):
+        # Fixed 2026-09-13 (code review): the forward-slash case above
+        # was already handled correctly, but this repo's CI runs on
+        # POSIX, where os.sep is '/' -- a Windows-style backslash
+        # traversal payload's leading '..\\' segments used to survive
+        # the stripping loop entirely untouched (os.path.normpath
+        # doesn't treat '\\' as a separator on POSIX either), unlike the
+        # equivalent forward-slash payload.
+        patch = {"src/main.py": {10}}
+        doc = {
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {"driver": {"name": "test"}},
+                "results": [{
+                    "ruleId": "r1",
+                    "locations": [{"physicalLocation": {"artifactLocation": {"uri": "..\\..\\..\\etc\\shadow"}, "region": {"startLine": 10}}}]
+                }]
+            }]
+        }
+        path = self._write_text(json.dumps(doc))
+        report = parse_sarif_file(path, patch_modified_lines=patch)
+        self.assertEqual(report.findings[0].file_path, "etc/shadow")
+        self.assertFalse(report.findings[0].is_new_in_patch)
+
+    def test_comma_formatted_metric_string_is_parsed_not_dropped(self):
+        # Fixed 2026-09-13 (code review): a real SonarQube export shape
+        # can format a metric with thousands-separator commas
+        # ("1,000") -- float() has always rejected that outright,
+        # silently dropping the metric instead of reading it.
+        doc = {
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {"driver": {"name": "sonarqube"}},
+                "properties": {"sonarqube": {"technicalDebtMinutes": "1,000"}},
+                "results": []
+            }]
+        }
+        path = self._write_text(json.dumps(doc))
+        report = parse_sarif_file(path)
+        self.assertEqual(report.tools[0].extensions["sonarqube"]["technical_debt_minutes"], 1000)
+
 if __name__ == "__main__":
     unittest.main()

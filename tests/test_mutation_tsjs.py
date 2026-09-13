@@ -10,7 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cli.mutation.common import LANGUAGE_TSJS, REASON_CODE_NO_COVERABLE_LINES
-from cli.mutation.tsjs_runner import _collect_from_report, _stryker_configured, run
+from cli.mutation.tsjs_runner import _collect_from_report, _resolve_report_path, _stryker_configured, run
 
 
 def _ok(stdout="", stderr="", returncode=0):
@@ -48,6 +48,58 @@ class StrykerConfigDetectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "package.json").write_text("{not valid json", encoding="utf-8")
             self.assertFalse(_stryker_configured(Path(tmp)))
+
+
+class ResolveReportPathTests(unittest.TestCase):
+    """Direct tests of the config-aware report-path resolver added
+    2026-09-13 -- see tsjs_runner.py's own module docstring for why
+    Stryker has no CLI override for this and a JS/CJS config can't be
+    read safely."""
+
+    def test_no_config_falls_back_to_the_documented_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.assertEqual(_resolve_report_path(repo), repo / "reports" / "mutation" / "mutation.json")
+
+    def test_stryker_conf_json_override_is_honored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "stryker.conf.json").write_text(
+                json.dumps({"jsonReporter": {"fileName": "out/report.json"}}), encoding="utf-8"
+            )
+            self.assertEqual(_resolve_report_path(repo), repo / "out" / "report.json")
+
+    def test_dotfile_variant_override_is_honored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".stryker.conf.json").write_text(
+                json.dumps({"jsonReporter": {"fileName": "out/report.json"}}), encoding="utf-8"
+            )
+            self.assertEqual(_resolve_report_path(repo), repo / "out" / "report.json")
+
+    def test_config_without_a_jsonreporter_override_falls_back_to_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "stryker.conf.json").write_text(json.dumps({"mutate": ["src/**"]}), encoding="utf-8")
+            self.assertEqual(_resolve_report_path(repo), repo / "reports" / "mutation" / "mutation.json")
+
+    def test_malformed_json_config_falls_back_to_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "stryker.conf.json").write_text("{not valid json", encoding="utf-8")
+            self.assertEqual(_resolve_report_path(repo), repo / "reports" / "mutation" / "mutation.json")
+
+    def test_js_config_cannot_be_read_and_falls_back_to_default(self):
+        # A .mjs/.cjs config would require executing arbitrary JS to
+        # evaluate -- this module never does that, so its real override
+        # (if any) simply can't be known; falling back is the honest,
+        # documented limitation, not a bug.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "stryker.conf.mjs").write_text(
+                "export default { jsonReporter: { fileName: 'out/report.json' } };", encoding="utf-8"
+            )
+            self.assertEqual(_resolve_report_path(repo), repo / "reports" / "mutation" / "mutation.json")
 
 
 class RunTests(unittest.TestCase):
@@ -119,13 +171,57 @@ class RunTests(unittest.TestCase):
         self.assertEqual(result.language, LANGUAGE_TSJS)
         self.assertEqual(result.reason, REASON_CODE_NO_COVERABLE_LINES)
 
-    def test_missing_report_after_a_clean_exit_is_the_exemption_not_a_failure(self):
+    def test_missing_report_after_a_clean_exit_is_unavailable_not_full_credit(self):
+        """Changed 2026-09-13 (code review): this used to assert a
+        missing report + clean exit was the zero-mutant exemption (full
+        credit) -- disproven as a real, dangerous fail-open bug: a
+        target repo's own custom jsonReporter.fileName (Stryker has no
+        CLI override for this, confirmed empirically) means "the default
+        path is empty" can never safely imply "nothing was mutated." A
+        genuinely empty scope must come from reading a real report and
+        finding it empty (see test_zero_mutants_in_report_is_the_exemption
+        above), never from failing to find one at all."""
         with patch("cli.mutation.tsjs_runner._run_stryker", return_value=_ok(returncode=0)):
             result = run(self.repo_dir, self._diff_files(), timeout_seconds=90, max_surviving_detail=5)
-        self.assertEqual(result.status, "ran")
+        self.assertEqual(result.status, "unavailable")
         self.assertEqual(result.language, LANGUAGE_TSJS)
-        self.assertEqual(result.reason, REASON_CODE_NO_COVERABLE_LINES)
-        self.assertEqual(result.scoped_files, self._diff_files())
+        self.assertIn("could not be found or read", result.reason)
+
+    def test_custom_json_reporter_path_from_stryker_conf_json_is_honored(self):
+        # Stryker has no CLI override for jsonReporter.fileName -- the
+        # only way to find a customized report path is reading the
+        # target's own JSON-format config.
+        (self.repo_dir / "stryker.conf.json").write_text(
+            json.dumps({"jsonReporter": {"fileName": "custom/out.json"}}), encoding="utf-8"
+        )
+
+        def side_effect(files, *, cwd, timeout_seconds):
+            out = self.repo_dir / "custom" / "out.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(
+                json.dumps({"files": {"src/mathy.js": {"language": "javascript", "mutants": [
+                    {"id": "1", "mutatorName": "X", "status": "Survived", "location": {"start": {"line": 1}}},
+                ]}}}),
+                encoding="utf-8",
+            )
+            return _ok()
+
+        with patch("cli.mutation.tsjs_runner._run_stryker", side_effect=side_effect):
+            result = run(self.repo_dir, self._diff_files(), timeout_seconds=90, max_surviving_detail=5)
+        self.assertEqual(result.status, "ran")
+        self.assertEqual(result.survived, 1)
+
+    def test_missing_report_still_unavailable_even_with_a_custom_config_path(self):
+        # The custom path is honored for lookup, but if nothing is
+        # actually there, this must still fail closed, not fall back to
+        # the default path's own absence as "confirmation" of anything.
+        (self.repo_dir / "stryker.conf.json").write_text(
+            json.dumps({"jsonReporter": {"fileName": "custom/out.json"}}), encoding="utf-8"
+        )
+        with patch("cli.mutation.tsjs_runner._run_stryker", return_value=_ok(returncode=0)):
+            result = run(self.repo_dir, self._diff_files(), timeout_seconds=90, max_surviving_detail=5)
+        self.assertEqual(result.status, "unavailable")
+        self.assertIn("custom/out.json", result.reason)
 
     def test_nonzero_exit_with_no_report_is_unavailable(self):
         with patch("cli.mutation.tsjs_runner._run_stryker", return_value=_ok(returncode=1, stderr="boom")):

@@ -170,10 +170,30 @@ def _parse_diff_output(diff_text: str) -> Dict[str, List[int]]:
     result: Dict[str, List[int]] = {}
     current_file: Optional[str] = None
     next_new_line: Optional[int] = None
+    # True once a hunk header has been seen for the current file, until the
+    # next `diff --git` file-section boundary. Found via code review
+    # 2026-09-13: a real *added* source line whose own content starts with
+    # `++ ` (e.g. `++ i;`, a plausible C/C++/Java prefix-increment style)
+    # becomes `+++ i;` once diffed (the `+` marker, then the line's own
+    # content verbatim) -- indistinguishable from a real `+++ b/<path>`
+    # file header by prefix alone. A real header only ever appears between
+    # files, never inside a hunk's own body, so gating header-detection on
+    # "not currently inside a hunk" resolves the ambiguity: this line is
+    # unambiguously content whenever we're already past a hunk header for
+    # the current file. `diff --git a/<path> b/<path>` (git's own,
+    # effectively-never-ambiguous file-section marker, always present
+    # since `_run_git_diff` doesn't pass `--no-prefix`) is what re-arms
+    # header-detection for the next file, not `--- `/`+++ ` themselves --
+    # those are exactly the lines this ambiguity is about.
+    in_hunk = False
 
     for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            in_hunk = False
+            continue
+
         # Track the current target file, skipping deleted files (+++ /dev/null)
-        if line.startswith("+++ "):
+        if line.startswith("+++ ") and not in_hunk:
             current_file = _extract_target_file(line)
             if current_file is not None:
                 result.setdefault(current_file, [])
@@ -182,6 +202,7 @@ def _parse_diff_output(diff_text: str) -> Dict[str, List[int]]:
         m_hunk = _HUNK_HEADER.match(line)
         if m_hunk:
             next_new_line = int(m_hunk.group(1))
+            in_hunk = True
             continue
 
         if current_file is None or next_new_line is None:
@@ -190,8 +211,13 @@ def _parse_diff_output(diff_text: str) -> Dict[str, List[int]]:
         # In unified=0 diffs, '+' indicates an added/modified line in the new
         # revision. '-' (deletions) don't advance the new-file line counter,
         # and "\ No newline at end of file" markers carry no line info --
-        # both simply fall through here with nothing to do.
-        if line.startswith("+") and not line.startswith("+++"):
+        # both simply fall through here with nothing to do. No `+++`
+        # exclusion here (unlike before) -- once in_hunk is True, the
+        # header check above has already consumed any real file-header
+        # line, so anything reaching this point starting with '+' is
+        # genuinely added content regardless of how many '+' characters
+        # its own text happens to start with.
+        if line.startswith("+"):
             result[current_file].append(next_new_line)
             next_new_line += 1
 

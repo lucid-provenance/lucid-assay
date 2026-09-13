@@ -272,21 +272,54 @@ def _unavailable(branch: str, reason: str, reason_code: Optional[str] = None) ->
     )
 
 
+_LINK_REL_RE = re.compile(r'''rel\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s,;]+))''', re.IGNORECASE)
+
+
 def _parse_link_header(link_header: str) -> Dict[str, str]:
-    """Parses an RFC 5988 `Link` header (as used for GitHub REST pagination)
-    into {rel: url}. Malformed segments are skipped rather than raising."""
+    """Parses an RFC 5988/8288 `Link` header (as used for GitHub REST
+    pagination) into {rel: url}. Malformed segments are skipped rather
+    than raising.
+
+    Hardened 2026-09-13 (code review) against a real gap: this used to
+    `.split(";")` over the *whole* segment, including the URL itself --
+    a URL containing a literal `;` (legal in a URI, e.g. an old-style
+    query-string separator -- GitHub's own pagination URLs never use one
+    today, but a GitHub Enterprise Server or an intermediary proxy
+    isn't guaranteed to match that) would fragment across multiple
+    `segments` entries, and the truncated first one would then fail its
+    own `endswith(">")` check and get silently skipped -- the pagination
+    link is lost, not truncated-and-used, but the end result is the same
+    real risk either way: a later page (potentially containing a real
+    branch-governance bypass actor) never gets fetched, and nothing
+    reports that it didn't. Fixed by extracting the URL as everything
+    between the first `<` and the *last* `>` in the segment first -- `>`
+    is not a legal unencoded URI character, so the last one always
+    closes the URL, however many `;` characters (or, in principle, `,`
+    characters within this one already-comma-split part) the URL itself
+    contains -- then only searching whatever follows for `rel=`. `rel`'s
+    own value is matched tolerant of double-quoted, single-quoted, or
+    bare-token forms (RFC 8288 permits an unquoted token) -- the
+    previous `.strip('"')` already handled the double-quoted and
+    unquoted cases fine (a no-op on an already-unquoted value, verified
+    directly), the only real gap was a single-quoted value, which a
+    non-GitHub Link-header emitter could in principle still send even
+    though RFC 8288's own quoted-string grammar is double-quote-only."""
     links: Dict[str, str] = {}
     if not link_header:
         return links
     for part in link_header.split(","):
-        segments = [s.strip() for s in part.split(";")]
-        if len(segments) < 2 or not (segments[0].startswith("<") and segments[0].endswith(">")):
+        part = part.strip()
+        if not part.startswith("<"):
             continue
-        url = segments[0][1:-1]
-        rel = None
-        for seg in segments[1:]:
-            if seg.startswith("rel="):
-                rel = seg[len("rel="):].strip('"')
+        end = part.rfind(">")
+        if end == -1:
+            continue
+        url = part[1:end]
+        params = part[end + 1:]
+        m = _LINK_REL_RE.search(params)
+        if not m:
+            continue
+        rel = next((g for g in m.groups() if g is not None), None)
         if rel:
             links[rel] = url
     return links

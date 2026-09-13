@@ -120,8 +120,17 @@ Hardened against:
     changed file is out of scope, never discarding an in-scope file
     alongside an out-of-scope one in the same diff. Falls back to
     attempting mutmut regardless when `source_paths` can't be confidently
-    read (missing file, multi-line array, ...) -- never guesses a scope
-    mutmut itself didn't declare.
+    read (missing file, no [tool.mutmut] table, an array this module's own
+    narrow parser doesn't understand, ...) -- never guesses a scope mutmut
+    itself didn't declare. `_STOPPING_EARLY_MARKER` (stdout) is checked
+    the same way `_NO_MATCH_MARKER` (stderr) already was, as a
+    defense-in-depth backstop for exactly this "couldn't confidently
+    read" case -- see that constant's own comment, and the 2026-09-13
+    entry below for a real gap this closed in the reader itself
+    (single-quoted strings, a trailing comma, and a genuinely multi-line
+    array were all TOML-legal but unparseable here, silently triggering
+    this same fallback and, for a diff with real out-of-scope files,
+    this exact crash).
 
 Known equivalent mutants (confirmed via a real mutmut run against this
 module's own diff, 2026-09-12 -- 175/178 real mutants killed, 98%; the
@@ -173,6 +182,7 @@ from .common import (
 )
 
 _NO_MATCH_MARKER = "Filtered for specific mutants, but nothing matches"
+_STOPPING_EARLY_MARKER = "Stopping early, because we could not find any test case for any mutant"
 _MUTANT_KEY_RE = re.compile(r"^x_(?P<func>.+)__mutmut_\d+$")
 
 
@@ -227,9 +237,11 @@ def _is_only_mutate_assignment(line: str) -> bool:
     return value.startswith("[") and value.endswith("]")
 
 
-def _is_source_paths_assignment(line: str) -> bool:
-    """True for a real `source_paths = [...]` TOML array assignment
-    written entirely on this one line -- same plain string check as
+def _source_paths_assignment_start(line: str) -> bool:
+    """True for a line that *starts* a `source_paths = [...]` TOML array
+    assignment -- the array itself may or may not close on this same
+    line; see _find_source_paths_value_text below, which is what
+    actually determines that. Same plain string check as
     _is_only_mutate_assignment above, see _find_tool_mutmut_section's
     own docstring for why neither is a regex."""
     stripped = line.strip()
@@ -238,23 +250,108 @@ def _is_source_paths_assignment(line: str) -> bool:
     rest = stripped[len("source_paths"):].lstrip()
     if not rest.startswith("="):
         return False
-    value = rest[1:].lstrip()
-    return value.startswith("[") and value.endswith("]")
+    return rest[1:].lstrip().startswith("[")
+
+
+def _parse_toml_string_array(text: str) -> Optional[List[str]]:
+    """Parses a TOML array-of-strings literal (e.g. '["a", "b"]' or
+    "['a', 'b',]", however many lines it spans) into a list of strings --
+    deliberately narrow, only ever called on the exact `source_paths = ...`
+    value text this module already isolated, never arbitrary TOML.
+    Found 2026-09-13 (code review): the previous implementation fed this
+    value straight to json.loads(), which is stricter than TOML and
+    silently rejected several TOML-legal forms as unparseable (falling
+    back to "attempt mutmut regardless", the same fallback a missing
+    pyproject.toml gets -- reopening the exact PR #98 crash this
+    function exists to prevent, for any repo formatting its config this
+    way) -- TOML literal (single-quoted) strings, a trailing comma before
+    the closing bracket, and a genuinely multi-line array (which couldn't
+    even reach this far, since the single-line assignment check rejected
+    it outright). Handles all three. Returns None (never guesses) on
+    anything else this narrow parser doesn't confidently understand:
+    nested arrays, non-string elements, an escape sequence other than
+    \\" or \\\\, or unbalanced/unterminated brackets and quotes."""
+    text = text.strip()
+    if not (text.startswith("[") and text.endswith("]")):
+        return None
+    inner = text[1:-1]
+    items: List[str] = []
+    i, n = 0, len(inner)
+    while i < n:
+        while i < n and inner[i] in " \t\r\n,":
+            i += 1
+        if i >= n:
+            break
+        quote = inner[i]
+        if quote not in ("'", '"'):
+            return None
+        i += 1
+        chars: List[str] = []
+        closed = False
+        while i < n:
+            ch = inner[i]
+            if ch == quote:
+                closed = True
+                i += 1
+                break
+            if quote == '"' and ch == "\\" and i + 1 < n and inner[i + 1] in ('"', "\\"):
+                chars.append(inner[i + 1])
+                i += 2
+                continue
+            if quote == '"' and ch == "\\":
+                return None  # an escape this narrow parser doesn't understand
+            chars.append(ch)
+            i += 1
+        if not closed:
+            return None  # unterminated string literal
+        items.append("".join(chars))
+        while i < n and inner[i] in " \t\r\n":
+            i += 1
+        if i < n and inner[i] == ",":
+            i += 1
+        elif i < n:
+            return None  # junk between elements that isn't a separator
+    return items
+
+
+def _find_source_paths_value_text(lines: List[str], start: int, end: int) -> Optional[str]:
+    """Finds the one `source_paths = [...]` assignment within
+    lines[start:end] (the [tool.mutmut] table's own body) and returns its
+    raw array-literal text, joined across multiple lines when the array
+    itself spans more than one -- TOML permits this and real pyproject.toml
+    files use it for a long source_paths list. None when there isn't
+    exactly one such assignment, or its array is never closed before the
+    table's body ends (a genuinely different table starts, or the file
+    ends)."""
+    starts = [i for i in range(start, end) if _source_paths_assignment_start(lines[i])]
+    if len(starts) != 1:
+        return None
+    i = starts[0]
+    stripped = lines[i].strip()
+    first_line_value = stripped[len("source_paths"):].lstrip()[1:].lstrip()
+    collected = [first_line_value]
+    j = i
+    while "]" not in collected[-1]:
+        j += 1
+        if j >= end:
+            return None
+        collected.append(lines[j])
+    return "\n".join(collected)
 
 
 def _read_source_paths(repo_dir: Path) -> Optional[List[str]]:
     """Reads the target repo's own [tool.mutmut] source_paths list
     straight off its real pyproject.toml -- None when it can't be
     confidently read (missing file, no [tool.mutmut] table, not exactly
-    one single-line source_paths assignment, or the array doesn't parse
-    as a JSON array of strings). Callers must fall back to attempting
-    mutmut regardless in that case -- never guess a scope mutmut itself
-    didn't declare, the same discipline _build_scoped_pyproject_text's
-    own "can't confidently narrow" fallback already follows. See run()'s
-    own docstring/this module's "Hardened against" entry for why this
-    exists: mutmut only ever generates mutants for files under
-    source_paths, so a changed file entirely outside it can never
-    produce one regardless of wildcard."""
+    one source_paths assignment, its array is never closed, or it
+    doesn't parse as an array of plain strings). Callers must fall back
+    to attempting mutmut regardless in that case -- never guess a scope
+    mutmut itself didn't declare, the same discipline
+    _build_scoped_pyproject_text's own "can't confidently narrow"
+    fallback already follows. See run()'s own docstring/this module's
+    "Hardened against" entry for why this exists: mutmut only ever
+    generates mutants for files under source_paths, so a changed file
+    entirely outside it can never produce one regardless of wildcard."""
     try:
         lines = (repo_dir / "pyproject.toml").read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -263,18 +360,10 @@ def _read_source_paths(repo_dir: Path) -> Optional[List[str]]:
     if section is None:
         return None
     start, end = section
-    matches = [line for line in lines[start:end] if _is_source_paths_assignment(line)]
-    if len(matches) != 1:
+    value_text = _find_source_paths_value_text(lines, start, end)
+    if value_text is None:
         return None
-    stripped = matches[0].strip()
-    value = stripped[len("source_paths"):].lstrip()[1:].lstrip()
-    try:
-        parsed = json.loads(value)
-    except ValueError:
-        return None
-    if not isinstance(parsed, list) or not all(isinstance(p, str) for p in parsed):
-        return None
-    return parsed
+    return _parse_toml_string_array(value_text)
 
 
 def _is_within_source_paths(file_path: str, source_paths: List[str]) -> bool:
@@ -659,17 +748,50 @@ def _run_scoped(
         )
 
     if run_proc.returncode != 0:
-        if _NO_MATCH_MARKER in (run_proc.stderr or ""):
+        # Checked against BOTH streams combined, not just stderr -- the
+        # two known "mutmut generated nothing" shapes land on different
+        # streams (_NO_MATCH_MARKER on stderr, _STOPPING_EARLY_MARKER on
+        # stdout, confirmed empirically for each), and this is also a
+        # deliberate defense-in-depth backstop: _read_source_paths()'s own
+        # pre-filtering in run() should already exempt an out-of-scope
+        # diff before mutmut is ever invoked, but if source_paths ever
+        # can't be confidently read for some reason this narrow parser
+        # doesn't anticipate, this still converts the resulting crash into
+        # the correct full-credit exemption rather than an unavailable
+        # penalty for a state nobody could have dodged.
+        combined_for_markers = (run_proc.stdout or "") + (run_proc.stderr or "")
+        if _NO_MATCH_MARKER in combined_for_markers or _STOPPING_EARLY_MARKER in combined_for_markers:
             return LanguageRunResult(
                 language=LANGUAGE_PYTHON, status="ran",
                 scoped_files=existing_files,
                 reason=REASON_CODE_NO_COVERABLE_LINES,
             )
-        # stderr first (an uncaught Python exception's traceback lands
-        # there by default); stdout only as a fallback, for a tool failure
-        # (e.g. a pytest collection error) that prints to stdout instead --
-        # see this module's own "Hardened against" docstring.
-        error_detail = (run_proc.stderr or "").strip() or (run_proc.stdout or "").strip()
+        # Both streams are combined, never one discarded in favor of the
+        # other -- found 2026-09-13 via a real lucid-dsse-collector run:
+        # this used to prefer non-empty stderr outright (an uncaught
+        # Python exception's traceback lands there by default), falling
+        # back to stdout only when stderr was completely empty. That
+        # heuristic is broken for this exact call shape: `uv run --with`
+        # unconditionally writes its own routine progress text to stderr
+        # (confirmed by direct reproduction -- "Installed N packages in
+        # Nms" appears on every invocation, success or failure, with
+        # nothing to do with mutmut's own outcome), so stderr is
+        # essentially never truly empty here. A real mutmut failure that
+        # prints to stdout (e.g. a pytest collection error -- the
+        # ModuleNotFoundError shape that originally motivated preferring
+        # stderr's absence as the fallback trigger) was silently and
+        # completely discarded, replaced by uv's own harmless install
+        # line, exactly as happened for real on that PR. Concatenating
+        # both means the real content is never dropped regardless of
+        # which stream it landed on -- uv's own noise (a short, fixed
+        # shape) ending up alongside it is a minor readability cost, not
+        # a suppression bug.
+        stdout_detail = (run_proc.stdout or "").strip()
+        stderr_detail = (run_proc.stderr or "").strip()
+        if stdout_detail and stderr_detail:
+            error_detail = f"stdout: {stdout_detail} | stderr: {stderr_detail}"
+        else:
+            error_detail = stdout_detail or stderr_detail
         return LanguageRunResult(
             language=LANGUAGE_PYTHON, status="unavailable",
             reason=f"mutmut run failed (exit {run_proc.returncode}): {error_detail[:300]}",

@@ -95,6 +95,33 @@ Hardened against:
     collection failure or any other tool output mutmut itself prints to
     stdout. Falls back to stdout only when stderr is empty, so an existing
     stderr-carrying failure's message is unchanged.
+  - A changed `*.py` file that exists but sits entirely outside the
+    target repo's own `[tool.mutmut]` `source_paths` -- confirmed
+    empirically, 2026-09-13 (lucid-dsse-collector PR #62's own real CI
+    run, the first diff any caller ever landed that added a `.py` file
+    outside its own `source_paths`): this is a *different* failure shape
+    than the already-handled "wildcard matches zero of many generated
+    mutants" case above (`_NO_MATCH_MARKER`, a clean `AssertionError` on
+    stderr). `_scoped_only_mutate()` narrows `only_mutate` to the diff's
+    own files regardless of whether they're under `source_paths` at all
+    -- when none are, mutmut's generation phase produces zero mutated
+    files *at all* (`0 files mutated`, confirmed via a real run) and
+    exits 1 with an entirely different, undocumented message on
+    **stdout**, not stderr ("Stopping early, because we could not find
+    any test case for any mutant") -- invisible to the existing
+    stderr-only marker check, surfacing as a confusing generic
+    `unavailable` crash instead of the same zero-coverable-lines
+    exemption a comment-only diff already gets. Fixed by checking
+    containment *before* ever invoking mutmut: `_read_source_paths()`
+    reads the target's own real `source_paths` off its `pyproject.toml`
+    (same restricted single-line-assignment scan `_is_only_mutate_
+    assignment` already uses for `only_mutate`), and `run()` drops any
+    changed file outside it -- exempting the whole run only when *every*
+    changed file is out of scope, never discarding an in-scope file
+    alongside an out-of-scope one in the same diff. Falls back to
+    attempting mutmut regardless when `source_paths` can't be confidently
+    read (missing file, multi-line array, ...) -- never guesses a scope
+    mutmut itself didn't declare.
 
 Known equivalent mutants (confirmed via a real mutmut run against this
 module's own diff, 2026-09-12 -- 175/178 real mutants killed, 98%; the
@@ -113,6 +140,17 @@ own "never chase provably-equivalent mutants" convention):
     UTF-8 regardless, and codec name lookup is case-insensitive -- both
     variants behave identically to the real code for every JSON payload
     mutmut itself ever writes here.
+
+Two more of the same equivalence classes confirmed the next day
+(2026-09-13, `_read_source_paths()`'s own diff -- 116/119 killed, 97%):
+  - `(repo_dir / "pyproject.toml").read_text(encoding="utf-8")` with the
+    same `encoding=None`/`encoding="UTF-8"` variants above -- identical
+    reasoning, a second, independent occurrence of the same pattern.
+  - The value-extraction line's second `.lstrip()` (after slicing off the
+    leading `=`) mutated to `.rstrip()`: `json.loads()` itself tolerates
+    insignificant leading *and* trailing whitespace around a top-level
+    JSON value per spec, so which side gets stripped here never changes
+    what actually gets parsed for any real `source_paths = [...]` line.
 """
 from __future__ import annotations
 
@@ -123,7 +161,7 @@ import re
 import shutil
 import subprocess
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from .common import (
@@ -186,6 +224,69 @@ def _is_only_mutate_assignment(line: str) -> bool:
         return False
     value = rest[1:].lstrip()
     return value.startswith("[") and value.endswith("]")
+
+
+def _is_source_paths_assignment(line: str) -> bool:
+    """True for a real `source_paths = [...]` TOML array assignment
+    written entirely on this one line -- same plain string check as
+    _is_only_mutate_assignment above, see _find_tool_mutmut_section's
+    own docstring for why neither is a regex."""
+    stripped = line.strip()
+    if not stripped.startswith("source_paths"):
+        return False
+    rest = stripped[len("source_paths"):].lstrip()
+    if not rest.startswith("="):
+        return False
+    value = rest[1:].lstrip()
+    return value.startswith("[") and value.endswith("]")
+
+
+def _read_source_paths(repo_dir: Path) -> Optional[List[str]]:
+    """Reads the target repo's own [tool.mutmut] source_paths list
+    straight off its real pyproject.toml -- None when it can't be
+    confidently read (missing file, no [tool.mutmut] table, not exactly
+    one single-line source_paths assignment, or the array doesn't parse
+    as a JSON array of strings). Callers must fall back to attempting
+    mutmut regardless in that case -- never guess a scope mutmut itself
+    didn't declare, the same discipline _build_scoped_pyproject_text's
+    own "can't confidently narrow" fallback already follows. See run()'s
+    own docstring/this module's "Hardened against" entry for why this
+    exists: mutmut only ever generates mutants for files under
+    source_paths, so a changed file entirely outside it can never
+    produce one regardless of wildcard."""
+    try:
+        lines = (repo_dir / "pyproject.toml").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    section = _find_tool_mutmut_section(lines)
+    if section is None:
+        return None
+    start, end = section
+    matches = [line for line in lines[start:end] if _is_source_paths_assignment(line)]
+    if len(matches) != 1:
+        return None
+    stripped = matches[0].strip()
+    value = stripped[len("source_paths"):].lstrip()[1:].lstrip()
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(parsed, list) or not all(isinstance(p, str) for p in parsed):
+        return None
+    return parsed
+
+
+def _is_within_source_paths(file_path: str, source_paths: List[str]) -> bool:
+    """True when file_path sits under (or is exactly) one of
+    source_paths' own entries -- real path-segment containment, not a
+    naive string prefix, so source_paths=["app"] doesn't false-positive
+    match a file under "application/"."""
+    file_parts = PurePosixPath(file_path).parts
+    for prefix in source_paths:
+        prefix_parts = PurePosixPath(prefix).parts
+        if file_parts[: len(prefix_parts)] == prefix_parts:
+            return True
+    return False
 
 
 def _build_scoped_pyproject_text(original_text: str, existing_files: List[str]) -> Optional[str]:
@@ -448,6 +549,25 @@ def run(
     existing_files = [f for f in changed_files if (repo_dir / f).is_file()]
     if not existing_files:
         return LanguageRunResult(language=LANGUAGE_PYTHON, status="not_configured")
+
+    # A changed *.py file outside the target repo's own source_paths can
+    # never produce a mutant regardless of wildcard -- drop it before
+    # ever invoking mutmut, rather than let _scoped_only_mutate() narrow
+    # only_mutate to a file mutmut was never going to generate anything
+    # for at all. See this module's "Hardened against" docstring for the
+    # real failure this closes. source_paths=None (couldn't confidently
+    # read it) leaves existing_files untouched -- attempt mutmut anyway
+    # rather than guess a scope it never declared.
+    source_paths = _read_source_paths(repo_dir)
+    if source_paths is not None:
+        in_scope_files = [f for f in existing_files if _is_within_source_paths(f, source_paths)]
+        if not in_scope_files:
+            return LanguageRunResult(
+                language=LANGUAGE_PYTHON, status="ran",
+                scoped_files=existing_files,
+                reason=REASON_CODE_NO_COVERABLE_LINES,
+            )
+        existing_files = in_scope_files
 
     changed_lines = changed_lines or {}
     wildcards = [

@@ -36,7 +36,10 @@ from cli.mutation.python_runner import (
     _NO_MATCH_MARKER,
     _build_scoped_pyproject_text,
     _dotted_module,
+    _is_source_paths_assignment,
+    _is_within_source_paths,
     _parse_mutant_key,
+    _read_source_paths,
     _scoped_only_mutate,
     _touched_functions,
     _wildcard_for,
@@ -831,6 +834,212 @@ class ScopedOnlyMutateTests(unittest.TestCase):
 
     def test_build_scoped_text_returns_none_when_no_confident_match(self):
         self.assertIsNone(_build_scoped_pyproject_text("[tool.other]\nkey = 1\n", ["cli/foo.py"]))
+
+
+class IsWithinSourcePathsTests(unittest.TestCase):
+    def test_exact_prefix_directory_match(self):
+        self.assertTrue(_is_within_source_paths("app/services/extraction.py", ["app"]))
+
+    def test_file_outside_every_source_path(self):
+        self.assertFalse(_is_within_source_paths("scripts/submit_deployment_verification.py", ["app"]))
+
+    def test_does_not_false_positive_on_a_sibling_directory_with_a_shared_prefix(self):
+        # "application/foo.py" must not match source_paths=["app"] just
+        # because the string "app" is a textual prefix -- real path-segment
+        # containment, not naive string startswith.
+        self.assertFalse(_is_within_source_paths("application/foo.py", ["app"]))
+
+    def test_matches_any_one_of_multiple_source_paths(self):
+        self.assertTrue(_is_within_source_paths("schema/foo.json.py", ["cli", "schema"]))
+
+    def test_a_source_path_that_is_itself_the_exact_file_matches(self):
+        self.assertTrue(_is_within_source_paths("cli/main.py", ["cli/main.py"]))
+
+
+class IsSourcePathsAssignmentTests(unittest.TestCase):
+    """Direct tests, not just through _read_source_paths -- that
+    function's own redundant re-parse-and-json.loads fail-safe masks a
+    couple of real mutations in this predicate alone (a malformed line
+    this returns True for still fails json.loads independently, so the
+    end-to-end behavior stays correct either way -- real defense in
+    depth, but it means these two specific mutations need a direct test
+    to actually kill)."""
+
+    def test_true_for_a_real_single_line_assignment(self):
+        self.assertTrue(_is_source_paths_assignment('source_paths = ["app"]'))
+
+    def test_false_for_a_key_that_merely_starts_with_source_paths(self):
+        self.assertFalse(_is_source_paths_assignment('source_pathsx = ["app"]'))
+
+    def test_false_for_a_value_missing_its_closing_bracket(self):
+        self.assertFalse(_is_source_paths_assignment('source_paths = ["app"'))
+
+    def test_false_for_a_value_missing_its_opening_bracket(self):
+        self.assertFalse(_is_source_paths_assignment('source_paths = "app"]'))
+
+    def test_false_for_an_unrelated_line(self):
+        self.assertFalse(_is_source_paths_assignment('only_mutate = ["app/*"]'))
+
+
+class ReadSourcePathsTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo_dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_pyproject(self, text: str) -> None:
+        (self.repo_dir / "pyproject.toml").write_text(text, encoding="utf-8")
+
+    def test_reads_a_real_single_line_source_paths_array(self):
+        self._write_pyproject('[tool.mutmut]\nsource_paths = ["app"]\nonly_mutate = ["app/*"]\n')
+        self.assertEqual(_read_source_paths(self.repo_dir), ["app"])
+
+    def test_reads_multiple_entries(self):
+        self._write_pyproject('[tool.mutmut]\nsource_paths = ["cli", "scripts", "schema"]\n')
+        self.assertEqual(_read_source_paths(self.repo_dir), ["cli", "scripts", "schema"])
+
+    def test_missing_pyproject_returns_none_not_an_empty_list(self):
+        self.assertIsNone(_read_source_paths(self.repo_dir))
+
+    def test_no_tool_mutmut_table_returns_none(self):
+        self._write_pyproject("[tool.other]\nkey = 1\n")
+        self.assertIsNone(_read_source_paths(self.repo_dir))
+
+    def test_no_source_paths_key_returns_none(self):
+        self._write_pyproject('[tool.mutmut]\nonly_mutate = ["app/*"]\n')
+        self.assertIsNone(_read_source_paths(self.repo_dir))
+
+    def test_ambiguous_multiple_source_paths_lines_returns_none(self):
+        self._write_pyproject(
+            '[tool.mutmut]\nsource_paths = ["app"]\nsource_paths = ["other"]\n'
+        )
+        self.assertIsNone(_read_source_paths(self.repo_dir))
+
+    def test_a_non_string_array_entry_returns_none_not_a_partial_list(self):
+        self._write_pyproject('[tool.mutmut]\nsource_paths = ["app", 1]\n')
+        self.assertIsNone(_read_source_paths(self.repo_dir))
+
+    def test_reads_correctly_with_no_whitespace_around_the_equals_sign(self):
+        # Distinguishes the real off-by-one slice boundary (both here and
+        # in _is_source_paths_assignment's own copy) from a whitespace-
+        # padded line, where .lstrip() would mask a wrong slice index.
+        self._write_pyproject('[tool.mutmut]\nsource_paths=["app"]\n')
+        self.assertEqual(_read_source_paths(self.repo_dir), ["app"])
+
+    def test_a_key_that_merely_starts_with_source_paths_is_not_a_match(self):
+        # "source_pathsx" must not be mistaken for "source_paths" just
+        # because it starts with the same characters.
+        self._write_pyproject('[tool.mutmut]\nsource_pathsx = ["app"]\n')
+        self.assertIsNone(_read_source_paths(self.repo_dir))
+
+    def test_a_value_missing_its_closing_bracket_is_not_a_single_line_match(self):
+        self._write_pyproject('[tool.mutmut]\nsource_paths = ["app"\nonly_mutate = ["app/*"]\n')
+        self.assertIsNone(_read_source_paths(self.repo_dir))
+
+
+class RunSkipsFilesOutsideSourcePathsTests(unittest.TestCase):
+    """Closes the real bug found 2026-09-13 (lucid-dsse-collector PR #62's
+    own CI run, the first diff any caller landed that added a *.py file
+    outside its own source_paths): a changed file that exists but sits
+    entirely outside source_paths can never produce a mutant regardless
+    of wildcard, but _scoped_only_mutate() previously narrowed
+    only_mutate to it anyway -- mutmut then failed with a different,
+    stdout-only message (`0 files mutated`, "Stopping early...") the
+    existing _NO_MATCH_MARKER stderr check never caught, surfacing as a
+    confusing generic `unavailable` crash. run() now filters out-of-scope
+    files before ever invoking mutmut."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo_dir = Path(self._tmp.name)
+        (self.repo_dir / "pyproject.toml").write_text(
+            '[tool.mutmut]\nsource_paths = ["app"]\nonly_mutate = ["app/*"]\n', encoding="utf-8"
+        )
+        (self.repo_dir / "app").mkdir()
+        (self.repo_dir / "app" / "extraction.py").write_text(
+            "def extract(x):\n    return x\n", encoding="utf-8"
+        )
+        (self.repo_dir / "scripts").mkdir()
+        (self.repo_dir / "scripts" / "submit.py").write_text(
+            "def main():\n    return 1\n", encoding="utf-8"
+        )
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_diff_touching_only_an_out_of_scope_file_never_invokes_mutmut(self):
+        with patch("cli.mutation.python_runner._run_mutmut") as run_mock:
+            result = python_runner_run(
+                self.repo_dir, ["scripts/submit.py"],
+                timeout_seconds=30, max_surviving_detail=5,
+            )
+        run_mock.assert_not_called()
+        self.assertEqual(result.language, LANGUAGE_PYTHON)
+        self.assertEqual(result.status, "ran")
+        self.assertEqual(result.reason, REASON_CODE_NO_COVERABLE_LINES)
+        self.assertEqual(result.scoped_files, ["scripts/submit.py"])
+
+    def test_not_configured_when_no_changed_file_exists_on_disk_at_all(self):
+        result = python_runner_run(
+            self.repo_dir, ["scripts/does_not_exist.py"],
+            timeout_seconds=30, max_surviving_detail=5,
+        )
+        self.assertEqual(result.language, LANGUAGE_PYTHON)
+        self.assertEqual(result.status, "not_configured")
+
+    def test_zero_wildcards_exemption_reports_exact_fields(self):
+        # Every touched line falls outside any function body -- a real,
+        # pre-existing short-circuit (predates this session's fix) that
+        # now sits in the same function as the new source_paths check
+        # above and gets exercised by the same diff's own mutation scope.
+        (self.repo_dir / "app" / "module_level_only.py").write_text(
+            "X = 1\nY = 2\n", encoding="utf-8"
+        )
+        result = python_runner_run(
+            self.repo_dir, ["app/module_level_only.py"],
+            timeout_seconds=30, max_surviving_detail=5,
+            changed_lines={"app/module_level_only.py": {1, 2}},
+        )
+        self.assertEqual(result.language, LANGUAGE_PYTHON)
+        self.assertEqual(result.status, "ran")
+        self.assertEqual(result.reason, REASON_CODE_NO_COVERABLE_LINES)
+        self.assertEqual(result.scoped_files, ["app/module_level_only.py"])
+
+    def test_a_mixed_diff_still_scopes_mutmut_to_just_the_in_scope_file(self):
+        calls = []
+
+        def side_effect(args, *, cwd, timeout_seconds):
+            calls.append(args)
+            if args[0] == "run":
+                _write_stats(self.repo_dir, killed=1, total=1)
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = python_runner_run(
+                self.repo_dir, ["scripts/submit.py", "app/extraction.py"],
+                timeout_seconds=30, max_surviving_detail=5,
+            )
+        # The out-of-scope file is silently dropped -- only the real,
+        # in-scope file is ever passed to mutmut's own wildcard filter.
+        self.assertEqual(result.scoped_files, ["app/extraction.py"])
+        run_call = next(c for c in calls if c[0] == "run")
+        self.assertTrue(all("scripts.submit" not in w for w in run_call[1:]))
+        self.assertTrue(any("app.extraction" in w for w in run_call[1:]))
+
+    def test_source_paths_unreadable_falls_back_to_attempting_mutmut(self):
+        # No pyproject.toml at all in this variant -- _read_source_paths
+        # returns None, and run() must not silently exempt the diff on a
+        # scope it couldn't actually confirm.
+        (self.repo_dir / "pyproject.toml").unlink()
+        with patch("cli.mutation.python_runner._run_mutmut") as run_mock:
+            run_mock.return_value = _ok(returncode=1, stderr=f"AssertionError: {_NO_MATCH_MARKER}")
+            python_runner_run(
+                self.repo_dir, ["scripts/submit.py"],
+                timeout_seconds=30, max_surviving_detail=5,
+            )
+        run_mock.assert_called()
 
 
 class CombineResultsMultiLanguageTests(unittest.TestCase):

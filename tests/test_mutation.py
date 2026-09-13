@@ -240,6 +240,38 @@ class RunMutmutSubprocessInvocationTests(unittest.TestCase):
 
         self.assertEqual(_MUTMUT_VERSION, importlib.metadata.version("mutmut"))
 
+    def test_virtual_env_is_stripped_from_the_subprocess_environment(self):
+        """Found 2026-09-13 via a real lucid-dsse-collector CI run: this
+        process (cli.main) always runs inside `_assay/.venv`, so an
+        inherited VIRTUAL_ENV pointing there made uv print a
+        "does not match the project environment path" warning to stderr
+        on every invocation -- which then silently displaced a real
+        mutmut failure's own stdout-based error message, since
+        _run_scoped's error_detail prefers non-empty stderr over stdout.
+        uv was already resolving the correct (cwd-relative) environment
+        regardless of VIRTUAL_ENV -- this fix only removes the input that
+        made it warn about it."""
+        from cli.mutation.python_runner import _run_mutmut
+
+        with patch("cli.mutation.python_runner.subprocess.run") as run_mock, \
+                patch.dict("cli.mutation.python_runner.os.environ", {"VIRTUAL_ENV": "/some/_assay/.venv"}):
+            run_mock.return_value = _ok()
+            _run_mutmut(["run", "cli.scorer.*"], cwd=Path("/tmp/some-repo"), timeout_seconds=30)
+
+        env_passed = run_mock.call_args.kwargs["env"]
+        self.assertNotIn("VIRTUAL_ENV", env_passed)
+
+    def test_other_environment_variables_are_preserved(self):
+        from cli.mutation.python_runner import _run_mutmut
+
+        with patch("cli.mutation.python_runner.subprocess.run") as run_mock, \
+                patch.dict("cli.mutation.python_runner.os.environ", {"PATH": "/usr/bin", "VIRTUAL_ENV": "/x"}):
+            run_mock.return_value = _ok()
+            _run_mutmut(["run", "cli.scorer.*"], cwd=Path("/tmp/some-repo"), timeout_seconds=30)
+
+        env_passed = run_mock.call_args.kwargs["env"]
+        self.assertEqual(env_passed.get("PATH"), "/usr/bin")
+
 
 def _recording_side_effect(calls, responses):
     """A `_run_mutmut` side_effect that records every call's (args, cwd,

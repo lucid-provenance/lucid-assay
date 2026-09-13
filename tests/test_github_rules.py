@@ -20,6 +20,7 @@ from cli.parsers.github_rules import (
     _github_api_get,
     _has_rule_type,
     _is_platform_tier_limitation,
+    _parse_link_header,
     _quote_ref,
 )
 from cli.parsers.junit import TestTotals
@@ -457,6 +458,45 @@ class QuoteRefTests(unittest.TestCase):
 
     def test_slash_is_percent_encoded(self):
         self.assertEqual(_quote_ref("release/1.0"), "release%2F1.0")
+
+
+class ParseLinkHeaderTests(unittest.TestCase):
+    """Hardened 2026-09-13 (code review) -- see _parse_link_header's own
+    docstring for the real gap this closes: a naive split(';') over the
+    whole segment (including the URL) would truncate a URL containing a
+    literal ';', and only .strip('"') never handled a single-quoted rel
+    value."""
+
+    def test_real_github_shape_still_works(self):
+        header = '<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=5>; rel="last"'
+        self.assertEqual(
+            _parse_link_header(header),
+            {"next": "https://api.github.com/x?page=2", "last": "https://api.github.com/x?page=5"},
+        )
+
+    def test_empty_header_returns_empty_dict(self):
+        self.assertEqual(_parse_link_header(""), {})
+
+    def test_url_containing_a_literal_semicolon_is_not_truncated(self):
+        header = '<https://example.com/x?a=1;b=2>; rel="next"'
+        self.assertEqual(_parse_link_header(header), {"next": "https://example.com/x?a=1;b=2"})
+
+    def test_single_quoted_rel_value_is_recognized(self):
+        header = "<https://example.com/x>; rel='next'"
+        self.assertEqual(_parse_link_header(header), {"next": "https://example.com/x"})
+
+    def test_unquoted_rel_token_is_recognized(self):
+        header = "<https://example.com/x>; rel=next"
+        self.assertEqual(_parse_link_header(header), {"next": "https://example.com/x"})
+
+    def test_segment_missing_angle_brackets_is_skipped(self):
+        self.assertEqual(_parse_link_header('not-a-url; rel="next"'), {})
+
+    def test_segment_with_no_rel_parameter_is_skipped(self):
+        self.assertEqual(_parse_link_header("<https://example.com/x>"), {})
+
+    def test_unclosed_angle_bracket_is_skipped(self):
+        self.assertEqual(_parse_link_header('<https://example.com/x; rel="next"'), {})
 
 
 class IsPlatformTierLimitationTests(unittest.TestCase):

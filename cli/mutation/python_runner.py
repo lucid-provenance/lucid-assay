@@ -157,6 +157,7 @@ from __future__ import annotations
 import ast
 import importlib.metadata
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -418,7 +419,31 @@ def _run_mutmut(args: List[str], *, cwd: Path, timeout_seconds: int) -> subproce
     """See this module's own "Hardened against" docstring (the
     `sys.executable` bullet) for why this is `uv run --with
     mutmut==<pinned version> --no-sync python -m mutmut <args>`, not a
-    direct `[sys.executable, "-m", "mutmut", *args]` invocation."""
+    direct `[sys.executable, "-m", "mutmut", *args]` invocation.
+
+    Explicitly strips VIRTUAL_ENV from the subprocess's own environment
+    -- found 2026-09-13 via a real lucid-dsse-collector CI run: this
+    process (cli.main) always runs inside `_assay/.venv`, so VIRTUAL_ENV
+    is already set to that path in the ambient environment by the time
+    this subprocess launches. uv resolves `--no-sync`'s project
+    environment relative to `cwd` (the *target* repo's own `.venv`) --
+    correctly, but it also compares that resolution against the inherited
+    VIRTUAL_ENV, finds a mismatch, and prints a warning to stderr
+    ("VIRTUAL_ENV=... does not match the project environment path...").
+    uv still does the right thing regardless (the warning says so
+    itself: "will be ignored") -- this was never a functional bug, but it
+    is a diagnostics one: `_run_scoped`'s error_detail prefers stderr
+    over stdout whenever stderr is non-empty, so once uv started emitting
+    this warning, a real mutmut failure's own message (usually on stdout)
+    was silently replaced by this harmless warning text, truncated at
+    300 chars -- exactly what happened in that real run, which showed
+    only the uv warning and a package-install summary line with no trace
+    of mutmut's actual error. Removing VIRTUAL_ENV here doesn't change
+    which environment uv actually uses (it was already resolving cwd's
+    own `.venv`, not the inherited one) -- it only removes the input that
+    made uv think there was something worth warning about."""
+    env = os.environ.copy()
+    env.pop("VIRTUAL_ENV", None)
     return subprocess.run(
         ["uv", "run", "--with", f"mutmut=={_MUTMUT_VERSION}", "--no-sync", "python", "-m", "mutmut", *args],
         cwd=cwd,
@@ -426,6 +451,7 @@ def _run_mutmut(args: List[str], *, cwd: Path, timeout_seconds: int) -> subproce
         text=True,
         timeout=timeout_seconds,
         check=False,
+        env=env,
     )
 
 

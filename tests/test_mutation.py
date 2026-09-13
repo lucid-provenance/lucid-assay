@@ -372,17 +372,25 @@ class PythonRunnerRunDirectFieldTests(unittest.TestCase):
         self.assertEqual(result.scoped_files, ["cli/scorer.py"])
         self.assertEqual(result.reason, REASON_CODE_NO_COVERABLE_LINES)
 
-    def test_general_run_failure_prefers_stderr_verbatim(self):
+    def test_general_run_failure_combines_both_streams_when_both_present(self):
+        """Changed 2026-09-13: this used to assert stderr wins outright
+        and stdout is discarded -- disproven by a real run (uv's own
+        routine "Installed N packages" progress text on stderr silently
+        ate a real stdout-based mutmut error). Both streams must now
+        survive into the reason string."""
         def side_effect(args, *, cwd, timeout_seconds):
             if args[0] == "run":
-                return _ok(returncode=1, stdout="ignored stdout", stderr="the real stderr reason")
+                return _ok(returncode=1, stdout="the real stdout reason", stderr="uv's own noise")
             return _ok()
 
         with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
             result = self._run()
         self.assertEqual(result.language, LANGUAGE_PYTHON)
         self.assertEqual(result.status, "unavailable")
-        self.assertEqual(result.reason, "mutmut run failed (exit 1): the real stderr reason")
+        self.assertEqual(
+            result.reason,
+            "mutmut run failed (exit 1): stdout: the real stdout reason | stderr: uv's own noise",
+        )
 
     def test_general_run_failure_falls_back_to_stdout_verbatim_when_stderr_empty(self):
         def side_effect(args, *, cwd, timeout_seconds):
@@ -419,6 +427,20 @@ class PythonRunnerRunDirectFieldTests(unittest.TestCase):
         with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
             result = self._run()
         self.assertEqual(result.reason, f"mutmut run failed (exit 1): {'x' * 300}")
+
+    def test_general_run_failure_truncates_the_combined_both_streams_string(self):
+        """The 300-char cap applies to the already-combined "stdout: ... |
+        stderr: ..." string, not to each stream independently -- pins
+        that combining behavior doesn't accidentally bypass truncation."""
+        def side_effect(args, *, cwd, timeout_seconds):
+            if args[0] == "run":
+                return _ok(returncode=1, stdout="y" * 305, stderr="z" * 305)
+            return _ok()
+
+        with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
+            result = self._run()
+        combined = f"stdout: {'y' * 305} | stderr: {'z' * 305}"
+        self.assertEqual(result.reason, f"mutmut run failed (exit 1): {combined[:300]}")
 
     def test_stats_read_failure_reports_exact_language_status_and_reason(self):
         # "run" succeeds but never actually writes mutmut-cicd-stats.json
@@ -648,15 +670,20 @@ class RunMutationTestingPythonTests(unittest.TestCase):
         self.assertFalse(report.available)
         self.assertIn("ModuleNotFoundError: No module named 'fastapi'", report.reason)
 
-    def test_a_failed_run_prefers_stderr_over_stdout_when_both_are_present(self):
+    def test_a_failed_run_combines_both_streams_when_both_are_present(self):
+        """Changed 2026-09-13 -- see python_runner.py's own comment: `uv
+        run --with` always writes routine, harmless progress text to
+        stderr, so "stderr is non-empty" can no longer mean "the real
+        error must be here." Both streams must survive into the reason."""
         def side_effect(args, *, cwd, timeout_seconds):
             if args[0] == "run":
-                return _ok(returncode=1, stdout="some incidental progress output", stderr="the real crash reason")
+                return _ok(returncode=1, stdout="the real crash reason", stderr="Installed 19 packages in 24ms")
             return _ok()
 
         with patch("cli.mutation.python_runner._run_mutmut", side_effect=side_effect):
             report = run_mutation_testing(str(self.repo_dir), self._diff())
         self.assertIn("the real crash reason", report.reason)
+        self.assertIn("Installed 19 packages in 24ms", report.reason)
         self.assertNotIn("some incidental progress output", report.reason)
 
     def test_surviving_mutant_detail_is_collected_and_capped(self):

@@ -665,11 +665,32 @@ def _run_scoped(
                 scoped_files=existing_files,
                 reason=REASON_CODE_NO_COVERABLE_LINES,
             )
-        # stderr first (an uncaught Python exception's traceback lands
-        # there by default); stdout only as a fallback, for a tool failure
-        # (e.g. a pytest collection error) that prints to stdout instead --
-        # see this module's own "Hardened against" docstring.
-        error_detail = (run_proc.stderr or "").strip() or (run_proc.stdout or "").strip()
+        # Both streams are combined, never one discarded in favor of the
+        # other -- found 2026-09-13 via a real lucid-dsse-collector run:
+        # this used to prefer non-empty stderr outright (an uncaught
+        # Python exception's traceback lands there by default), falling
+        # back to stdout only when stderr was completely empty. That
+        # heuristic is broken for this exact call shape: `uv run --with`
+        # unconditionally writes its own routine progress text to stderr
+        # (confirmed by direct reproduction -- "Installed N packages in
+        # Nms" appears on every invocation, success or failure, with
+        # nothing to do with mutmut's own outcome), so stderr is
+        # essentially never truly empty here. A real mutmut failure that
+        # prints to stdout (e.g. a pytest collection error -- the
+        # ModuleNotFoundError shape that originally motivated preferring
+        # stderr's absence as the fallback trigger) was silently and
+        # completely discarded, replaced by uv's own harmless install
+        # line, exactly as happened for real on that PR. Concatenating
+        # both means the real content is never dropped regardless of
+        # which stream it landed on -- uv's own noise (a short, fixed
+        # shape) ending up alongside it is a minor readability cost, not
+        # a suppression bug.
+        stdout_detail = (run_proc.stdout or "").strip()
+        stderr_detail = (run_proc.stderr or "").strip()
+        if stdout_detail and stderr_detail:
+            error_detail = f"stdout: {stdout_detail} | stderr: {stderr_detail}"
+        else:
+            error_detail = stdout_detail or stderr_detail
         return LanguageRunResult(
             language=LANGUAGE_PYTHON, status="unavailable",
             reason=f"mutmut run failed (exit {run_proc.returncode}): {error_detail[:300]}",

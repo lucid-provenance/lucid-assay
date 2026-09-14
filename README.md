@@ -1784,12 +1784,18 @@ libraries, exact interpreter build, a live runtime dependency on PyPI's
 availability) is otherwise reassembled fresh on every run. The image
 freezes all of that.
 
-**Tags and pinning**: every push to `main` that touches `cli/`,
-`schema/`, `pyproject.toml`, `uv.lock`, or `Dockerfile` publishes a new
-image tagged by commit SHA (`:​<sha>`) and Sigstore-signed. There is
-**no `latest` tag, deliberately** — consistent with this project's own
-explicit-pinning stance everywhere else (`--min-rcs`, `TRUSTED_SIGNER_SHA`,
-...). Resolve a real digest before using this anywhere that matters:
+**Tags and pinning**: every push to `main` publishes a new image tagged
+by commit SHA (`:​<sha>`) and Sigstore-signed — promoted, never rebuilt,
+from the exact image `assay.yml`'s own `build` job already built and
+`verify` already gated (`--min-rcs`, `--require-slsa-build-l3`,
+`--disallow-degraded`) that same run, via a registry-to-registry digest
+copy (`publish` job, `docker buildx imagetools create`) rather than a
+second, independent `docker build` — so this tag's digest is
+byte-for-byte the same image lucid-assay's own attestation scored and
+signed, not merely "built from the same commit." There is **no `latest`
+tag, deliberately** — consistent with this project's own explicit-pinning
+stance everywhere else (`--min-rcs`, `TRUSTED_SIGNER_SHA`, ...). Resolve a
+real digest before using this anywhere that matters:
 
 ```bash
 docker buildx imagetools inspect ghcr.io/lucid-provenance/lucid-assay:<sha>

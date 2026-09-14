@@ -97,6 +97,13 @@ jobs:
       contents: read
       security-events: write
       pull-requests: read # "Resolve PR Context for a Push-Triggered Run" below
+      # "Build container image" below -- pushes the real ephemeral
+      # ci-subject image this attestation's digest describes. A no-op for
+      # a fork PR's own downgraded, read-only token (a platform guarantee,
+      # not something this line controls) -- that case is handled by
+      # push/load being conditional in the step itself, not by this
+      # permission being absent.
+      packages: write
     outputs:
       # Consumed by `attest` below as subject-name/subject-digest -- the
       # only provenance-relevant values the isolated signer job accepts
@@ -403,6 +410,62 @@ jobs:
           echo "base-sha=$(echo "$pulls_json" | jq -r '.[0].base.sha // empty')" >> "$GITHUB_OUTPUT"
           echo "number=$(echo "$pulls_json" | jq -r '.[0].number // empty')" >> "$GITHUB_OUTPUT"
 
+      # Builds the actual container image this run's attestation subject
+      # describes. Fixed 2026-09-14 (see CLAUDE.md's "Build artifact vs.
+      # deploy artifact integrity gap" entry): this used to skip building
+      # anything at all and fabricate IMAGE_DIGEST as
+      # sha256($(git rev-parse HEAD | sha256sum)) -- a hash of the commit
+      # SHA *text*, not of any artifact. cli.main's own "Ground Truth
+      # Only" invariant (this file's own CLAUDE.md) applies to this
+      # workflow's inputs to it exactly as much as it applies to cli/
+      # itself.
+      #
+      # Pushed under its own package (lucid-assay-ci-subject), deliberately
+      # NOT the same ghcr.io/lucid-provenance/lucid-assay tag
+      # publish-image.yml pushes to on a push-to-main -- two independent
+      # builds of "the same" commit racing for one shared tag would just
+      # reintroduce this same class of bug one level down (which build's
+      # digest is the real one?). This image is the one lucid-assay's own
+      # attestation is scored/signed against; publish-image.yml's is the
+      # one meant for real consumption. They are not claimed to be the
+      # same bytes.
+      #
+      # push/load are conditional on the same trust test "Generate GitHub
+      # App Token" above already uses: a fork PR's GITHUB_TOKEN is
+      # downgraded to read-only regardless of this job's own `packages:
+      # write` (a GitHub Actions platform guarantee, not a choice made
+      # here), so pushing would simply fail. In that case the image is
+      # still really built and loaded into the runner's local Docker
+      # daemon (load: true) so its digest is real, just never published --
+      # matching the fact that nothing from an untrusted fork PR should
+      # reach GHCR anyway. imageid (the local image config digest) and
+      # digest (the pushed registry manifest digest) are different kinds
+      # of value computed over the same real build; "Mint Unsigned Lucid
+      # Attestation" below picks whichever one this step actually
+      # produced, never fabricates a substitute for the other.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build container image
+        id: image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          provenance: false
+          sbom: false
+          platforms: linux/amd64
+          tags: ghcr.io/${{ github.repository }}-ci-subject:${{ github.sha }}
+          push: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
+          load: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') }}
+
       # Deliberately no --sign/--dry-run-sign here: this job has no
       # id-token permission, so it could not mint a Sigstore identity even
       # if it tried. Written unsigned; the separate `attest` job below
@@ -558,8 +621,30 @@ jobs:
 
           echo "Running with EXTRA_ARGS: ${EXTRA_ARGS[*]}"
 
-          IMAGE_REF="ghcr.io/${{ github.repository }}:${HEAD_SHA}"
-          IMAGE_DIGEST="sha256:$(git rev-parse HEAD | sha256sum | awk '{print $1}')"
+          # github.sha, not HEAD_SHA (a PR's own head commit, used below
+          # only as cli.main's --head-sha -- the commit whose code was
+          # analyzed): "Build container image" above tagged its image with
+          # github.sha, since that's the trigger's own checked-out commit
+          # in every case (a pull_request event's github.sha is the
+          # synthetic merge commit GitHub actually built and ran against,
+          # not the PR head) -- this must name the tag that was actually
+          # pushed, not a different commit's hypothetical one.
+          IMAGE_REF="ghcr.io/${{ github.repository }}-ci-subject:${{ github.sha }}"
+          # "Build container image" above sets exactly one of these two
+          # outputs depending on whether it pushed (digest, a real
+          # registry manifest digest) or only loaded locally (imageid, a
+          # real local image config digest) -- never both, never neither;
+          # its own push/load conditions are exact complements of each
+          # other. Fail closed rather than silently falling through to
+          # some other value if that ever stops being true.
+          IMAGE_DIGEST="${{ steps.image.outputs.digest }}"
+          if [ -z "$IMAGE_DIGEST" ]; then
+            IMAGE_DIGEST="${{ steps.image.outputs.imageid }}"
+          fi
+          if [ -z "$IMAGE_DIGEST" ]; then
+            echo "ERROR: 'Build container image' produced neither a digest nor an imageid output -- refusing to mint an attestation with no real subject digest" >&2
+            exit 1
+          fi
           echo "image-ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
           echo "image-digest=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
 

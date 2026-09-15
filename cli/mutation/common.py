@@ -40,6 +40,14 @@ REASON_CODE_SKIPPED = "skipped"
 REASON_CODE_NO_SOURCE_CHANGES = "no_source_changes"
 REASON_CODE_NO_COVERABLE_LINES = "no_coverable_lines"
 REASON_CODE_INSUFFICIENT_SAMPLE = "insufficient_sample"
+# Distinct from REASON_CODE_NO_SOURCE_CHANGES: source in a supported
+# language *did* change, but no mutation-testing tool is configured for
+# it in the target repo at all (no [tool.mutmut]/no Stryker config/no
+# pitest-maven plugin). Consumers that render this to a human (e.g.
+# lucid-console) need this split to say "not configured" rather than the
+# misleading "nothing relevant changed" -- see _combine_results' own
+# not_applicable_report call for where this is actually produced.
+REASON_CODE_NOT_CONFIGURED = "not_configured"
 
 DEFAULT_TIMEOUT_SECONDS = 90
 DEFAULT_MAX_SURVIVING_DETAIL = 5

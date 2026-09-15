@@ -90,6 +90,7 @@ from .common import (
     REASON_CODE_INSUFFICIENT_SAMPLE,
     REASON_CODE_NO_COVERABLE_LINES,
     REASON_CODE_NO_SOURCE_CHANGES,
+    REASON_CODE_NOT_CONFIGURED,
     REASON_CODE_SKIPPED,
     REASON_CODE_UNAVAILABLE,
     REASON_CODE_WEAK,
@@ -244,7 +245,8 @@ def _combine_results(
             return unavailable_report(f"mutation testing failed for every touched language ({reasons})")
         return not_applicable_report(
             "no mutation-testing tool is configured in this repo for any language "
-            "this diff touched (no [tool.mutmut]/no Stryker config/no pitest-maven plugin)"
+            "this diff touched (no [tool.mutmut]/no Stryker config/no pitest-maven plugin)",
+            REASON_CODE_NOT_CONFIGURED,
         )
 
     killed = sum(r.killed for r in ran)

@@ -262,7 +262,14 @@ did touch) is exempt — full credit, no discount, flagged
 is) — and a sample below `--mutation-testing-min-sample` (default 3
 mutants actually tested) grades `insufficient_sample` and also applies no
 discount, since one surviving mutant out of one generated isn't a real
-signal. **Skipping mutation testing (`--skip-mutation-testing`) or a
+signal. The "no relevant source changed at all" and "no tool configured
+for a language that did change" cases carry distinct `reason_code`s
+(`no_source_changes` vs. `not_configured`, 2026-09-15) even though both
+grade `not_applicable` and neither is a degradation trigger — a
+downstream reader (e.g. lucid-console) needs the split to say "not
+configured" honestly rather than the misleading "nothing relevant
+changed" for a repo that touched real source but has no tool set up for
+that language yet. **Skipping mutation testing (`--skip-mutation-testing`) or a
 genuine tool failure/timeout never defaults to full credit** — both apply
 the same 0.85 multiplier as the weak tier, fail-closed, so opting out is
 never the cheap way to dodge the control meant to stop exactly that. The

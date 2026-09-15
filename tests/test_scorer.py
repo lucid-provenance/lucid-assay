@@ -258,6 +258,23 @@ class RCSScorerTests(unittest.TestCase):
         self.assertEqual(no_changes.mutation_multiplier, 1.0)
         self.assertEqual(insufficient.mutation_multiplier, 1.0)
 
+    def test_not_configured_is_not_degraded(self):
+        # Distinct from no_source_changes: real *.py/*.ts/*.java/*.go
+        # source changed, but no mutation-testing tool is configured for
+        # that language in this repo at all -- still "nothing to say",
+        # never a gap (see REASON_CODE_NOT_CONFIGURED's own docstring).
+        result = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(
+                available=False, grade="not_applicable", multiplier=1.0, mutation_score=None,
+                killed=0, survived=0, timeout=0, total_generated=0,
+                reason="no mutation-testing tool is configured in this repo for any language "
+                "this diff touched (no [tool.mutmut]/no Stryker config/no pitest-maven plugin)",
+                reason_code="not_configured",
+            ),
+        ))
+        self.assertFalse(result.degraded)
+        self.assertEqual(result.mutation_multiplier, 1.0)
+
     def test_no_coverable_lines_is_degraded_but_full_credit(self):
         # Mirrors patch_coverage:no_coverable_lines -- a docs/comment-only
         # diff must not take any real penalty, but is still flagged

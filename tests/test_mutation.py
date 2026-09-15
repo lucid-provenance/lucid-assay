@@ -30,6 +30,7 @@ from cli.mutation.common import (
     REASON_CODE_INSUFFICIENT_SAMPLE,
     REASON_CODE_NO_COVERABLE_LINES,
     REASON_CODE_NO_SOURCE_CHANGES,
+    REASON_CODE_NOT_CONFIGURED,
     REASON_CODE_SKIPPED,
 )
 from cli.mutation.python_runner import (
@@ -1263,6 +1264,7 @@ class CombineResultsMultiLanguageTests(unittest.TestCase):
         )
         self.assertEqual(report.grade, "not_applicable")
         self.assertEqual(report.multiplier, MULTIPLIER_NOT_APPLICABLE)
+        self.assertEqual(report.reason_code, REASON_CODE_NOT_CONFIGURED)
 
     def test_a_real_failure_in_one_language_is_not_masked_by_another_not_configured(self):
         # Fail-closed: if a language's tool genuinely failed, that must

@@ -917,13 +917,19 @@ Every control this module doesn't implement is simply absent from
 `predicate.s2c2f.controls[]`; it is never guessed at as met or unmet. Each
 control that *is* evaluated reports one of three states:
 
-- `met` / `unmet` — the check ran and got a definitive answer.
-- `not_yet_reported` — the check couldn't run (no token, a rate limit or
-  auth failure, an invalid repository identifier) *or* no generic,
-  repo-observable signal exists for that control at all (e.g. UPD-1
-  "Manual Updates" describes a documented process, not an artifact).
-  Never conflated with `unmet`: a check that didn't run must never look
-  like one that ran and failed.
+- `met` / `unmet` — the check ran and got a definitive answer. This
+  includes every "checked, found nothing" case (a missing denylist, a
+  `--sarif` input from the wrong tool, a hardcoded check with no possible
+  signal at all like `ING-4`) — a confirmed, known absence is `unmet`,
+  not `not_yet_reported`, even when the check itself never branches on
+  any real repo-specific data (fixed 2026-09-18 for `ING-4`/`SCA-1`/
+  `SCA-2`/`SCA-4`/`SCA-3`'s 403 case, alongside `UPD-1`'s earlier same-day
+  rewrite — a definitively knowable "no" is a real answer, not an
+  unknown, however it was determined).
+- `not_yet_reported` — the check itself could not be completed at all:
+  no token, a rate limit, a transport failure, an invalid repository
+  identifier. Reserved for genuine "we don't know," never used for "we
+  know, and the answer is no."
 
 Currently evaluated: `ING-1`/`ING-2` (lockfile presence / per-dependency
 feed-provenance — see `ING-2`'s own paragraph below; a `--sbom`'s

@@ -93,6 +93,7 @@ from .github_rules import (
     BranchGovernanceReport,
     GitHubAPIError,
     _REPO_RE,
+    _extract_http_error_detail,
     _github_api_get,
 )
 from .sarif import SarifSummaryReport
@@ -167,17 +168,28 @@ def _control(id: str, status: str, detail: str = "") -> S2C2FControlResult:
 # ---------------------------------------------------------------------------
 
 
-def _github_api_status(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[int]:
-    """GET a GitHub REST API path and return just the HTTP status code.
+def _github_api_status(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[int], Optional[str]]:
+    """GET a GitHub REST API path and return (status_code, error_detail).
 
     Some GitHub endpoints (e.g. GET .../vulnerability-alerts) are
     boolean-shaped: 204 means "enabled", 404 means "disabled", and neither
     response carries a JSON body -- reusing cli.parsers.github_rules.
     _github_api_get's json.loads()-always contract would raise on the empty
-    204 body. Returns None on any transport failure (timeout, DNS,
+    204 body. Returns (None, None) on any transport failure (timeout, DNS,
     connection reset) -- never raises -- since every caller here already
-    treats "couldn't determine" as its own honest not_yet_reported outcome,
-    same as a definitive negative status.
+    treats "couldn't determine" as its own honest not_yet_reported outcome.
+
+    `error_detail` (via `_extract_http_error_detail`, same helper
+    cli.parsers.github_rules' own 401/403 diagnostics use) is populated
+    only on a genuine HTTPError -- 2026-09-18: a real, confirmed case
+    (SCA-3's own 403) showed a status code alone can be actively
+    misleading here. GitHub returns HTTP 403 with body message
+    "Dependabot alerts are disabled for this repository." when the
+    *repository feature itself* is off -- a completely different, and
+    definitively answerable, condition from "the token lacks the
+    permission", which this module's own SCA-3 evaluator previously
+    assumed a bare 403 always meant. Surfacing GitHub's own message lets
+    callers tell the two apart instead of guessing at one.
     """
     req = urllib.request.Request(
         f"{GITHUB_API_BASE}{path}",
@@ -190,11 +202,11 @@ def _github_api_status(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) ->
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status
+            return resp.status, None
     except urllib.error.HTTPError as e:
-        return e.code
+        return e.code, _extract_http_error_detail(e)
     except urllib.error.URLError:
-        return None
+        return None, None
 
 
 def _resolve_github_context(repository: str, token: Optional[str]) -> Optional[str]:
@@ -621,9 +633,14 @@ def _eval_ing4_source_cloning() -> S2C2FControlResult:
     # S2C2F's ING-4 means mirroring the upstream *source* of a consumed OSS
     # component (distinct from ING-2's registry/package-level pinning) --
     # this project operates no such source-mirroring infrastructure today.
-    # Honest gap, not a fabricated signal, same treatment UPD-1 already
-    # gets: a real "not yet built" is itself a valid, non-guessed outcome.
-    return _control("ING-4", STATUS_NOT_YET_REPORTED, "no generic, repo-observable signal exists for upstream-source mirroring; no such infrastructure is operated today")
+    # unmet, not not_yet_reported (fixed 2026-09-18, same day as first
+    # written): this check never branches on anything -- there is no
+    # scenario where evaluating it could tell us anything other than what
+    # we already know for certain. not_yet_reported means "couldn't
+    # determine"; this is the opposite, a confirmed, known absence. A
+    # real "not yet built" is a valid, honest unmet, never a fabricated
+    # signal, but it's still a met/unmet answer, not an unknown one.
+    return _control("ING-4", STATUS_UNMET, "no generic, repo-observable signal exists for upstream-source mirroring; no such infrastructure is operated today")
 
 
 # ---------------------------------------------------------------------------
@@ -648,7 +665,12 @@ def _eval_sca4_malware_scans(sarif_tools_scanned: List[str]) -> S2C2FControlResu
     tool_match = _sarif_tool_name_matches(sarif_tools_scanned, _MALWARE_SCAN_TOOL_PATTERNS)
     if tool_match:
         return _control("SCA-4", STATUS_MET, f"SARIF findings from a recognized malware/malicious-package-scanning tool ({tool_match})")
-    return _control("SCA-4", STATUS_NOT_YET_REPORTED, "no --sarif input came from a recognized malware-scanning tool (default: OSV-Scanner); no other generic signal is available")
+    # unmet, not not_yet_reported (fixed 2026-09-18): the check genuinely
+    # ran against whatever --sarif input this run actually provided and
+    # found no matching tool -- a real, checked absence for this run, the
+    # same "checked, confirmed absent" treatment ING-3/UPD-1 already give
+    # a missing denylist/runbook, not a "couldn't determine" unknown.
+    return _control("SCA-4", STATUS_UNMET, "no --sarif input came from a recognized malware-scanning tool (default: OSV-Scanner); no other generic signal is available")
 
 
 # ---------------------------------------------------------------------------
@@ -740,14 +762,24 @@ def _eval_sca1_vulnerability_scans(sarif_tools_scanned: List[str], vuln_alerts_s
         return _control("SCA-1", STATUS_MET, "GitHub Dependabot vulnerability alerts are enabled for this repository")
     if vuln_alerts_status == 404:
         return _control("SCA-1", STATUS_UNMET, "GitHub Dependabot vulnerability alerts are not enabled, and no SARIF input came from a recognized SCA tool")
-    return _control("SCA-1", STATUS_NOT_YET_REPORTED, "no SARIF input from a recognized SCA tool, and the GitHub vulnerability-alerts API could not be reached (missing token or network failure)")
+    if vuln_alerts_status is None:
+        return _control("SCA-1", STATUS_NOT_YET_REPORTED, "no SARIF input from a recognized SCA tool, and the GitHub vulnerability-alerts API could not be reached (missing token or network failure)")
+    # A real, if unexpected, non-2xx/404 status (e.g. 403) -- the API was
+    # reached and answered, just not with a positive result, and no
+    # SARIF evidence exists either. unmet, not not_yet_reported (fixed
+    # 2026-09-18): we did get a real response, this isn't an unknown.
+    return _control("SCA-1", STATUS_UNMET, f"no SARIF input from a recognized SCA tool, and GitHub's vulnerability-alerts API returned an inconclusive status ({vuln_alerts_status})")
 
 
 def _eval_sca2_license_checks(sarif_tools_scanned: List[str]) -> S2C2FControlResult:
     tool_match = _sarif_tool_name_matches(sarif_tools_scanned, _LICENSE_TOOL_NAME_PATTERNS)
     if tool_match:
         return _control("SCA-2", STATUS_MET, f"SARIF findings from a recognized license-scanning tool ({tool_match})")
-    return _control("SCA-2", STATUS_NOT_YET_REPORTED, "no --sarif input came from a recognized license-scanning tool; no other generic signal is available")
+    # unmet, not not_yet_reported (fixed 2026-09-18) -- same reasoning as
+    # SCA-4: the check ran against whatever --sarif input this run
+    # actually provided and found no matching tool, a real checked
+    # absence, not an unknown.
+    return _control("SCA-2", STATUS_UNMET, "no --sarif input came from a recognized license-scanning tool; no other generic signal is available")
 
 
 def _eval_inv1_inventory(resolved_dependencies: List[Dict[str, Any]]) -> S2C2FControlResult:
@@ -897,13 +929,26 @@ def _eval_upd2_auto_updates(repo_dir: str) -> S2C2FControlResult:
 # ---------------------------------------------------------------------------
 
 
-def _eval_sca3_eol_scans(dependabot_alerts_status: Optional[int]) -> S2C2FControlResult:
+def _eval_sca3_eol_scans(dependabot_alerts_status: Optional[int], dependabot_alerts_detail: Optional[str]) -> S2C2FControlResult:
     if dependabot_alerts_status == 200:
         return _control("SCA-3", STATUS_MET, "GitHub Dependabot alerts API is enabled and reachable for this repository (closest available signal for automated deprecated/EOL package flagging)")
     if dependabot_alerts_status == 404:
         return _control("SCA-3", STATUS_UNMET, "GitHub Dependabot alerts are not enabled for this repository")
     if dependabot_alerts_status == 403:
-        return _control("SCA-3", STATUS_NOT_YET_REPORTED, "GitHub Dependabot alerts API returned 403; the token likely lacks 'Dependabot alerts: Read' permission")
+        # 2026-09-18: confirmed against a real repository (a genuine
+        # unauthenticated view of its Security settings) that GitHub
+        # returns this exact status with body message "Dependabot alerts
+        # are disabled for this repository." when the *repository
+        # feature* itself is off -- a completely different, and
+        # definitively answerable, condition from a token merely lacking
+        # 'Dependabot alerts: Read' permission, which this evaluator used
+        # to assume unconditionally. Either way the practical answer is
+        # the same and definitively knowable: this control is not
+        # satisfied today, a real unmet, not an unknown -- GitHub's own
+        # message (when available) leads the detail so the actual cause
+        # is never guessed at.
+        cause = dependabot_alerts_detail or "the token likely lacks 'Dependabot alerts: Read' permission"
+        return _control("SCA-3", STATUS_UNMET, f"GitHub Dependabot alerts API returned 403: {cause}")
     return _control("SCA-3", STATUS_NOT_YET_REPORTED, "GitHub Dependabot alerts API could not be reached (missing token or network failure)")
 
 
@@ -1046,11 +1091,12 @@ def evaluate_s2c2f(
     resolved_token = _resolve_github_context(repository, token)
     vuln_alerts_status: Optional[int] = None
     dependabot_alerts_status: Optional[int] = None
+    dependabot_alerts_detail: Optional[str] = None
     security_md_present: Optional[bool] = None
 
     if resolved_token:
-        vuln_alerts_status = _github_api_status(f"/repos/{repository}/vulnerability-alerts", resolved_token, timeout)
-        dependabot_alerts_status = _github_api_status(f"/repos/{repository}/dependabot/alerts?per_page=1", resolved_token, timeout)
+        vuln_alerts_status, _ = _github_api_status(f"/repos/{repository}/vulnerability-alerts", resolved_token, timeout)
+        dependabot_alerts_status, dependabot_alerts_detail = _github_api_status(f"/repos/{repository}/dependabot/alerts?per_page=1", resolved_token, timeout)
         security_md_present = _detect_security_md(repository, resolved_token, timeout)
 
     resolved_repo_dir = _resolve_repo_dir(repo_dir)
@@ -1064,7 +1110,7 @@ def evaluate_s2c2f(
         _eval_sca2_license_checks(sarif_tools_scanned),
         _eval_inv1_inventory(resolved_dependencies),
         _eval_upd1_manual_updates(repo_dir),
-        _eval_sca3_eol_scans(dependabot_alerts_status),
+        _eval_sca3_eol_scans(dependabot_alerts_status, dependabot_alerts_detail),
         _eval_inv2_incident_plans(security_md_present),
         _eval_upd2_auto_updates(repo_dir),
         _eval_upd3_pr_alerts(repo_dir),

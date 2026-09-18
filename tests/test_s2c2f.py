@@ -149,8 +149,13 @@ class EvaluateS2C2FTests(unittest.TestCase):
             token=None,
         )
         controls = _controls_by_id(report)
+        # SCA-1 still has a real API fallback path that a missing token
+        # genuinely can't complete -- stays not_yet_reported. SCA-2 has
+        # no such fallback at all: a real check ran against real SARIF
+        # input and found no matching tool, a confirmed absence (fixed
+        # 2026-09-18, same reasoning as ING-3/UPD-1's checked-absent unmet).
         self.assertEqual(controls["SCA-1"].status, STATUS_NOT_YET_REPORTED)
-        self.assertEqual(controls["SCA-2"].status, STATUS_NOT_YET_REPORTED)
+        self.assertEqual(controls["SCA-2"].status, STATUS_UNMET)
 
     def test_clean_grype_sarif_satisfies_sca1(self):
         # Grype ran (driver present, tools_scanned=["grype"]), found
@@ -414,7 +419,7 @@ class EvaluateS2C2FTests(unittest.TestCase):
     @patch("cli.parsers.s2c2f._github_api_get")
     def test_vulnerability_alerts_204_satisfies_sca1(self, mock_get, mock_status):
         mock_get.return_value = None
-        mock_status.side_effect = lambda path, token, timeout=10: 204 if "vulnerability-alerts" in path else 404
+        mock_status.side_effect = lambda path, token, timeout=10: (204, None) if "vulnerability-alerts" in path else (404, None)
 
         report = evaluate_s2c2f(
             repo_dir=tempfile.mkdtemp(),
@@ -430,7 +435,7 @@ class EvaluateS2C2FTests(unittest.TestCase):
     @patch("cli.parsers.s2c2f._github_api_get")
     def test_dependabot_alerts_200_satisfies_sca3(self, mock_get, mock_status):
         mock_get.return_value = None
-        mock_status.side_effect = lambda path, token, timeout=10: 200 if "dependabot/alerts" in path else 404
+        mock_status.side_effect = lambda path, token, timeout=10: (200, None) if "dependabot/alerts" in path else (404, None)
 
         report = evaluate_s2c2f(
             repo_dir=tempfile.mkdtemp(),
@@ -444,9 +449,14 @@ class EvaluateS2C2FTests(unittest.TestCase):
 
     @patch("cli.parsers.s2c2f._github_api_status")
     @patch("cli.parsers.s2c2f._github_api_get")
-    def test_dependabot_alerts_403_is_not_yet_reported_not_unmet(self, mock_get, mock_status):
+    def test_dependabot_alerts_403_is_unmet_a_confirmed_answer_not_an_unknown(self, mock_get, mock_status):
+        # Fixed 2026-09-18: a real, confirmed case showed 403 here can
+        # mean "the repository feature itself is disabled" (GitHub's own
+        # body message), a definitively knowable state -- not just "the
+        # token lacks permission". Either way the practical answer is
+        # the same and real: this control isn't satisfied today.
         mock_get.return_value = None
-        mock_status.side_effect = lambda path, token, timeout=10: 403 if "dependabot/alerts" in path else 404
+        mock_status.side_effect = lambda path, token, timeout=10: (403, "Dependabot alerts are disabled for this repository.") if "dependabot/alerts" in path else (404, None)
 
         report = evaluate_s2c2f(
             repo_dir=tempfile.mkdtemp(),
@@ -456,7 +466,27 @@ class EvaluateS2C2FTests(unittest.TestCase):
             branch_governance=_governance(),
             token="tok",
         )
-        self.assertEqual(_controls_by_id(report)["SCA-3"].status, STATUS_NOT_YET_REPORTED)
+        result = _controls_by_id(report)["SCA-3"]
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertIn("Dependabot alerts are disabled for this repository.", result.detail)
+
+    @patch("cli.parsers.s2c2f._github_api_status")
+    @patch("cli.parsers.s2c2f._github_api_get")
+    def test_dependabot_alerts_403_without_a_body_message_falls_back_honestly(self, mock_get, mock_status):
+        mock_get.return_value = None
+        mock_status.side_effect = lambda path, token, timeout=10: (403, None) if "dependabot/alerts" in path else (404, None)
+
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(),
+            repository="acme/widgets",
+            resolved_dependencies=[],
+            sarif_report=None,
+            branch_governance=_governance(),
+            token="tok",
+        )
+        result = _controls_by_id(report)["SCA-3"]
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertIn("likely lacks", result.detail)
 
     @patch("cli.parsers.s2c2f._github_api_status")
     @patch("cli.parsers.s2c2f._github_api_get")
@@ -467,7 +497,7 @@ class EvaluateS2C2FTests(unittest.TestCase):
         # the repo's own root SECURITY.md exists here; the other two
         # candidate paths (and the org .github fallback) must never be
         # reached once the first one is found.
-        mock_status.return_value = 404
+        mock_status.return_value = (404, None)
         mock_get.side_effect = lambda path, token, timeout=10: (
             {"name": "SECURITY.md"} if path == "/repos/acme/widgets/contents/SECURITY.md" else None
         )
@@ -494,7 +524,7 @@ class EvaluateS2C2FTests(unittest.TestCase):
         # fallback: acme/widgets has none of its own, but acme/.github
         # does -- this must still report MET, the same way GitHub's own
         # UI credits the inherited default.
-        mock_status.return_value = 404
+        mock_status.return_value = (404, None)
         mock_get.side_effect = lambda path, token, timeout=10: (
             {"name": "SECURITY.md"} if path == "/repos/acme/.github/contents/SECURITY.md" else None
         )
@@ -512,7 +542,7 @@ class EvaluateS2C2FTests(unittest.TestCase):
     @patch("cli.parsers.s2c2f._github_api_status")
     @patch("cli.parsers.s2c2f._github_api_get")
     def test_no_security_md_anywhere_is_unmet(self, mock_get, mock_status):
-        mock_status.return_value = 404
+        mock_status.return_value = (404, None)
         mock_get.return_value = None  # every candidate path, repo and org alike, 404s
 
         report = evaluate_s2c2f(
@@ -528,7 +558,7 @@ class EvaluateS2C2FTests(unittest.TestCase):
     @patch("cli.parsers.s2c2f._github_api_status")
     @patch("cli.parsers.s2c2f._github_api_get")
     def test_contents_api_failure_is_not_yet_reported(self, mock_get, mock_status):
-        mock_status.return_value = 404
+        mock_status.return_value = (404, None)
         mock_get.side_effect = GitHubAPIError("boom", status_code=403)
 
         report = evaluate_s2c2f(
@@ -799,13 +829,17 @@ class Upd2AutoUpdatesTests(unittest.TestCase):
 
 
 class Ing4SourceCloningTests(unittest.TestCase):
-    def test_always_not_yet_reported_an_honest_gap_not_a_fabricated_signal(self):
+    def test_always_unmet_a_confirmed_gap_not_an_unknown(self):
+        # Fixed 2026-09-18: this check never branches on anything -- it's
+        # not that we couldn't determine the answer, it's that we know
+        # it for certain. A confirmed absence is unmet, not
+        # not_yet_reported (same fix UPD-1 got the same day).
         report = evaluate_s2c2f(
             repo_dir=tempfile.mkdtemp(), repository="acme/widgets", resolved_dependencies=[],
             sarif_report=None, branch_governance=_governance(), token=None,
         )
         result = _controls_by_id(report)["ING-4"]
-        self.assertEqual(result.status, STATUS_NOT_YET_REPORTED)
+        self.assertEqual(result.status, STATUS_UNMET)
         self.assertIn("no such infrastructure is operated today", result.detail)
 
 
@@ -831,14 +865,17 @@ class Sca4MalwareScansTests(unittest.TestCase):
         )
         controls = _controls_by_id(report)
         self.assertEqual(controls["SCA-1"].status, STATUS_MET)
-        self.assertEqual(controls["SCA-4"].status, STATUS_NOT_YET_REPORTED)
+        self.assertEqual(controls["SCA-4"].status, STATUS_UNMET)
 
-    def test_no_sarif_at_all_is_not_yet_reported(self):
+    def test_no_sarif_at_all_is_unmet(self):
+        # Fixed 2026-09-18: a real check ran against whatever --sarif
+        # input this run actually provided (none) and found no matching
+        # tool -- a confirmed absence for this run, not an unknown.
         report = evaluate_s2c2f(
             repo_dir=tempfile.mkdtemp(), repository="acme/widgets", resolved_dependencies=[],
             sarif_report=None, branch_governance=_governance(), token=None,
         )
-        self.assertEqual(_controls_by_id(report)["SCA-4"].status, STATUS_NOT_YET_REPORTED)
+        self.assertEqual(_controls_by_id(report)["SCA-4"].status, STATUS_UNMET)
 
 
 class Sca5ProactiveReviewsTests(unittest.TestCase):

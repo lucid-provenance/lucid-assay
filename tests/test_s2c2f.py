@@ -768,6 +768,26 @@ class Upd2AutoUpdatesTests(unittest.TestCase):
             )
         self.assertEqual(_controls_by_id(report)["UPD-2"].status, STATUS_NOT_YET_REPORTED)
 
+    @patch("cli.parsers.s2c2f._github_api_status")
+    @patch("cli.parsers.s2c2f._github_api_get")
+    def test_a_real_403_on_the_bare_repo_endpoint_is_distinguishable_from_a_generic_failure(self, mock_get, mock_status):
+        # 2026-09-18: a real run showed UPD-2 collapsing every possible
+        # GitHubAPIError (a genuine 403, a network blip, anything) into
+        # the same generic "could not be reached" detail -- indistinguishable
+        # from SCA-3's own precise 403-vs-unreachable split. Locks in that
+        # the real status_code now surfaces in the detail text.
+        mock_status.return_value = 404
+        mock_get.side_effect = lambda path, token, timeout=10: (_ for _ in ()).throw(GitHubAPIError("boom", status_code=403)) if path == "/repos/acme/widgets" else None
+        with tempfile.TemporaryDirectory() as repo_dir:
+            self._write_dependabot_config(repo_dir)
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token="tok",
+            )
+        result = _controls_by_id(report)["UPD-2"]
+        self.assertEqual(result.status, STATUS_NOT_YET_REPORTED)
+        self.assertIn("boom", result.detail)
+
 
 class Ing4SourceCloningTests(unittest.TestCase):
     def test_always_not_yet_reported_an_honest_gap_not_a_fabricated_signal(self):

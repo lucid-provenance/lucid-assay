@@ -834,16 +834,28 @@ def _eval_upd1_manual_updates(repo_dir: str) -> S2C2FControlResult:
 # ---------------------------------------------------------------------------
 
 
-def _fetch_allow_auto_merge(repository: str, token: str, timeout: int) -> Optional[bool]:
+def _fetch_allow_auto_merge(repository: str, token: str, timeout: int) -> Tuple[Optional[bool], Optional[str]]:
+    """Returns (allow_auto_merge, None) on success, or (None, reason) on
+    any failure -- unlike _github_api_status's bare status-code contract,
+    _github_api_get raises GitHubAPIError uniformly for every non-2xx
+    status *and* every transport failure, so the real cause (a genuine
+    403, vs. a network blip, vs. something else) would otherwise be
+    indistinguishable in the reported detail -- the same "explain exactly
+    what's wrong" diagnostics-first convention SCA-3's own 403-vs-
+    unreachable distinction already follows."""
     try:
         data = _github_api_get(f"/repos/{repository}", token, timeout)
-    except GitHubAPIError:
-        return None
-    value = data.get("allow_auto_merge") if isinstance(data, dict) else None
-    return value if isinstance(value, bool) else None
+    except GitHubAPIError as e:
+        return None, str(e)
+    if not isinstance(data, dict):
+        return None, f"GET /repos/{repository} returned a non-object response"
+    value = data.get("allow_auto_merge")
+    if not isinstance(value, bool):
+        return None, f"GET /repos/{repository}'s response carries no boolean allow_auto_merge field"
+    return value, None
 
 
-def _eval_upd2_auto_updates(repo_dir: str, allow_auto_merge: Optional[bool]) -> S2C2FControlResult:
+def _eval_upd2_auto_updates(repo_dir: str, allow_auto_merge: Optional[bool], allow_auto_merge_error: Optional[str]) -> S2C2FControlResult:
     # A real, if soft, proxy: Dependabot/Renovate configured (the same
     # signal UPD-3 checks) *and* the repo allows auto-merge -- consistent
     # with, not proof of, updates actually landing without a human click.
@@ -852,7 +864,8 @@ def _eval_upd2_auto_updates(repo_dir: str, allow_auto_merge: Optional[bool]) -> 
     # generic signal, so this is the honest ceiling.
     found = _find_update_automation_config(repo_dir)
     if allow_auto_merge is None:
-        return _control("UPD-2", STATUS_NOT_YET_REPORTED, "the GitHub API could not be reached to check whether auto-merge is allowed for this repository (missing token or network failure)")
+        detail = f"the GitHub API could not be reached to check whether auto-merge is allowed for this repository ({allow_auto_merge_error})" if allow_auto_merge_error else "the GitHub API could not be reached to check whether auto-merge is allowed for this repository (missing token)"
+        return _control("UPD-2", STATUS_NOT_YET_REPORTED, detail)
     if not found:
         return _control("UPD-2", STATUS_UNMET, "no Dependabot or Renovate configuration file was found under the repo, so there is nothing for auto-merge to apply to")
     if allow_auto_merge:
@@ -1016,12 +1029,13 @@ def evaluate_s2c2f(
     dependabot_alerts_status: Optional[int] = None
     security_md_present: Optional[bool] = None
     allow_auto_merge: Optional[bool] = None
+    allow_auto_merge_error: Optional[str] = None
 
     if resolved_token:
         vuln_alerts_status = _github_api_status(f"/repos/{repository}/vulnerability-alerts", resolved_token, timeout)
         dependabot_alerts_status = _github_api_status(f"/repos/{repository}/dependabot/alerts?per_page=1", resolved_token, timeout)
         security_md_present = _detect_security_md(repository, resolved_token, timeout)
-        allow_auto_merge = _fetch_allow_auto_merge(repository, resolved_token, timeout)
+        allow_auto_merge, allow_auto_merge_error = _fetch_allow_auto_merge(repository, resolved_token, timeout)
 
     resolved_repo_dir = _resolve_repo_dir(repo_dir)
     feed_results = _evaluate_feed_provenance(resolved_repo_dir, internal_hosts) if resolved_repo_dir is not None else []
@@ -1036,7 +1050,7 @@ def evaluate_s2c2f(
         _eval_upd1_manual_updates(repo_dir),
         _eval_sca3_eol_scans(dependabot_alerts_status),
         _eval_inv2_incident_plans(security_md_present),
-        _eval_upd2_auto_updates(repo_dir, allow_auto_merge),
+        _eval_upd2_auto_updates(repo_dir, allow_auto_merge, allow_auto_merge_error),
         _eval_upd3_pr_alerts(repo_dir),
         _eval_aud2_consumption_audits(resolved_dependencies),
         _eval_aud3_integrity_validation(resolved_dependencies),

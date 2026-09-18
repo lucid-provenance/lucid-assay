@@ -571,12 +571,27 @@ def compute_denylist_digest(entries: List[Dict[str, Any]]) -> str:
 
 def load_denylist(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Returns (parsed_document, None) on success, or (None, reason) on any
-    failure -- missing file, malformed JSON, a schema violation, or a
-    digest mismatch (tamper-evidence, not just presence). Never raises."""
+    failure -- an unsafe path (null bytes, unrepresentable path string --
+    see cli.common.safe_resolve_path), missing file, malformed JSON, a
+    schema violation, or a digest mismatch (tamper-evidence, not just
+    presence). Never raises.
+
+    `path` is CLI-operator-supplied (--denylist, same as --junit-xml/
+    --coverage-report/--sarif) -- resolved via safe_resolve_path() here,
+    the same "sanitize right before the read, fail closed on
+    UnsafePathError" pattern every other file-input path in this package
+    follows (cli.parsers.sarif.parse_sarif_reports, cli.parsers.coverage's
+    three parsers), not enforced earlier at the CLI-arg level.
+    """
     try:
-        text = path.read_text(encoding="utf-8")
+        resolved_path = safe_resolve_path(path)
+    except UnsafePathError as e:
+        return None, f"unsafe denylist path: {e}"
+    try:
+        text = resolved_path.read_text(encoding="utf-8")
     except OSError:
-        return None, f"no denylist policy artifact found at {path}"
+        return None, f"no denylist policy artifact found at {resolved_path}"
+    path = resolved_path
     try:
         doc = json.loads(text)
     except json.JSONDecodeError as e:

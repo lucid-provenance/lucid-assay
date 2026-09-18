@@ -660,6 +660,23 @@ class Ing3DenylistsTests(unittest.TestCase):
             )
         self.assertEqual(_controls_by_id(report)["ING-3"].status, STATUS_MET)
 
+    def test_unsafe_denylist_path_degrades_closed_never_raises(self):
+        # SonarQube flagged this: --denylist is CLI-operator-supplied,
+        # same class of input as --junit-xml/--coverage-report/--sarif,
+        # and load_denylist() previously read it without routing through
+        # cli.common.safe_resolve_path() first -- the "sanitize right
+        # before the read" pattern every other file-input path in this
+        # package already follows (cli.parsers.sarif/coverage). A null
+        # byte is the concrete case safe_resolve_path itself rejects.
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(), repository="acme/widgets", resolved_dependencies=[],
+            sarif_report=None, branch_governance=_governance(), token=None,
+            denylist_path="denylist.json\x00.txt",
+        )
+        result = _controls_by_id(report)["ING-3"]
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertIn("unsafe denylist path", result.detail)
+
 
 def _write_manual_updates_config(repo_dir, process_ref):
     os.makedirs(os.path.join(repo_dir, ".lucid"), exist_ok=True)

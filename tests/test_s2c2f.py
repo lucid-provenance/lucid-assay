@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -8,9 +9,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cli.parsers.github_rules import BranchGovernanceReport, GitHubAPIError
 from cli.parsers.s2c2f import (
+    DENYLIST_SCHEMA_VERSION,
     STATUS_MET,
     STATUS_NOT_YET_REPORTED,
     STATUS_UNMET,
+    compute_denylist_digest,
     evaluate_s2c2f,
 )
 from cli.parsers.sarif import SarifRuleGroup, SarifSummaryReport, SarifToolSummary
@@ -273,9 +276,17 @@ class EvaluateS2C2FTests(unittest.TestCase):
         self.assertEqual(_controls_by_id(report)["UPD-3"].status, STATUS_MET)
 
     def test_private_registry_npmrc_satisfies_ing2(self):
+        # ING-2's real signal is per-dependency (which host each resolved
+        # package-lock.json entry actually came from) -- a bare .npmrc with
+        # no lockfile to check against can no longer satisfy it (promoted
+        # 2026-09-18; see cli.parsers.s2c2f's own module docstring).
         with tempfile.TemporaryDirectory() as repo_dir:
             with open(os.path.join(repo_dir, ".npmrc"), "w") as f:
                 f.write("registry=https://npm.internal.acme.com/\n")
+            with open(os.path.join(repo_dir, "package-lock.json"), "w") as f:
+                json.dump({"packages": {"": {}, "node_modules/left-pad": {
+                    "resolved": "https://npm.internal.acme.com/left-pad/-/left-pad-1.3.0.tgz"
+                }}}, f)
             report = evaluate_s2c2f(
                 repo_dir=repo_dir,
                 repository="acme/widgets",
@@ -283,6 +294,7 @@ class EvaluateS2C2FTests(unittest.TestCase):
                 sarif_report=None,
                 branch_governance=_governance(),
                 token=None,
+                internal_registry_hosts=["npm.internal.acme.com"],
             )
         self.assertEqual(_controls_by_id(report)["ING-2"].status, STATUS_MET)
 
@@ -290,6 +302,26 @@ class EvaluateS2C2FTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as repo_dir:
             with open(os.path.join(repo_dir, ".npmrc"), "w") as f:
                 f.write("registry=https://registry.npmjs.org/\n")
+            with open(os.path.join(repo_dir, "package-lock.json"), "w") as f:
+                json.dump({"packages": {"": {}, "node_modules/left-pad": {
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+                }}}, f)
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir,
+                repository="acme/widgets",
+                resolved_dependencies=[],
+                sarif_report=None,
+                branch_governance=_governance(),
+                token=None,
+                internal_registry_hosts=["npm.internal.acme.com"],
+            )
+        self.assertEqual(_controls_by_id(report)["ING-2"].status, STATUS_UNMET)
+
+    def test_no_manifest_at_all_yields_not_yet_reported_ing2(self):
+        # No package-lock.json/requirements.txt/pyproject.toml/Pipfile/
+        # pom.xml at all -- nothing to evaluate feed provenance against,
+        # never a fabricated met/unmet.
+        with tempfile.TemporaryDirectory() as repo_dir:
             report = evaluate_s2c2f(
                 repo_dir=repo_dir,
                 repository="acme/widgets",
@@ -298,7 +330,8 @@ class EvaluateS2C2FTests(unittest.TestCase):
                 branch_governance=_governance(),
                 token=None,
             )
-        self.assertEqual(_controls_by_id(report)["ING-2"].status, STATUS_UNMET)
+        self.assertEqual(_controls_by_id(report)["ING-2"].status, STATUS_NOT_YET_REPORTED)
+        self.assertEqual(_controls_by_id(report)["ENF-2"].status, STATUS_NOT_YET_REPORTED)
 
     def test_upd1_manual_updates_always_not_yet_reported(self):
         report = evaluate_s2c2f(
@@ -516,6 +549,242 @@ class EvaluateS2C2FTests(unittest.TestCase):
         as_dict = report.as_dict()
         self.assertEqual(as_dict["evaluated_controls"], len(as_dict["controls"]))
         self.assertEqual(as_dict["framework"], "S2C2F")
+
+
+def _write_denylist(path, entries):
+    with open(path, "w") as f:
+        json.dump({
+            "schema_version": DENYLIST_SCHEMA_VERSION,
+            "entries": entries,
+            "digest_sha256": compute_denylist_digest(entries),
+        }, f)
+
+
+class Ing3DenylistsTests(unittest.TestCase):
+    """Promoted 2026-09-18 from scripts/_ingestion_lib.py -- see
+    cli.parsers.s2c2f's own module docstring."""
+
+    def test_missing_denylist_is_unmet_not_not_yet_reported(self):
+        # A repo that never set one up genuinely hasn't implemented ING-3
+        # -- a definitive, confirmed absence, not "couldn't check".
+        with tempfile.TemporaryDirectory() as repo_dir:
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+            )
+        result = _controls_by_id(report)["ING-3"]
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertIn("no denylist policy artifact found", result.detail)
+
+    def test_empty_denylist_with_dependencies_is_met(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            denylist_path = os.path.join(repo_dir, "denylist.json")
+            _write_denylist(denylist_path, [])
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets",
+                resolved_dependencies=[{"uri": "pkg:pypi/requests@2.31.0"}],
+                sarif_report=None, branch_governance=_governance(), token=None,
+                denylist_path=denylist_path,
+            )
+        self.assertEqual(_controls_by_id(report)["ING-3"].status, STATUS_MET)
+
+    def test_matching_dependency_is_unmet(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            denylist_path = os.path.join(repo_dir, "denylist.json")
+            _write_denylist(denylist_path, [{"ecosystem": "pypi", "name": "evil-pkg", "reason": "known backdoor"}])
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets",
+                resolved_dependencies=[{"uri": "pkg:pypi/evil-pkg@1.0.0"}],
+                sarif_report=None, branch_governance=_governance(), token=None,
+                denylist_path=denylist_path,
+            )
+        result = _controls_by_id(report)["ING-3"]
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertIn("evil-pkg", result.detail)
+
+    def test_tampered_digest_is_unmet_not_a_silent_pass(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            denylist_path = os.path.join(repo_dir, "denylist.json")
+            with open(denylist_path, "w") as f:
+                json.dump({"schema_version": DENYLIST_SCHEMA_VERSION, "entries": [], "digest_sha256": "not-the-real-digest"}, f)
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+                denylist_path=denylist_path,
+            )
+        result = _controls_by_id(report)["ING-3"]
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertIn("possible tampering", result.detail)
+
+    def test_default_denylist_path_is_lucid_denylist_json_under_repo_dir(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            os.makedirs(os.path.join(repo_dir, ".lucid"))
+            _write_denylist(os.path.join(repo_dir, ".lucid", "denylist.json"), [])
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+            )
+        self.assertEqual(_controls_by_id(report)["ING-3"].status, STATUS_MET)
+
+
+class Ing4SourceCloningTests(unittest.TestCase):
+    def test_always_not_yet_reported_an_honest_gap_not_a_fabricated_signal(self):
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(), repository="acme/widgets", resolved_dependencies=[],
+            sarif_report=None, branch_governance=_governance(), token=None,
+        )
+        result = _controls_by_id(report)["ING-4"]
+        self.assertEqual(result.status, STATUS_NOT_YET_REPORTED)
+        self.assertIn("no such infrastructure is operated today", result.detail)
+
+
+class Sca4MalwareScansTests(unittest.TestCase):
+    def _sarif(self, tools_scanned):
+        return SarifSummaryReport(available=True, tools_scanned=tools_scanned)
+
+    def test_osv_scanner_sarif_satisfies_sca4(self):
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(), repository="acme/widgets", resolved_dependencies=[],
+            sarif_report=self._sarif(["osv-scanner"]), branch_governance=_governance(), token=None,
+        )
+        self.assertEqual(_controls_by_id(report)["SCA-4"].status, STATUS_MET)
+
+    def test_a_pure_cve_tool_does_not_satisfy_sca4_even_though_it_satisfies_sca1(self):
+        # trivy is a recognized SCA-1 (Vulnerability Scans) tool but has no
+        # dedicated malicious-package feed -- SCA-4 is a genuinely
+        # different question ("did a malware-capable scan run"), and the
+        # two must be able to disagree.
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(), repository="acme/widgets", resolved_dependencies=[],
+            sarif_report=self._sarif(["trivy"]), branch_governance=_governance(), token=None,
+        )
+        controls = _controls_by_id(report)
+        self.assertEqual(controls["SCA-1"].status, STATUS_MET)
+        self.assertEqual(controls["SCA-4"].status, STATUS_NOT_YET_REPORTED)
+
+    def test_no_sarif_at_all_is_not_yet_reported(self):
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(), repository="acme/widgets", resolved_dependencies=[],
+            sarif_report=None, branch_governance=_governance(), token=None,
+        )
+        self.assertEqual(_controls_by_id(report)["SCA-4"].status, STATUS_NOT_YET_REPORTED)
+
+
+class Sca5ProactiveReviewsTests(unittest.TestCase):
+    def test_branch_governance_unavailable_is_not_yet_reported(self):
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(), repository="acme/widgets", resolved_dependencies=[],
+            sarif_report=None, branch_governance=_governance(available=False), token=None,
+        )
+        self.assertEqual(_controls_by_id(report)["SCA-5"].status, STATUS_NOT_YET_REPORTED)
+
+    def test_no_codeowners_is_unmet(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(require_code_owner_review=True), token=None,
+            )
+        self.assertEqual(_controls_by_id(report)["SCA-5"].status, STATUS_UNMET)
+
+    def test_codeowners_covers_manifest_but_review_not_required_is_unmet(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            with open(os.path.join(repo_dir, "CODEOWNERS"), "w") as f:
+                f.write("package.json @acme/platform-team\n")
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(require_code_owner_review=False), token=None,
+            )
+        result = _controls_by_id(report)["SCA-5"]
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertIn("does not require code-owner review", result.detail)
+
+    def test_codeowners_covers_manifest_and_review_required_is_met(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            os.makedirs(os.path.join(repo_dir, ".github"))
+            with open(os.path.join(repo_dir, ".github", "CODEOWNERS"), "w") as f:
+                f.write("*.md @acme/docs-team\nrequirements.txt @acme/platform-team\n")
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(require_code_owner_review=True), token=None,
+            )
+        result = _controls_by_id(report)["SCA-5"]
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertIn("requirements.txt", result.detail)
+
+    def test_codeowners_present_but_covers_no_manifest_is_unmet(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            with open(os.path.join(repo_dir, "CODEOWNERS"), "w") as f:
+                f.write("*.md @acme/docs-team\n")
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(require_code_owner_review=True), token=None,
+            )
+        self.assertEqual(_controls_by_id(report)["SCA-5"].status, STATUS_UNMET)
+
+    def test_wildcard_codeowners_entry_covers_every_manifest(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            with open(os.path.join(repo_dir, "CODEOWNERS"), "w") as f:
+                f.write("* @acme/platform-team\n")
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(require_code_owner_review=True), token=None,
+            )
+        self.assertEqual(_controls_by_id(report)["SCA-5"].status, STATUS_MET)
+
+
+class Enf2CuratedFeedsTests(unittest.TestCase):
+    def test_all_internal_is_met(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            with open(os.path.join(repo_dir, "package-lock.json"), "w") as f:
+                json.dump({"packages": {"": {}, "node_modules/left-pad": {
+                    "resolved": "https://npm.internal.acme.com/left-pad/-/left-pad-1.3.0.tgz"
+                }}}, f)
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+                internal_registry_hosts=["npm.internal.acme.com"],
+            )
+        result = _controls_by_id(report)["ENF-2"]
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertIn("enforcement would not break this build", result.detail)
+
+    def test_a_public_resolution_is_unmet_a_real_enforcement_gate_would_break(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            with open(os.path.join(repo_dir, "package-lock.json"), "w") as f:
+                json.dump({"packages": {"": {}, "node_modules/left-pad": {
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+                }}}, f)
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+                internal_registry_hosts=["npm.internal.acme.com"],
+            )
+        result = _controls_by_id(report)["ENF-2"]
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertIn("a build enforcing curated-feed consumption would break here", result.detail)
+
+
+class NewControlCatalogTests(unittest.TestCase):
+    """Locks in label/level for every control promoted/added 2026-09-18 --
+    a typo here would silently mismatch lucid-console's lib/s2c2f.ts
+    catalog (checked by hand against that file, not duplicated here)."""
+
+    def test_labels_and_levels(self):
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(), repository="acme/widgets", resolved_dependencies=[],
+            sarif_report=None, branch_governance=_governance(), token=None,
+        )
+        controls = _controls_by_id(report)
+        expected = {
+            "ING-3": ("Denylists", 3),
+            "ING-4": ("Source Cloning", 3),
+            "SCA-4": ("Malware Scans", 3),
+            "SCA-5": ("Proactive Reviews", 3),
+            "ENF-2": ("Curated Feeds", 3),
+        }
+        for control_id, (label, level) in expected.items():
+            self.assertEqual(controls[control_id].label, label, control_id)
+            self.assertEqual(controls[control_id].level, level, control_id)
 
 
 if __name__ == "__main__":

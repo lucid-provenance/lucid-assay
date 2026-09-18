@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -545,6 +546,8 @@ def _evaluate_s2c2f_controls(
     rationale as _ingest_sarif/_detect_lockfile_dependencies/
     _compute_real_coverage_analysis above) so it's unit-testable directly."""
     with _stage(stage_ns, "s2c2f_evaluation"):
+        internal_hosts_raw = args.internal_registry if args.internal_registry is not None else os.environ.get("LUCID_INTERNAL_REGISTRY_HOSTS", "")
+        internal_registry_hosts = [h.strip().lower() for h in internal_hosts_raw.split(",") if h.strip()]
         return evaluate_s2c2f(
             repo_dir=args.repo_dir,
             repository=args.repository,
@@ -552,6 +555,8 @@ def _evaluate_s2c2f_controls(
             sarif_report=sarif_report,
             branch_governance=branch_governance,
             token=args.github_token,
+            denylist_path=args.denylist,
+            internal_registry_hosts=internal_registry_hosts,
         )
 
 
@@ -745,6 +750,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--github-token",
         default=None,
         help="GitHub token for branch governance/ruleset inspection (default: ambient GITHUB_TOKEN env var)",
+    )
+    p.add_argument(
+        "--denylist",
+        default=None,
+        help="path to the S2C2F ING-3 denylist policy artifact (default: <repo-dir>/.lucid/denylist.json)",
+    )
+    p.add_argument(
+        "--internal-registry",
+        default=None,
+        help="comma-separated internal/curated registry host substrings, for S2C2F ING-2/ENF-2's feed-provenance check "
+        "(default: ambient LUCID_INTERNAL_REGISTRY_HOSTS env var, else none configured)",
     )
     p.add_argument(
         "--sarif",

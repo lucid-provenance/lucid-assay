@@ -715,78 +715,87 @@ class Upd1ManualUpdatesTests(unittest.TestCase):
 
 
 class Upd2AutoUpdatesTests(unittest.TestCase):
+    """Rewritten 2026-09-18, same day as it was first built: the original
+    design (GET /repos/{owner}/{repo}'s allow_auto_merge field) was
+    confirmed -- against a real CI run, then independently against a real
+    unauthenticated API call -- to be structurally unreachable with any
+    read-only token, since GitHub omits that field unless the caller has
+    push access. Replaced with a real, local, no-API signal: a workflow
+    under .github/workflows/ that wires up Dependabot-PR auto-merge via
+    dependabot/fetch-metadata."""
+
     def _write_dependabot_config(self, repo_dir):
         os.makedirs(os.path.join(repo_dir, ".github"))
         with open(os.path.join(repo_dir, ".github", "dependabot.yml"), "w") as f:
             f.write("version: 2\n")
 
-    @patch("cli.parsers.s2c2f._github_api_status")
-    @patch("cli.parsers.s2c2f._github_api_get")
-    def test_dependabot_config_plus_allow_auto_merge_is_met(self, mock_get, mock_status):
-        mock_status.return_value = 404
-        mock_get.side_effect = lambda path, token, timeout=10: {"allow_auto_merge": True} if path == "/repos/acme/widgets" else None
-        with tempfile.TemporaryDirectory() as repo_dir:
-            self._write_dependabot_config(repo_dir)
-            report = evaluate_s2c2f(
-                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
-                sarif_report=None, branch_governance=_governance(), token="tok",
-            )
-        self.assertEqual(_controls_by_id(report)["UPD-2"].status, STATUS_MET)
+    def _write_automerge_workflow(self, repo_dir, name="dependabot-automerge.yml"):
+        workflows_dir = os.path.join(repo_dir, ".github", "workflows")
+        os.makedirs(workflows_dir, exist_ok=True)
+        with open(os.path.join(workflows_dir, name), "w") as f:
+            f.write("on: pull_request\njobs:\n  auto-merge:\n    steps:\n      - uses: dependabot/fetch-metadata@v2\n")
 
-    @patch("cli.parsers.s2c2f._github_api_status")
-    @patch("cli.parsers.s2c2f._github_api_get")
-    def test_dependabot_config_without_allow_auto_merge_is_unmet(self, mock_get, mock_status):
-        mock_status.return_value = 404
-        mock_get.side_effect = lambda path, token, timeout=10: {"allow_auto_merge": False} if path == "/repos/acme/widgets" else None
+    def test_dependabot_config_plus_automerge_workflow_is_met(self):
         with tempfile.TemporaryDirectory() as repo_dir:
             self._write_dependabot_config(repo_dir)
+            self._write_automerge_workflow(repo_dir)
             report = evaluate_s2c2f(
                 repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
-                sarif_report=None, branch_governance=_governance(), token="tok",
+                sarif_report=None, branch_governance=_governance(), token=None,
             )
         result = _controls_by_id(report)["UPD-2"]
-        self.assertEqual(result.status, STATUS_UNMET)
-        self.assertIn("does not allow auto-merge", result.detail)
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertIn("dependabot-automerge.yml", result.detail)
 
-    @patch("cli.parsers.s2c2f._github_api_status")
-    @patch("cli.parsers.s2c2f._github_api_get")
-    def test_no_update_automation_config_is_unmet_even_with_auto_merge_allowed(self, mock_get, mock_status):
-        mock_status.return_value = 404
-        mock_get.side_effect = lambda path, token, timeout=10: {"allow_auto_merge": True} if path == "/repos/acme/widgets" else None
-        report = evaluate_s2c2f(
-            repo_dir=tempfile.mkdtemp(), repository="acme/widgets", resolved_dependencies=[],
-            sarif_report=None, branch_governance=_governance(), token="tok",
-        )
-        self.assertEqual(_controls_by_id(report)["UPD-2"].status, STATUS_UNMET)
-
-    def test_no_token_is_not_yet_reported(self):
+    def test_dependabot_config_without_automerge_workflow_is_unmet(self):
         with tempfile.TemporaryDirectory() as repo_dir:
             self._write_dependabot_config(repo_dir)
             report = evaluate_s2c2f(
                 repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
                 sarif_report=None, branch_governance=_governance(), token=None,
             )
-        self.assertEqual(_controls_by_id(report)["UPD-2"].status, STATUS_NOT_YET_REPORTED)
+        result = _controls_by_id(report)["UPD-2"]
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertIn("no dependabot/fetch-metadata usage found", result.detail)
 
-    @patch("cli.parsers.s2c2f._github_api_status")
-    @patch("cli.parsers.s2c2f._github_api_get")
-    def test_a_real_403_on_the_bare_repo_endpoint_is_distinguishable_from_a_generic_failure(self, mock_get, mock_status):
-        # 2026-09-18: a real run showed UPD-2 collapsing every possible
-        # GitHubAPIError (a genuine 403, a network blip, anything) into
-        # the same generic "could not be reached" detail -- indistinguishable
-        # from SCA-3's own precise 403-vs-unreachable split. Locks in that
-        # the real status_code now surfaces in the detail text.
-        mock_status.return_value = 404
-        mock_get.side_effect = lambda path, token, timeout=10: (_ for _ in ()).throw(GitHubAPIError("boom", status_code=403)) if path == "/repos/acme/widgets" else None
+    def test_a_workflow_that_merely_skips_steps_for_dependabot_actors_does_not_satisfy_it(self):
+        # A workflow with an `if: github.actor != 'dependabot[bot]'` guard
+        # (this repo's own real assay.yml pattern) is not auto-merge
+        # automation -- it's the opposite, a secrets-withholding
+        # workaround. Must not be mistaken for the real signal.
         with tempfile.TemporaryDirectory() as repo_dir:
             self._write_dependabot_config(repo_dir)
+            workflows_dir = os.path.join(repo_dir, ".github", "workflows")
+            os.makedirs(workflows_dir)
+            with open(os.path.join(workflows_dir, "ci.yml"), "w") as f:
+                f.write("on: push\njobs:\n  build:\n    steps:\n      - if: github.actor != 'dependabot[bot]'\n        run: echo ok\n")
             report = evaluate_s2c2f(
                 repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
-                sarif_report=None, branch_governance=_governance(), token="tok",
+                sarif_report=None, branch_governance=_governance(), token=None,
             )
-        result = _controls_by_id(report)["UPD-2"]
-        self.assertEqual(result.status, STATUS_NOT_YET_REPORTED)
-        self.assertIn("boom", result.detail)
+        self.assertEqual(_controls_by_id(report)["UPD-2"].status, STATUS_UNMET)
+
+    def test_no_update_automation_config_is_unmet_even_with_an_automerge_workflow(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            self._write_automerge_workflow(repo_dir)
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+            )
+        self.assertEqual(_controls_by_id(report)["UPD-2"].status, STATUS_UNMET)
+
+    def test_no_token_needed_at_all_this_is_a_local_check(self):
+        # Unlike the original design, this control needs no GitHub API
+        # access whatsoever -- confirms it evaluates identically with or
+        # without a token.
+        with tempfile.TemporaryDirectory() as repo_dir:
+            self._write_dependabot_config(repo_dir)
+            self._write_automerge_workflow(repo_dir)
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+            )
+        self.assertEqual(_controls_by_id(report)["UPD-2"].status, STATUS_MET)
 
 
 class Ing4SourceCloningTests(unittest.TestCase):

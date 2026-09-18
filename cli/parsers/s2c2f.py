@@ -834,43 +834,62 @@ def _eval_upd1_manual_updates(repo_dir: str) -> S2C2FControlResult:
 # ---------------------------------------------------------------------------
 
 
-def _fetch_allow_auto_merge(repository: str, token: str, timeout: int) -> Tuple[Optional[bool], Optional[str]]:
-    """Returns (allow_auto_merge, None) on success, or (None, reason) on
-    any failure -- unlike _github_api_status's bare status-code contract,
-    _github_api_get raises GitHubAPIError uniformly for every non-2xx
-    status *and* every transport failure, so the real cause (a genuine
-    403, vs. a network blip, vs. something else) would otherwise be
-    indistinguishable in the reported detail -- the same "explain exactly
-    what's wrong" diagnostics-first convention SCA-3's own 403-vs-
-    unreachable distinction already follows."""
+# 2026-09-18, rewritten same day: the first version of this check read
+# GET /repos/{owner}/{repo}'s allow_auto_merge field -- confirmed against
+# a real run, then independently against a real *unauthenticated* call,
+# that GitHub omits that field entirely unless the caller has *push*
+# access to the repo. Every GitHub-API-backed check in this pipeline
+# deliberately uses a read-only token (see this repo's own README/
+# CLAUDE.md) -- allow_auto_merge was therefore structurally unreachable
+# from day one, not a permission this App could ever be granted without
+# abandoning that posture. Replaced with a real, local, no-API signal
+# instead: whether a workflow under .github/workflows/ actually wires up
+# Dependabot-PR auto-merge, detected via `dependabot/fetch-metadata` --
+# the de facto standard building block every real "gh pr merge --auto"-
+# style Dependabot automation is built on (it's what exposes the PR's
+# own update-type/dependency metadata to a workflow's own `if:`
+# condition). More specific than the old signal would even have been:
+# a bare allow_auto_merge=true says nothing about whether *dependency*
+# PRs specifically get auto-merged, just that auto-merge is possible for
+# some PR, by someone, for any reason.
+_DEPENDABOT_AUTOMERGE_MARKER = "dependabot/fetch-metadata"
+
+
+def _find_dependabot_automerge_workflow(repo_dir: str) -> Optional[str]:
+    resolved_dir = _resolve_repo_dir(repo_dir)
+    if resolved_dir is None:
+        return None
+    workflows_dir = resolved_dir / ".github" / "workflows"
+    if not workflows_dir.is_dir():
+        return None
     try:
-        data = _github_api_get(f"/repos/{repository}", token, timeout)
-    except GitHubAPIError as e:
-        return None, str(e)
-    if not isinstance(data, dict):
-        return None, f"GET /repos/{repository} returned a non-object response"
-    value = data.get("allow_auto_merge")
-    if not isinstance(value, bool):
-        return None, f"GET /repos/{repository}'s response carries no boolean allow_auto_merge field"
-    return value, None
+        entries = sorted(workflows_dir.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.suffix not in (".yml", ".yaml") or not entry.is_file():
+            continue
+        try:
+            text = entry.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if _DEPENDABOT_AUTOMERGE_MARKER in text:
+            return f".github/workflows/{entry.name}"
+    return None
 
 
-def _eval_upd2_auto_updates(repo_dir: str, allow_auto_merge: Optional[bool], allow_auto_merge_error: Optional[str]) -> S2C2FControlResult:
-    # A real, if soft, proxy: Dependabot/Renovate configured (the same
-    # signal UPD-3 checks) *and* the repo allows auto-merge -- consistent
-    # with, not proof of, updates actually landing without a human click.
-    # Neither GitHub nor this repo's tooling exposes "did the last N
-    # Dependabot PRs merge without a human approving them" as a cheap,
-    # generic signal, so this is the honest ceiling.
+def _eval_upd2_auto_updates(repo_dir: str) -> S2C2FControlResult:
     found = _find_update_automation_config(repo_dir)
-    if allow_auto_merge is None:
-        detail = f"the GitHub API could not be reached to check whether auto-merge is allowed for this repository ({allow_auto_merge_error})" if allow_auto_merge_error else "the GitHub API could not be reached to check whether auto-merge is allowed for this repository (missing token)"
-        return _control("UPD-2", STATUS_NOT_YET_REPORTED, detail)
     if not found:
         return _control("UPD-2", STATUS_UNMET, "no Dependabot or Renovate configuration file was found under the repo, so there is nothing for auto-merge to apply to")
-    if allow_auto_merge:
-        return _control("UPD-2", STATUS_MET, f"{found} configures automated dependency-update pull requests, and this repository allows auto-merge")
-    return _control("UPD-2", STATUS_UNMET, f"{found} configures automated dependency-update pull requests, but this repository does not allow auto-merge; updates still require a manual merge")
+    automerge_workflow = _find_dependabot_automerge_workflow(repo_dir)
+    if automerge_workflow:
+        return _control("UPD-2", STATUS_MET, f"{found} configures automated dependency-update pull requests, and {automerge_workflow} auto-merges them (dependabot/fetch-metadata)")
+    return _control(
+        "UPD-2", STATUS_UNMET,
+        f"{found} configures automated dependency-update pull requests, but no workflow under .github/workflows/ appears to auto-merge them "
+        "(no dependabot/fetch-metadata usage found); updates still require a manual merge",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1028,14 +1047,11 @@ def evaluate_s2c2f(
     vuln_alerts_status: Optional[int] = None
     dependabot_alerts_status: Optional[int] = None
     security_md_present: Optional[bool] = None
-    allow_auto_merge: Optional[bool] = None
-    allow_auto_merge_error: Optional[str] = None
 
     if resolved_token:
         vuln_alerts_status = _github_api_status(f"/repos/{repository}/vulnerability-alerts", resolved_token, timeout)
         dependabot_alerts_status = _github_api_status(f"/repos/{repository}/dependabot/alerts?per_page=1", resolved_token, timeout)
         security_md_present = _detect_security_md(repository, resolved_token, timeout)
-        allow_auto_merge, allow_auto_merge_error = _fetch_allow_auto_merge(repository, resolved_token, timeout)
 
     resolved_repo_dir = _resolve_repo_dir(repo_dir)
     feed_results = _evaluate_feed_provenance(resolved_repo_dir, internal_hosts) if resolved_repo_dir is not None else []
@@ -1050,7 +1066,7 @@ def evaluate_s2c2f(
         _eval_upd1_manual_updates(repo_dir),
         _eval_sca3_eol_scans(dependabot_alerts_status),
         _eval_inv2_incident_plans(security_md_present),
-        _eval_upd2_auto_updates(repo_dir, allow_auto_merge, allow_auto_merge_error),
+        _eval_upd2_auto_updates(repo_dir),
         _eval_upd3_pr_alerts(repo_dir),
         _eval_aud2_consumption_audits(resolved_dependencies),
         _eval_aud3_integrity_validation(resolved_dependencies),

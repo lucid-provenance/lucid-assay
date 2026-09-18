@@ -976,15 +976,24 @@ since the check genuinely ran and found nothing, the same "checked vs.
 couldn't check" distinction every other control in this module already
 draws.
 
-**`UPD-2` (Auto-Updates), new 2026-09-18**: a Dependabot/Renovate config
-(the same signal `UPD-3` checks) *and* the repository's own
-`allow_auto_merge` setting (`GET /repos/{owner}/{repo}`) both being true.
-Deliberately a soft proxy, documented as such: neither this pipeline nor
-GitHub's own API exposes "did the last N dependency-update PRs actually
-merge without a human clicking approve" as a cheap, generic signal, so
-"update automation is configured, and the repo permits auto-merge" is the
-honest ceiling — consistent with, not proof of, updates landing
-automatically.
+**`UPD-2` (Auto-Updates), new 2026-09-18, redesigned the same day**: a
+Dependabot/Renovate config (the same signal `UPD-3` checks) *and* a
+workflow under `.github/workflows/` that actually auto-merges Dependabot
+PRs, detected via the `dependabot/fetch-metadata` marker — the de facto
+standard building block every real "`gh pr merge --auto`"-style
+Dependabot automation is built on. The first version of this check read
+`GET /repos/{owner}/{repo}`'s `allow_auto_merge` field instead —
+confirmed, first against a real CI run and then independently against a
+real *unauthenticated* API call, that GitHub omits that field entirely
+unless the caller has *push* access to the repo. Every GitHub-API-backed
+check in this pipeline deliberately uses a read-only token, so that
+field was structurally unreachable from day one, not a permission this
+repo's own App could ever be granted without abandoning that posture.
+The replacement needs no GitHub API access at all — and is arguably a
+more precise signal than the original would have been anyway:
+`allow_auto_merge=true` alone says nothing about whether *dependency*
+PRs specifically get auto-merged, just that auto-merge is possible for
+some PR, by someone, for any reason.
 
 **`ING-3` (Denylists)** validates a checked-in, schema/digest-verified
 denylist policy artifact (`--denylist`, default

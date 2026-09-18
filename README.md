@@ -934,10 +934,10 @@ matching against known SCA/license-scanning tools — including
 for `SCA-2` — or GitHub's vulnerability-alerts API), `INV-1`
 (resolved-dependency inventory), `UPD-1` (a real, checked assertion as of
 2026-09-18 — see its own paragraph below), `SCA-3` (GitHub Dependabot
-alerts API reachability — needs `permission-vulnerability-alerts: read`
-on the caller's own App/PAT token; see `.github/workflows/assay.yml`'s
-own "Generate GitHub App Token" step for this repo's dogfood
-configuration of it), `INV-2`
+alerts API reachability — needs a permission this repo's own dogfood App
+token doesn't grant today; confirmed 403ing on a real run, see
+`.github/workflows/assay.yml`'s own "Generate GitHub App Token" step
+comment for the unresolved diagnosis), `INV-2`
 (`SECURITY.md` present via the GitHub Contents API — the repository's own
 copy at one of GitHub's three recognized paths, or the organization's
 `.github` repo's default if the repository has none of its own; fixed

@@ -932,14 +932,19 @@ too, see `parsers/sbom.py` below), `SCA-1`/`SCA-2` (SARIF tool-name
 matching against known SCA/license-scanning tools — including
 `parsers/sbom.py`'s own synthetic `lucid-assay-sbom-license-policy` tool
 for `SCA-2` — or GitHub's vulnerability-alerts API), `INV-1`
-(resolved-dependency inventory), `UPD-1` (always `not_yet_reported` — see
-above), `SCA-3` (GitHub Dependabot alerts API reachability), `INV-2`
+(resolved-dependency inventory), `UPD-1` (a real, checked assertion as of
+2026-09-18 — see its own paragraph below), `SCA-3` (GitHub Dependabot
+alerts API reachability — needs `permission-vulnerability-alerts: read`
+on the caller's own App/PAT token; see `.github/workflows/assay.yml`'s
+own "Generate GitHub App Token" step for this repo's dogfood
+configuration of it), `INV-2`
 (`SECURITY.md` present via the GitHub Contents API — the repository's own
 copy at one of GitHub's three recognized paths, or the organization's
 `.github` repo's default if the repository has none of its own; fixed
 2026-09-10 from an earlier version that read the community-profile API's
 `files.security` key, which GitHub's own REST API schema has never
-actually defined), `UPD-3`
+actually defined), `UPD-2` (new 2026-09-18 — see its own paragraph
+below), `UPD-3`
 (a Dependabot/Renovate config file), `AUD-2`/`AUD-3` (resolved-dependency
 inventory / pkg: PURL + sha256/sha512 digest — the same hermeticity check
 `cli/verify.py`'s Dependency Materialization Evidence section's
@@ -949,6 +954,37 @@ check on the branch names a provenance/attestation verification job —
 see `github_rules.BranchGovernanceReport.required_status_check_contexts`),
 and, new 2026-09-18, `ING-3`/`ING-4`/`SCA-4`/`SCA-5`/`ENF-2` (all
 described in their own paragraphs below).
+
+**`UPD-1` (Manual Updates), rewritten 2026-09-18** from a permanent
+`not_yet_reported` into a real, checked assertion — Bill's own framing,
+explicitly rejecting a "scan CONTRIBUTING.md for update-sounding text"
+heuristic: *"to keep our evaluations honest and avoid fuzzy markdown
+regexes... treat UPD-1 as an asserted procedural control verified via
+explicit repo configuration or a dedicated runbook document, rather than
+pretending static analysis can infer a human process."* A checked-in
+`.lucid/manual-updates.json` (`{"schema_version": "s2c2f-manual-updates/v1",
+"process_ref": "<repo-relative path or http(s) URL>"}`) is the primary
+assertion path — a relative-path `process_ref` is verified to actually
+exist in the repo (a dangling pointer reports `unmet`, never silently
+trusted); a URL `process_ref` is trusted without being fetched, the same
+model `--license-curations`' own entries already use, since this pipeline
+has no network-egress budget for verifying arbitrary external URLs stay
+live. With no config present, a dedicated `UPDATING.md` or
+`docs/manual-updates.md` at the repo root also satisfies it. Neither
+present: `unmet` (checked, confirmed absent) — never `not_yet_reported`,
+since the check genuinely ran and found nothing, the same "checked vs.
+couldn't check" distinction every other control in this module already
+draws.
+
+**`UPD-2` (Auto-Updates), new 2026-09-18**: a Dependabot/Renovate config
+(the same signal `UPD-3` checks) *and* the repository's own
+`allow_auto_merge` setting (`GET /repos/{owner}/{repo}`) both being true.
+Deliberately a soft proxy, documented as such: neither this pipeline nor
+GitHub's own API exposes "did the last N dependency-update PRs actually
+merge without a human clicking approve" as a cheap, generic signal, so
+"update automation is configured, and the repo permits auto-merge" is the
+honest ceiling — consistent with, not proof of, updates landing
+automatically.
 
 **`ING-3` (Denylists)** validates a checked-in, schema/digest-verified
 denylist policy artifact (`--denylist`, default

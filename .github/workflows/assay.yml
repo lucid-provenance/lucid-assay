@@ -367,6 +367,15 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           permission-administration: read
           permission-contents: read
+          # For cli.parsers.s2c2f's SCA-3 (EOL Scans, GET .../dependabot/
+          # alerts) and SCA-1's vulnerability-alerts fallback -- both were
+          # 403ing (confirmed 2026-09-18: SCA-3 reported "the token likely
+          # lacks 'Dependabot alerts: Read' permission", and this was
+          # never requested here). Not yet confirmed against a real run
+          # whether the App itself has this permission enabled in its own
+          # GitHub settings -- if this step starts failing outright rather
+          # than just SCA-3 staying 403, that's the first thing to check.
+          permission-vulnerability-alerts: read
 
       # push carries no PR context of its own -- see the `on:` block's
       # comment for the full rationale. Looks up whichever PR GitHub

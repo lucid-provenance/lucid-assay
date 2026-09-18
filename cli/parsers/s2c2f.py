@@ -143,6 +143,7 @@ _CONTROL_CATALOG: Dict[str, Tuple[str, int]] = {
     "UPD-1": ("Manual Updates", 1),
     "SCA-3": ("EOL Scans", 2),
     "INV-2": ("Incident Plans", 2),
+    "UPD-2": ("Auto-Updates", 2),
     "UPD-3": ("PR Alerts", 2),
     "AUD-2": ("Consumption Audits", 2),
     "AUD-3": ("Integrity Validation", 2),
@@ -756,13 +757,107 @@ def _eval_inv1_inventory(resolved_dependencies: List[Dict[str, Any]]) -> S2C2FCo
     return _control("INV-1", STATUS_UNMET, "predicate.resolved_dependencies is empty; no recognized lockfile was found")
 
 
-def _eval_upd1_manual_updates() -> S2C2FControlResult:
-    # S2C2F's UPD-1 describes a documented *process* for manually updating
-    # OSS components when auto-update isn't available -- a policy fact, not
-    # a technical artifact this pipeline can observe in a repo checkout or
-    # via the GitHub API. Always not_yet_reported, honestly, rather than
-    # inferred from an unrelated proxy signal.
-    return _control("UPD-1", STATUS_NOT_YET_REPORTED, "no generic, repo-observable signal exists for a documented manual-update process")
+# S2C2F's UPD-1 describes a documented *process* for manually updating OSS
+# components when auto-update isn't available -- a policy fact a fuzzy
+# markdown-content heuristic can't honestly infer (2026-09-18: deliberately
+# rejected a "scan CONTRIBUTING.md for update-sounding text" heuristic in
+# favor of this -- an explicit, checked-in assertion, verified where it
+# can be, not guessed at). Two ways a repo can assert this control, both
+# real and checkable rather than scraped:
+#   1. `.lucid/manual-updates.json`'s `process_ref` -- a relative repo path
+#      (verified to actually exist -- a dangling pointer is a real,
+#      reportable unmet, not silently trusted) or an http(s) URL (not
+#      fetched -- same trust-the-human-asserter model
+#      `--license-curations`' own entries already use, since this
+#      pipeline has no network-egress budget for verifying arbitrary
+#      external URLs are live).
+#   2. A dedicated runbook file at one of `_MANUAL_UPDATES_FALLBACK_PATHS`,
+#      when no config points elsewhere.
+MANUAL_UPDATES_SCHEMA_VERSION = "s2c2f-manual-updates/v1"
+_MANUAL_UPDATES_CONFIG_PATH = ".lucid/manual-updates.json"
+_MANUAL_UPDATES_FALLBACK_PATHS = ("UPDATING.md", "docs/manual-updates.md")
+
+
+def _load_manual_updates_process_ref(repo_dir: Path) -> Optional[str]:
+    """Returns the real `process_ref` string from `.lucid/manual-updates.json`,
+    or None on anything short of a fully valid, schema-matching assertion
+    (missing file, malformed JSON, wrong/missing schema_version, missing/
+    empty process_ref) -- never raises, never guesses."""
+    try:
+        text = (repo_dir / _MANUAL_UPDATES_CONFIG_PATH).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(doc, dict) or doc.get("schema_version") != MANUAL_UPDATES_SCHEMA_VERSION:
+        return None
+    process_ref = doc.get("process_ref")
+    return process_ref if isinstance(process_ref, str) and process_ref.strip() else None
+
+
+def _process_ref_is_url(process_ref: str) -> bool:
+    parsed = urlparse(process_ref)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def _eval_upd1_manual_updates(repo_dir: str) -> S2C2FControlResult:
+    resolved_dir = _resolve_repo_dir(repo_dir)
+    if resolved_dir is None:
+        return _control("UPD-1", STATUS_NOT_YET_REPORTED, f"repo_dir {repo_dir!r} could not be resolved")
+
+    process_ref = _load_manual_updates_process_ref(resolved_dir)
+    if process_ref:
+        if _process_ref_is_url(process_ref):
+            return _control("UPD-1", STATUS_MET, f".lucid/manual-updates.json asserts a documented manual-update process at {process_ref}")
+        if (resolved_dir / process_ref).is_file():
+            return _control("UPD-1", STATUS_MET, f".lucid/manual-updates.json asserts a documented manual-update process at {process_ref}, and that file exists in the repo")
+        return _control(
+            "UPD-1", STATUS_UNMET,
+            f".lucid/manual-updates.json's process_ref ({process_ref!r}) does not exist in the repo -- a stale or broken assertion",
+        )
+
+    for rel_path in _MANUAL_UPDATES_FALLBACK_PATHS:
+        if (resolved_dir / rel_path).is_file():
+            return _control("UPD-1", STATUS_MET, f"{rel_path} is present as a dedicated manual-update runbook")
+
+    return _control(
+        "UPD-1", STATUS_UNMET,
+        "no .lucid/manual-updates.json process_ref, and neither UPDATING.md nor docs/manual-updates.md exists -- "
+        "no documented manual-update process asserted",
+    )
+
+
+# ---------------------------------------------------------------------------
+# UPD-2: Auto-Updates
+# ---------------------------------------------------------------------------
+
+
+def _fetch_allow_auto_merge(repository: str, token: str, timeout: int) -> Optional[bool]:
+    try:
+        data = _github_api_get(f"/repos/{repository}", token, timeout)
+    except GitHubAPIError:
+        return None
+    value = data.get("allow_auto_merge") if isinstance(data, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def _eval_upd2_auto_updates(repo_dir: str, allow_auto_merge: Optional[bool]) -> S2C2FControlResult:
+    # A real, if soft, proxy: Dependabot/Renovate configured (the same
+    # signal UPD-3 checks) *and* the repo allows auto-merge -- consistent
+    # with, not proof of, updates actually landing without a human click.
+    # Neither GitHub nor this repo's tooling exposes "did the last N
+    # Dependabot PRs merge without a human approving them" as a cheap,
+    # generic signal, so this is the honest ceiling.
+    found = _find_update_automation_config(repo_dir)
+    if allow_auto_merge is None:
+        return _control("UPD-2", STATUS_NOT_YET_REPORTED, "the GitHub API could not be reached to check whether auto-merge is allowed for this repository (missing token or network failure)")
+    if not found:
+        return _control("UPD-2", STATUS_UNMET, "no Dependabot or Renovate configuration file was found under the repo, so there is nothing for auto-merge to apply to")
+    if allow_auto_merge:
+        return _control("UPD-2", STATUS_MET, f"{found} configures automated dependency-update pull requests, and this repository allows auto-merge")
+    return _control("UPD-2", STATUS_UNMET, f"{found} configures automated dependency-update pull requests, but this repository does not allow auto-merge; updates still require a manual merge")
 
 
 # ---------------------------------------------------------------------------
@@ -920,11 +1015,13 @@ def evaluate_s2c2f(
     vuln_alerts_status: Optional[int] = None
     dependabot_alerts_status: Optional[int] = None
     security_md_present: Optional[bool] = None
+    allow_auto_merge: Optional[bool] = None
 
     if resolved_token:
         vuln_alerts_status = _github_api_status(f"/repos/{repository}/vulnerability-alerts", resolved_token, timeout)
         dependabot_alerts_status = _github_api_status(f"/repos/{repository}/dependabot/alerts?per_page=1", resolved_token, timeout)
         security_md_present = _detect_security_md(repository, resolved_token, timeout)
+        allow_auto_merge = _fetch_allow_auto_merge(repository, resolved_token, timeout)
 
     resolved_repo_dir = _resolve_repo_dir(repo_dir)
     feed_results = _evaluate_feed_provenance(resolved_repo_dir, internal_hosts) if resolved_repo_dir is not None else []
@@ -936,9 +1033,10 @@ def evaluate_s2c2f(
         _eval_sca1_vulnerability_scans(sarif_tools_scanned, vuln_alerts_status),
         _eval_sca2_license_checks(sarif_tools_scanned),
         _eval_inv1_inventory(resolved_dependencies),
-        _eval_upd1_manual_updates(),
+        _eval_upd1_manual_updates(repo_dir),
         _eval_sca3_eol_scans(dependabot_alerts_status),
         _eval_inv2_incident_plans(security_md_present),
+        _eval_upd2_auto_updates(repo_dir, allow_auto_merge),
         _eval_upd3_pr_alerts(repo_dir),
         _eval_aud2_consumption_audits(resolved_dependencies),
         _eval_aud3_integrity_validation(resolved_dependencies),

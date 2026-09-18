@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cli.parsers.github_rules import BranchGovernanceReport, GitHubAPIError
 from cli.parsers.s2c2f import (
     DENYLIST_SCHEMA_VERSION,
+    MANUAL_UPDATES_SCHEMA_VERSION,
     STATUS_MET,
     STATUS_NOT_YET_REPORTED,
     STATUS_UNMET,
@@ -333,7 +334,10 @@ class EvaluateS2C2FTests(unittest.TestCase):
         self.assertEqual(_controls_by_id(report)["ING-2"].status, STATUS_NOT_YET_REPORTED)
         self.assertEqual(_controls_by_id(report)["ENF-2"].status, STATUS_NOT_YET_REPORTED)
 
-    def test_upd1_manual_updates_always_not_yet_reported(self):
+    def test_upd1_manual_updates_unmet_with_no_assertion_at_all(self):
+        # 2026-09-18: UPD-1 stopped being a permanent not_yet_reported --
+        # it's now a real, checked assertion (see Upd1ManualUpdatesTests).
+        # No config, no runbook: checked and confirmed absent, unmet.
         report = evaluate_s2c2f(
             repo_dir=tempfile.mkdtemp(),
             repository="acme/widgets",
@@ -342,7 +346,7 @@ class EvaluateS2C2FTests(unittest.TestCase):
             branch_governance=_governance(),
             token=None,
         )
-        self.assertEqual(_controls_by_id(report)["UPD-1"].status, STATUS_NOT_YET_REPORTED)
+        self.assertEqual(_controls_by_id(report)["UPD-1"].status, STATUS_UNMET)
 
     def test_enf1_met_when_pr_required_and_direct_push_prevented(self):
         report = evaluate_s2c2f(
@@ -627,6 +631,144 @@ class Ing3DenylistsTests(unittest.TestCase):
         self.assertEqual(_controls_by_id(report)["ING-3"].status, STATUS_MET)
 
 
+def _write_manual_updates_config(repo_dir, process_ref):
+    os.makedirs(os.path.join(repo_dir, ".lucid"), exist_ok=True)
+    with open(os.path.join(repo_dir, ".lucid", "manual-updates.json"), "w") as f:
+        json.dump({"schema_version": MANUAL_UPDATES_SCHEMA_VERSION, "process_ref": process_ref}, f)
+
+
+class Upd1ManualUpdatesTests(unittest.TestCase):
+    """Rewritten 2026-09-18 from a permanent not_yet_reported to a real,
+    checked assertion -- see cli.parsers.s2c2f's own comment on why a
+    markdown-content heuristic was deliberately rejected in favor of this."""
+
+    def test_process_ref_pointing_at_a_real_local_file_is_met(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            os.makedirs(os.path.join(repo_dir, "docs"))
+            with open(os.path.join(repo_dir, "docs", "manual-updates.md"), "w") as f:
+                f.write("# Manual update process\n")
+            _write_manual_updates_config(repo_dir, "docs/manual-updates.md")
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+            )
+        result = _controls_by_id(report)["UPD-1"]
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertIn("docs/manual-updates.md", result.detail)
+
+    def test_process_ref_pointing_at_a_missing_local_file_is_unmet(self):
+        # A dangling pointer is a real, reportable problem -- never
+        # silently trusted just because the config file itself is valid.
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _write_manual_updates_config(repo_dir, "docs/manual-updates.md")
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+            )
+        result = _controls_by_id(report)["UPD-1"]
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertIn("stale or broken", result.detail)
+
+    def test_process_ref_pointing_at_a_url_is_met_without_fetching_it(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _write_manual_updates_config(repo_dir, "https://wiki.acme.internal/ops/manual-dependency-updates")
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+            )
+        result = _controls_by_id(report)["UPD-1"]
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertIn("wiki.acme.internal", result.detail)
+
+    def test_updating_md_fallback_is_met(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            with open(os.path.join(repo_dir, "UPDATING.md"), "w") as f:
+                f.write("# Updating\n")
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+            )
+        self.assertEqual(_controls_by_id(report)["UPD-1"].status, STATUS_MET)
+
+    def test_no_config_and_no_runbook_is_unmet(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+            )
+        result = _controls_by_id(report)["UPD-1"]
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertIn("no documented manual-update process asserted", result.detail)
+
+    def test_malformed_config_is_treated_as_absent_falls_back_to_runbook_check(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            os.makedirs(os.path.join(repo_dir, ".lucid"))
+            with open(os.path.join(repo_dir, ".lucid", "manual-updates.json"), "w") as f:
+                f.write("{not valid json")
+            with open(os.path.join(repo_dir, "UPDATING.md"), "w") as f:
+                f.write("# Updating\n")
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+            )
+        self.assertEqual(_controls_by_id(report)["UPD-1"].status, STATUS_MET)
+
+
+class Upd2AutoUpdatesTests(unittest.TestCase):
+    def _write_dependabot_config(self, repo_dir):
+        os.makedirs(os.path.join(repo_dir, ".github"))
+        with open(os.path.join(repo_dir, ".github", "dependabot.yml"), "w") as f:
+            f.write("version: 2\n")
+
+    @patch("cli.parsers.s2c2f._github_api_status")
+    @patch("cli.parsers.s2c2f._github_api_get")
+    def test_dependabot_config_plus_allow_auto_merge_is_met(self, mock_get, mock_status):
+        mock_status.return_value = 404
+        mock_get.side_effect = lambda path, token, timeout=10: {"allow_auto_merge": True} if path == "/repos/acme/widgets" else None
+        with tempfile.TemporaryDirectory() as repo_dir:
+            self._write_dependabot_config(repo_dir)
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token="tok",
+            )
+        self.assertEqual(_controls_by_id(report)["UPD-2"].status, STATUS_MET)
+
+    @patch("cli.parsers.s2c2f._github_api_status")
+    @patch("cli.parsers.s2c2f._github_api_get")
+    def test_dependabot_config_without_allow_auto_merge_is_unmet(self, mock_get, mock_status):
+        mock_status.return_value = 404
+        mock_get.side_effect = lambda path, token, timeout=10: {"allow_auto_merge": False} if path == "/repos/acme/widgets" else None
+        with tempfile.TemporaryDirectory() as repo_dir:
+            self._write_dependabot_config(repo_dir)
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token="tok",
+            )
+        result = _controls_by_id(report)["UPD-2"]
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertIn("does not allow auto-merge", result.detail)
+
+    @patch("cli.parsers.s2c2f._github_api_status")
+    @patch("cli.parsers.s2c2f._github_api_get")
+    def test_no_update_automation_config_is_unmet_even_with_auto_merge_allowed(self, mock_get, mock_status):
+        mock_status.return_value = 404
+        mock_get.side_effect = lambda path, token, timeout=10: {"allow_auto_merge": True} if path == "/repos/acme/widgets" else None
+        report = evaluate_s2c2f(
+            repo_dir=tempfile.mkdtemp(), repository="acme/widgets", resolved_dependencies=[],
+            sarif_report=None, branch_governance=_governance(), token="tok",
+        )
+        self.assertEqual(_controls_by_id(report)["UPD-2"].status, STATUS_UNMET)
+
+    def test_no_token_is_not_yet_reported(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            self._write_dependabot_config(repo_dir)
+            report = evaluate_s2c2f(
+                repo_dir=repo_dir, repository="acme/widgets", resolved_dependencies=[],
+                sarif_report=None, branch_governance=_governance(), token=None,
+            )
+        self.assertEqual(_controls_by_id(report)["UPD-2"].status, STATUS_NOT_YET_REPORTED)
+
+
 class Ing4SourceCloningTests(unittest.TestCase):
     def test_always_not_yet_reported_an_honest_gap_not_a_fabricated_signal(self):
         report = evaluate_s2c2f(
@@ -781,6 +923,7 @@ class NewControlCatalogTests(unittest.TestCase):
             "SCA-4": ("Malware Scans", 3),
             "SCA-5": ("Proactive Reviews", 3),
             "ENF-2": ("Curated Feeds", 3),
+            "UPD-2": ("Auto-Updates", 2),
         }
         for control_id, (label, level) in expected.items():
             self.assertEqual(controls[control_id].label, label, control_id)

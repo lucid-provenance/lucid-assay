@@ -367,18 +367,19 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           permission-administration: read
           permission-contents: read
-          # permission-vulnerability-alerts: read was added and reverted
-          # the same day (2026-09-18) -- confirmed by a real CI run
-          # (build's own "Generate GitHub App Token" step, run
-          # #35382424745) that requesting it breaks token minting
-          # outright, not just leaving SCA-3 403ing. GitHub's own job-log
-          # API needed admin rights this session didn't have, so the
-          # exact rejection reason (the App genuinely lacking that
-          # permission in its own GitHub settings vs. the wrong input key
-          # entirely) is still unconfirmed. SCA-3 (EOL Scans) stays
-          # not_yet_reported/403 until that's actually diagnosed -- don't
-          # re-add this line without checking the App's own permission
-          # settings first, or a real log.
+          # For cli.parsers.s2c2f's SCA-3 (EOL Scans, GET .../dependabot/
+          # alerts). First attempt (2026-09-18) broke the whole token-
+          # minting step outright -- root-caused, not guessed: the App's
+          # own Permissions & events page showed only Administration/
+          # Contents selected, "Dependabot alerts" (GitHub's current UI
+          # label -- confirmed via a real screenshot of this App's own
+          # settings; older docs called it "Vulnerability alerts", same
+          # underlying permission) was never granted. Bill granted it
+          # (Read-only) directly in the App's own settings the same day;
+          # this line requests the identical permission the
+          # `actions/create-github-app-token` action's own input schema
+          # names `permission-vulnerability-alerts` for.
+          permission-vulnerability-alerts: read
 
       # push carries no PR context of its own -- see the `on:` block's
       # comment for the full rationale. Looks up whichever PR GitHub

@@ -27,6 +27,8 @@ from cli.parsers.functional_adequacy import (
     _parse_generic_json_report,
     _parse_junit_functional_report,
     _parse_playwright_report,
+    _playwright_final_status,
+    _unavailable_report,
     evaluate_functional_adequacy,
     load_functional_verification_config,
 )
@@ -190,6 +192,87 @@ class ParsePlaywrightReportTests(TempRepoTestCase):
         cases = _parse_playwright_report(path)
         self.assertEqual(cases[0].status, "skipped")
 
+    def test_a_real_skipped_status_from_playwright_itself_folds_to_skipped(self):
+        # Distinct from test_no_results_folds_to_skipped above: this hits
+        # `if final_status in _PLAYWRIGHT_SKIP_STATUSES: return "skipped"`,
+        # not the `if not results: return "skipped"` early-return -- a real
+        # Playwright run reports an explicitly skipped test this way, with
+        # a real (non-empty) results entry.
+        doc = _playwright_doc(("skipped test @cuj:auth-flow", "skipped"))
+        path = self._write_json_report("pw.json", doc)
+        cases = _parse_playwright_report(path)
+        self.assertEqual(cases[0].status, "skipped")
+
+    def test_a_non_dict_spec_is_skipped_but_later_specs_in_the_same_suite_still_process(self):
+        doc = {
+            "suites": [
+                {
+                    "title": "e2e",
+                    "specs": ["not-a-dict", {"title": "login @cuj:auth-flow", "tests": [{"results": [{"status": "passed"}]}]}],
+                    "suites": [],
+                }
+            ]
+        }
+        path = self._write_json_report("pw.json", doc)
+        cases = _parse_playwright_report(path)
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0].journeys, ("auth-flow",))
+
+    def test_a_non_dict_test_is_skipped_but_later_tests_in_the_same_spec_still_process(self):
+        doc = {
+            "suites": [
+                {
+                    "title": "e2e",
+                    "specs": [
+                        {
+                            "title": "login @cuj:auth-flow",
+                            "tests": ["not-a-dict", {"results": [{"status": "passed"}]}],
+                        }
+                    ],
+                    "suites": [],
+                }
+            ]
+        }
+        path = self._write_json_report("pw.json", doc)
+        cases = _parse_playwright_report(path)
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0].status, "passed")
+
+    def test_tag_embedded_only_in_the_suite_level_title_is_found(self):
+        doc = {
+            "suites": [
+                {"title": "e2e @cuj:auth-flow", "specs": [{"title": "login", "tests": [{"results": [{"status": "passed"}]}]}], "suites": []}
+            ]
+        }
+        path = self._write_json_report("pw.json", doc)
+        cases = _parse_playwright_report(path)
+        self.assertEqual(cases[0].journeys, ("auth-flow",))
+
+    def test_parent_suite_title_propagates_through_nested_recursion(self):
+        # Pins that the *real* accumulated title_prefix (not a dropped/None
+        # one) is threaded into the recursive call -- a tag embedded only
+        # in the outermost suite's own title must still reach a spec two
+        # levels of nesting down.
+        doc = {
+            "suites": [
+                {
+                    "title": "@cuj:auth-flow",
+                    "specs": [],
+                    "suites": [
+                        {
+                            "title": "auth",
+                            "specs": [{"title": "login", "tests": [{"results": [{"status": "passed"}]}]}],
+                            "suites": [],
+                        }
+                    ],
+                }
+            ]
+        }
+        path = self._write_json_report("pw.json", doc)
+        cases = _parse_playwright_report(path)
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0].journeys, ("auth-flow",))
+
     def test_nested_suites_are_walked(self):
         doc = {
             "suites": [
@@ -219,7 +302,7 @@ class ParsePlaywrightReportTests(TempRepoTestCase):
 
     def test_non_object_root_raises(self):
         path = self._write_json_report("pw.json", [1, 2, 3])
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, r"^playwright report root is not a JSON object$"):
             _parse_playwright_report(path)
 
 
@@ -451,6 +534,32 @@ class ParseJunitFunctionalReportTests(TempRepoTestCase):
         cases = _parse_junit_functional_report(path)
         self.assertEqual(cases[0].journeys, ("auth-flow",))
 
+    def test_tag_in_classname_alone_is_extracted(self):
+        # Distinct from test_tag_in_name_is_extracted -- pins that
+        # classname is genuinely read on its own, not just name.
+        xml = """<testsuite><testcase classname="e2e @cuj:auth-flow" name="test_login"/></testsuite>"""
+        path = self._write_report("junit.xml", xml)
+        cases = _parse_junit_functional_report(path)
+        self.assertEqual(cases[0].journeys, ("auth-flow",))
+
+    def test_tag_in_property_name_alone_is_extracted(self):
+        # Distinct from test_tag_in_property_value_is_extracted -- pins
+        # that a <property>'s own `name` attribute is genuinely read too,
+        # not just its `value`.
+        xml = """<testsuite><testcase classname="e2e" name="test_login">
+            <properties><property name="@cuj:auth-flow" value="irrelevant"/></properties>
+        </testcase></testsuite>"""
+        path = self._write_report("junit.xml", xml)
+        cases = _parse_junit_functional_report(path)
+        self.assertEqual(cases[0].journeys, ("auth-flow",))
+
+    def test_missing_classname_and_name_attributes_do_not_crash(self):
+        xml = """<testsuite><testcase/></testsuite>"""
+        path = self._write_report("junit.xml", xml)
+        cases = _parse_junit_functional_report(path)
+        self.assertEqual(cases[0].journeys, ())
+        self.assertEqual(cases[0].status, "passed")
+
     def test_failure_element_marks_failed(self):
         xml = """<testsuite><testcase classname="e2e" name="test_login @cuj:auth-flow">
             <failure message="boom"/>
@@ -536,12 +645,12 @@ class ParseGenericJsonReportTests(TempRepoTestCase):
 
     def test_missing_tests_array_raises(self):
         path = self._write_json_report("report.json", {"not_tests": []})
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, r"^generic_json report is missing a 'tests' array$"):
             _parse_generic_json_report(path)
 
     def test_non_object_root_raises(self):
         path = self._write_json_report("report.json", ["a", "b"])
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, r"^generic_json report root is not a JSON object$"):
             _parse_generic_json_report(path)
 
     def test_non_dict_test_entries_are_skipped_not_raised(self):
@@ -597,6 +706,70 @@ class ComputeAdequacyTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _unavailable_report: every field, exactly (imported/called directly --
+# every evaluate_functional_adequacy() failure branch delegates here, so
+# one exhaustive test of the helper itself covers every call site's shared
+# field-construction logic without needing to independently re-verify each
+# of "total/passed/failed/skipped/score_pct/declared/covered/missing" at
+# every one of evaluate_functional_adequacy's own four call sites).
+# ---------------------------------------------------------------------------
+
+
+class UnavailableReportDirectFieldTests(unittest.TestCase):
+    def test_every_field_is_exact(self):
+        report = _unavailable_report(
+            framework="playwright",
+            target_env="staging",
+            declared_journeys=["auth-flow", "attestation-ingest"],
+            report_uri="https://ci/example",
+            reason="a specific real reason",
+            reason_code="report_missing",
+        )
+        self.assertEqual(
+            report.as_dict(),
+            {
+                "available": False,
+                "met": False,
+                "framework": "playwright",
+                "target_env": "staging",
+                "metrics": {"total": 0, "passed": 0, "failed": 0, "skipped": 0},
+                "adequacy": {
+                    "status": "unavailable",
+                    "metric_type": "cuj_coverage",
+                    "score_pct": 0.0,
+                    "declared": ["auth-flow", "attestation-ingest"],
+                    "covered": [],
+                    "missing": ["auth-flow", "attestation-ingest"],
+                },
+                "report_uri": "https://ci/example",
+                "reason": "a specific real reason",
+                "reason_code": "report_missing",
+            },
+        )
+
+    def test_framework_and_target_env_can_be_none(self):
+        report = _unavailable_report(
+            framework=None,
+            target_env=None,
+            declared_journeys=["auth-flow"],
+            report_uri=None,
+            reason="x",
+            reason_code="unsupported_framework",
+        )
+        self.assertIsNone(report.framework)
+        self.assertIsNone(report.target_env)
+        self.assertIsNone(report.report_uri)
+
+    def test_empty_declared_journeys_yields_empty_declared_and_missing(self):
+        report = _unavailable_report(
+            framework="playwright", target_env=None, declared_journeys=[], report_uri=None, reason="x", reason_code="report_missing"
+        )
+        self.assertEqual(report.declared, [])
+        self.assertEqual(report.missing, [])
+        self.assertEqual(report.covered, [])
+
+
+# ---------------------------------------------------------------------------
 # evaluate_functional_adequacy: end-to-end behavior
 # ---------------------------------------------------------------------------
 
@@ -609,43 +782,102 @@ class EvaluateFunctionalAdequacyTests(TempRepoTestCase):
         # face value -- available/adequacy.status/reason_code are what
         # distinguish "never configured" from "evaluated and failed".
         report = evaluate_functional_adequacy(self.repo_dir, None)
-        self.assertFalse(report.available)
-        self.assertFalse(report.met)
-        self.assertEqual(report.adequacy_status, ADEQUACY_STATUS_NOT_CONFIGURED)
-        self.assertEqual(report.reason_code, REASON_CODE_NOT_CONFIGURED)
-        d = report.as_dict()
-        self.assertEqual(d["met"], False)
-        self.assertEqual(d["adequacy"]["status"], "not_configured")
-        self.assertEqual(d["metrics"], {"total": 0, "passed": 0, "failed": 0, "skipped": 0})
+        self.assertEqual(
+            report.as_dict(),
+            {
+                "available": False,
+                "met": False,
+                "framework": None,
+                "target_env": None,
+                "metrics": {"total": 0, "passed": 0, "failed": 0, "skipped": 0},
+                "adequacy": {
+                    "status": "not_configured",
+                    "metric_type": "cuj_coverage",
+                    "score_pct": 0.0,
+                    "declared": [],
+                    "covered": [],
+                    "missing": [],
+                },
+                "report_uri": None,
+                "reason": (
+                    "no declared_journeys configured at .lucid/functional-verification.json -- "
+                    "functional test adequacy is not evaluated for this run (reported as unmet, "
+                    "not a silent pass, to avoid a false 'evaluated and passed' signal for a "
+                    "control that never actually ran)"
+                ),
+                "reason_code": "not_configured",
+            },
+        )
+
+    def test_not_configured_carries_report_uri_and_target_env_through_even_though_unconfigured(self):
+        report = evaluate_functional_adequacy(self.repo_dir, None, target_env="staging", report_uri="https://ci/1")
+        self.assertEqual(report.target_env, "staging")
+        self.assertEqual(report.report_uri, "https://ci/1")
 
     def test_configured_but_no_report_path_is_unavailable(self):
         self._write_config({"framework": "playwright", "declared_journeys": ["auth-flow"]})
-        report = evaluate_functional_adequacy(self.repo_dir, None)
-        self.assertFalse(report.available)
-        self.assertFalse(report.met)
-        self.assertEqual(report.adequacy_status, ADEQUACY_STATUS_UNAVAILABLE)
-        self.assertEqual(report.reason_code, REASON_CODE_REPORT_MISSING)
-        self.assertEqual(report.missing, ["auth-flow"])
+        report = evaluate_functional_adequacy(self.repo_dir, None, target_env="staging", report_uri="https://ci/1")
+        self.assertEqual(
+            report.as_dict(),
+            {
+                "available": False,
+                "met": False,
+                "framework": "playwright",
+                "target_env": "staging",
+                "metrics": {"total": 0, "passed": 0, "failed": 0, "skipped": 0},
+                "adequacy": {
+                    "status": "unavailable",
+                    "metric_type": "cuj_coverage",
+                    "score_pct": 0.0,
+                    "declared": ["auth-flow"],
+                    "covered": [],
+                    "missing": ["auth-flow"],
+                },
+                "report_uri": "https://ci/1",
+                "reason": (
+                    ".lucid/functional-verification.json declares 1 journey(s), but "
+                    "--functional-report was not provided for this run"
+                ),
+                "reason_code": "report_missing",
+            },
+        )
 
     def test_unsupported_framework_is_unavailable(self):
         self._write_config({"framework": "cypress", "declared_journeys": ["auth-flow"]})
         path = self._write_json_report("report.json", {"tests": []})
-        report = evaluate_functional_adequacy(self.repo_dir, path)
-        self.assertFalse(report.available)
+        report = evaluate_functional_adequacy(self.repo_dir, path, target_env="staging", report_uri="https://ci/1")
+        self.assertEqual(report.framework, "cypress")
+        self.assertEqual(report.target_env, "staging")
+        self.assertEqual(report.report_uri, "https://ci/1")
         self.assertEqual(report.reason_code, REASON_CODE_UNSUPPORTED_FRAMEWORK)
+        self.assertEqual(
+            report.reason,
+            ".lucid/functional-verification.json declares an unsupported framework 'cypress' "
+            "(expected one of ['generic_json', 'playwright', 'pytest'])",
+        )
+        self.assertEqual(report.declared, ["auth-flow"])
+        self.assertEqual(report.missing, ["auth-flow"])
 
     def test_unreadable_report_path_is_malformed(self):
         self._write_config({"framework": "generic_json", "declared_journeys": ["auth-flow"]})
-        report = evaluate_functional_adequacy(self.repo_dir, str(Path(self.repo_dir) / "does-not-exist.json"))
+        missing_path = str(Path(self.repo_dir) / "does-not-exist.json")
+        report = evaluate_functional_adequacy(self.repo_dir, missing_path, target_env="staging", report_uri="https://ci/1")
         self.assertFalse(report.available)
         self.assertEqual(report.reason_code, REASON_CODE_REPORT_MALFORMED)
+        self.assertEqual(report.framework, "generic_json")
+        self.assertEqual(report.target_env, "staging")
+        self.assertEqual(report.report_uri, "https://ci/1")
+        self.assertIn(f"--functional-report {missing_path!r} could not be read as a 'generic_json' report:", report.reason)
 
     def test_malformed_report_content_is_malformed(self):
         self._write_config({"framework": "generic_json", "declared_journeys": ["auth-flow"]})
         path = self._write_report("report.json", "{not json")
-        report = evaluate_functional_adequacy(self.repo_dir, path)
+        report = evaluate_functional_adequacy(self.repo_dir, path, target_env="staging", report_uri="https://ci/1")
         self.assertFalse(report.available)
         self.assertEqual(report.reason_code, REASON_CODE_REPORT_MALFORMED)
+        self.assertEqual(report.target_env, "staging")
+        self.assertEqual(report.report_uri, "https://ci/1")
+        self.assertIn(f"--functional-report {path!r} could not be read as a 'generic_json' report:", report.reason)
 
     def test_full_adequacy_pass_case(self):
         self._write_config(
@@ -663,20 +895,39 @@ class EvaluateFunctionalAdequacyTests(TempRepoTestCase):
         }
         path = self._write_json_report("report.json", doc)
         report = evaluate_functional_adequacy(self.repo_dir, path, target_env="staging", report_uri="https://ci/artifacts/1")
-        self.assertTrue(report.available)
-        self.assertTrue(report.met)
-        self.assertEqual(report.adequacy_status, ADEQUACY_STATUS_EVALUATED)
-        self.assertEqual(report.score_pct, 100.0)
-        self.assertEqual(report.covered, ["auth-flow", "attestation-ingest"])
-        self.assertEqual(report.missing, [])
-        self.assertIsNone(report.reason_code)
-        self.assertEqual(report.target_env, "staging")
-        self.assertEqual(report.report_uri, "https://ci/artifacts/1")
-        d = report.as_dict()
-        self.assertEqual(d["met"], True)
-        self.assertEqual(d["framework"], "generic_json")
-        self.assertEqual(d["metrics"], {"total": 2, "passed": 2, "failed": 0, "skipped": 0})
-        self.assertEqual(d["adequacy"]["score_pct"], 100.0)
+        self.assertEqual(
+            report.as_dict(),
+            {
+                "available": True,
+                "met": True,
+                "framework": "generic_json",
+                "target_env": "staging",
+                "metrics": {"total": 2, "passed": 2, "failed": 0, "skipped": 0},
+                "adequacy": {
+                    "status": "evaluated",
+                    "metric_type": "cuj_coverage",
+                    "score_pct": 100.0,
+                    "declared": ["auth-flow", "attestation-ingest"],
+                    "covered": ["auth-flow", "attestation-ingest"],
+                    "missing": [],
+                },
+                "report_uri": "https://ci/artifacts/1",
+                "reason": "2/2 declared journey(s) covered (100.0% >= 100.0% required), 0 failed test(s)",
+                "reason_code": None,
+            },
+        )
+
+    def test_score_pct_rounds_to_exactly_two_decimal_places(self):
+        # A fraction that actually differs at the 3rd decimal place (1/3 !=
+        # 0.33 at 3+ digits) -- pins the literal `2` in `round(..., 2)`,
+        # which a coincidentally-round percentage (e.g. 50%/100%) can't.
+        self._write_config(
+            {"framework": "generic_json", "min_adequacy_pct": 0, "declared_journeys": ["a", "b", "c"]}
+        )
+        doc = {"tests": [{"name": "t", "status": "passed", "journeys": ["a"]}]}
+        path = self._write_json_report("report.json", doc)
+        report = evaluate_functional_adequacy(self.repo_dir, path)
+        self.assertEqual(report.score_pct, 33.33)
 
     def test_partial_adequacy_is_amber_not_met(self):
         self._write_config(
@@ -697,8 +948,12 @@ class EvaluateFunctionalAdequacyTests(TempRepoTestCase):
         self.assertTrue(report.available)
         self.assertFalse(report.met)
         self.assertEqual(report.reason_code, REASON_CODE_PARTIAL_ADEQUACY)
-        self.assertAlmostEqual(report.score_pct, 66.67, places=1)
+        self.assertEqual(report.score_pct, 66.67)
         self.assertEqual(report.missing, ["policy-evaluation"])
+        self.assertEqual(
+            report.reason,
+            "only 2/3 declared journey(s) covered (66.7% < 100.0% required); missing: ['policy-evaluation']",
+        )
 
     def test_partial_adequacy_passes_when_below_min_threshold(self):
         self._write_config(
@@ -733,6 +988,10 @@ class EvaluateFunctionalAdequacyTests(TempRepoTestCase):
         self.assertFalse(report.met)
         self.assertEqual(report.score_pct, 100.0)
         self.assertEqual(report.reason_code, REASON_CODE_TEST_FAILURES)
+        self.assertEqual(
+            report.reason,
+            "1 executed test(s) failed -- functional adequacy cannot be met regardless of 100.0% journey coverage",
+        )
 
     def test_zero_tests_executed_is_not_met(self):
         self._write_config({"framework": "generic_json", "declared_journeys": ["auth-flow"]})
@@ -742,6 +1001,21 @@ class EvaluateFunctionalAdequacyTests(TempRepoTestCase):
         self.assertFalse(report.met)
         self.assertEqual(report.reason_code, REASON_CODE_NO_TESTS_EXECUTED)
         self.assertEqual(report.total, 0)
+        self.assertEqual(report.reason, f"'generic_json' report at {path!r} parsed but contained zero executed tests")
+
+    def test_met_requires_total_strictly_greater_than_zero_even_with_a_zero_threshold(self):
+        # Pins `total > 0` (not `total >= 0`, which is always true): with
+        # min_adequacy_pct=0 and zero declared_journeys ever executed,
+        # score_pct is 0.0 (0 covered / N declared) which already clears a
+        # 0 threshold, and failed==0 too -- only the total>0 guard stops
+        # this from being incorrectly reported as met.
+        self._write_config({"framework": "generic_json", "min_adequacy_pct": 0, "declared_journeys": ["auth-flow"]})
+        path = self._write_json_report("report.json", {"tests": []})
+        report = evaluate_functional_adequacy(self.repo_dir, path)
+        self.assertEqual(report.total, 0)
+        self.assertEqual(report.score_pct, 0.0)
+        self.assertFalse(report.met)
+        self.assertEqual(report.reason_code, REASON_CODE_NO_TESTS_EXECUTED)
 
     def test_playwright_framework_end_to_end(self):
         self._write_config({"framework": "playwright", "declared_journeys": ["auth-flow"]})

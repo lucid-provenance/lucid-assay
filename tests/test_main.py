@@ -20,7 +20,8 @@ from unittest.mock import ANY, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cli.main import _dispatch_standalone_subcommand, _evaluate_s2c2f_controls, main, parse_args
+from cli.main import _dispatch_standalone_subcommand, _evaluate_functional_adequacy, _evaluate_s2c2f_controls, main, parse_args
+from cli.mutation import skipped_report as skipped_mutation_report
 
 
 def _min_argv(**overrides):
@@ -336,6 +337,7 @@ class MainPipelineTests(unittest.TestCase):
             _detect_lockfile_dependencies=MagicMock(return_value=[]),
             _compute_real_coverage_analysis=MagicMock(return_value=None),
             _evaluate_s2c2f_controls=MagicMock(return_value=None),
+            _evaluate_functional_adequacy=MagicMock(return_value=None),
             build_statement=MagicMock(return_value={"mock": "statement"}),
             _build_sbom_artifact_block=MagicMock(return_value=None),
             _maybe_emit_slsa_provenance=MagicMock(return_value=None),
@@ -406,6 +408,114 @@ class MainPipelineTests(unittest.TestCase):
         with cm:
             main(argv)
         mocks["run_mutation_testing"].assert_called_once()
+
+    def test_without_skip_flag_run_mutation_testing_receives_every_real_argument(self):
+        argv = _min_argv(**{"--out": self.out_path, "--min-rcs": "80"})  # no --skip-mutation-testing
+        cm, mocks = self._patches(rcs_value=90)
+        with cm:
+            main(argv)
+        mocks["run_mutation_testing"].assert_called_once_with(
+            ".",
+            mocks["compute_patch_modified_lines"].return_value,
+            timeout_seconds=90,
+            min_sample_size=3,
+            report_out=str(Path(".") / "reports" / "mutation" / "mutation-report.json"),
+            base_sha=None,
+        )
+        mocks["compute_patch_modified_lines"].assert_called_once_with(None, "a" * 40, ".")
+
+    def test_hashes_junit_and_coverage_report_by_their_real_paths(self):
+        cm, mocks = self._patches(rcs_value=90)
+        with cm:
+            main(self._argv())
+        mocks["sha256_file"].assert_any_call("junit.xml")
+        mocks["sha256_file"].assert_any_call("coverage.xml")
+
+    def test_compute_patch_coverage_receives_the_real_repo_dir(self):
+        cm, mocks = self._patches(rcs_value=90)
+        with cm:
+            main(self._argv())
+        mocks["compute_patch_coverage"].assert_called_once_with(None, "a" * 40, ".", mocks["parse_cobertura"].return_value)
+
+    def test_branch_governance_and_commit_author_receive_the_real_repository(self):
+        cm, mocks = self._patches(rcs_value=90)
+        with cm:
+            main(self._argv())
+        mocks["inspect_branch_governance"].assert_called_once_with("org/repo", "main", token=None)
+        mocks["inspect_commit_author"].assert_called_once_with("org/repo", "a" * 40, token=None)
+
+    def test_compute_real_coverage_analysis_receives_the_real_ast_metrics(self):
+        cm, mocks = self._patches(rcs_value=90)
+        with cm:
+            main(self._argv())
+        args, _ = mocks["_compute_real_coverage_analysis"].call_args
+        self.assertIs(args[2], mocks["inspect_test_suite"].return_value)
+
+    def test_score_pipeline_receives_every_real_kwarg(self):
+        cm, mocks = self._patches(rcs_value=90)
+        with cm:
+            main(self._argv())
+        mocks["score_pipeline"].assert_called_once_with(
+            test_totals=mocks["parse_junit_xml"].return_value,
+            patch_coverage=mocks["compute_patch_coverage"].return_value,
+            overall_line_rate=0.9,
+            pr_present=False,
+            approvers_count=0,
+            required_approvals=0,
+            review_state="not_applicable",
+            patch_coverage_min=0.80,
+            overall_coverage_min=0.60,
+            branch_governance=mocks["inspect_branch_governance"].return_value,
+            sarif_report=None,
+            # self._argv() always sets --skip-mutation-testing, so this is
+            # the real (unmocked) skipped_mutation_report()'s own return
+            # value, not run_mutation_testing's -- a real, comparable
+            # dataclass instance (MutationTestReport defines __eq__).
+            mutation_report=skipped_mutation_report(),
+        )
+
+    def test_build_statement_receives_the_real_pr_and_coverage_fields(self):
+        cm, mocks = self._patches(rcs_value=90)
+        with cm:
+            main(self._argv())
+        kwargs = mocks["build_statement"].call_args.kwargs
+        self.assertIsNone(kwargs["pr_number"])
+        self.assertEqual(kwargs["empty_test_bodies"], 0)
+        self.assertEqual(kwargs["ast_languages"], {})
+        self.assertEqual(kwargs["coverage_format"], "cobertura-xml")
+        self.assertEqual(kwargs["test_report_uri"], "s3://evidence/sha256/deadbeef")
+        self.assertEqual(kwargs["coverage_report_uri"], "s3://evidence/sha256/deadbeef")
+        self.assertIs(kwargs["functional_verification"], mocks["_evaluate_functional_adequacy"].return_value)
+
+    def test_build_statement_receives_jacoco_coverage_format_when_configured(self):
+        cm, mocks = self._patches(rcs_value=90)
+        with cm:
+            main(self._argv(**{"--coverage-format": "jacoco"}))
+        self.assertEqual(mocks["build_statement"].call_args.kwargs["coverage_format"], "jacoco-xml")
+        mocks["parse_jacoco"].assert_called_once_with("coverage.xml")
+        mocks["parse_cobertura"].assert_not_called()
+
+    def test_worm_uploads_use_the_real_source_file_paths(self):
+        cm, mocks = self._patches(rcs_value=90)
+        with cm:
+            main(self._argv())
+        mocks["upload_to_worm_async"].assert_any_call("junit.xml", "deadbeef")
+        mocks["upload_to_worm_async"].assert_any_call("coverage.xml", "deadbeef")
+
+    def test_emit_run_warnings_receives_the_real_branch(self):
+        cm, mocks = self._patches(rcs_value=90)
+        with cm:
+            main(self._argv())
+        args, _ = mocks["_emit_run_warnings"].call_args
+        self.assertEqual(args[2], "main")
+
+    def test_stage_ns_carries_the_exact_real_stage_labels(self):
+        cm, mocks = self._patches(rcs_value=90)
+        with cm:
+            main(self._argv(extra_flags=["--debug"]))
+        stage_ns = mocks["_emit_stage_profile"].call_args[0][0]
+        for expected_label in ("parse_inputs", "diff_patch_analysis", "ast_inspection", "github_rules_api", "rcs_scoring", "mutation_testing"):
+            self.assertIn(expected_label, stage_ns)
 
 
 class EvaluateS2c2fControlsDirectTests(unittest.TestCase):
@@ -505,6 +615,55 @@ class EvaluateS2c2fControlsDirectTests(unittest.TestCase):
             )
         self.assertEqual(list(stage_ns.keys()), ["s2c2f_evaluation"])
         self.assertGreaterEqual(stage_ns["s2c2f_evaluation"], 0)
+
+
+class EvaluateFunctionalAdequacyDirectTests(unittest.TestCase):
+    """Direct-field tests for _evaluate_functional_adequacy -- same
+    rationale as EvaluateS2c2fControlsDirectTests above: MainPipelineTests
+    only ever mocks this function away wholesale, leaving its own
+    positional/keyword pass-through (args.repo_dir/args.functional_report/
+    args.functional_env/args.functional_report_uri, and the exact
+    functional_adequacy_evaluation stage-timer label) with zero direct
+    mutation-testing pressure."""
+
+    def _args(self, **overrides):
+        base = dict(
+            repo_dir=".",
+            functional_report="report.json",
+            functional_env="staging",
+            functional_report_uri="https://ci/1",
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_forwards_every_arg_exactly_by_position_and_keyword(self):
+        args = self._args()
+        sentinel_return = object()
+        fake_evaluate = MagicMock(return_value=sentinel_return)
+        with patch("cli.main.evaluate_functional_adequacy", fake_evaluate):
+            result = _evaluate_functional_adequacy(args, {})
+        fake_evaluate.assert_called_once_with(
+            ".",
+            "report.json",
+            target_env="staging",
+            report_uri="https://ci/1",
+        )
+        self.assertIs(result, sentinel_return)
+
+    def test_none_functional_report_env_and_uri_pass_through_as_none(self):
+        args = self._args(functional_report=None, functional_env=None, functional_report_uri=None)
+        fake_evaluate = MagicMock(return_value=None)
+        with patch("cli.main.evaluate_functional_adequacy", fake_evaluate):
+            _evaluate_functional_adequacy(args, {})
+        fake_evaluate.assert_called_once_with(".", None, target_env=None, report_uri=None)
+
+    def test_records_elapsed_time_under_the_exact_functional_adequacy_evaluation_stage_key(self):
+        args = self._args()
+        stage_ns: dict = {}
+        with patch("cli.main.evaluate_functional_adequacy", MagicMock(return_value=None)):
+            _evaluate_functional_adequacy(args, stage_ns)
+        self.assertEqual(list(stage_ns.keys()), ["functional_adequacy_evaluation"])
+        self.assertGreaterEqual(stage_ns["functional_adequacy_evaluation"], 0)
 
 
 if __name__ == "__main__":

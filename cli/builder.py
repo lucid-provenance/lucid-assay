@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from .mutation import MutationTestReport
 from .parsers.commit_author import CommitAuthorReport
 from .parsers.coverage import CoverageReport
+from .parsers.functional_adequacy import FunctionalVerificationReport
 from .parsers.github_rules import BranchGovernanceReport
 from .parsers.junit import TestTotals
 from .parsers.s2c2f import S2C2FReport
@@ -162,6 +163,50 @@ def _build_mutation_testing_block(mutation_report: Optional["MutationTestReport"
     return mutation_report.as_dict()
 
 
+# predicate.functional_verification when the caller didn't pass a
+# FunctionalVerificationReport at all (every caller predating this
+# field) -- same explicit "not configured" contract as
+# _S2C2F_NOT_CONFIGURED/_MUTATION_TESTING_NOT_CONFIGURED above, not an
+# omitted key. met=False here (never True) is deliberate: CLAUDE.md's
+# Fail-Closed Verification invariant requires missing/unevaluated
+# metadata to evaluate to false, never a passing state, and `met` is a
+# direct boolean gate signal a console (or a future
+# --require-functional-adequacy flag) could read at face value -- unlike
+# cli.mutation's not_applicable grade, whose full credit lives only
+# inside an internal scoring multiplier, never a bare pass/fail claim.
+# available=False/adequacy.status="not_configured"/reason_code=
+# "not_configured" are what a consumer must check to tell "never
+# configured" apart from "evaluated and failed" -- see
+# cli.parsers.functional_adequacy.evaluate_functional_adequacy's own
+# docstring for the full rationale.
+_FUNCTIONAL_VERIFICATION_NOT_CONFIGURED: Dict[str, Any] = {
+    "available": False,
+    "met": False,
+    "framework": None,
+    "target_env": None,
+    "metrics": {"total": 0, "passed": 0, "failed": 0, "skipped": 0},
+    "adequacy": {
+        "status": "not_configured",
+        "metric_type": "cuj_coverage",
+        "score_pct": 0.0,
+        "declared": [],
+        "covered": [],
+        "missing": [],
+    },
+    "report_uri": None,
+    "reason": "functional test adequacy was not evaluated for this run",
+    "reason_code": "not_configured",
+}
+
+
+def _build_functional_verification_block(
+    functional_verification: Optional["FunctionalVerificationReport"],
+) -> Dict[str, Any]:
+    if functional_verification is None:
+        return dict(_FUNCTIONAL_VERIFICATION_NOT_CONFIGURED)
+    return functional_verification.as_dict()
+
+
 def build_statement(
     *,
     subject_name: str,
@@ -203,6 +248,7 @@ def build_statement(
     real_coverage: Optional[RealCoverageResult] = None,
     s2c2f: Optional[S2C2FReport] = None,
     mutation_report: Optional[MutationTestReport] = None,
+    functional_verification: Optional[FunctionalVerificationReport] = None,
 ) -> Dict[str, Any]:
     """Returns a dict matching the lifecycle/v0.1 predicate schema, wrapped
     in a standard in-toto Statement envelope."""
@@ -511,6 +557,13 @@ def build_statement(
         # ScoreComponent shape. See that component's own `reason` for the
         # plain-English discount explanation.
         "mutation_testing": _build_mutation_testing_block(mutation_report),
+        # Functional test adequacy (cli/parsers/functional_adequacy.py):
+        # Declared Operational Surface (.lucid/functional-verification.json's
+        # declared_journeys) vs. Executed Scenarios (--functional-report).
+        # Scoring-independent, same rationale as s2c2f/resolved_dependencies
+        # above -- a deterministic governance signal on its own, not folded
+        # into release_confidence_score.
+        "functional_verification": _build_functional_verification_block(functional_verification),
         "release_confidence_score": {
             "value": rcs.value,
             "algorithm_version": rcs.algorithm_version,

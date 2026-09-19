@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import types
 import unittest
 
 from jsonschema import Draft202012Validator
@@ -18,7 +19,7 @@ from cli.parsers.junit import TestTotals
 from cli.patch_coverage import PatchCoverageResult, REASON_CODE_NO_COVERABLE_LINES
 from cli.real_coverage import CoverageTrackResult, RealCoverageResult
 from cli.parsers.sarif import SarifSummaryReport
-from cli.scorer import score_pipeline
+from cli.scorer import ASSERTION_DENSITY_TARGET, score_pipeline
 
 
 def _default_branch_governance() -> BranchGovernanceReport:
@@ -580,6 +581,7 @@ class BuilderStatementTests(unittest.TestCase):
             commit_signature_verified=True,
             commit_signature_reason="valid",
             commit_signature_type="gpg",
+            commit_signature_source_sha="c" * 40,
         )
         statement = build_statement(**_base_kwargs(commit_author=report))
         commit_sig_block = statement["predicate"]["repository_governance"]["commit_signature"]
@@ -587,6 +589,10 @@ class BuilderStatementTests(unittest.TestCase):
         self.assertTrue(commit_sig_block["verified"])
         self.assertEqual(commit_sig_block["reason"], "valid")
         self.assertEqual(commit_sig_block["signature_type"], "gpg")
+        # Pins the real key name "source_sha" -- a typo'd/renamed key here
+        # would raise KeyError against real consumers even though the dict
+        # itself still "has a value" for the (wrong) mutated key.
+        self.assertEqual(commit_sig_block["source_sha"], "c" * 40)
 
     def test_repository_governance_available_follows_branch_governance_availability(self):
         bg = _default_branch_governance()
@@ -682,6 +688,190 @@ class PipelineBlockTests(unittest.TestCase):
 
         statement = build_statement(**_base_kwargs())
 
+        with open(_SCHEMA_PATH, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        errors = list(Draft202012Validator(schema).iter_errors(statement["predicate"]))
+        self.assertEqual(errors, [], msg=[e.message for e in errors])
+
+
+class BuildStatementPreexistingBoundaryTests(unittest.TestCase):
+    """A handful of build_statement() gaps found via a real mutation-testing
+    CI failure, 2026-09-19 -- all pre-existing (unrelated to the
+    functional_verification field this same diff added), swept into scope
+    only because this file's own diff-scoped mutation testing is function-
+    granular, not line-granular (see CLAUDE.md's own precedent for the
+    exact same shape of discovery in cli/parsers/github_rules.py)."""
+
+    def test_static_analysis_not_configured_default_block_every_count_is_exact(self):
+        statement = build_statement(**_base_kwargs())
+        static_analysis = statement["predicate"]["static_analysis"]
+        self.assertEqual(
+            {k: v for k, v in static_analysis.items() if k.endswith("_count") or k == "total_findings"},
+            {
+                "total_findings": 0,
+                "errors_count": 0,
+                "warnings_count": 0,
+                "notes_count": 0,
+                "none_count": 0,
+                "patch_errors_count": 0,
+                "patch_warnings_count": 0,
+                "critical_count": 0,
+                "high_count": 0,
+                "medium_count": 0,
+                "low_count": 0,
+            },
+        )
+
+    def test_density_ratio_rounds_to_exactly_three_decimal_places(self):
+        # 1/3 differs at the 4th decimal (0.333 vs 0.3333) -- pins the
+        # literal `3` in round(..., 3), which 150/100=1.5 can't (rounds
+        # identically at 3 or 4 places).
+        statement = build_statement(**_base_kwargs(total_assertions=1, total_test_functions=3))
+        self.assertEqual(statement["predicate"]["assertion_density"]["density_ratio"], 0.333)
+
+    def test_density_ratio_is_computed_when_exactly_one_test_function(self):
+        # Pins `total_test_functions > 0`, not `> 1`.
+        statement = build_statement(**_base_kwargs(total_assertions=2, total_test_functions=1))
+        self.assertEqual(statement["predicate"]["assertion_density"]["density_ratio"], 2.0)
+
+    def test_valid_test_ratio_is_computed_when_exactly_one_test_function(self):
+        statement = build_statement(**_base_kwargs(total_test_functions=1, valid_test_functions=1))
+        self.assertEqual(statement["predicate"]["assertion_density"]["valid_test_ratio"], 1.0)
+
+    def test_total_test_count_uses_skipped_when_it_exceeds_tests(self):
+        # Pins that `skipped` is a real input to the max(), not dropped.
+        statement = build_statement(
+            **_base_kwargs(test_totals=TestTotals(tests=0, passed=0, failed=0, errored=0, skipped=5, duration_ms=0))
+        )
+        self.assertEqual(statement["predicate"]["assertion_density"]["heuristics"]["skipped_or_disabled_ratio"], 1.0)
+
+    def test_total_test_count_floors_at_exactly_one_not_two(self):
+        statement = build_statement(
+            **_base_kwargs(test_totals=TestTotals(tests=0, passed=0, failed=0, errored=0, skipped=1, duration_ms=0))
+        )
+        self.assertEqual(statement["predicate"]["assertion_density"]["heuristics"]["skipped_or_disabled_ratio"], 1.0)
+
+    def test_skipped_ratio_rounds_to_exactly_four_decimal_places(self):
+        # 1/3 differs at the 5th decimal (0.3333 vs 0.33333).
+        statement = build_statement(
+            **_base_kwargs(test_totals=TestTotals(tests=3, passed=2, failed=0, errored=0, skipped=1, duration_ms=0))
+        )
+        self.assertEqual(statement["predicate"]["assertion_density"]["heuristics"]["skipped_or_disabled_ratio"], 0.3333)
+
+    def test_test_health_met_requires_more_than_zero_tests_not_more_than_one(self):
+        statement = build_statement(
+            **_base_kwargs(test_totals=TestTotals(tests=1, passed=1, failed=0, errored=0, skipped=0, duration_ms=1))
+        )
+        self.assertTrue(statement["predicate"]["test_verification"]["met"])
+
+    def test_patch_met_is_exactly_false_not_none_when_patch_coverage_is_unavailable(self):
+        statement = build_statement(
+            **_base_kwargs(
+                patch_coverage=PatchCoverageResult(available=False, line_rate=None, lines_changed=0, lines_covered=0, reason="x")
+            )
+        )
+        self.assertEqual(statement["predicate"]["coverage"]["thresholds"]["patch_met"], False)
+
+    def test_patch_met_stays_false_when_available_but_line_rate_is_none(self):
+        # Pins `and`, not `or`: available=True with line_rate=None must
+        # NOT attempt `None >= patch_coverage_min` (which would raise).
+        statement = build_statement(
+            **_base_kwargs(
+                patch_coverage=PatchCoverageResult(available=True, line_rate=None, lines_changed=0, lines_covered=0, reason="x")
+            )
+        )
+        self.assertEqual(statement["predicate"]["coverage"]["thresholds"]["patch_met"], False)
+
+    def test_patch_met_boundary_is_inclusive_of_equal_to_the_threshold(self):
+        statement = build_statement(
+            **_base_kwargs(
+                patch_coverage=PatchCoverageResult(available=True, line_rate=0.80, lines_changed=10, lines_covered=8, reason="ok"),
+                patch_coverage_min=0.80,
+            )
+        )
+        self.assertTrue(statement["predicate"]["coverage"]["thresholds"]["patch_met"])
+
+    def test_overall_met_boundary_is_inclusive_of_equal_to_the_threshold(self):
+        # Pins `>=`, not `>`: a line rate exactly equal to the threshold
+        # must count as met.
+        coverage = CoverageReport(overall_line_rate=0.60, overall_branch_rate=0.5, files={})
+        statement = build_statement(**_base_kwargs(coverage=coverage, overall_coverage_min=0.60))
+        self.assertTrue(statement["predicate"]["coverage"]["thresholds"]["overall_met"])
+
+    def test_assertion_density_met_boundary_is_inclusive_of_equal_to_the_target(self):
+        # Pins `>=`, not `>`, against ASSERTION_DENSITY_TARGET.
+        total_test_functions = 100
+        total_assertions = round(ASSERTION_DENSITY_TARGET * total_test_functions)
+        statement = build_statement(
+            **_base_kwargs(total_assertions=total_assertions, total_test_functions=total_test_functions)
+        )
+        density = statement["predicate"]["assertion_density"]
+        self.assertEqual(density["density_ratio"], ASSERTION_DENSITY_TARGET)
+        self.assertTrue(density["met"])
+
+    def test_mutation_testing_block_is_the_real_report_not_the_not_configured_default(self):
+        mutation_report = types.SimpleNamespace(as_dict=lambda: {"available": True, "grade": "passed", "sentinel": "real-report"})
+        statement = build_statement(**_base_kwargs(mutation_report=mutation_report))
+        self.assertEqual(statement["predicate"]["mutation_testing"], {"available": True, "grade": "passed", "sentinel": "real-report"})
+
+    def test_mutation_multiplier_and_pre_multiplier_cluster_score_use_their_own_real_values_and_precision(self):
+        rcs = _base_kwargs()["rcs"]
+        rcs.mutation_multiplier = 0.856789
+        rcs.pre_multiplier_cluster_score = 58.987654
+        statement = build_statement(**_base_kwargs(rcs=rcs))
+        score_block = statement["predicate"]["release_confidence_score"]
+        self.assertEqual(score_block["mutation_multiplier"], 0.8568)
+        self.assertEqual(score_block["pre_multiplier_cluster_score"], 58.99)
+
+    def test_subject_dict_uses_the_real_name_key(self):
+        statement = build_statement(**_base_kwargs(subject_name="ghcr.io/example/app"))
+        self.assertEqual(statement["subject"][0]["name"], "ghcr.io/example/app")
+
+
+class FunctionalVerificationBlockTests(unittest.TestCase):
+    """predicate.functional_verification: absent by default (every caller
+    predating cli.parsers.functional_adequacy) must report met=False, not
+    a naive full-credit pass -- see cli.builder's own
+    _FUNCTIONAL_VERIFICATION_NOT_CONFIGURED docstring for why this is
+    deliberately not the same relief cli.mutation's not_applicable grade
+    gives an unconfigured run."""
+
+    def test_default_is_not_configured_and_never_a_silent_pass(self):
+        statement = build_statement(**_base_kwargs())
+        block = statement["predicate"]["functional_verification"]
+        self.assertFalse(block["available"])
+        self.assertFalse(block["met"])
+        self.assertEqual(block["adequacy"]["status"], "not_configured")
+        self.assertEqual(block["reason_code"], "not_configured")
+
+    def test_real_report_is_embedded_verbatim(self):
+        from cli.parsers.functional_adequacy import FunctionalVerificationReport
+
+        report = FunctionalVerificationReport(
+            available=True,
+            met=True,
+            framework="generic_json",
+            target_env="staging",
+            total=1,
+            passed=1,
+            failed=0,
+            skipped=0,
+            adequacy_status="evaluated",
+            score_pct=100.0,
+            declared=["auth-flow"],
+            covered=["auth-flow"],
+            missing=[],
+            report_uri="https://ci/example",
+            reason="1/1 declared journey(s) covered",
+            reason_code=None,
+        )
+        statement = build_statement(**_base_kwargs(functional_verification=report))
+        block = statement["predicate"]["functional_verification"]
+        self.assertEqual(block, report.as_dict())
+        self.assertTrue(block["met"])
+
+    def test_not_configured_default_validates_against_schema(self):
+        statement = build_statement(**_base_kwargs())
         with open(_SCHEMA_PATH, "r", encoding="utf-8") as f:
             schema = json.load(f)
         errors = list(Draft202012Validator(schema).iter_errors(statement["predicate"]))

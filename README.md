@@ -1090,6 +1090,92 @@ Dependabot alerts API, its only honest signal, and legitimately reports
 `not_yet_reported` off-GitHub or when the token lacks
 `Dependabot alerts: Read`.
 
+## Functional test adequacy evaluation (`predicate.functional_verification`)
+
+Coverage and unit-test health say nothing about whether a repo's actual
+critical user journeys (login, checkout, an ingestion pipeline, ...) were
+exercised end-to-end against a real/live environment. `cli/parsers/
+functional_adequacy.py` turns that into a deterministic, verifiable
+governance metric instead of trusting a green CI checkmark at face value:
+an evaluated contract, never a guess or a scrape of raw terminal logs.
+
+**The contract** is declared once, checked in, at
+`.lucid/functional-verification.json` (JSON, not YAML — every other
+`.lucid/*` config in this repo is JSON and `cli/` stays stdlib-only by
+design; see `--license-curations`/`.lucid/denylist.json`/
+`.lucid/manual-updates.json` above for the same convention):
+
+```json
+{
+  "framework": "playwright",
+  "min_adequacy_pct": 100,
+  "declared_journeys": ["auth-flow", "attestation-ingest", "policy-evaluation"]
+}
+```
+
+`declared_journeys` is the **Declared Operational Surface** — the
+denominator. Absent, empty, or the config file missing entirely all mean
+the same honest thing: `predicate.functional_verification.adequacy.status
+== "not_configured"`, `available: false`, `reason_code: "not_configured"`
+— and, deliberately, `met: false` too. `met` is a concrete, non-nullable
+boolean in every outcome this module produces, and it is never `true`
+unless a real evaluation actually ran and passed: a naive consumer that
+reads only `met` must see `false` for a repo that never declared a
+contract, not an emerald "passed" it never earned (CLAUDE.md's
+Fail-Closed Verification invariant — missing/unevaluated metadata must
+never default to a passing state). This is deliberately *not* the same
+relief `cli/mutation`'s `not_applicable` grade gives an unconfigured
+mutation-testing run: that grade only ever discounts an internal scoring
+*multiplier*, never a bare pass/fail claim a console would render
+directly. A consumer that needs to tell "never configured" apart from
+"evaluated and failed" reads `available`/`adequacy.status`/`reason_code`
+— never `met` alone.
+
+**The evidence** is `--functional-report <path>`, a real structured test
+report — the **Executed Scenarios**, the numerator. Three formats are
+supported, selected by the config's own `framework`:
+
+- `"playwright"` — a real Playwright JSON reporter report (`--reporter=json`).
+- `"pytest"` — JUnit XML (what `pytest --junitxml=...` and most other
+  JUnit-emitting runners produce).
+- `"generic_json"` — this project's own minimal shape for anything else:
+  `{"tests": [{"name": "...", "status": "passed", "journeys": ["auth-flow"]}]}`.
+
+A declared journey is tied to an executed test via one tagging
+convention shared by Playwright and JUnit — a `@cuj:<journey-id>` token
+embedded in the test's own title/name (Playwright: the full suite-path +
+spec title; JUnit: `classname`/`name`/any `<properties><property>`
+value) — while `generic_json` carries an explicit `journeys` array per
+test instead (its `@cuj:` tags in `name` are still honored, for
+consistency). A journey counts as **covered** only when at least one
+associated test passed *and none* associated with it failed anywhere in
+the run — a real failure on a declared journey is never masked by a
+coincidental pass elsewhere.
+
+`--functional-env <name>` (e.g. `staging`, `preview`) and
+`--functional-report-uri <uri>` are both purely descriptive, embedded
+verbatim as `target_env`/`report_uri` — the latter is never fetched or
+validated by this pipeline.
+
+**`met`** is `true` only when the report actually ran at least one test
+(`total > 0`), zero executed tests failed, *and*
+`adequacy.score_pct >= min_adequacy_pct`. A single failed test blocks
+`met` regardless of journey coverage — a real, comprehensive suite that
+also has one broken assertion is not "adequate" just because every
+journey happened to be tagged elsewhere. Every other honest outcome gets
+its own `reason_code` rather than a shared, ambiguous one:
+`not_configured`, `report_missing` (a contract exists but
+`--functional-report` wasn't passed this run), `unsupported_framework`
+(the config names something other than `playwright`/`pytest`/
+`generic_json`), `report_malformed` (unreadable/unparseable input),
+`no_tests_executed`, `test_failures`, and `partial_adequacy`.
+
+This section is scoring-independent by design — it never feeds
+`release_confidence_score`, the same posture `predicate.s2c2f` and
+`predicate.resolved_dependencies` already take, since a repo without any
+declared journeys yet must never see its RCS silently penalized for a
+contract it hasn't opted into.
+
 ## Signing flow (keyless / Sigstore)
 
 `oidc_signer.py` implements the ambient-credential keyless model end to
@@ -2003,12 +2089,19 @@ python3 -m cli.main \
   --sonar-metrics path/to/sonar-measures.json \
   --sbom path/to/cyclonedx-bom.json \
   --coverage-contexts build/coverage-contexts.json \
+  --functional-report build/playwright-report.json --functional-env staging \
   --skip-perf-budget-check --debug \
   --emit-slsa-provenance --slsa-provenance-out /tmp/attestation.slsa-provenance.unsigned.json \
   --out /tmp/attestation.unsigned.json
 # `lucid-assay run --sarif ... --sonar-metrics ...` is an equivalent, explicit
 # spelling of the same pipeline invocation above. Omit --emit-slsa-provenance/
 # --slsa-provenance-out to skip the second, SLSA-shaped statement entirely.
+# --functional-report needs a `.lucid/functional-verification.json` contract
+# checked into the target repo declaring its framework/declared_journeys (see
+# "Functional test adequacy evaluation" above) -- without one, this flag is a
+# no-op and predicate.functional_verification reports adequacy.status=
+# "not_configured" rather than failing the run.
+#
 # --coverage-contexts is generated by:
 #   pytest --cov=cli --cov-context=test --cov-report=xml:build/coverage.xml tests/
 #   coverage json --show-contexts -o build/coverage-contexts.json

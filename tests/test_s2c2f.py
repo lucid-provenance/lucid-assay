@@ -14,8 +14,31 @@ from cli.parsers.s2c2f import (
     STATUS_MET,
     STATUS_NOT_YET_REPORTED,
     STATUS_UNMET,
+    _FeedProvenanceResult,
+    _canonical_entries_bytes,
+    _codeowners_pattern_covers_manifest,
+    _eval_enf2_curated_feeds,
+    _eval_ing2_local_copies,
+    _eval_ing3_denylists,
+    _eval_ing4_source_cloning,
+    _eval_sca1_vulnerability_scans,
+    _eval_sca2_license_checks,
+    _eval_sca3_eol_scans,
+    _eval_sca4_malware_scans,
+    _eval_sca5_proactive_reviews,
+    _eval_upd1_manual_updates,
+    _eval_upd2_auto_updates,
+    _evaluate_maven_feed,
+    _evaluate_npm_feed,
+    _evaluate_pip_feed,
+    _find_codeowners_manifest_coverage,
+    _find_dependabot_automerge_workflow,
+    _iter_npm_resolved_urls,
+    _load_manual_updates_process_ref,
+    _process_ref_is_url,
     compute_denylist_digest,
     evaluate_s2c2f,
+    load_denylist,
 )
 from cli.parsers.sarif import SarifRuleGroup, SarifSummaryReport, SarifToolSummary
 from cli.parsers.sbom import SbomComponent, build_sbom_sarif_report, sbom_components_to_resolved_dependencies
@@ -1011,6 +1034,539 @@ class NewControlCatalogTests(unittest.TestCase):
         for control_id, (label, level) in expected.items():
             self.assertEqual(controls[control_id].label, label, control_id)
             self.assertEqual(controls[control_id].level, level, control_id)
+
+
+# ---------------------------------------------------------------------------
+# Direct-field tests on private helpers, 2026-09-19: mutation testing on
+# PR #104's real diff (cli/main.py, cli/parsers/github_rules.py,
+# cli/parsers/s2c2f.py) scored 68.4% -- weak tier, blocked by
+# --disallow-degraded. Every survivor traced to the same root cause: the
+# integration-level tests above call evaluate_s2c2f() and check only
+# `.status` (or a substring of `.detail`), so a mutation swapping an
+# unobserved field (a wrong ecosystem string, an off-by-one counter never
+# referenced in the asserted substring, singular/plural grammar, a status
+# constant one branch over) went undetected. Same fix this project's own
+# PythonRunnerRunDirectFieldTests already established for exactly this
+# class of gap: call the private helper directly, assert every field
+# exactly, not through the lossy public-API substring lens.
+# ---------------------------------------------------------------------------
+
+
+class IterNpmResolvedUrlsTests(unittest.TestCase):
+    def test_packages_format_skips_root_entry(self):
+        data = {"packages": {"": {"resolved": "should-never-be-yielded"}, "node_modules/left-pad": {"resolved": "https://registry.npmjs.org/left-pad"}}}
+        self.assertEqual(list(_iter_npm_resolved_urls(data)), ["https://registry.npmjs.org/left-pad"])
+
+    def test_packages_format_skips_entries_with_no_resolved_field(self):
+        data = {"packages": {"": {}, "node_modules/left-pad": {"version": "1.3.0"}}}
+        self.assertEqual(list(_iter_npm_resolved_urls(data)), [])
+
+    def test_packages_format_skips_non_dict_meta(self):
+        data = {"packages": {"": {}, "node_modules/left-pad": "not-a-dict"}}
+        self.assertEqual(list(_iter_npm_resolved_urls(data)), [])
+
+    def test_dependencies_v1_format_recurses_into_nested_dependencies(self):
+        data = {"dependencies": {
+            "left-pad": {"resolved": "https://registry.npmjs.org/left-pad", "dependencies": {
+                "nested-dep": {"resolved": "https://registry.npmjs.org/nested-dep"},
+            }},
+        }}
+        self.assertEqual(
+            sorted(_iter_npm_resolved_urls(data)),
+            sorted(["https://registry.npmjs.org/left-pad", "https://registry.npmjs.org/nested-dep"]),
+        )
+
+    def test_dependencies_v1_format_skips_non_dict_meta(self):
+        data = {"dependencies": {"left-pad": "not-a-dict"}}
+        self.assertEqual(list(_iter_npm_resolved_urls(data)), [])
+
+    def test_neither_packages_nor_dependencies_yields_nothing(self):
+        self.assertEqual(list(_iter_npm_resolved_urls({})), [])
+
+
+def _write_package_lock(repo_dir, resolved_urls):
+    """resolved_urls: list of URL strings, written as distinct packages
+    entries (npm v7+ "packages" format)."""
+    packages = {"": {}}
+    for i, url in enumerate(resolved_urls):
+        packages[f"node_modules/dep{i}"] = {"resolved": url}
+    with open(os.path.join(repo_dir, "package-lock.json"), "w") as f:
+        json.dump({"packages": packages}, f)
+
+
+class EvaluateNpmFeedDirectFieldTests(unittest.TestCase):
+    def test_no_lockfile_returns_none(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            self.assertIsNone(_evaluate_npm_feed(Path(repo_dir), []))
+
+    def test_malformed_json_exact_result(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            with open(os.path.join(repo_dir, "package-lock.json"), "w") as f:
+                f.write("{not valid json")
+            result = _evaluate_npm_feed(Path(repo_dir), [])
+        self.assertEqual(result, _FeedProvenanceResult("npm", False, "package-lock.json is present but unreadable/malformed JSON"))
+
+    def test_no_resolved_urls_exact_result(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            _write_package_lock(repo_dir, [])
+            result = _evaluate_npm_feed(Path(repo_dir), [])
+        self.assertEqual(result, _FeedProvenanceResult("npm", False, "package-lock.json carries no resolved dependency URLs to evaluate"))
+
+    def test_single_public_dependency_exact_result_singular_grammar(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            _write_package_lock(repo_dir, ["https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"])
+            result = _evaluate_npm_feed(Path(repo_dir), ["internal.example"])
+        self.assertEqual(result, _FeedProvenanceResult(
+            "npm", False,
+            "1 resolved dependency: 0 via a configured internal host, 1 direct from registry.npmjs.org, 0 from another unclassified host",
+        ))
+
+    def test_mixed_internal_public_other_exact_result_plural_grammar(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            _write_package_lock(repo_dir, [
+                "https://internal.example/left-pad",
+                "https://registry.npmjs.org/right-pad",
+                "https://some-other-registry.example/other-pad",
+            ])
+            result = _evaluate_npm_feed(Path(repo_dir), ["internal.example"])
+        self.assertEqual(result, _FeedProvenanceResult(
+            "npm", False,
+            "3 resolved dependencies: 1 via a configured internal host, 1 direct from registry.npmjs.org, 1 from another unclassified host",
+        ))
+
+    def test_all_internal_single_dependency_exact_result_singular_grammar(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            _write_package_lock(repo_dir, ["https://internal.example/left-pad"])
+            result = _evaluate_npm_feed(Path(repo_dir), ["internal.example"])
+        self.assertEqual(result, _FeedProvenanceResult("npm", True, "all 1 resolved dependency came from a configured internal host"))
+
+    def test_all_internal_multiple_dependencies_exact_result_plural_grammar(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            _write_package_lock(repo_dir, ["https://internal.example/left-pad", "https://internal.example/right-pad"])
+            result = _evaluate_npm_feed(Path(repo_dir), ["internal.example"])
+        self.assertEqual(result, _FeedProvenanceResult("npm", True, "all 2 resolved dependencies came from a configured internal host"))
+
+
+class EvaluatePipFeedDirectFieldTests(unittest.TestCase):
+    def test_no_pip_manifest_returns_none(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            self.assertIsNone(_evaluate_pip_feed(Path(repo_dir)))
+
+    def test_manifest_without_proxy_config_exact_result(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            with open(os.path.join(repo_dir, "requirements.txt"), "w") as f:
+                f.write("requests==2.31.0\n")
+            result = _evaluate_pip_feed(Path(repo_dir))
+        self.assertEqual(result, _FeedProvenanceResult(
+            "pip", False,
+            "a pip manifest is present but no pip.conf/pip.ini at the repo root names a private index-url; "
+            "an org-wide proxy configured outside the repo would not be visible here",
+        ))
+
+    def test_manifest_with_proxy_config_exact_result(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            with open(os.path.join(repo_dir, "pyproject.toml"), "w") as f:
+                f.write("[project]\nname = 'widgets'\n")
+            with open(os.path.join(repo_dir, "pip.conf"), "w") as f:
+                f.write("[global]\nindex-url = https://pip.internal.example/simple\n")
+            result = _evaluate_pip_feed(Path(repo_dir))
+        self.assertEqual(result, _FeedProvenanceResult("pip", True, "pip.conf names a non-default index-url, consistent with an internal package proxy"))
+
+
+class EvaluateMavenFeedDirectFieldTests(unittest.TestCase):
+    def test_no_pom_returns_none(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            self.assertIsNone(_evaluate_maven_feed(Path(repo_dir)))
+
+    def test_no_repository_block_exact_result(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            with open(os.path.join(repo_dir, "pom.xml"), "w") as f:
+                f.write("<project></project>")
+            result = _evaluate_maven_feed(Path(repo_dir))
+        self.assertEqual(result, _FeedProvenanceResult(
+            "maven", False,
+            "pom.xml declares no <repository> outside Maven Central; settings.xml-level mirrors (outside this repo) would not be visible here",
+        ))
+
+    def test_repository_pointing_at_maven_central_exact_result(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            with open(os.path.join(repo_dir, "pom.xml"), "w") as f:
+                f.write("<project><repositories><repository><url>https://repo.maven.apache.org/maven2</url></repository></repositories></project>")
+            result = _evaluate_maven_feed(Path(repo_dir))
+        self.assertEqual(result, _FeedProvenanceResult(
+            "maven", False,
+            "pom.xml declares no <repository> outside Maven Central; settings.xml-level mirrors (outside this repo) would not be visible here",
+        ))
+
+    def test_repository_pointing_outside_maven_central_exact_result(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            with open(os.path.join(repo_dir, "pom.xml"), "w") as f:
+                f.write("<project><repositories><repository><url>https://maven.internal.example/repo</url></repository></repositories></project>")
+            result = _evaluate_maven_feed(Path(repo_dir))
+        self.assertEqual(result, _FeedProvenanceResult("maven", True, "pom.xml declares a <repository> outside Maven Central (https://maven.internal.example/repo)"))
+
+
+class Ing2Enf2DirectFieldTests(unittest.TestCase):
+    """Constructs _FeedProvenanceResult lists directly, bypassing the
+    filesystem entirely -- isolates ING-2/ENF-2's own join/filter logic
+    from the feed-provenance helpers already covered above."""
+
+    def test_empty_feed_results_exact_not_yet_reported(self):
+        ing2 = _eval_ing2_local_copies([])
+        enf2 = _eval_enf2_curated_feeds([])
+        self.assertEqual(ing2.status, STATUS_NOT_YET_REPORTED)
+        self.assertEqual(ing2.detail, "no npm/pip/maven manifest was found under the repo to evaluate feed provenance against")
+        self.assertEqual(enf2.status, STATUS_NOT_YET_REPORTED)
+        self.assertEqual(enf2.detail, "no npm/pip/maven manifest was found under the repo to evaluate curated-feed enforcement against")
+
+    def test_all_met_exact_joined_detail(self):
+        results = [_FeedProvenanceResult("npm", True, "all good"), _FeedProvenanceResult("pip", True, "also good")]
+        ing2 = _eval_ing2_local_copies(results)
+        enf2 = _eval_enf2_curated_feeds(results)
+        self.assertEqual(ing2.status, STATUS_MET)
+        self.assertEqual(ing2.detail, "npm: all good; pip: also good")
+        self.assertEqual(enf2.status, STATUS_MET)
+        self.assertEqual(enf2.detail, "no dependency resolution bypassed the required curated feed(s); enforcement would not break this build: npm: all good; pip: also good")
+
+    def test_one_failing_ing2_lists_every_result_enf2_lists_only_failing(self):
+        results = [_FeedProvenanceResult("npm", False, "npm bad"), _FeedProvenanceResult("pip", True, "pip good")]
+        ing2 = _eval_ing2_local_copies(results)
+        enf2 = _eval_enf2_curated_feeds(results)
+        self.assertEqual(ing2.status, STATUS_UNMET)
+        self.assertEqual(ing2.detail, "npm: npm bad; pip: pip good")
+        self.assertEqual(enf2.status, STATUS_UNMET)
+        self.assertEqual(enf2.detail, "a build enforcing curated-feed consumption would break here: npm: npm bad")
+
+
+class Sca1DirectFieldTests(unittest.TestCase):
+    def test_tool_match_exact_detail(self):
+        result = _eval_sca1_vulnerability_scans(["grype"], None)
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertEqual(result.detail, "SARIF findings from a recognized SCA tool (grype)")
+
+    def test_204_exact_detail(self):
+        result = _eval_sca1_vulnerability_scans([], 204)
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertEqual(result.detail, "GitHub Dependabot vulnerability alerts are enabled for this repository")
+
+    def test_404_exact_detail(self):
+        result = _eval_sca1_vulnerability_scans([], 404)
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertEqual(result.detail, "GitHub Dependabot vulnerability alerts are not enabled, and no SARIF input came from a recognized SCA tool")
+
+    def test_none_status_exact_detail_not_yet_reported(self):
+        result = _eval_sca1_vulnerability_scans([], None)
+        self.assertEqual(result.status, STATUS_NOT_YET_REPORTED)
+        self.assertEqual(result.detail, "no SARIF input from a recognized SCA tool, and the GitHub vulnerability-alerts API could not be reached (missing token or network failure)")
+
+    def test_inconclusive_status_exact_detail_unmet(self):
+        result = _eval_sca1_vulnerability_scans([], 403)
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertEqual(result.detail, "no SARIF input from a recognized SCA tool, and GitHub's vulnerability-alerts API returned an inconclusive status (403)")
+
+
+class Sca2DirectFieldTests(unittest.TestCase):
+    def test_tool_match_exact_detail(self):
+        result = _eval_sca2_license_checks(["fossa"])
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertEqual(result.detail, "SARIF findings from a recognized license-scanning tool (fossa)")
+
+    def test_no_match_exact_detail_unmet(self):
+        result = _eval_sca2_license_checks([])
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertEqual(result.detail, "no --sarif input came from a recognized license-scanning tool; no other generic signal is available")
+
+
+class Sca3DirectFieldTests(unittest.TestCase):
+    def test_200_exact_detail(self):
+        result = _eval_sca3_eol_scans(200, None)
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertEqual(result.detail, "GitHub Dependabot alerts API is enabled and reachable for this repository (closest available signal for automated deprecated/EOL package flagging)")
+
+    def test_404_exact_detail(self):
+        result = _eval_sca3_eol_scans(404, None)
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertEqual(result.detail, "GitHub Dependabot alerts are not enabled for this repository")
+
+    def test_403_with_real_body_message_exact_detail(self):
+        result = _eval_sca3_eol_scans(403, "Dependabot alerts are disabled for this repository.")
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertEqual(result.detail, "GitHub Dependabot alerts API returned 403: Dependabot alerts are disabled for this repository.")
+
+    def test_403_without_body_message_exact_fallback_detail(self):
+        result = _eval_sca3_eol_scans(403, None)
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertEqual(result.detail, "GitHub Dependabot alerts API returned 403: the token likely lacks 'Dependabot alerts: Read' permission")
+
+    def test_unreachable_exact_detail_not_yet_reported(self):
+        result = _eval_sca3_eol_scans(None, None)
+        self.assertEqual(result.status, STATUS_NOT_YET_REPORTED)
+        self.assertEqual(result.detail, "GitHub Dependabot alerts API could not be reached (missing token or network failure)")
+
+
+class Sca4DirectFieldTests(unittest.TestCase):
+    def test_tool_match_exact_detail(self):
+        result = _eval_sca4_malware_scans(["osv-scanner"])
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertEqual(result.detail, "SARIF findings from a recognized malware/malicious-package-scanning tool (osv-scanner)")
+
+    def test_no_match_exact_detail_unmet(self):
+        result = _eval_sca4_malware_scans([])
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertEqual(result.detail, "no --sarif input came from a recognized malware-scanning tool (default: OSV-Scanner); no other generic signal is available")
+
+
+class CodeownersPatternCoversManifestDirectTests(unittest.TestCase):
+    def test_exact_filename_match(self):
+        self.assertEqual(_codeowners_pattern_covers_manifest("package.json"), "package.json")
+
+    def test_leading_slash_stripped(self):
+        self.assertEqual(_codeowners_pattern_covers_manifest("/requirements.txt"), "requirements.txt")
+
+    def test_trailing_double_star_stripped(self):
+        self.assertEqual(_codeowners_pattern_covers_manifest("/pom.xml/**"), "pom.xml")
+
+    def test_bare_wildcard_matches_first_catalog_entry(self):
+        self.assertEqual(_codeowners_pattern_covers_manifest("*"), "package.json")
+
+    def test_double_star_matches_first_catalog_entry(self):
+        self.assertEqual(_codeowners_pattern_covers_manifest("**"), "package.json")
+
+    def test_unrelated_pattern_returns_none(self):
+        self.assertIsNone(_codeowners_pattern_covers_manifest("*.md"))
+
+
+class FindCodeownersManifestCoverageDirectTests(unittest.TestCase):
+    def test_no_codeowners_file_at_any_location_returns_none(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            self.assertIsNone(_find_codeowners_manifest_coverage(repo_dir))
+
+    def test_comment_and_blank_lines_skipped(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            with open(os.path.join(repo_dir, "CODEOWNERS"), "w") as f:
+                f.write("# a comment\n\npackage.json @acme/team\n")
+            self.assertEqual(_find_codeowners_manifest_coverage(repo_dir), ("CODEOWNERS", "package.json"))
+
+    def test_root_codeowners_checked_before_github_subdirectory(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            os.makedirs(os.path.join(repo_dir, ".github"))
+            with open(os.path.join(repo_dir, "CODEOWNERS"), "w") as f:
+                f.write("package.json @acme/team\n")
+            with open(os.path.join(repo_dir, ".github", "CODEOWNERS"), "w") as f:
+                f.write("requirements.txt @acme/other-team\n")
+            self.assertEqual(_find_codeowners_manifest_coverage(repo_dir), ("CODEOWNERS", "package.json"))
+
+
+class Sca5DirectFieldTests(unittest.TestCase):
+    def test_branch_governance_unavailable_exact_detail(self):
+        result = _eval_sca5_proactive_reviews(tempfile.mkdtemp(), _governance(available=False))
+        self.assertEqual(result.status, STATUS_NOT_YET_REPORTED)
+        self.assertEqual(result.detail, "branch governance could not be verified (see predicate.branch_governance.reason)")
+
+    def test_no_coverage_exact_detail(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            result = _eval_sca5_proactive_reviews(repo_dir, _governance())
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertEqual(result.detail, "no CODEOWNERS entry (checked CODEOWNERS/.github/CODEOWNERS/docs/CODEOWNERS) covers a recognized dependency-manifest file")
+
+    def test_coverage_without_required_review_exact_detail(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            with open(os.path.join(repo_dir, "CODEOWNERS"), "w") as f:
+                f.write("requirements.txt @acme/team\n")
+            result = _eval_sca5_proactive_reviews(repo_dir, _governance(require_code_owner_review=False))
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertEqual(result.detail, "CODEOWNERS covers requirements.txt, but the branch does not require code-owner review (require_code_owner_review is false)")
+
+    def test_coverage_with_required_review_exact_detail_met(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            with open(os.path.join(repo_dir, "CODEOWNERS"), "w") as f:
+                f.write("requirements.txt @acme/team\n")
+            result = _eval_sca5_proactive_reviews(repo_dir, _governance(require_code_owner_review=True))
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertEqual(result.detail, "CODEOWNERS covers requirements.txt, and the branch requires code-owner review before merge")
+
+
+class LoadManualUpdatesProcessRefDirectTests(unittest.TestCase):
+    def test_missing_file_returns_none(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as repo_dir:
+            self.assertIsNone(_load_manual_updates_process_ref(Path(repo_dir)))
+
+    def test_malformed_json_returns_none(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as repo_dir:
+            os.makedirs(os.path.join(repo_dir, ".lucid"))
+            with open(os.path.join(repo_dir, ".lucid", "manual-updates.json"), "w") as f:
+                f.write("{not valid json")
+            self.assertIsNone(_load_manual_updates_process_ref(Path(repo_dir)))
+
+    def test_wrong_schema_version_returns_none(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _write_manual_updates_config(repo_dir, "docs/x.md")
+            with open(os.path.join(repo_dir, ".lucid", "manual-updates.json"), "w") as f:
+                json.dump({"schema_version": "wrong/v0", "process_ref": "docs/x.md"}, f)
+            self.assertIsNone(_load_manual_updates_process_ref(Path(repo_dir)))
+
+    def test_empty_process_ref_returns_none(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _write_manual_updates_config(repo_dir, "   ")
+            self.assertIsNone(_load_manual_updates_process_ref(Path(repo_dir)))
+
+    def test_valid_process_ref_returned_verbatim(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as repo_dir:
+            _write_manual_updates_config(repo_dir, "docs/manual-updates.md")
+            self.assertEqual(_load_manual_updates_process_ref(Path(repo_dir)), "docs/manual-updates.md")
+
+
+class ProcessRefIsUrlDirectTests(unittest.TestCase):
+    def test_https_url_is_true(self):
+        self.assertTrue(_process_ref_is_url("https://wiki.example.com/docs"))
+
+    def test_http_url_is_true(self):
+        self.assertTrue(_process_ref_is_url("http://wiki.example.com/docs"))
+
+    def test_relative_path_is_false(self):
+        self.assertFalse(_process_ref_is_url("docs/manual-updates.md"))
+
+    def test_unsupported_scheme_is_false(self):
+        self.assertFalse(_process_ref_is_url("ftp://example.com/docs"))
+
+    def test_scheme_with_no_netloc_is_false(self):
+        self.assertFalse(_process_ref_is_url("https://"))
+
+
+class Upd1DirectFieldTests(unittest.TestCase):
+    def test_unresolvable_repo_dir_exact_detail(self):
+        result = _eval_upd1_manual_updates("bad\x00path")
+        self.assertEqual(result.status, STATUS_NOT_YET_REPORTED)
+        self.assertEqual(result.detail, "repo_dir 'bad\\x00path' could not be resolved")
+
+
+class FindDependabotAutomergeWorkflowDirectTests(unittest.TestCase):
+    def test_no_github_directory_returns_none(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            self.assertIsNone(_find_dependabot_automerge_workflow(repo_dir))
+
+    def test_workflows_directory_with_no_yaml_files_returns_none(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            workflows_dir = os.path.join(repo_dir, ".github", "workflows")
+            os.makedirs(workflows_dir)
+            with open(os.path.join(workflows_dir, "readme.txt"), "w") as f:
+                f.write("dependabot/fetch-metadata mentioned but wrong extension\n")
+            self.assertIsNone(_find_dependabot_automerge_workflow(repo_dir))
+
+    def test_yaml_workflow_without_marker_returns_none(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            workflows_dir = os.path.join(repo_dir, ".github", "workflows")
+            os.makedirs(workflows_dir)
+            with open(os.path.join(workflows_dir, "ci.yml"), "w") as f:
+                f.write("on: push\njobs:\n  build:\n    steps:\n      - run: echo hi\n")
+            self.assertIsNone(_find_dependabot_automerge_workflow(repo_dir))
+
+    def test_yaml_workflow_with_marker_returns_real_path(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            workflows_dir = os.path.join(repo_dir, ".github", "workflows")
+            os.makedirs(workflows_dir)
+            with open(os.path.join(workflows_dir, "automerge.yml"), "w") as f:
+                f.write("uses: dependabot/fetch-metadata@v2\n")
+            self.assertEqual(_find_dependabot_automerge_workflow(repo_dir), ".github/workflows/automerge.yml")
+
+    def test_yml_and_yaml_extensions_both_recognized(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            workflows_dir = os.path.join(repo_dir, ".github", "workflows")
+            os.makedirs(workflows_dir)
+            with open(os.path.join(workflows_dir, "automerge.yaml"), "w") as f:
+                f.write("uses: dependabot/fetch-metadata@v2\n")
+            self.assertEqual(_find_dependabot_automerge_workflow(repo_dir), ".github/workflows/automerge.yaml")
+
+
+class CanonicalEntriesBytesAndDigestDirectTests(unittest.TestCase):
+    def test_canonical_bytes_are_sorted_keys_compact_separators(self):
+        entries = [{"name": "evil", "ecosystem": "pypi", "reason": "bad"}]
+        result = _canonical_entries_bytes(entries)
+        self.assertEqual(result, b'[{"ecosystem":"pypi","name":"evil","reason":"bad"}]')
+
+    def test_key_order_does_not_affect_the_digest(self):
+        entries_a = [{"name": "evil", "ecosystem": "pypi", "reason": "bad"}]
+        entries_b = [{"reason": "bad", "ecosystem": "pypi", "name": "evil"}]
+        self.assertEqual(compute_denylist_digest(entries_a), compute_denylist_digest(entries_b))
+
+    def test_digest_changes_when_entries_change(self):
+        digest_empty = compute_denylist_digest([])
+        digest_one = compute_denylist_digest([{"name": "evil", "ecosystem": "pypi", "reason": "bad"}])
+        self.assertNotEqual(digest_empty, digest_one)
+
+
+class LoadDenylistDirectFieldTests(unittest.TestCase):
+    def test_missing_file_exact_reason(self):
+        from pathlib import Path
+        path = Path(tempfile.mkdtemp()) / "denylist.json"
+        doc, reason = load_denylist(path)
+        self.assertIsNone(doc)
+        self.assertEqual(reason, f"no denylist policy artifact found at {path}")
+
+    def test_malformed_json_reason_names_the_resolved_path(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as repo_dir:
+            path = Path(repo_dir) / "denylist.json"
+            path.write_text("{not valid json")
+            doc, reason = load_denylist(path)
+        self.assertIsNone(doc)
+        self.assertIn(str(path), reason)
+        self.assertIn("is not valid JSON", reason)
+
+    def test_missing_digest_exact_reason(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as repo_dir:
+            path = Path(repo_dir) / "denylist.json"
+            path.write_text(json.dumps({"schema_version": DENYLIST_SCHEMA_VERSION, "entries": []}))
+            doc, reason = load_denylist(path)
+        self.assertIsNone(doc)
+        self.assertEqual(reason, f"{path} is missing 'digest_sha256'")
+
+
+class Ing3SingularPluralDirectTests(unittest.TestCase):
+    def test_single_resolved_dependency_singular_grammar(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            denylist_path = Path(repo_dir) / "denylist.json"
+            _write_denylist(str(denylist_path), [])
+            result = _eval_ing3_denylists(denylist_path, [{"uri": "pkg:pypi/requests@2.31.0"}])
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertEqual(result.detail, "denylist artifact present, schema-valid, digest-verified (0 entries); none matched the 1 resolved dependency checked")
+
+    def test_two_resolved_dependencies_plural_grammar(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            from pathlib import Path
+            denylist_path = Path(repo_dir) / "denylist.json"
+            _write_denylist(str(denylist_path), [])
+            result = _eval_ing3_denylists(denylist_path, [{"uri": "pkg:pypi/requests@2.31.0"}, {"uri": "pkg:pypi/flask@3.0.0"}])
+        self.assertEqual(result.status, STATUS_MET)
+        self.assertEqual(result.detail, "denylist artifact present, schema-valid, digest-verified (0 entries); none matched the 2 resolved dependencies checked")
+
+
+class Ing4DirectFieldTests(unittest.TestCase):
+    def test_exact_detail(self):
+        result = _eval_ing4_source_cloning()
+        self.assertEqual(result.status, STATUS_UNMET)
+        self.assertEqual(result.detail, "no generic, repo-observable signal exists for upstream-source mirroring; no such infrastructure is operated today")
 
 
 if __name__ == "__main__":

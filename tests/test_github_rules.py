@@ -15,6 +15,7 @@ from cli.parsers.github_rules import (
     bypass_permits_unreviewed_change,
     inspect_branch_governance,
     _derive_branch_hygiene,
+    _derive_pr_requirements,
     _derive_required_status_check_contexts,
     _extract_http_error_detail,
     _github_api_get,
@@ -28,12 +29,15 @@ from cli.patch_coverage import PatchCoverageResult
 from cli.scorer import score_pipeline, BRANCH_GOVERNANCE_UNVERIFIED_PENALTY
 
 
-def _pull_request_rule(required_approving_review_count=2):
+def _pull_request_rule(required_approving_review_count=2, require_code_owner_review=None):
+    params = {"required_approving_review_count": required_approving_review_count}
+    if require_code_owner_review is not None:
+        params["require_code_owner_review"] = require_code_owner_review
     return {
         "type": "pull_request",
         "ruleset_source_type": "Repository",
         "ruleset_id": 1,
-        "parameters": {"required_approving_review_count": required_approving_review_count},
+        "parameters": params,
     }
 
 
@@ -81,6 +85,59 @@ class InspectBranchGovernanceTests(unittest.TestCase):
         self.assertTrue(report.admin_enforced)
         self.assertEqual(report.warnings, [])
         self.assertFalse(bypass_permits_unreviewed_change(report))
+        # No require_code_owner_review parameter on the rule -> real,
+        # checked False, not a fabricated default that happens to match.
+        self.assertFalse(report.require_code_owner_review)
+        self.assertEqual(report.reason, "queried GitHub rules for acme/widgets@main: 1 applicable rule(s), 0 bypass actor(s) across active branch rulesets")
+
+    @patch("cli.parsers.github_rules._github_api_get")
+    def test_require_code_owner_review_true_on_the_pull_request_rule_propagates(self, mock_get):
+        mock_get.side_effect = _api_get_router({
+            "/repos/acme/widgets/rules/branches/main": [_pull_request_rule(2, require_code_owner_review=True)],
+            "/repos/acme/widgets/rulesets": [_active_branch_ruleset_summary(1)],
+            "/repos/acme/widgets/rulesets/1": {"id": 1, "bypass_actors": []},
+        })
+        report = inspect_branch_governance("acme/widgets", "main", token="tok")
+        self.assertTrue(report.require_code_owner_review)
+
+    def test_invalid_repository_reports_the_real_branch_name(self):
+        report = inspect_branch_governance("not-a-valid-repo", "release/1.0", token="tok")
+        self.assertFalse(report.available)
+        self.assertEqual(report.branch, "release/1.0")
+
+    def test_missing_token_reports_the_real_branch_name(self):
+        report = inspect_branch_governance("acme/widgets", "release/1.0", token=None)
+        self.assertFalse(report.available)
+        self.assertEqual(report.branch, "release/1.0")
+        self.assertIn("no GITHUB_TOKEN available", report.reason)
+
+
+class DerivePrRequirementsDirectTests(unittest.TestCase):
+    """Direct calls, bypassing the GitHub-API layer entirely -- isolates
+    this function's own field-extraction logic from inspect_branch_
+    governance's own orchestration, already covered above."""
+
+    def test_no_pull_request_rule_all_fields_false_zero(self):
+        result = _derive_pr_requirements([{"type": "required_linear_history"}])
+        self.assertEqual(result, (False, 0, False, False))
+
+    def test_pull_request_rule_with_no_require_code_owner_review_param_defaults_false(self):
+        result = _derive_pr_requirements([_pull_request_rule(3)])
+        self.assertEqual(result, (True, 3, True, False))
+
+    def test_pull_request_rule_with_require_code_owner_review_true(self):
+        result = _derive_pr_requirements([_pull_request_rule(1, require_code_owner_review=True)])
+        self.assertEqual(result, (True, 1, True, True))
+
+    def test_pull_request_rule_with_require_code_owner_review_false(self):
+        result = _derive_pr_requirements([_pull_request_rule(1, require_code_owner_review=False)])
+        self.assertEqual(result, (True, 1, True, False))
+
+    def test_non_numeric_required_approving_review_count_degrades_to_zero(self):
+        rule = _pull_request_rule()
+        rule["parameters"]["required_approving_review_count"] = "not-a-number"
+        result = _derive_pr_requirements([rule])
+        self.assertEqual(result[1], 0)
 
     @patch("cli.parsers.github_rules._github_api_get")
     def test_200_with_always_bypass_actor_flags_warning_and_disables_admin_enforced(self, mock_get):

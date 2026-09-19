@@ -27,6 +27,7 @@ from .parsers.ast import inspect_test_suite
 from .parsers.commit_author import CommitAuthorReport, inspect_commit_author
 from .parsers.coverage import parse_cobertura, parse_jacoco, parse_lcov
 from .parsers.coverage_contexts import parse_coverage_contexts
+from .parsers.functional_adequacy import FunctionalVerificationReport, evaluate_functional_adequacy
 from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
 from .parsers.lockfiles import detect_and_parse_dependencies
@@ -72,6 +73,7 @@ _STAGE_LABELS = [
     ("rcs_scoring", "RCS Scoring Engine"),
     ("lockfile_dependencies", "Lockfile Dependency Detection"),
     ("s2c2f_evaluation", "S2C2F Control Evaluation"),
+    ("functional_adequacy_evaluation", "Functional Test Adequacy Evaluation"),
     ("predicate_assembly", "Predicate Serialization"),
     ("worm_upload", "WORM Upload Dispatch"),
     ("verdict_annotation", "Verdict Annotation"),
@@ -560,6 +562,27 @@ def _evaluate_s2c2f_controls(
         )
 
 
+def _evaluate_functional_adequacy(
+    args: argparse.Namespace,
+    stage_ns: Dict[str, int],
+) -> FunctionalVerificationReport:
+    """Step 6e: functional test adequacy evaluation (see
+    cli.parsers.functional_adequacy) -- Declared Operational Surface
+    (.lucid/functional-verification.json) vs. Executed Scenarios
+    (--functional-report). Never raises -- an absent config, missing
+    report, unsupported framework, or malformed report all degrade to an
+    honest, explicit outcome (see that module's own docstring). Extracted
+    (same rationale as _evaluate_s2c2f_controls/_ingest_sarif above) so
+    it's unit-testable directly."""
+    with _stage(stage_ns, "functional_adequacy_evaluation"):
+        return evaluate_functional_adequacy(
+            args.repo_dir,
+            args.functional_report,
+            target_env=args.functional_env,
+            report_uri=args.functional_report_uri,
+        )
+
+
 def _maybe_sign(
     args: argparse.Namespace, out_path
 ) -> Tuple[Optional[int], Dict[str, int], Optional[Path]]:
@@ -761,6 +784,29 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="comma-separated internal/curated registry host substrings, for S2C2F ING-2/ENF-2's feed-provenance check "
         "(default: ambient LUCID_INTERNAL_REGISTRY_HOSTS env var, else none configured)",
+    )
+    p.add_argument(
+        "--functional-report",
+        default=None,
+        help="path to a structured functional/end-to-end test report (Playwright JSON reporter output, "
+        "JUnit XML, or this project's own generic_json shape -- see cli/parsers/functional_adequacy.py) "
+        "evaluated against .lucid/functional-verification.json's declared_journeys contract. A no-op "
+        "(predicate.functional_verification reports adequacy.status='not_configured') when that config "
+        "file is absent; a configured contract with no --functional-report is an honest 'unavailable' "
+        "result, not a silent pass.",
+    )
+    p.add_argument(
+        "--functional-env",
+        default=None,
+        help="the environment --functional-report's suite actually ran against (e.g. staging, preview) "
+        "-- purely descriptive, embedded verbatim as predicate.functional_verification.target_env",
+    )
+    p.add_argument(
+        "--functional-report-uri",
+        default=None,
+        help="optional URI to the full --functional-report artifact in external storage (e.g. a WORM/"
+        "CI-artifact link), embedded verbatim as predicate.functional_verification.report_uri; this "
+        "pipeline never fetches or validates it",
     )
     p.add_argument(
         "--sarif",
@@ -1102,6 +1148,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         stage_ns=stage_ns,
     )
 
+    # 6e. Functional test adequacy evaluation (see _evaluate_functional_adequacy)
+    functional_verification = _evaluate_functional_adequacy(args, stage_ns)
+
     # 7. Build unsigned in-toto Statement
     with _stage(stage_ns, "predicate_assembly"):
         statement = build_statement(
@@ -1144,6 +1193,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             s2c2f=s2c2f_report,
             sbom=_build_sbom_artifact_block(sbom_report, sbom_report_sha),
             mutation_report=mutation_report,
+            functional_verification=functional_verification,
         )
 
     blocking_elapsed_ms = (time.perf_counter() - t_start) * 1000.0

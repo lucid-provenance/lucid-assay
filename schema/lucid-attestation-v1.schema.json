@@ -638,6 +638,45 @@
         "reason": { "type": "string" },
         "reason_code": { "type": ["string", "null"] }
       }
+    },
+
+    "functional_verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Functional/end-to-end test adequacy (cli/parsers/functional_adequacy.py): Declared Operational Surface (.lucid/functional-verification.json's declared_journeys) vs. Executed Scenarios (--functional-report). Scoring-independent -- never folded into release_confidence_score. adequacy.status='not_configured' (met=false, available=false, reason_code='not_configured') on an attestation predating this field, or when the repo never declared a contract -- met is a concrete, non-nullable bool that is never true unless a real evaluation actually ran and passed (fail-closed by design); a consumer must read available/adequacy.status/reason_code, not met alone, to tell 'never configured' apart from 'evaluated and failed'.",
+      "properties": {
+        "available": { "type": "boolean", "description": "False when the contract was never evaluated at all (not configured) or a real evaluation attempt failed (missing/unsupported/unreadable --functional-report) -- see reason_code." },
+        "met": { "type": "boolean", "description": "True only when the report actually ran (total > 0), zero executed tests failed, and adequacy.score_pct >= the configured min_adequacy_pct. A single failed test blocks met=true regardless of journey coverage." },
+        "framework": { "type": ["string", "null"], "enum": ["playwright", "pytest", "generic_json", "", null] },
+        "target_env": { "type": ["string", "null"], "description": "The environment --functional-report's suite ran against (e.g. staging, preview) -- purely descriptive, from --functional-env." },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["total", "passed", "failed", "skipped"],
+          "properties": {
+            "total": { "type": "integer", "minimum": 0 },
+            "passed": { "type": "integer", "minimum": 0 },
+            "failed": { "type": "integer", "minimum": 0 },
+            "skipped": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "adequacy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "metric_type", "score_pct", "declared", "covered", "missing"],
+          "properties": {
+            "status": { "type": "string", "enum": ["evaluated", "not_configured", "unavailable"] },
+            "metric_type": { "type": "string", "const": "cuj_coverage" },
+            "score_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+            "declared": { "type": "array", "items": { "type": "string" }, "description": "Every journey id declared in .lucid/functional-verification.json's declared_journeys." },
+            "covered": { "type": "array", "items": { "type": "string" }, "description": "Declared journeys with at least one passing associated test and zero failing ones." },
+            "missing": { "type": "array", "items": { "type": "string" }, "description": "Declared journeys not covered -- never executed, or executed with at least one failure." }
+          }
+        },
+        "report_uri": { "type": ["string", "null"], "description": "Optional external-storage link to the full --functional-report artifact, from --functional-report-uri; never fetched or validated by this pipeline." },
+        "reason": { "type": "string" },
+        "reason_code": { "type": ["string", "null"], "enum": ["not_configured", "report_missing", "report_malformed", "unsupported_framework", "no_tests_executed", "test_failures", "partial_adequacy", null] }
+      }
     }
   },
 

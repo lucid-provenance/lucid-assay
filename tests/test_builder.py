@@ -688,5 +688,55 @@ class PipelineBlockTests(unittest.TestCase):
         self.assertEqual(errors, [], msg=[e.message for e in errors])
 
 
+class FunctionalVerificationBlockTests(unittest.TestCase):
+    """predicate.functional_verification: absent by default (every caller
+    predating cli.parsers.functional_adequacy) must report met=False, not
+    a naive full-credit pass -- see cli.builder's own
+    _FUNCTIONAL_VERIFICATION_NOT_CONFIGURED docstring for why this is
+    deliberately not the same relief cli.mutation's not_applicable grade
+    gives an unconfigured run."""
+
+    def test_default_is_not_configured_and_never_a_silent_pass(self):
+        statement = build_statement(**_base_kwargs())
+        block = statement["predicate"]["functional_verification"]
+        self.assertFalse(block["available"])
+        self.assertFalse(block["met"])
+        self.assertEqual(block["adequacy"]["status"], "not_configured")
+        self.assertEqual(block["reason_code"], "not_configured")
+
+    def test_real_report_is_embedded_verbatim(self):
+        from cli.parsers.functional_adequacy import FunctionalVerificationReport
+
+        report = FunctionalVerificationReport(
+            available=True,
+            met=True,
+            framework="generic_json",
+            target_env="staging",
+            total=1,
+            passed=1,
+            failed=0,
+            skipped=0,
+            adequacy_status="evaluated",
+            score_pct=100.0,
+            declared=["auth-flow"],
+            covered=["auth-flow"],
+            missing=[],
+            report_uri="https://ci/example",
+            reason="1/1 declared journey(s) covered",
+            reason_code=None,
+        )
+        statement = build_statement(**_base_kwargs(functional_verification=report))
+        block = statement["predicate"]["functional_verification"]
+        self.assertEqual(block, report.as_dict())
+        self.assertTrue(block["met"])
+
+    def test_not_configured_default_validates_against_schema(self):
+        statement = build_statement(**_base_kwargs())
+        with open(_SCHEMA_PATH, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        errors = list(Draft202012Validator(schema).iter_errors(statement["predicate"]))
+        self.assertEqual(errors, [], msg=[e.message for e in errors])
+
+
 if __name__ == "__main__":
     unittest.main()

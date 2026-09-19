@@ -243,9 +243,22 @@ def _combine_results(
         if unavailable:
             reasons = "; ".join(f"{r.language}: {r.reason}" for r in unavailable)
             return unavailable_report(f"mutation testing failed for every touched language ({reasons})")
-        return not_applicable_report(
-            "no mutation-testing tool is configured in this repo for any language "
-            "this diff touched (no [tool.mutmut]/no Stryker config/no pitest-maven plugin)",
+        # Real, avoidable gap, not credited as a pass (Bill's own rule,
+        # 2026-09-19: "If Assay can detect something and the job has it
+        # not configured, it should fail the check and show as amber,
+        # never gray") -- source in a supported language genuinely
+        # changed, but this repo has no tool set up to mutation-test it
+        # at all. Graded via unavailable_report (grade="degraded"), the
+        # same constructor a real tool crash/timeout already uses --
+        # "never configured" is no better a signal than "configured but
+        # failed," so it gets the same real discount, not a free pass.
+        # cli.scorer._score_pipeline no longer exempts this reason_code
+        # from degraded_reasons either -- see that module's own comment.
+        languages = ", ".join(sorted({r.language for r in results}))
+        return unavailable_report(
+            f"source changed in a supported language ({languages}) but no mutation-testing "
+            "tool is configured for it in this repo (no [tool.mutmut]/no Stryker config/no "
+            "pitest-maven plugin) -- a real, avoidable gap, not credited as a pass",
             REASON_CODE_NOT_CONFIGURED,
         )
 

@@ -1253,7 +1253,13 @@ class CombineResultsMultiLanguageTests(unittest.TestCase):
         self.assertEqual(report.survived, 1)
         self.assertNotIn(LANGUAGE_TSJS, report.by_language)
 
-    def test_every_touched_language_not_configured_is_not_applicable(self):
+    def test_every_touched_language_not_configured_is_a_real_degraded_gap(self):
+        # Changed 2026-09-19 (Bill's own rule: "If Assay can detect
+        # something and the job has it not configured, it should fail the
+        # check and show as amber, never gray") -- a language's tool
+        # genuinely never being set up is a real, avoidable gap, not the
+        # same "nothing to say" as no_source_changes/insufficient_sample.
+        # Graded exactly like a real tool crash/timeout (unavailable_report).
         from cli.mutation import _combine_results
         report = _combine_results(
             [
@@ -1262,9 +1268,11 @@ class CombineResultsMultiLanguageTests(unittest.TestCase):
             ],
             min_sample_size=3, max_surviving_detail=5,
         )
-        self.assertEqual(report.grade, "not_applicable")
-        self.assertEqual(report.multiplier, MULTIPLIER_NOT_APPLICABLE)
+        self.assertEqual(report.grade, "degraded")
+        self.assertEqual(report.multiplier, MULTIPLIER_UNAVAILABLE)
         self.assertEqual(report.reason_code, REASON_CODE_NOT_CONFIGURED)
+        self.assertIn(LANGUAGE_PYTHON, report.reason)
+        self.assertIn(LANGUAGE_TSJS, report.reason)
 
     def test_a_real_failure_in_one_language_is_not_masked_by_another_not_configured(self):
         # Fail-closed: if a language's tool genuinely failed, that must

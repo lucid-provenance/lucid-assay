@@ -6,15 +6,46 @@ This module deliberately does NOT attempt every control in the published
 S2C2F catalog (see lucid-console's `lib/s2c2f.ts` for the full Level 1-4
 taxonomy). It evaluates only the subset a CI-time tool can honestly assess
 from data this pipeline already has, or a cheap, well-defined new signal
-(a GitHub API call or a local config-file check) -- every other control
-(malware scans, source-cloning restrictions, denylists, curated feeds,
-trusted rebuilding, SBOM validation, ...) is an org-level policy/tooling
-decision with no generic, repo-visible signal, and is simply never emitted
-here rather than guessed at. `evaluate_s2c2f()`'s caller (cli.builder) is
-expected to render "not evaluated" for every control id this module never
-returns, exactly the same "absent, not fabricated" contract every other
-optional block in the predicate already follows (see cli.real_coverage,
-cli.parsers.sarif's "not configured" states).
+(a GitHub API call, a local config-file check, or a checked-in policy
+artifact) -- every other control (trusted rebuilding, SBOM validation,
+...) is an org-level policy/tooling decision with no generic, repo-visible
+signal, and is simply never emitted here rather than guessed at.
+`evaluate_s2c2f()`'s caller (cli.builder) is expected to render "not
+evaluated" for every control id this module never returns, exactly the
+same "absent, not fabricated" contract every other optional block in the
+predicate already follows (see cli.real_coverage, cli.parsers.sarif's "not
+configured" states).
+
+ING-3 (Denylists), ING-2 (Local Copies), and ENF-2 (Curated Feeds) were
+promoted in here 2026-09-18 from `scripts/_ingestion_lib.py`, which was
+deliberately pre-production, own-repo-only scaffolding (never part of the
+packaged `cli` module -- see `pyproject.toml`'s own package-discovery
+config) run only inside lucid-assay's own dogfood CI, never by any caller
+repo invoking the real, published pipeline. That scaffold is retired now
+that its signal has run for real (since 2026-09-10/12) and is judged
+trustworthy -- see this module's own git history and CLAUDE.md for the
+full account of why this repo's own s2c2f-evidence-telemetry never
+actually made these controls repo-observable for any repo but this one.
+ING-2's evaluator is upgraded in the same move: a real per-dependency
+feed-provenance check for npm (classifying every resolved URL by host),
+config-presence for pip/maven -- strictly stronger than the config-
+presence-only check this module used before, and shared with ENF-2's
+enforcement framing of the identical signal.
+
+ING-4 (Source Cloning), SCA-4 (Malware Scans), and SCA-5 (Proactive
+Reviews) are new the same day. ING-4's real S2C2F definition is mirroring
+the upstream *source* of a consumed OSS component -- a materially
+different, harder claim than ING-2's registry/package-level pinning, and
+this project operates no such source-mirroring infrastructure today, so
+its evaluator reports the honest gap (`not_yet_reported`) rather than a
+fabricated signal, the same treatment UPD-1 already gets. SCA-4 checks for
+a recognized malware-scanning tool's SARIF findings (OSV-Scanner by
+default -- OSV.dev aggregates the OpenSSF `ossf/malicious-packages`
+advisory feed; MVP-scoped to "did a malware-capable tool run", the same
+shape SCA-1/SCA-2 already use, not a claim this pipeline itself performs
+any scanning). SCA-5 checks for a CODEOWNERS entry covering common
+dependency-manifest files plus a real branch-ruleset
+`require_code_owner_review` boolean.
 
 Each control that *is* evaluated gets one of three honest outcomes:
   - "met":              a real, positive signal was found.
@@ -43,12 +74,17 @@ rather than re-implemented):
 """
 from __future__ import annotations
 
+import fnmatch
+import hashlib
+import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from ..common import UnsafePathError, safe_resolve_path
 from .github_rules import (
@@ -57,6 +93,7 @@ from .github_rules import (
     BranchGovernanceReport,
     GitHubAPIError,
     _REPO_RE,
+    _extract_http_error_detail,
     _github_api_get,
 )
 from .sarif import SarifSummaryReport
@@ -107,11 +144,17 @@ _CONTROL_CATALOG: Dict[str, Tuple[str, int]] = {
     "UPD-1": ("Manual Updates", 1),
     "SCA-3": ("EOL Scans", 2),
     "INV-2": ("Incident Plans", 2),
+    "UPD-2": ("Auto-Updates", 2),
     "UPD-3": ("PR Alerts", 2),
     "AUD-2": ("Consumption Audits", 2),
     "AUD-3": ("Integrity Validation", 2),
     "ENF-1": ("Secure Source Config", 2),
     "AUD-1": ("Enforcing Provenance", 3),
+    "ING-3": ("Denylists", 3),
+    "ING-4": ("Source Cloning", 3),
+    "SCA-4": ("Malware Scans", 3),
+    "SCA-5": ("Proactive Reviews", 3),
+    "ENF-2": ("Curated Feeds", 3),
 }
 
 
@@ -125,17 +168,28 @@ def _control(id: str, status: str, detail: str = "") -> S2C2FControlResult:
 # ---------------------------------------------------------------------------
 
 
-def _github_api_status(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[int]:
-    """GET a GitHub REST API path and return just the HTTP status code.
+def _github_api_status(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[int], Optional[str]]:
+    """GET a GitHub REST API path and return (status_code, error_detail).
 
     Some GitHub endpoints (e.g. GET .../vulnerability-alerts) are
     boolean-shaped: 204 means "enabled", 404 means "disabled", and neither
     response carries a JSON body -- reusing cli.parsers.github_rules.
     _github_api_get's json.loads()-always contract would raise on the empty
-    204 body. Returns None on any transport failure (timeout, DNS,
+    204 body. Returns (None, None) on any transport failure (timeout, DNS,
     connection reset) -- never raises -- since every caller here already
-    treats "couldn't determine" as its own honest not_yet_reported outcome,
-    same as a definitive negative status.
+    treats "couldn't determine" as its own honest not_yet_reported outcome.
+
+    `error_detail` (via `_extract_http_error_detail`, same helper
+    cli.parsers.github_rules' own 401/403 diagnostics use) is populated
+    only on a genuine HTTPError -- 2026-09-18: a real, confirmed case
+    (SCA-3's own 403) showed a status code alone can be actively
+    misleading here. GitHub returns HTTP 403 with body message
+    "Dependabot alerts are disabled for this repository." when the
+    *repository feature itself* is off -- a completely different, and
+    definitively answerable, condition from "the token lacks the
+    permission", which this module's own SCA-3 evaluator previously
+    assumed a bare 403 always meant. Surfacing GitHub's own message lets
+    callers tell the two apart instead of guessing at one.
     """
     req = urllib.request.Request(
         f"{GITHUB_API_BASE}{path}",
@@ -148,11 +202,11 @@ def _github_api_status(path: str, token: str, timeout: int = DEFAULT_TIMEOUT) ->
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status
+            return resp.status, None
     except urllib.error.HTTPError as e:
-        return e.code
+        return e.code, _extract_http_error_detail(e)
     except urllib.error.URLError:
-        return None
+        return None, None
 
 
 def _resolve_github_context(repository: str, token: Optional[str]) -> Optional[str]:
@@ -333,14 +387,385 @@ def _eval_ing1_package_managers(resolved_dependencies: List[Dict[str, Any]]) -> 
     return _control("ING-1", STATUS_UNMET, "no lockfile with package-manager-resolved dependencies was found under the repo")
 
 
-def _eval_ing2_local_copies(repo_dir: str) -> S2C2FControlResult:
-    found = _find_private_package_proxy_config(repo_dir)
+# ---------------------------------------------------------------------------
+# Feed-provenance signal shared by ING-2 and ENF-2 (promoted 2026-09-18 from
+# scripts/_ingestion_lib.py -- see that history in this module's own
+# docstring). A real, per-dependency check for npm (classifies every
+# resolved URL in package-lock.json by host); config-presence-only for
+# pip/maven, same caveat _find_private_package_proxy_config's own docstring
+# already carries.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FeedProvenanceResult:
+    ecosystem: str
+    met: bool
+    detail: str
+
+
+def _iter_npm_resolved_urls_v1(deps: Dict[str, Any]):
+    for _name, meta in deps.items():
+        if not isinstance(meta, dict):
+            continue
+        resolved = meta.get("resolved")
+        if isinstance(resolved, str):
+            yield resolved
+        nested = meta.get("dependencies")
+        if isinstance(nested, dict):
+            yield from _iter_npm_resolved_urls_v1(nested)
+
+
+def _iter_npm_resolved_urls(data: Dict[str, Any]):
+    packages = data.get("packages")
+    if isinstance(packages, dict):
+        for key, meta in packages.items():
+            if key == "":
+                continue  # the root project's own entry, not a dependency
+            if isinstance(meta, dict):
+                resolved = meta.get("resolved")
+                if isinstance(resolved, str):
+                    yield resolved
+        return
+    deps = data.get("dependencies")
+    if isinstance(deps, dict):
+        yield from _iter_npm_resolved_urls_v1(deps)
+
+
+_PUBLIC_NPM_HOST = "registry.npmjs.org"
+
+
+def _evaluate_npm_feed(repo_dir: Path, internal_hosts: List[str]) -> Optional[_FeedProvenanceResult]:
+    """Strong, per-dependency signal: classifies every resolved URL in
+    package-lock.json by host. Returns None when no package-lock.json is
+    present (npm isn't applicable here), never when it's present but
+    empty/malformed -- that's a real, reportable unmet, not an
+    "inapplicable" skip."""
+    lockfile = repo_dir / "package-lock.json"
+    if not lockfile.is_file():
+        return None
+    try:
+        data = json.loads(lockfile.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return _FeedProvenanceResult("npm", False, "package-lock.json is present but unreadable/malformed JSON")
+    urls = list(_iter_npm_resolved_urls(data))
+    total = len(urls)
+    if total == 0:
+        return _FeedProvenanceResult("npm", False, "package-lock.json carries no resolved dependency URLs to evaluate")
+    internal = public = other = 0
+    for url in urls:
+        host = (urlparse(url).hostname or "").lower()
+        if any(h and h in host for h in internal_hosts):
+            internal += 1
+        elif host == _PUBLIC_NPM_HOST:
+            public += 1
+        else:
+            other += 1
+    if public > 0 or other > 0:
+        return _FeedProvenanceResult(
+            "npm", False,
+            f"{total} resolved dependenc{'y' if total == 1 else 'ies'}: {internal} via a configured internal host, "
+            f"{public} direct from {_PUBLIC_NPM_HOST}, {other} from another unclassified host",
+        )
+    return _FeedProvenanceResult("npm", True, f"all {total} resolved dependenc{'y' if total == 1 else 'ies'} came from a configured internal host")
+
+
+_PIP_MANIFEST_FILES = ("requirements.txt", "pyproject.toml", "Pipfile")
+
+
+def _evaluate_pip_feed(repo_dir: Path) -> Optional[_FeedProvenanceResult]:
+    """Weaker, presence-only signal (same caveat
+    _find_private_package_proxy_config's own docstring already carries).
+    Only applicable when this repo actually looks like a pip consumer at
+    all -- otherwise "no pip.conf found" would misreport a repo that
+    doesn't use pip as a curated-feed violation."""
+    if not any((repo_dir / name).is_file() for name in _PIP_MANIFEST_FILES):
+        return None
+    found = _find_private_package_proxy_config(str(repo_dir))
     if found:
-        return _control("ING-2", STATUS_MET, f"{found} configures a non-default registry/index-url, consistent with an internal package proxy/cache")
-    return _control(
-        "ING-2", STATUS_UNMET,
-        "no .npmrc/.yarnrc/pip.conf at the repo root names a private registry/index-url; "
+        return _FeedProvenanceResult("pip", True, f"{found} names a non-default index-url, consistent with an internal package proxy")
+    return _FeedProvenanceResult(
+        "pip", False,
+        "a pip manifest is present but no pip.conf/pip.ini at the repo root names a private index-url; "
         "an org-wide proxy configured outside the repo would not be visible here",
+    )
+
+
+_MAVEN_CENTRAL_HOSTS = ("repo.maven.apache.org", "repo1.maven.org", "central.sonatype.com")
+_POM_REPOSITORY_RE = re.compile(r"<repository>(.*?)</repository>", re.DOTALL)
+_POM_URL_RE = re.compile(r"<url>\s*([^<\s]+)\s*</url>")
+
+
+def _evaluate_maven_feed(repo_dir: Path) -> Optional[_FeedProvenanceResult]:
+    """Best-effort, regex-based scan of pom.xml <repository> declarations
+    -- same "purpose-built line/regex scanner, stdlib-only" convention
+    cli.parsers.lockfiles uses for pnpm-lock.yaml/yarn.lock. Doesn't
+    resolve Maven's inherited/settings.xml-level mirror configuration, so
+    like the pip check this is a presence signal, not a per-dependency
+    one."""
+    pom = repo_dir / "pom.xml"
+    if not pom.is_file():
+        return None
+    try:
+        text = pom.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return _FeedProvenanceResult("maven", False, "pom.xml is present but unreadable")
+    for block in _POM_REPOSITORY_RE.findall(text):
+        match = _POM_URL_RE.search(block)
+        if match and not any(host in match.group(1) for host in _MAVEN_CENTRAL_HOSTS):
+            return _FeedProvenanceResult("maven", True, f"pom.xml declares a <repository> outside Maven Central ({match.group(1)})")
+    return _FeedProvenanceResult(
+        "maven", False,
+        "pom.xml declares no <repository> outside Maven Central; settings.xml-level mirrors (outside this repo) would not be visible here",
+    )
+
+
+def _evaluate_feed_provenance(repo_dir: Path, internal_hosts: List[str]) -> List[_FeedProvenanceResult]:
+    """Runs every applicable ecosystem's feed-provenance check and returns
+    the results actually applicable to this repo (empty list when none of
+    npm/pip/maven's manifests are present at all)."""
+    results = []
+    for fn in (lambda: _evaluate_npm_feed(repo_dir, internal_hosts), lambda: _evaluate_pip_feed(repo_dir), lambda: _evaluate_maven_feed(repo_dir)):
+        result = fn()
+        if result is not None:
+            results.append(result)
+    return results
+
+
+def _eval_ing2_local_copies(feed_results: List[_FeedProvenanceResult]) -> S2C2FControlResult:
+    if not feed_results:
+        return _control("ING-2", STATUS_NOT_YET_REPORTED, "no npm/pip/maven manifest was found under the repo to evaluate feed provenance against")
+    failing = [r for r in feed_results if not r.met]
+    detail = "; ".join(f"{r.ecosystem}: {r.detail}" for r in feed_results)
+    status = STATUS_UNMET if failing else STATUS_MET
+    return _control("ING-2", status, detail)
+
+
+def _eval_enf2_curated_feeds(feed_results: List[_FeedProvenanceResult]) -> S2C2FControlResult:
+    if not feed_results:
+        return _control("ENF-2", STATUS_NOT_YET_REPORTED, "no npm/pip/maven manifest was found under the repo to evaluate curated-feed enforcement against")
+    failing = [r for r in feed_results if not r.met]
+    if failing:
+        detail = "a build enforcing curated-feed consumption would break here: " + "; ".join(f"{r.ecosystem}: {r.detail}" for r in failing)
+        return _control("ENF-2", STATUS_UNMET, detail)
+    detail = "no dependency resolution bypassed the required curated feed(s); enforcement would not break this build: " + "; ".join(
+        f"{r.ecosystem}: {r.detail}" for r in feed_results
+    )
+    return _control("ENF-2", STATUS_MET, detail)
+
+
+# ---------------------------------------------------------------------------
+# ING-3: Denylists (promoted 2026-09-18 from scripts/_ingestion_lib.py)
+# ---------------------------------------------------------------------------
+
+DENYLIST_SCHEMA_VERSION = "s2c2f-denylist/v1"
+
+
+def _canonical_entries_bytes(entries: List[Dict[str, Any]]) -> bytes:
+    return json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def compute_denylist_digest(entries: List[Dict[str, Any]]) -> str:
+    return hashlib.sha256(_canonical_entries_bytes(entries)).hexdigest()
+
+
+def load_denylist(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Returns (parsed_document, None) on success, or (None, reason) on any
+    failure -- an unsafe path (null bytes, unrepresentable path string --
+    see cli.common.safe_resolve_path), missing file, malformed JSON, a
+    schema violation, or a digest mismatch (tamper-evidence, not just
+    presence). Never raises.
+
+    `path` is CLI-operator-supplied (--denylist, same as --junit-xml/
+    --coverage-report/--sarif) -- resolved via safe_resolve_path() here,
+    the same "sanitize right before the read, fail closed on
+    UnsafePathError" pattern every other file-input path in this package
+    follows (cli.parsers.sarif.parse_sarif_reports, cli.parsers.coverage's
+    three parsers), not enforced earlier at the CLI-arg level.
+    """
+    try:
+        resolved_path = safe_resolve_path(path)
+    except UnsafePathError as e:
+        return None, f"unsafe denylist path: {e}"
+    try:
+        text = resolved_path.read_text(encoding="utf-8")
+    except OSError:
+        return None, f"no denylist policy artifact found at {resolved_path}"
+    path = resolved_path
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError as e:
+        return None, f"{path} is not valid JSON ({e})"
+    if not isinstance(doc, dict):
+        return None, f"{path}'s top-level document must be a JSON object"
+    if doc.get("schema_version") != DENYLIST_SCHEMA_VERSION:
+        return None, f"{path} has an unrecognized schema_version (expected {DENYLIST_SCHEMA_VERSION!r})"
+    entries = doc.get("entries")
+    if not isinstance(entries, list):
+        return None, f"{path}'s 'entries' must be a list"
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("ecosystem") or not entry.get("name") or not entry.get("reason"):
+            return None, f"{path} has an entry missing a required 'ecosystem'/'name'/'reason' field"
+    recorded_digest = doc.get("digest_sha256")
+    if not isinstance(recorded_digest, str) or not recorded_digest:
+        return None, f"{path} is missing 'digest_sha256'"
+    actual_digest = compute_denylist_digest(entries)
+    if recorded_digest != actual_digest:
+        return None, f"{path}'s digest_sha256 does not match its own entries (recorded {recorded_digest}, recomputed {actual_digest}) -- possible tampering"
+    return doc, None
+
+
+def _eval_ing3_denylists(denylist_path: Path, resolved_dependencies: List[Dict[str, Any]]) -> S2C2FControlResult:
+    doc, error = load_denylist(denylist_path)
+    if doc is None:
+        return _control("ING-3", STATUS_UNMET, error or "denylist artifact could not be loaded")
+    entries = doc["entries"]
+    matches = []
+    for dep in resolved_dependencies:
+        uri = dep.get("uri") if isinstance(dep, dict) else None
+        if not isinstance(uri, str):
+            continue
+        for entry in entries:
+            token = f"pkg:{entry['ecosystem']}/{entry['name']}"
+            if uri.startswith(token):
+                matches.append(entry["name"])
+    if matches:
+        names = ", ".join(sorted(set(matches)))
+        return _control("ING-3", STATUS_UNMET, f"{len(matches)} resolved dependency(ies) matched a denylisted package: {names}")
+    return _control(
+        "ING-3", STATUS_MET,
+        f"denylist artifact present, schema-valid, digest-verified ({len(entries)} entries); "
+        f"none matched the {len(resolved_dependencies)} resolved dependenc{'y' if len(resolved_dependencies) == 1 else 'ies'} checked",
+    )
+
+
+# ---------------------------------------------------------------------------
+# ING-4: Source Cloning
+# ---------------------------------------------------------------------------
+
+
+def _eval_ing4_source_cloning() -> S2C2FControlResult:
+    # S2C2F's ING-4 means mirroring the upstream *source* of a consumed OSS
+    # component (distinct from ING-2's registry/package-level pinning) --
+    # this project operates no such source-mirroring infrastructure today.
+    # unmet, not not_yet_reported (fixed 2026-09-18, same day as first
+    # written): this check never branches on anything -- there is no
+    # scenario where evaluating it could tell us anything other than what
+    # we already know for certain. not_yet_reported means "couldn't
+    # determine"; this is the opposite, a confirmed, known absence. A
+    # real "not yet built" is a valid, honest unmet, never a fabricated
+    # signal, but it's still a met/unmet answer, not an unknown one.
+    return _control("ING-4", STATUS_UNMET, "no generic, repo-observable signal exists for upstream-source mirroring; no such infrastructure is operated today")
+
+
+# ---------------------------------------------------------------------------
+# SCA-4: Malware Scans
+# ---------------------------------------------------------------------------
+
+# Tools specifically known for maintaining a malicious-package advisory
+# feed (distinct from SCA-1's broader CVE/vulnerability-scan tool list,
+# which OSV-Scanner also appears on -- SCA-1 asks "did a vulnerability
+# scan run", SCA-4 asks "did a scan that also checks malicious-package
+# advisories run"). OSV-Scanner is the MVP default: OSV.dev aggregates the
+# OpenSSF `ossf/malicious-packages` advisory feed alongside ordinary CVE
+# data. Deliberately a named, narrow allowlist, not every SCA-1 tool --
+# most (Trivy, Grype, npm-audit, ...) are CVE-focused without a dedicated
+# malicious-package feed. Socket/Phylum are commercial alternatives a
+# caller can point --sarif at instead; this module makes no distinction
+# between them beyond tool-name recognition.
+_MALWARE_SCAN_TOOL_PATTERNS = ("osv-scanner", "socket", "phylum")
+
+
+def _eval_sca4_malware_scans(sarif_tools_scanned: List[str]) -> S2C2FControlResult:
+    tool_match = _sarif_tool_name_matches(sarif_tools_scanned, _MALWARE_SCAN_TOOL_PATTERNS)
+    if tool_match:
+        return _control("SCA-4", STATUS_MET, f"SARIF findings from a recognized malware/malicious-package-scanning tool ({tool_match})")
+    # unmet, not not_yet_reported (fixed 2026-09-18): the check genuinely
+    # ran against whatever --sarif input this run actually provided and
+    # found no matching tool -- a real, checked absence for this run, the
+    # same "checked, confirmed absent" treatment ING-3/UPD-1 already give
+    # a missing denylist/runbook, not a "couldn't determine" unknown.
+    return _control("SCA-4", STATUS_UNMET, "no --sarif input came from a recognized malware-scanning tool (default: OSV-Scanner); no other generic signal is available")
+
+
+# ---------------------------------------------------------------------------
+# SCA-5: Proactive Reviews
+# ---------------------------------------------------------------------------
+
+_CODEOWNERS_CANDIDATE_PATHS = ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS")
+
+# Common dependency-manifest filenames across the ecosystems this pipeline
+# already parses (cli.parsers.lockfiles) plus a few more, matched against
+# each CODEOWNERS pattern via fnmatch -- a best-effort, gitignore-style
+# glob match, not full CODEOWNERS path semantics (directory-scoped `/**`
+# nesting, negation, ...). Same "soft heuristic, honestly caveated" class
+# of signal as _find_private_package_proxy_config.
+_DEPENDENCY_MANIFEST_NAMES = (
+    "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+    "requirements.txt", "pyproject.toml", "poetry.lock", "uv.lock", "Pipfile", "Pipfile.lock",
+    "pom.xml", "build.gradle", "build.gradle.kts",
+    "go.mod", "go.sum",
+    "Cargo.toml", "Cargo.lock",
+    "Gemfile", "Gemfile.lock",
+)
+
+
+def _codeowners_pattern_covers_manifest(pattern: str) -> Optional[str]:
+    """Returns the manifest filename a CODEOWNERS pattern line appears to
+    cover, or None. Strips a leading '/' (CODEOWNERS patterns are
+    repo-root-relative) and a trailing '/**' before matching; a bare '*'
+    (covers everything) matches trivially."""
+    normalized = pattern.strip().lstrip("/")
+    if normalized.endswith("/**"):
+        normalized = normalized[:-3]
+    for name in _DEPENDENCY_MANIFEST_NAMES:
+        if fnmatch.fnmatch(name, normalized) or normalized in ("*", "**", name):
+            return name
+    return None
+
+
+def _find_codeowners_manifest_coverage(repo_dir: str) -> Optional[Tuple[str, str]]:
+    """Returns (codeowners_path, matched_manifest_name) for the first
+    CODEOWNERS entry (checked at GitHub's three recognized locations) that
+    appears to cover a real dependency-manifest filename, or None if no
+    CODEOWNERS file exists at any of them, or none of its entries do."""
+    resolved_dir = _resolve_repo_dir(repo_dir)
+    if resolved_dir is None:
+        return None
+    for rel_path in _CODEOWNERS_CANDIDATE_PATHS:
+        candidate = resolved_dir / rel_path
+        if not candidate.is_file():
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            pattern = stripped.split()[0]
+            matched = _codeowners_pattern_covers_manifest(pattern)
+            if matched:
+                return rel_path, matched
+    return None
+
+
+def _eval_sca5_proactive_reviews(repo_dir: str, branch_governance: BranchGovernanceReport) -> S2C2FControlResult:
+    if not branch_governance.available:
+        return _control("SCA-5", STATUS_NOT_YET_REPORTED, "branch governance could not be verified (see predicate.branch_governance.reason)")
+    coverage = _find_codeowners_manifest_coverage(repo_dir)
+    if coverage is None:
+        return _control("SCA-5", STATUS_UNMET, "no CODEOWNERS entry (checked CODEOWNERS/.github/CODEOWNERS/docs/CODEOWNERS) covers a recognized dependency-manifest file")
+    codeowners_path, manifest_name = coverage
+    if not branch_governance.require_code_owner_review:
+        return _control(
+            "SCA-5", STATUS_UNMET,
+            f"{codeowners_path} covers {manifest_name}, but the branch does not require code-owner review (require_code_owner_review is false)",
+        )
+    return _control(
+        "SCA-5", STATUS_MET,
+        f"{codeowners_path} covers {manifest_name}, and the branch requires code-owner review before merge",
     )
 
 
@@ -352,14 +777,24 @@ def _eval_sca1_vulnerability_scans(sarif_tools_scanned: List[str], vuln_alerts_s
         return _control("SCA-1", STATUS_MET, "GitHub Dependabot vulnerability alerts are enabled for this repository")
     if vuln_alerts_status == 404:
         return _control("SCA-1", STATUS_UNMET, "GitHub Dependabot vulnerability alerts are not enabled, and no SARIF input came from a recognized SCA tool")
-    return _control("SCA-1", STATUS_NOT_YET_REPORTED, "no SARIF input from a recognized SCA tool, and the GitHub vulnerability-alerts API could not be reached (missing token or network failure)")
+    if vuln_alerts_status is None:
+        return _control("SCA-1", STATUS_NOT_YET_REPORTED, "no SARIF input from a recognized SCA tool, and the GitHub vulnerability-alerts API could not be reached (missing token or network failure)")
+    # A real, if unexpected, non-2xx/404 status (e.g. 403) -- the API was
+    # reached and answered, just not with a positive result, and no
+    # SARIF evidence exists either. unmet, not not_yet_reported (fixed
+    # 2026-09-18): we did get a real response, this isn't an unknown.
+    return _control("SCA-1", STATUS_UNMET, f"no SARIF input from a recognized SCA tool, and GitHub's vulnerability-alerts API returned an inconclusive status ({vuln_alerts_status})")
 
 
 def _eval_sca2_license_checks(sarif_tools_scanned: List[str]) -> S2C2FControlResult:
     tool_match = _sarif_tool_name_matches(sarif_tools_scanned, _LICENSE_TOOL_NAME_PATTERNS)
     if tool_match:
         return _control("SCA-2", STATUS_MET, f"SARIF findings from a recognized license-scanning tool ({tool_match})")
-    return _control("SCA-2", STATUS_NOT_YET_REPORTED, "no --sarif input came from a recognized license-scanning tool; no other generic signal is available")
+    # unmet, not not_yet_reported (fixed 2026-09-18) -- same reasoning as
+    # SCA-4: the check ran against whatever --sarif input this run
+    # actually provided and found no matching tool, a real checked
+    # absence, not an unknown.
+    return _control("SCA-2", STATUS_UNMET, "no --sarif input came from a recognized license-scanning tool; no other generic signal is available")
 
 
 def _eval_inv1_inventory(resolved_dependencies: List[Dict[str, Any]]) -> S2C2FControlResult:
@@ -369,13 +804,139 @@ def _eval_inv1_inventory(resolved_dependencies: List[Dict[str, Any]]) -> S2C2FCo
     return _control("INV-1", STATUS_UNMET, "predicate.resolved_dependencies is empty; no recognized lockfile was found")
 
 
-def _eval_upd1_manual_updates() -> S2C2FControlResult:
-    # S2C2F's UPD-1 describes a documented *process* for manually updating
-    # OSS components when auto-update isn't available -- a policy fact, not
-    # a technical artifact this pipeline can observe in a repo checkout or
-    # via the GitHub API. Always not_yet_reported, honestly, rather than
-    # inferred from an unrelated proxy signal.
-    return _control("UPD-1", STATUS_NOT_YET_REPORTED, "no generic, repo-observable signal exists for a documented manual-update process")
+# S2C2F's UPD-1 describes a documented *process* for manually updating OSS
+# components when auto-update isn't available -- a policy fact a fuzzy
+# markdown-content heuristic can't honestly infer (2026-09-18: deliberately
+# rejected a "scan CONTRIBUTING.md for update-sounding text" heuristic in
+# favor of this -- an explicit, checked-in assertion, verified where it
+# can be, not guessed at). Two ways a repo can assert this control, both
+# real and checkable rather than scraped:
+#   1. `.lucid/manual-updates.json`'s `process_ref` -- a relative repo path
+#      (verified to actually exist -- a dangling pointer is a real,
+#      reportable unmet, not silently trusted) or an http(s) URL (not
+#      fetched -- same trust-the-human-asserter model
+#      `--license-curations`' own entries already use, since this
+#      pipeline has no network-egress budget for verifying arbitrary
+#      external URLs are live).
+#   2. A dedicated runbook file at one of `_MANUAL_UPDATES_FALLBACK_PATHS`,
+#      when no config points elsewhere.
+MANUAL_UPDATES_SCHEMA_VERSION = "s2c2f-manual-updates/v1"
+_MANUAL_UPDATES_CONFIG_PATH = ".lucid/manual-updates.json"
+_MANUAL_UPDATES_FALLBACK_PATHS = ("UPDATING.md", "docs/manual-updates.md")
+
+
+def _load_manual_updates_process_ref(repo_dir: Path) -> Optional[str]:
+    """Returns the real `process_ref` string from `.lucid/manual-updates.json`,
+    or None on anything short of a fully valid, schema-matching assertion
+    (missing file, malformed JSON, wrong/missing schema_version, missing/
+    empty process_ref) -- never raises, never guesses."""
+    try:
+        text = (repo_dir / _MANUAL_UPDATES_CONFIG_PATH).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(doc, dict) or doc.get("schema_version") != MANUAL_UPDATES_SCHEMA_VERSION:
+        return None
+    process_ref = doc.get("process_ref")
+    return process_ref if isinstance(process_ref, str) and process_ref.strip() else None
+
+
+def _process_ref_is_url(process_ref: str) -> bool:
+    parsed = urlparse(process_ref)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def _eval_upd1_manual_updates(repo_dir: str) -> S2C2FControlResult:
+    resolved_dir = _resolve_repo_dir(repo_dir)
+    if resolved_dir is None:
+        return _control("UPD-1", STATUS_NOT_YET_REPORTED, f"repo_dir {repo_dir!r} could not be resolved")
+
+    process_ref = _load_manual_updates_process_ref(resolved_dir)
+    if process_ref:
+        if _process_ref_is_url(process_ref):
+            return _control("UPD-1", STATUS_MET, f".lucid/manual-updates.json asserts a documented manual-update process at {process_ref}")
+        if (resolved_dir / process_ref).is_file():
+            return _control("UPD-1", STATUS_MET, f".lucid/manual-updates.json asserts a documented manual-update process at {process_ref}, and that file exists in the repo")
+        return _control(
+            "UPD-1", STATUS_UNMET,
+            f".lucid/manual-updates.json's process_ref ({process_ref!r}) does not exist in the repo -- a stale or broken assertion",
+        )
+
+    for rel_path in _MANUAL_UPDATES_FALLBACK_PATHS:
+        if (resolved_dir / rel_path).is_file():
+            return _control("UPD-1", STATUS_MET, f"{rel_path} is present as a dedicated manual-update runbook")
+
+    return _control(
+        "UPD-1", STATUS_UNMET,
+        "no .lucid/manual-updates.json process_ref, and neither UPDATING.md nor docs/manual-updates.md exists -- "
+        "no documented manual-update process asserted",
+    )
+
+
+# ---------------------------------------------------------------------------
+# UPD-2: Auto-Updates
+# ---------------------------------------------------------------------------
+
+
+# 2026-09-18, rewritten same day: the first version of this check read
+# GET /repos/{owner}/{repo}'s allow_auto_merge field -- confirmed against
+# a real run, then independently against a real *unauthenticated* call,
+# that GitHub omits that field entirely unless the caller has *push*
+# access to the repo. Every GitHub-API-backed check in this pipeline
+# deliberately uses a read-only token (see this repo's own README/
+# CLAUDE.md) -- allow_auto_merge was therefore structurally unreachable
+# from day one, not a permission this App could ever be granted without
+# abandoning that posture. Replaced with a real, local, no-API signal
+# instead: whether a workflow under .github/workflows/ actually wires up
+# Dependabot-PR auto-merge, detected via `dependabot/fetch-metadata` --
+# the de facto standard building block every real "gh pr merge --auto"-
+# style Dependabot automation is built on (it's what exposes the PR's
+# own update-type/dependency metadata to a workflow's own `if:`
+# condition). More specific than the old signal would even have been:
+# a bare allow_auto_merge=true says nothing about whether *dependency*
+# PRs specifically get auto-merged, just that auto-merge is possible for
+# some PR, by someone, for any reason.
+_DEPENDABOT_AUTOMERGE_MARKER = "dependabot/fetch-metadata"
+
+
+def _find_dependabot_automerge_workflow(repo_dir: str) -> Optional[str]:
+    resolved_dir = _resolve_repo_dir(repo_dir)
+    if resolved_dir is None:
+        return None
+    workflows_dir = resolved_dir / ".github" / "workflows"
+    if not workflows_dir.is_dir():
+        return None
+    try:
+        entries = sorted(workflows_dir.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.suffix not in (".yml", ".yaml") or not entry.is_file():
+            continue
+        try:
+            text = entry.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if _DEPENDABOT_AUTOMERGE_MARKER in text:
+            return f".github/workflows/{entry.name}"
+    return None
+
+
+def _eval_upd2_auto_updates(repo_dir: str) -> S2C2FControlResult:
+    found = _find_update_automation_config(repo_dir)
+    if not found:
+        return _control("UPD-2", STATUS_UNMET, "no Dependabot or Renovate configuration file was found under the repo, so there is nothing for auto-merge to apply to")
+    automerge_workflow = _find_dependabot_automerge_workflow(repo_dir)
+    if automerge_workflow:
+        return _control("UPD-2", STATUS_MET, f"{found} configures automated dependency-update pull requests, and {automerge_workflow} auto-merges them (dependabot/fetch-metadata)")
+    return _control(
+        "UPD-2", STATUS_UNMET,
+        f"{found} configures automated dependency-update pull requests, but no workflow under .github/workflows/ appears to auto-merge them "
+        "(no dependabot/fetch-metadata usage found); updates still require a manual merge",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -383,13 +944,26 @@ def _eval_upd1_manual_updates() -> S2C2FControlResult:
 # ---------------------------------------------------------------------------
 
 
-def _eval_sca3_eol_scans(dependabot_alerts_status: Optional[int]) -> S2C2FControlResult:
+def _eval_sca3_eol_scans(dependabot_alerts_status: Optional[int], dependabot_alerts_detail: Optional[str]) -> S2C2FControlResult:
     if dependabot_alerts_status == 200:
         return _control("SCA-3", STATUS_MET, "GitHub Dependabot alerts API is enabled and reachable for this repository (closest available signal for automated deprecated/EOL package flagging)")
     if dependabot_alerts_status == 404:
         return _control("SCA-3", STATUS_UNMET, "GitHub Dependabot alerts are not enabled for this repository")
     if dependabot_alerts_status == 403:
-        return _control("SCA-3", STATUS_NOT_YET_REPORTED, "GitHub Dependabot alerts API returned 403; the token likely lacks 'Dependabot alerts: Read' permission")
+        # 2026-09-18: confirmed against a real repository (a genuine
+        # unauthenticated view of its Security settings) that GitHub
+        # returns this exact status with body message "Dependabot alerts
+        # are disabled for this repository." when the *repository
+        # feature* itself is off -- a completely different, and
+        # definitively answerable, condition from a token merely lacking
+        # 'Dependabot alerts: Read' permission, which this evaluator used
+        # to assume unconditionally. Either way the practical answer is
+        # the same and definitively knowable: this control is not
+        # satisfied today, a real unmet, not an unknown -- GitHub's own
+        # message (when available) leads the detail so the actual cause
+        # is never guessed at.
+        cause = dependabot_alerts_detail or "the token likely lacks 'Dependabot alerts: Read' permission"
+        return _control("SCA-3", STATUS_UNMET, f"GitHub Dependabot alerts API returned 403: {cause}")
     return _control("SCA-3", STATUS_NOT_YET_REPORTED, "GitHub Dependabot alerts API could not be reached (missing token or network failure)")
 
 
@@ -510,39 +1084,59 @@ def evaluate_s2c2f(
     branch_governance: BranchGovernanceReport,
     token: Optional[str] = None,
     timeout: int = DEFAULT_TIMEOUT,
+    denylist_path: Optional[str] = None,
+    internal_registry_hosts: Optional[List[str]] = None,
 ) -> S2C2FReport:
     """Evaluates every S2C2F control this module supports (see module
     docstring for why that's a subset of the full catalog) and returns an
     S2C2FReport. Never raises: every network-backed control independently
     degrades to STATUS_NOT_YET_REPORTED on a missing token, rate limit, or
     any other API/transport failure, exactly like every other GitHub-API-
-    backed check in this package (cli.parsers.github_rules/commit_author)."""
+    backed check in this package (cli.parsers.github_rules/commit_author).
+
+    `denylist_path` defaults to `.lucid/denylist.json` relative to
+    `repo_dir` (ING-3); `internal_registry_hosts` defaults to `[]` (no
+    internal/curated registry configured -- every resolved dependency then
+    reads as "not from an internal host" for ING-2/ENF-2's feed-provenance
+    check, an honest reflection of "none declared", not a guess)."""
     resolved_dependencies = resolved_dependencies or []
     sarif_tools_scanned = list(sarif_report.tools_scanned) if sarif_report is not None else []
+    internal_hosts = internal_registry_hosts or []
 
     resolved_token = _resolve_github_context(repository, token)
     vuln_alerts_status: Optional[int] = None
     dependabot_alerts_status: Optional[int] = None
+    dependabot_alerts_detail: Optional[str] = None
     security_md_present: Optional[bool] = None
 
     if resolved_token:
-        vuln_alerts_status = _github_api_status(f"/repos/{repository}/vulnerability-alerts", resolved_token, timeout)
-        dependabot_alerts_status = _github_api_status(f"/repos/{repository}/dependabot/alerts?per_page=1", resolved_token, timeout)
+        vuln_alerts_status, _ = _github_api_status(f"/repos/{repository}/vulnerability-alerts", resolved_token, timeout)
+        dependabot_alerts_status, dependabot_alerts_detail = _github_api_status(f"/repos/{repository}/dependabot/alerts?per_page=1", resolved_token, timeout)
         security_md_present = _detect_security_md(repository, resolved_token, timeout)
+
+    resolved_repo_dir = _resolve_repo_dir(repo_dir)
+    feed_results = _evaluate_feed_provenance(resolved_repo_dir, internal_hosts) if resolved_repo_dir is not None else []
+    resolved_denylist_path = Path(denylist_path) if denylist_path is not None else Path(repo_dir) / ".lucid" / "denylist.json"
 
     controls = [
         _eval_ing1_package_managers(resolved_dependencies),
-        _eval_ing2_local_copies(repo_dir),
+        _eval_ing2_local_copies(feed_results),
         _eval_sca1_vulnerability_scans(sarif_tools_scanned, vuln_alerts_status),
         _eval_sca2_license_checks(sarif_tools_scanned),
         _eval_inv1_inventory(resolved_dependencies),
-        _eval_upd1_manual_updates(),
-        _eval_sca3_eol_scans(dependabot_alerts_status),
+        _eval_upd1_manual_updates(repo_dir),
+        _eval_sca3_eol_scans(dependabot_alerts_status, dependabot_alerts_detail),
         _eval_inv2_incident_plans(security_md_present),
+        _eval_upd2_auto_updates(repo_dir),
         _eval_upd3_pr_alerts(repo_dir),
         _eval_aud2_consumption_audits(resolved_dependencies),
         _eval_aud3_integrity_validation(resolved_dependencies),
         _eval_enf1_secure_source_config(branch_governance),
         _eval_aud1_enforcing_provenance(branch_governance),
+        _eval_ing3_denylists(resolved_denylist_path, resolved_dependencies),
+        _eval_ing4_source_cloning(),
+        _eval_sca4_malware_scans(sarif_tools_scanned),
+        _eval_sca5_proactive_reviews(repo_dir, branch_governance),
+        _eval_enf2_curated_feeds(feed_results),
     ]
     return S2C2FReport(controls=controls)

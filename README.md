@@ -917,36 +917,156 @@ Every control this module doesn't implement is simply absent from
 `predicate.s2c2f.controls[]`; it is never guessed at as met or unmet. Each
 control that *is* evaluated reports one of three states:
 
-- `met` / `unmet` — the check ran and got a definitive answer.
-- `not_yet_reported` — the check couldn't run (no token, a rate limit or
-  auth failure, an invalid repository identifier) *or* no generic,
-  repo-observable signal exists for that control at all (e.g. UPD-1
-  "Manual Updates" describes a documented process, not an artifact).
-  Never conflated with `unmet`: a check that didn't run must never look
-  like one that ran and failed.
+- `met` / `unmet` — the check ran and got a definitive answer. This
+  includes every "checked, found nothing" case (a missing denylist, a
+  `--sarif` input from the wrong tool, a hardcoded check with no possible
+  signal at all like `ING-4`) — a confirmed, known absence is `unmet`,
+  not `not_yet_reported`, even when the check itself never branches on
+  any real repo-specific data (fixed 2026-09-18 for `ING-4`/`SCA-1`/
+  `SCA-2`/`SCA-4`/`SCA-3`'s 403 case, alongside `UPD-1`'s earlier same-day
+  rewrite — a definitively knowable "no" is a real answer, not an
+  unknown, however it was determined).
+- `not_yet_reported` — the check itself could not be completed at all:
+  no token, a rate limit, a transport failure, an invalid repository
+  identifier. Reserved for genuine "we don't know," never used for "we
+  know, and the answer is no."
 
-Currently evaluated: `ING-1`/`ING-2` (lockfile presence / private package
-proxy config — a `--sbom`'s PURL-bearing components count as a fallback
-source for `ING-1`/`INV-1` too, see `parsers/sbom.py` below), `SCA-1`/
-`SCA-2` (SARIF tool-name matching against known SCA/license-scanning
-tools — including `parsers/sbom.py`'s own synthetic
-`lucid-assay-sbom-license-policy` tool for `SCA-2` — or GitHub's
-vulnerability-alerts API), `INV-1`
-(resolved-dependency inventory), `UPD-1` (always `not_yet_reported` — see
-above), `SCA-3` (GitHub Dependabot alerts API reachability), `INV-2`
+Currently evaluated: `ING-1`/`ING-2` (lockfile presence / per-dependency
+feed-provenance — see `ING-2`'s own paragraph below; a `--sbom`'s
+PURL-bearing components count as a fallback source for `ING-1`/`INV-1`
+too, see `parsers/sbom.py` below), `SCA-1`/`SCA-2` (SARIF tool-name
+matching against known SCA/license-scanning tools — including
+`parsers/sbom.py`'s own synthetic `lucid-assay-sbom-license-policy` tool
+for `SCA-2` — or GitHub's vulnerability-alerts API), `INV-1`
+(resolved-dependency inventory), `UPD-1` (a real, checked assertion as of
+2026-09-18 — see its own paragraph below), `SCA-3` (GitHub Dependabot
+alerts API reachability — needs a permission this repo's own dogfood App
+token doesn't grant today; confirmed 403ing on a real run, see
+`.github/workflows/assay.yml`'s own "Generate GitHub App Token" step
+comment for the unresolved diagnosis), `INV-2`
 (`SECURITY.md` present via the GitHub Contents API — the repository's own
 copy at one of GitHub's three recognized paths, or the organization's
 `.github` repo's default if the repository has none of its own; fixed
 2026-09-10 from an earlier version that read the community-profile API's
 `files.security` key, which GitHub's own REST API schema has never
-actually defined), `UPD-3`
+actually defined), `UPD-2` (new 2026-09-18 — see its own paragraph
+below), `UPD-3`
 (a Dependabot/Renovate config file), `AUD-2`/`AUD-3` (resolved-dependency
 inventory / pkg: PURL + sha256/sha512 digest — the same hermeticity check
 `cli/verify.py`'s Dependency Materialization Evidence section's
 "Materialized Locked Dependencies" item uses), `ENF-1` (branch
-requires a PR and blocks direct pushes), and `AUD-1` (a required status
+requires a PR and blocks direct pushes), `AUD-1` (a required status
 check on the branch names a provenance/attestation verification job —
-see `github_rules.BranchGovernanceReport.required_status_check_contexts`).
+see `github_rules.BranchGovernanceReport.required_status_check_contexts`),
+and, new 2026-09-18, `ING-3`/`ING-4`/`SCA-4`/`SCA-5`/`ENF-2` (all
+described in their own paragraphs below).
+
+**`UPD-1` (Manual Updates), rewritten 2026-09-18** from a permanent
+`not_yet_reported` into a real, checked assertion — Bill's own framing,
+explicitly rejecting a "scan CONTRIBUTING.md for update-sounding text"
+heuristic: *"to keep our evaluations honest and avoid fuzzy markdown
+regexes... treat UPD-1 as an asserted procedural control verified via
+explicit repo configuration or a dedicated runbook document, rather than
+pretending static analysis can infer a human process."* A checked-in
+`.lucid/manual-updates.json` (`{"schema_version": "s2c2f-manual-updates/v1",
+"process_ref": "<repo-relative path or http(s) URL>"}`) is the primary
+assertion path — a relative-path `process_ref` is verified to actually
+exist in the repo (a dangling pointer reports `unmet`, never silently
+trusted); a URL `process_ref` is trusted without being fetched, the same
+model `--license-curations`' own entries already use, since this pipeline
+has no network-egress budget for verifying arbitrary external URLs stay
+live. With no config present, a dedicated `UPDATING.md` or
+`docs/manual-updates.md` at the repo root also satisfies it. Neither
+present: `unmet` (checked, confirmed absent) — never `not_yet_reported`,
+since the check genuinely ran and found nothing, the same "checked vs.
+couldn't check" distinction every other control in this module already
+draws.
+
+**`UPD-2` (Auto-Updates), new 2026-09-18, redesigned the same day**: a
+Dependabot/Renovate config (the same signal `UPD-3` checks) *and* a
+workflow under `.github/workflows/` that actually auto-merges Dependabot
+PRs, detected via the `dependabot/fetch-metadata` marker — the de facto
+standard building block every real "`gh pr merge --auto`"-style
+Dependabot automation is built on. The first version of this check read
+`GET /repos/{owner}/{repo}`'s `allow_auto_merge` field instead —
+confirmed, first against a real CI run and then independently against a
+real *unauthenticated* API call, that GitHub omits that field entirely
+unless the caller has *push* access to the repo. Every GitHub-API-backed
+check in this pipeline deliberately uses a read-only token, so that
+field was structurally unreachable from day one, not a permission this
+repo's own App could ever be granted without abandoning that posture.
+The replacement needs no GitHub API access at all — and is arguably a
+more precise signal than the original would have been anyway:
+`allow_auto_merge=true` alone says nothing about whether *dependency*
+PRs specifically get auto-merged, just that auto-merge is possible for
+some PR, by someone, for any reason.
+
+**`ING-3` (Denylists)** validates a checked-in, schema/digest-verified
+denylist policy artifact (`--denylist`, default
+`<repo-dir>/.lucid/denylist.json`) against `resolved_dependencies` — a
+missing artifact reports `unmet` (a definitive, confirmed absence, not
+"couldn't check"), a present-but-tampered one (its own recorded
+`digest_sha256` doesn't match a fresh recomputation over `entries`) also
+reports `unmet` rather than silently trusting a hand-edited file, and a
+resolved dependency matching an entry reports `unmet` naming the match.
+This repo's own `.lucid/denylist.json` ships empty — no real denylisted
+package has been curated yet, and an invented entry would be a fabricated
+claim this file's own Ground Truth Only invariant forbids.
+
+**`ING-2` (Local Copies)** is a real, per-dependency check for npm
+(classifies every resolved URL in `package-lock.json` by host against
+`--internal-registry`/`LUCID_INTERNAL_REGISTRY_HOSTS`), config-presence
+only for pip/maven (same caveat as before: an org-wide proxy configured
+outside the repo isn't visible here). `not_yet_reported` when none of
+npm/pip/maven's manifests are present at all — never a fabricated
+met/unmet with nothing to check.
+
+**`ENF-2` (Curated Feeds)** is the enforcement framing of the identical
+feed-provenance signal `ING-2` computes (shared, not recomputed): would a
+build that *broke* on a non-curated feed actually have broken here.
+
+**`ING-3`/`ING-2`/`ENF-2` were promoted here 2026-09-18** from
+`scripts/_ingestion_lib.py`, a deliberately pre-production scaffold that
+was never part of the packaged `cli` module (`pyproject.toml`'s own
+package-discovery only ever included `cli*`/`schema*`) — it ran only
+inside this repo's own dogfood CI, so no caller repo invoking the real,
+published pipeline ever got a repo-observable signal for these three
+controls, despite a signed companion DSSE envelope having existed since
+2026-09-10. Found while reviewing a real `lucid-console` render of a real
+`lucid-attest-service` attestation, which correctly showed these three as
+neutral/unevaluated — not a console bug, an architecture gap. The whole
+`scripts/` directory (and its 5th-envelope wiring in `assay.yml`) is
+retired now that its signal has run for real and is judged trustworthy —
+see this repo's git history (PRs #90/#94) for the scaffold's own origin.
+
+**`ING-4` (Source Cloning)** is a deliberate, permanent
+`not_yet_reported`: S2C2F's real definition is mirroring the upstream
+*source* of a consumed OSS component, a materially different (and harder)
+claim than `ING-2`'s registry/package-level pinning — this project
+operates no source-mirroring infrastructure today, so the honest signal
+is the gap itself, the same treatment `UPD-1` already gets, never a
+fabricated proxy.
+
+**`SCA-4` (Malware Scans)** checks for a recognized malware-scanning
+tool's SARIF findings — OSV-Scanner by default (OSV.dev aggregates the
+OpenSSF `ossf/malicious-packages` advisory feed alongside ordinary CVE
+data), Socket/Phylum recognized as commercial alternatives a caller can
+point `--sarif` at instead. Deliberately a narrow, named tool allowlist
+distinct from `SCA-1`'s broader one: most `SCA-1` tools (Trivy, Grype,
+npm-audit, ...) are CVE-focused without a dedicated malicious-package
+feed, so a Trivy-only SARIF input satisfies `SCA-1` but not `SCA-4` — the
+two controls can and do disagree. MVP-scoped to "did a malware-capable
+tool run", the same shape `SCA-1`/`SCA-2` already use — this pipeline
+never performs any scanning itself.
+
+**`SCA-5` (Proactive Reviews)** checks for a CODEOWNERS entry (checked at
+GitHub's three recognized locations) covering a recognized
+dependency-manifest filename, plus a real branch-ruleset
+`require_code_owner_review` boolean (the `pull_request` rule's own
+parameter, confirmed against GitHub's REST API ruleset documentation —
+`github_rules.BranchGovernanceReport.require_code_owner_review`). Both
+must hold for `met`; `not_yet_reported` only when branch governance
+itself couldn't be verified.
 
 **`SCA-1` is a process-existence control, not an outcome gate**: a
 recognized SCA tool's SARIF findings credit `SCA-1` as `met` regardless of

@@ -218,6 +218,15 @@ class BranchGovernanceReport:
     linear_history_required: bool = False
     force_pushes_blocked: bool = False
     deletions_blocked: bool = False
+    # The "pull_request" rule's own parameters.require_code_owner_review
+    # (confirmed against GitHub's REST API ruleset documentation, not
+    # guessed) -- same rule _derive_pr_requirements already reads for
+    # approvals_required, one more field off the identical object. False
+    # rather than omitted when no such rule exists, or on an attestation
+    # predating this field, or whenever available is False -- same
+    # convention every other branch-hygiene field here already follows.
+    # Consumed by cli.parsers.s2c2f's SCA-5 (Proactive Reviews) check.
+    require_code_owner_review: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -235,6 +244,7 @@ class BranchGovernanceReport:
             "linear_history_required": self.linear_history_required,
             "force_pushes_blocked": self.force_pushes_blocked,
             "deletions_blocked": self.deletions_blocked,
+            "require_code_owner_review": self.require_code_owner_review,
         }
 
 
@@ -536,24 +546,29 @@ def _fetch_bypass_actors_with_fallback(
     return bypass_actors, None, None
 
 
-def _derive_pr_requirements(rules: List[Any]) -> Tuple[bool, int, bool]:
+def _derive_pr_requirements(rules: List[Any]) -> Tuple[bool, int, bool, bool]:
     """Returns (pull_request_required, approvals_required,
-    direct_push_prevented) from the rules-for-branch response. A
-    "pull_request" rule is what actually blocks a direct (non-PR) push to
-    the branch; no other rule type in the response has that effect."""
+    direct_push_prevented, require_code_owner_review) from the
+    rules-for-branch response. A "pull_request" rule is what actually
+    blocks a direct (non-PR) push to the branch; no other rule type in the
+    response has that effect. `require_code_owner_review` is that same
+    rule's own boolean parameter (confirmed against GitHub's REST API
+    ruleset documentation), not a separate rule type."""
     pr_rule = next((r for r in rules if isinstance(r, dict) and r.get("type") == "pull_request"), None)
     pull_request_required = pr_rule is not None
 
     approvals_required = 0
+    require_code_owner_review = False
     if pr_rule is not None:
         params = pr_rule.get("parameters") or {}
         try:
             approvals_required = int(params.get("required_approving_review_count") or 0)
         except (TypeError, ValueError):
             approvals_required = 0
+        require_code_owner_review = bool(params.get("require_code_owner_review"))
 
     direct_push_prevented = pull_request_required
-    return pull_request_required, approvals_required, direct_push_prevented
+    return pull_request_required, approvals_required, direct_push_prevented, require_code_owner_review
 
 
 def _is_required_status_checks_rule(rule: Any) -> bool:
@@ -737,7 +752,7 @@ def inspect_branch_governance(
     if early_report is not None:
         return early_report
 
-    pull_request_required, approvals_required, direct_push_prevented = _derive_pr_requirements(rules)
+    pull_request_required, approvals_required, direct_push_prevented, require_code_owner_review = _derive_pr_requirements(rules)
     required_status_check_contexts = _derive_required_status_check_contexts(rules)
     linear_history_required, force_pushes_blocked, deletions_blocked = _derive_branch_hygiene(rules)
     always_bypass, pr_only_bypass, unknown_mode_bypass, admin_enforced = _classify_bypass_actors(bypass_actors)
@@ -773,4 +788,5 @@ def inspect_branch_governance(
         linear_history_required=linear_history_required,
         force_pushes_blocked=force_pushes_blocked,
         deletions_blocked=deletions_blocked,
+        require_code_owner_review=require_code_owner_review,
     )

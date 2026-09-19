@@ -20,7 +20,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cli.main import _dispatch_standalone_subcommand, main, parse_args
+from cli.main import _dispatch_standalone_subcommand, _evaluate_s2c2f_controls, main, parse_args
 
 
 def _min_argv(**overrides):
@@ -406,6 +406,105 @@ class MainPipelineTests(unittest.TestCase):
         with cm:
             main(argv)
         mocks["run_mutation_testing"].assert_called_once()
+
+
+class EvaluateS2c2fControlsDirectTests(unittest.TestCase):
+    """Direct-field tests for _evaluate_s2c2f_controls -- previously only
+    ever mocked away wholesale in MainPipelineTests above, leaving its real
+    pass-through wiring (repo_dir/repository/token/denylist_path forwarding,
+    the internal_registry comma-split/lower/strip, the env-var fallback,
+    and the s2c2f_evaluation stage-timer label) with zero direct mutation-
+    testing pressure -- found via a real mutation-testing CI failure,
+    2026-09-19."""
+
+    def _args(self, **overrides):
+        base = dict(
+            repo_dir=".",
+            repository="org/repo",
+            github_token="tok-123",
+            denylist=Path("custom-denylist.json"),
+            internal_registry=None,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_forwards_repo_dir_repository_token_denylist_and_untouched_params_exactly(self):
+        args = self._args()
+        sentinel_deps = [{"purl": "pkg:pypi/x"}]
+        sentinel_sarif = object()
+        sentinel_governance = object()
+        sentinel_return = object()
+        fake_evaluate = MagicMock(return_value=sentinel_return)
+        with patch("cli.main.evaluate_s2c2f", fake_evaluate):
+            result = _evaluate_s2c2f_controls(
+                args,
+                resolved_dependencies=sentinel_deps,
+                sarif_report=sentinel_sarif,
+                branch_governance=sentinel_governance,
+                stage_ns={},
+            )
+        fake_evaluate.assert_called_once_with(
+            repo_dir=".",
+            repository="org/repo",
+            resolved_dependencies=sentinel_deps,
+            sarif_report=sentinel_sarif,
+            branch_governance=sentinel_governance,
+            token="tok-123",
+            denylist_path=Path("custom-denylist.json"),
+            internal_registry_hosts=[],
+        )
+        self.assertIs(result, sentinel_return)
+
+    def test_internal_registry_flag_is_split_lowercased_and_stripped(self):
+        args = self._args(internal_registry=" Foo.Example.com, BAR.example.COM ,,")
+        fake_evaluate = MagicMock(return_value=None)
+        with patch("cli.main.evaluate_s2c2f", fake_evaluate):
+            _evaluate_s2c2f_controls(
+                args, resolved_dependencies=[], sarif_report=None,
+                branch_governance=None, stage_ns={},
+            )
+        self.assertEqual(
+            fake_evaluate.call_args.kwargs["internal_registry_hosts"],
+            ["foo.example.com", "bar.example.com"],
+        )
+
+    def test_internal_registry_none_falls_back_to_the_env_var(self):
+        args = self._args(internal_registry=None)
+        fake_evaluate = MagicMock(return_value=None)
+        with patch("cli.main.evaluate_s2c2f", fake_evaluate), \
+                patch.dict(os.environ, {"LUCID_INTERNAL_REGISTRY_HOSTS": "a.com,B.com"}, clear=False):
+            _evaluate_s2c2f_controls(
+                args, resolved_dependencies=[], sarif_report=None,
+                branch_governance=None, stage_ns={},
+            )
+        self.assertEqual(
+            fake_evaluate.call_args.kwargs["internal_registry_hosts"],
+            ["a.com", "b.com"],
+        )
+
+    def test_internal_registry_none_and_no_env_var_yields_empty_list(self):
+        args = self._args(internal_registry=None)
+        fake_evaluate = MagicMock(return_value=None)
+        env = dict(os.environ)
+        env.pop("LUCID_INTERNAL_REGISTRY_HOSTS", None)
+        with patch("cli.main.evaluate_s2c2f", fake_evaluate), \
+                patch.dict(os.environ, env, clear=True):
+            _evaluate_s2c2f_controls(
+                args, resolved_dependencies=[], sarif_report=None,
+                branch_governance=None, stage_ns={},
+            )
+        self.assertEqual(fake_evaluate.call_args.kwargs["internal_registry_hosts"], [])
+
+    def test_records_elapsed_time_under_the_exact_s2c2f_evaluation_stage_key(self):
+        args = self._args()
+        stage_ns: dict = {}
+        with patch("cli.main.evaluate_s2c2f", MagicMock(return_value=None)):
+            _evaluate_s2c2f_controls(
+                args, resolved_dependencies=[], sarif_report=None,
+                branch_governance=None, stage_ns=stage_ns,
+            )
+        self.assertEqual(list(stage_ns.keys()), ["s2c2f_evaluation"])
+        self.assertGreaterEqual(stage_ns["s2c2f_evaluation"], 0)
 
 
 if __name__ == "__main__":

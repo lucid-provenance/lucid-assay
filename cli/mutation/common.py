@@ -45,8 +45,12 @@ REASON_CODE_INSUFFICIENT_SAMPLE = "insufficient_sample"
 # it in the target repo at all (no [tool.mutmut]/no Stryker config/no
 # pitest-maven plugin). Consumers that render this to a human (e.g.
 # lucid-console) need this split to say "not configured" rather than the
-# misleading "nothing relevant changed" -- see _combine_results' own
-# not_applicable_report call for where this is actually produced.
+# misleading "nothing relevant changed". Graded via unavailable_report
+# (grade="degraded"), not not_applicable_report -- a real, avoidable gap
+# Assay can detect, not the same "nothing to say" no_source_changes gets
+# (2026-09-19: see _combine_results' own not-`ran` branch, and
+# cli/scorer.py's degraded-reasons handling, for where this is produced
+# and where it now flows through as a real degradation, not an exemption).
 REASON_CODE_NOT_CONFIGURED = "not_configured"
 
 DEFAULT_TIMEOUT_SECONDS = 90
@@ -91,11 +95,18 @@ class LanguageRunResult:
         anything real).
       - "not_configured": this language's tool isn't set up in the
         target repo at all (no stryker config, no pitest-maven plugin,
-        ...) -- contributes nothing, and on its own is not a penalty
-        (same as no changes in this diff at all).
+        ...) -- contributes no killed/survived/timeout counts, but IS a
+        real penalty when it's the only outcome for this run (2026-09-19:
+        Bill's own rule, "if Assay can detect something and the job has
+        it not configured, it should fail the check" -- see
+        __init__.py's own _combine_results, which grades this the same
+        "degraded" tier a real tool crash/timeout gets, not the free
+        "not_applicable" pass a genuine no-changes-at-all diff gets).
       - "unavailable": the tool *was* configured but a real attempt
         failed (missing binary, crashed, timed out) -- fail-closed,
-        never treated the same as "not_configured".
+        graded the identical tier "not_configured" now is, though the
+        two remain distinct reason_codes (see REASON_CODE_NOT_CONFIGURED
+        vs. REASON_CODE_UNAVAILABLE below).
     """
     language: str
     status: str

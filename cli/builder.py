@@ -171,12 +171,14 @@ def _build_mutation_testing_block(mutation_report: Optional["MutationTestReport"
 # Fail-Closed Verification invariant requires missing/unevaluated
 # metadata to evaluate to false, never a passing state, and `met` is a
 # direct boolean gate signal a console (or a future
-# --require-functional-adequacy flag) could read at face value -- unlike
-# cli.mutation's not_applicable grade, whose full credit lives only
-# inside an internal scoring multiplier, never a bare pass/fail claim.
-# available=False/adequacy.status="not_configured"/reason_code=
-# "not_configured" are what a consumer must check to tell "never
-# configured" apart from "evaluated and failed" -- see
+# --require-functional-adequacy flag) could read at face value. As of
+# 2026-09-19 this is no longer told apart from cli.mutation's own
+# not_configured handling -- that reason_code was corrected the same day
+# to grade a real "degraded" penalty rather than full credit, the same
+# "a detectable gap fails the check" rule this field's own met=False
+# already applied. available=False/adequacy.status="not_configured"/
+# reason_code="not_configured" are what a consumer must check to tell
+# "never configured" apart from "evaluated and failed" -- see
 # cli.parsers.functional_adequacy.evaluate_functional_adequacy's own
 # docstring for the full rationale.
 _FUNCTIONAL_VERIFICATION_NOT_CONFIGURED: Dict[str, Any] = {

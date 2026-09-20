@@ -253,23 +253,30 @@ language's own breakdown visible for exactly that reason:
 Two safeguards keep this from misfiring on a run that genuinely has
 nothing (or not enough) to say: a diff with **zero coverable statements**
 changed in any supported language (comment/docstring/type-annotation-only,
-or no `*.py`/`*.ts`/`*.tsx`/`*.js`/`*.jsx`/`*.java`/`*.go` touched at all, or no
-mutation-testing tool configured in the target repo for any language it
-did touch) is exempt — full credit, no discount, flagged
-`degraded` only in the "nothing to mutate" case (namespaced
-`mutation_testing:no_coverable_lines`, allowlisted for
-`--disallow-degraded` the same way `patch_coverage:no_coverable_lines`
-is) — and a sample below `--mutation-testing-min-sample` (default 3
-mutants actually tested) grades `insufficient_sample` and also applies no
-discount, since one surviving mutant out of one generated isn't a real
-signal. The "no relevant source changed at all" and "no tool configured
-for a language that did change" cases carry distinct `reason_code`s
-(`no_source_changes` vs. `not_configured`, 2026-09-15) even though both
-grade `not_applicable` and neither is a degradation trigger — a
-downstream reader (e.g. lucid-console) needs the split to say "not
+or no `*.py`/`*.ts`/`*.tsx`/`*.js`/`*.jsx`/`*.java`/`*.go` touched at all) is
+exempt — full credit, no discount, flagged `degraded` only in the
+"nothing to mutate" case (namespaced `mutation_testing:no_coverable_lines`,
+allowlisted for `--disallow-degraded` the same way
+`patch_coverage:no_coverable_lines` is) — and a sample below
+`--mutation-testing-min-sample` (default 3 mutants actually tested) grades
+`insufficient_sample` and also applies no discount, since one surviving
+mutant out of one generated isn't a real signal.
+
+**Source changing in a supported language with no tool configured for it
+is *not* exempt (changed 2026-09-19, Bill's own rule: "If Assay can detect
+something and the job has it not configured, it should fail the check and
+show as amber, never gray").** Until this date, `reason_code:
+"not_configured"` (distinct from `no_source_changes` since 2026-09-15 —
+a downstream reader like lucid-console needs the split to say "not
 configured" honestly rather than the misleading "nothing relevant
-changed" for a repo that touched real source but has no tool set up for
-that language yet. **Skipping mutation testing (`--skip-mutation-testing`) or a
+changed") graded `not_applicable` and took no discount, the same as
+genuinely having nothing to mutate. That was wrong: a repo that touched
+real source but never set up a tool for that language has a real,
+checked, avoidable gap, not an unavoidable "nothing to say." It now grades
+`degraded` (the same 0.85 multiplier a real tool crash/timeout already
+takes) and is a real degradation trigger (`mutation_testing:not_configured`,
+**not** allowlisted for `--disallow-degraded`), exactly like the
+skip/failure cases below. **Skipping mutation testing (`--skip-mutation-testing`) or a
 genuine tool failure/timeout never defaults to full credit** — both apply
 the same 0.85 multiplier as the weak tier, fail-closed, so opting out is
 never the cheap way to dodge the control meant to stop exactly that. The
@@ -396,11 +403,19 @@ of which language(s) contributed).
   "read the target repo's own tool config" principle as mutmut: this
   module never injects a test-runner config of its own, it requires the
   target repo to already carry a complete, working Stryker config (a
-  repo with none gets `not_applicable`, not a guess). Scopes via
-  `--mutate <files>` (confirmed empirically: "Found 1 of 5 file(s) to be
-  mutated"). Unlike Python, Stryker's own JSON reporter gives
-  `location.start.line` and a real `mutatorName` per mutant out of the
-  box -- no AST-based line resolution needed. `.stryker-tmp/`, its
+  repo with none gets `reason_code: "not_configured"`, graded `degraded`
+  since 2026-09-19 -- a real, avoidable gap, not a full-credit guess).
+  Scopes via `--mutate <files>` (confirmed empirically: "Found 1 of 5
+  file(s) to be mutated"). Unlike Python, Stryker's own JSON reporter
+  gives `location.start.line` and a real `mutatorName` per mutant out of
+  the box -- no AST-based line resolution needed. Stryker's own
+  `"NoCoverage"` status (a mutant generated but never executed by any
+  test at all -- worse than `"Survived"`) folds into `survived` (fixed
+  2026-09-19, mirroring `go_runner.py`'s own `"NOT COVERED"` handling) --
+  found via a real, empirical run against lucid-console's own codebase,
+  where it had been silently escaping killed/survived/timeout entirely
+  and letting a genuinely zero-coverage file misclassify as the
+  full-credit zero-mutant exemption. `.stryker-tmp/`, its
   sandbox working directory, is confirmed empirically to survive in the
   target repo after a run unless cleaned explicitly -- deleted both
   before and after every invocation (`--cleanTempDir always` plus a
@@ -1123,13 +1138,14 @@ unless a real evaluation actually ran and passed: a naive consumer that
 reads only `met` must see `false` for a repo that never declared a
 contract, not an emerald "passed" it never earned (CLAUDE.md's
 Fail-Closed Verification invariant — missing/unevaluated metadata must
-never default to a passing state). This is deliberately *not* the same
-relief `cli/mutation`'s `not_applicable` grade gives an unconfigured
-mutation-testing run: that grade only ever discounts an internal scoring
-*multiplier*, never a bare pass/fail claim a console would render
-directly. A consumer that needs to tell "never configured" apart from
-"evaluated and failed" reads `available`/`adequacy.status`/`reason_code`
-— never `met` alone.
+never default to a passing state). A consumer that needs to tell "never
+configured" apart from "evaluated and failed" reads
+`available`/`adequacy.status`/`reason_code` — never `met` alone; both are
+already `false`/`unmet`-shaped for either case (Bill's own rule,
+2026-09-19: a detectable gap fails the check and renders amber, never a
+neutral gray that undersells it — see `cli/mutation`'s own
+`REASON_CODE_NOT_CONFIGURED` handling below, which took the identical
+correction the same day).
 
 **The evidence** is `--functional-report <path>`, a real structured test
 report — the **Executed Scenarios**, the numerator. Three formats are

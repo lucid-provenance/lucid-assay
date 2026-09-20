@@ -79,7 +79,19 @@ _CONFIG_CANDIDATES = (
     ".stryker.conf.json",
 )
 _DEFAULT_REPORT_PATH = ("reports", "mutation", "mutation.json")
-_SURVIVED_STATUSES = {"Survived", "Timeout"}
+# "NoCoverage" -- a mutant Stryker generated but no test executed at all
+# -- folds into `survived`, the same way go_runner.py's "NOT COVERED"
+# already does: an undetected mutant is undetected whether a test ran and
+# missed it or no test touched the code at all. Found via a real,
+# empirical run against this repo's own diff (2026-09-19, confirmed
+# against a real lucid-console mutation.json carrying 66 "NoCoverage"
+# mutants): previously this status matched neither `elif` branch below,
+# so it inflated total_generated with zero effect on
+# killed/survived/timeout -- a file with real mutable code and truly
+# zero test coverage could misclassify as REASON_CODE_NO_COVERABLE_LINES
+# (tested == 0, full credit) instead of the real, ungraded gap it is.
+_UNDETECTED_STATUSES = {"Survived", "NoCoverage"}
+_DETAIL_STATUSES = _UNDETECTED_STATUSES | {"Timeout"}
 
 
 def _stryker_configured(repo_dir: Path) -> bool:
@@ -169,19 +181,24 @@ def _collect_from_report(report: Dict[str, Any], scoped_files: List[str], max_de
             status = m.get("status")
             if status == "Killed":
                 killed += 1
-            elif status == "Survived":
+            elif status in _UNDETECTED_STATUSES:
                 survived += 1
             elif status == "Timeout":
                 timeout_ct += 1
-            if status in _SURVIVED_STATUSES and len(surviving) < max_detail:
+            if status in _DETAIL_STATUSES and len(surviving) < max_detail:
                 location = m.get("location") if isinstance(m.get("location"), dict) else {}
                 start = location.get("start") if isinstance(location.get("start"), dict) else {}
+                # NoCoverage is reported as "survived" (never "nocoverage")
+                # in the detail list -- it's the same real signal
+                # (undetected), and a downstream reader (e.g. lucid-console)
+                # only ever branches on "survived"/"timeout" for styling.
+                detail_status = "survived" if status in _UNDETECTED_STATUSES else status.lower()
                 surviving.append(
                     SurvivingMutant(
                         language=LANGUAGE_TSJS,
                         file=file_path,
                         function=m.get("mutatorName", "unknown"),
-                        status=status.lower(),
+                        status=detail_status,
                         diff=f"{m.get('mutatorName', '')}: replaced with `{m.get('replacement', '')}`",
                         line=start.get("line"),
                     )

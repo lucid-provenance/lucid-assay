@@ -30,7 +30,6 @@ from typing import Dict, List, Optional
 from .mutation import (
     REASON_CODE_INSUFFICIENT_SAMPLE as _MUTATION_REASON_INSUFFICIENT_SAMPLE,
     REASON_CODE_NO_SOURCE_CHANGES as _MUTATION_REASON_NO_SOURCE_CHANGES,
-    REASON_CODE_NOT_CONFIGURED as _MUTATION_REASON_NOT_CONFIGURED,
     MutationTestReport,
 )
 from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change
@@ -394,19 +393,26 @@ def score_pipeline(
 
     # Fold in mutation_testing's own degraded trigger, if any.
     # REASON_CODE_NO_SOURCE_CHANGES ("no source in any supported language
-    # changed at all"), REASON_CODE_NOT_CONFIGURED ("source changed, but
-    # no tool is configured for that language in this repo"), and
-    # REASON_CODE_INSUFFICIENT_SAMPLE ("ran, too few mutants to trust")
-    # are deliberately *not* degradation triggers -- none of the three is
-    # a gap, just "this control genuinely had nothing/not enough to say"
-    # (see cli.mutation's package docstring). Everything else -- the real
-    # weak/decorative tiers, and the fail-closed unavailable/skipped
-    # cases -- is, namespaced the same way branch_governance/
-    # patch_coverage's reason codes already are.
+    # changed at all") and REASON_CODE_INSUFFICIENT_SAMPLE ("ran, too few
+    # mutants to trust") are deliberately *not* degradation triggers --
+    # neither is a gap, just "this control genuinely had nothing/not
+    # enough to say" (see cli.mutation's package docstring).
+    #
+    # REASON_CODE_NOT_CONFIGURED is deliberately *not* exempted (removed
+    # 2026-09-19, Bill's own rule: "If Assay can detect something and the
+    # job has it not configured, it should fail the check and show as
+    # amber, never gray"). Unlike no_source_changes, this is a real,
+    # checked gap -- source in a supported language changed, and this
+    # repo genuinely has no tool set up to mutation-test it -- not an
+    # unavoidable "nothing to say." cli.mutation.__init__._combine_results
+    # already grades this "degraded" (via unavailable_report, the same
+    # constructor a real tool crash/timeout uses) rather than
+    # "not_applicable", so it flows through here exactly like any other
+    # real gap, namespaced the same way branch_governance/patch_coverage's
+    # reason codes already are.
     if mutation_report is not None and mutation_report.reason_code not in (
         None,
         _MUTATION_REASON_NO_SOURCE_CHANGES,
-        _MUTATION_REASON_NOT_CONFIGURED,
         _MUTATION_REASON_INSUFFICIENT_SAMPLE,
     ):
         degraded = True

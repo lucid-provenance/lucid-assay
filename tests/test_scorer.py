@@ -258,22 +258,29 @@ class RCSScorerTests(unittest.TestCase):
         self.assertEqual(no_changes.mutation_multiplier, 1.0)
         self.assertEqual(insufficient.mutation_multiplier, 1.0)
 
-    def test_not_configured_is_not_degraded(self):
-        # Distinct from no_source_changes: real *.py/*.ts/*.java/*.go
-        # source changed, but no mutation-testing tool is configured for
-        # that language in this repo at all -- still "nothing to say",
-        # never a gap (see REASON_CODE_NOT_CONFIGURED's own docstring).
+    def test_not_configured_is_a_real_degraded_gap(self):
+        # Changed 2026-09-19 (Bill's own rule: "If Assay can detect
+        # something and the job has it not configured, it should fail the
+        # check and show as amber, never gray") -- distinct from
+        # no_source_changes: real *.py/*.ts/*.java/*.go source changed,
+        # but no mutation-testing tool is configured for that language in
+        # this repo at all. That's a real, avoidable gap, not "nothing to
+        # say" -- cli.mutation now grades it "degraded" (multiplier 0.85,
+        # same as a real tool crash/timeout), and this must flow through
+        # to a real degraded_reasons entry, not an exemption.
         result = score_pipeline(**_base_kwargs(
             mutation_report=_mutation_report(
-                available=False, grade="not_applicable", multiplier=1.0, mutation_score=None,
+                available=False, grade="degraded", multiplier=0.85, mutation_score=None,
                 killed=0, survived=0, timeout=0, total_generated=0,
-                reason="no mutation-testing tool is configured in this repo for any language "
-                "this diff touched (no [tool.mutmut]/no Stryker config/no pitest-maven plugin)",
+                reason="source changed in a supported language (typescript_javascript) but no "
+                "mutation-testing tool is configured for it in this repo (no [tool.mutmut]/no "
+                "Stryker config/no pitest-maven plugin) -- a real, avoidable gap, not credited as a pass",
                 reason_code="not_configured",
             ),
         ))
-        self.assertFalse(result.degraded)
-        self.assertEqual(result.mutation_multiplier, 1.0)
+        self.assertTrue(result.degraded)
+        self.assertIn("mutation_testing:not_configured", result.degraded_reasons)
+        self.assertEqual(result.mutation_multiplier, 0.85)
 
     def test_no_coverable_lines_is_degraded_but_full_credit(self):
         # Mirrors patch_coverage:no_coverable_lines -- a docs/comment-only

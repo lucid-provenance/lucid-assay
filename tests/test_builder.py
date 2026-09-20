@@ -613,7 +613,14 @@ class PipelineBlockTests(unittest.TestCase):
     statement (see _ambient_run_id/_ambient_run_attempt/
     _ambient_workflow_ref/_ambient_runner_environment's own docstrings)."""
 
-    _ENV_KEYS = ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_WORKFLOW_REF", "RUNNER_ENVIRONMENT")
+    _ENV_KEYS = (
+        "GITHUB_RUN_ID",
+        "GITHUB_RUN_ATTEMPT",
+        "GITHUB_WORKFLOW_REF",
+        "RUNNER_ENVIRONMENT",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_REF",
+    )
 
     def setUp(self):
         # This suite runs inside real GitHub Actions jobs too, where these
@@ -640,6 +647,8 @@ class PipelineBlockTests(unittest.TestCase):
         self.assertEqual(pipeline["workflow_ref"], "not-run-in-ci")
         self.assertEqual(pipeline["run_attempt"], 1)
         self.assertEqual(pipeline["runner_environment"], "unknown")
+        self.assertEqual(pipeline["trigger_event"], "not-run-in-ci")
+        self.assertEqual(pipeline["trigger_ref"], "not-run-in-ci")
         self.assertNotIn("PLACEHOLDER", pipeline["run_id"])
         self.assertNotIn("PLACEHOLDER", pipeline["workflow_ref"])
 
@@ -648,6 +657,8 @@ class PipelineBlockTests(unittest.TestCase):
         os.environ["GITHUB_RUN_ATTEMPT"] = "2"
         os.environ["GITHUB_WORKFLOW_REF"] = "lucid-provenance/lucid-assay/.github/workflows/assay.yml@refs/heads/main"
         os.environ["RUNNER_ENVIRONMENT"] = "github-hosted"
+        os.environ["GITHUB_EVENT_NAME"] = "push"
+        os.environ["GITHUB_REF"] = "refs/heads/main"
 
         statement = build_statement(**_base_kwargs())
         pipeline = statement["predicate"]["pipeline"]
@@ -658,6 +669,23 @@ class PipelineBlockTests(unittest.TestCase):
             pipeline["workflow_ref"], "lucid-provenance/lucid-assay/.github/workflows/assay.yml@refs/heads/main"
         )
         self.assertEqual(pipeline["runner_environment"], "github-hosted")
+        self.assertEqual(pipeline["trigger_event"], "push")
+        self.assertEqual(pipeline["trigger_ref"], "refs/heads/main")
+
+    def test_trigger_ref_reads_the_real_synthetic_pr_ref_not_a_branch_name(self):
+        # The whole point of this field: a pull_request event's own
+        # GITHUB_REF is the synthetic refs/pull/N/merge ref regardless of
+        # which branch the PR targets -- unlike vcs.branch (--branch),
+        # which every caller's own assay.yml deliberately resolves to the
+        # PR's *base* branch for branch-governance lookups. This must stay
+        # the raw, un-resolved value so it's still comparable against a
+        # Sigstore certificate's own signed ref claim.
+        os.environ["GITHUB_EVENT_NAME"] = "pull_request"
+        os.environ["GITHUB_REF"] = "refs/pull/42/merge"
+        statement = build_statement(**_base_kwargs())
+        pipeline = statement["predicate"]["pipeline"]
+        self.assertEqual(pipeline["trigger_event"], "pull_request")
+        self.assertEqual(pipeline["trigger_ref"], "refs/pull/42/merge")
 
     def test_run_attempt_defaults_to_one_when_env_var_genuinely_unset(self):
         os.environ["GITHUB_RUN_ID"] = "123456789"
@@ -685,6 +713,8 @@ class PipelineBlockTests(unittest.TestCase):
         os.environ["GITHUB_RUN_ATTEMPT"] = "1"
         os.environ["GITHUB_WORKFLOW_REF"] = "lucid-provenance/lucid-assay/.github/workflows/assay.yml@refs/heads/main"
         os.environ["RUNNER_ENVIRONMENT"] = "github-hosted"
+        os.environ["GITHUB_EVENT_NAME"] = "push"
+        os.environ["GITHUB_REF"] = "refs/heads/main"
 
         statement = build_statement(**_base_kwargs())
 

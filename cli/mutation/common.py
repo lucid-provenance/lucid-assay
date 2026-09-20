@@ -52,6 +52,17 @@ REASON_CODE_INSUFFICIENT_SAMPLE = "insufficient_sample"
 # cli/scorer.py's degraded-reasons handling, for where this is produced
 # and where it now flows through as a real degradation, not an exemption).
 REASON_CODE_NOT_CONFIGURED = "not_configured"
+# Distinct again from REASON_CODE_NOT_CONFIGURED: that one is for when
+# *every* touched language is unconfigured (nothing ran at all).  This one
+# is the mixed case -- at least one language ran (real killed/survived/
+# timeout data exists), but at least one *other* touched language has no
+# tool configured. Bill's own zero-trust policy, 2026-09-20: unassessed
+# code is unverified code, so a real, passing score from the configured
+# language(s) can never certify the whole diff -- see
+# _cap_for_unconfigured_language in __init__.py for the exact cap
+# (never worse than the configured language's own real grade, but never
+# better than "degraded" either).
+REASON_CODE_UNCONFIGURED_LANGUAGE_PRESENT = "unconfigured_language_present"
 
 DEFAULT_TIMEOUT_SECONDS = 90
 DEFAULT_MAX_SURVIVING_DETAIL = 5

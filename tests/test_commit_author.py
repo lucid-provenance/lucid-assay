@@ -444,15 +444,23 @@ class SquashOrRebaseMergeCorrectionTests(unittest.TestCase):
         self.assertTrue(result.verified_github_account)
         self.assertEqual(result.github_login, "billwonch")
 
+    @patch("cli.parsers.commit_author.time.sleep")
     @patch("cli.parsers.commit_author.urllib.request.urlopen")
-    def test_no_associated_pr_fails_closed(self, mock_urlopen):
-        mock_urlopen.side_effect = _mock_response_sequence(_REAL_SQUASH_MERGE_COMMIT, [])
+    def test_no_associated_pr_fails_closed(self, mock_urlopen, mock_sleep):
+        # A genuinely persistent "no PR" (empty on every one of the 5
+        # retry attempts, see _PR_LOOKUP_RETRY_ATTEMPTS) is still an
+        # honest, non-error outcome -- not escalated after retrying.
+        mock_urlopen.side_effect = _mock_response_sequence(_REAL_SQUASH_MERGE_COMMIT, [], [], [], [], [])
         result = inspect_commit_author(_REPO, _SQUASH_MERGE_SHA, token="tok")
 
         self.assertIsNone(result.commit_signature_verified)
         self.assertIn("no pull request associated", result.commit_signature_reason)
         # Never falls back to crediting the squash commit's own signature.
         self.assertIsNone(result.commit_signature_source_sha)
+        # Retried the full 5 attempts (4 sleeps between them) before
+        # concluding "no PR" for real -- confirms this didn't just give up
+        # on the first empty response.
+        self.assertEqual(mock_sleep.call_count, 4)
 
     @patch("cli.parsers.commit_author.urllib.request.urlopen")
     def test_transport_error_resolving_associated_pr_fails_closed(self, mock_urlopen):
@@ -516,6 +524,45 @@ class AssociatedPrLookupHelperTests(unittest.TestCase):
         number, error = _fetch_associated_pr_number(_REPO, _SQUASH_MERGE_SHA, {}, 10)
         self.assertIsNone(number)
         self.assertIn("unexpected response shape", error)
+
+    @patch("cli.parsers.commit_author.time.sleep")
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_retries_through_a_transient_empty_response_before_the_real_pr_appears(self, mock_urlopen, mock_sleep):
+        # The actual race this retry exists for (2026-09-03, confirmed for
+        # real against lucid-dsse-collector): right after a merge, this
+        # endpoint can report zero associated PRs for a few seconds while
+        # GitHub's own backend indexing catches up -- a transient empty
+        # response, not a real "no PR" outcome. Two empty attempts, then
+        # the real PR appears on the third -- must not give up early.
+        mock_urlopen.side_effect = _mock_response_sequence([], [], _REAL_ASSOCIATED_PRS_RESPONSE)
+        number, error = _fetch_associated_pr_number(_REPO, _SQUASH_MERGE_SHA, {}, 10)
+        self.assertEqual(number, _SQUASH_PR_NUMBER)
+        self.assertIsNone(error)
+        self.assertEqual(mock_urlopen.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    @patch("cli.parsers.commit_author.time.sleep")
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_transport_error_is_never_retried_only_the_empty_list_race_is(self, mock_urlopen, mock_sleep):
+        # A real HTTP/transport failure is a different, unrelated failure
+        # mode from the documented indexing-lag race -- must fail closed
+        # on the very first attempt, never burn through retries on it.
+        mock_urlopen.side_effect = urllib.error.URLError("connection refused")
+        number, error = _fetch_associated_pr_number(_REPO, _SQUASH_MERGE_SHA, {}, 10)
+        self.assertIsNone(number)
+        self.assertIn("connection refused", error)
+        self.assertEqual(mock_urlopen.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    @patch("cli.parsers.commit_author.time.sleep")
+    @patch("cli.parsers.commit_author.urllib.request.urlopen")
+    def test_genuinely_no_pr_after_every_retry_attempt_returns_none_not_an_error(self, mock_urlopen, mock_sleep):
+        mock_urlopen.side_effect = _mock_response_sequence([], [], [], [], [])
+        number, error = _fetch_associated_pr_number(_REPO, _SQUASH_MERGE_SHA, {}, 10)
+        self.assertIsNone(number)
+        self.assertIsNone(error)
+        self.assertEqual(mock_urlopen.call_count, 5)
+        self.assertEqual(mock_sleep.call_count, 4)
 
 
 class PrBranchTipHelperTests(unittest.TestCase):

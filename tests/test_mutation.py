@@ -18,6 +18,7 @@ from cli.mutation import (
 )
 from cli.mutation.common import (
     MUTATION_MIN_SAMPLE_SIZE_DEFAULT,
+    MULTIPLIER_DEGRADED,
     MULTIPLIER_FAILED,
     MULTIPLIER_NOT_APPLICABLE,
     MULTIPLIER_PASSED,
@@ -32,6 +33,7 @@ from cli.mutation.common import (
     REASON_CODE_NO_SOURCE_CHANGES,
     REASON_CODE_NOT_CONFIGURED,
     REASON_CODE_SKIPPED,
+    REASON_CODE_UNCONFIGURED_LANGUAGE_PRESENT,
 )
 from cli.mutation.python_runner import (
     _NO_MATCH_MARKER,
@@ -1241,7 +1243,14 @@ class CombineResultsMultiLanguageTests(unittest.TestCase):
         self.assertEqual(report.by_language[LANGUAGE_PYTHON]["killed"], 80)
         self.assertEqual(report.by_language[LANGUAGE_TSJS]["killed"], 2)
 
-    def test_not_configured_language_contributes_nothing(self):
+    def test_not_configured_language_contributes_no_raw_counts_but_caps_the_grade(self):
+        # Bill's own zero-trust policy, 2026-09-20: "If a PR sneaks in 500
+        # lines of Go alongside 5 lines of Python, the Python suite
+        # passing cannot sign off on the safety of the commit." Raw
+        # killed/survived counts still come only from the language(s)
+        # that actually ran (transparency), but the *grade* a real 90%
+        # Python kill rate would otherwise earn ("passed") is capped down
+        # to "degraded" because TS/JS went completely unassessed.
         python_result = LanguageRunResult(
             language=LANGUAGE_PYTHON, status="ran", killed=9, survived=1,
             total_generated=10, scoped_files=["cli/scorer.py"],
@@ -1252,6 +1261,69 @@ class CombineResultsMultiLanguageTests(unittest.TestCase):
         self.assertEqual(report.killed, 9)
         self.assertEqual(report.survived, 1)
         self.assertNotIn(LANGUAGE_TSJS, report.by_language)
+        self.assertAlmostEqual(report.mutation_score, 90.0)
+        # Without the cap this would grade "passed" (90% >= 80% threshold).
+        self.assertEqual(report.grade, "degraded")
+        self.assertEqual(report.multiplier, MULTIPLIER_DEGRADED)
+        self.assertEqual(report.reason_code, REASON_CODE_UNCONFIGURED_LANGUAGE_PRESENT)
+        self.assertIn(LANGUAGE_TSJS, report.reason)
+
+    def test_cap_never_improves_a_score_that_already_graded_worse_than_degraded(self):
+        # The cap is a ceiling, not a floor: a real 20% Python kill rate
+        # (the "failed" tier, 0.50x) must stay "failed" -- an unconfigured
+        # TS/JS file alongside it cannot rescue it up to "degraded" (0.85x).
+        python_result = LanguageRunResult(
+            language=LANGUAGE_PYTHON, status="ran", killed=2, survived=8,
+            total_generated=10, scoped_files=["cli/scorer.py"],
+        )
+        tsjs_result = LanguageRunResult(language=LANGUAGE_TSJS, status="not_configured")
+        from cli.mutation import _combine_results
+        report = _combine_results([python_result, tsjs_result], min_sample_size=3, max_surviving_detail=5)
+        self.assertEqual(report.grade, "failed")
+        self.assertEqual(report.multiplier, MULTIPLIER_FAILED)
+        self.assertEqual(report.reason_code, REASON_CODE_UNCONFIGURED_LANGUAGE_PRESENT)
+        self.assertIn(LANGUAGE_TSJS, report.reason)
+
+    def test_cap_applies_to_the_no_coverable_lines_case_too(self):
+        # A comment-only Python diff (tested == 0, normally full-credit
+        # not_applicable) must not grant a free pass just because it
+        # happened to be paired with an unassessed TS/JS file in the same
+        # diff -- the whole point is that the *other* language's real
+        # risk was never checked at all.
+        python_result = LanguageRunResult(
+            language=LANGUAGE_PYTHON, status="ran", total_generated=0, scoped_files=["cli/scorer.py"],
+        )
+        tsjs_result = LanguageRunResult(language=LANGUAGE_TSJS, status="not_configured")
+        from cli.mutation import _combine_results
+        report = _combine_results([python_result, tsjs_result], min_sample_size=3, max_surviving_detail=5)
+        self.assertEqual(report.grade, "degraded")
+        self.assertEqual(report.multiplier, MULTIPLIER_DEGRADED)
+        self.assertEqual(report.reason_code, REASON_CODE_UNCONFIGURED_LANGUAGE_PRESENT)
+
+    def test_cap_applies_to_the_insufficient_sample_case_too(self):
+        python_result = LanguageRunResult(
+            language=LANGUAGE_PYTHON, status="ran", killed=1, survived=0,
+            total_generated=1, scoped_files=["cli/scorer.py"],
+        )
+        tsjs_result = LanguageRunResult(language=LANGUAGE_TSJS, status="not_configured")
+        from cli.mutation import _combine_results
+        report = _combine_results([python_result, tsjs_result], min_sample_size=3, max_surviving_detail=5)
+        self.assertEqual(report.grade, "degraded")
+        self.assertEqual(report.multiplier, MULTIPLIER_DEGRADED)
+        self.assertEqual(report.reason_code, REASON_CODE_UNCONFIGURED_LANGUAGE_PRESENT)
+
+    def test_no_not_configured_languages_leaves_the_report_completely_untouched(self):
+        # The cap function must be a true no-op absent any not_configured
+        # result -- confirms reason_code/reason aren't rewritten when
+        # there's nothing to cap for.
+        python_result = LanguageRunResult(
+            language=LANGUAGE_PYTHON, status="ran", killed=9, survived=1,
+            total_generated=10, scoped_files=["cli/scorer.py"],
+        )
+        from cli.mutation import _combine_results
+        report = _combine_results([python_result], min_sample_size=3, max_surviving_detail=5)
+        self.assertEqual(report.grade, "passed")
+        self.assertIsNone(report.reason_code)
 
     def test_every_touched_language_not_configured_is_a_real_degraded_gap(self):
         # Changed 2026-09-19 (Bill's own rule: "If Assay can detect

@@ -80,6 +80,39 @@ def _ambient_runner_environment() -> str:
     return os.environ.get("RUNNER_ENVIRONMENT") or "unknown"
 
 
+def _ambient_trigger_event() -> str:
+    """GITHUB_EVENT_NAME, Actions-provided ("push"/"pull_request"/
+    "workflow_dispatch"/...) -- half of the real, un-tampered "was this
+    actually pushed to a branch, or just a PR preview" signal, alongside
+    _ambient_trigger_ref() below. Added 2026-09-20 (Bill's own request):
+    predicate.vcs.branch is NOT this signal -- every caller's own
+    assay.yml workflow deliberately resolves --branch to the PR's *base*
+    branch on a pull_request event (github.event.pull_request.base.ref),
+    since branch_governance needs a real, queryable branch name and the
+    synthetic refs/pull/N/merge ref isn't one -- so vcs.branch reads
+    "main" for both a genuine push to main AND an unmerged PR merely
+    targeting main, indistinguishable from each other. This field (and
+    _ambient_trigger_ref) capture the real, un-resolved trigger context
+    instead, exactly as GitHub's own OIDC token and this run's Sigstore
+    certificate already see it (cross-check against the signed cert's
+    own ref claim, not just this self-reported field, for anything
+    genuinely security-relevant -- see cli/verify.py's --expected-ref)."""
+    return os.environ.get("GITHUB_EVENT_NAME") or _OFF_CI_SENTINEL
+
+
+def _ambient_trigger_ref() -> str:
+    """GITHUB_REF, Actions-provided, the real ref this job actually ran
+    against -- "refs/heads/main" on a genuine push, or the synthetic
+    "refs/pull/N/merge" on a pull_request event regardless of that PR's
+    own target branch. See _ambient_trigger_event's own docstring for why
+    this, not vcs.branch, is the field to check for "did this really come
+    from main." Deliberately the *raw* value GitHub Actions sets this
+    env var to -- never re-derived or normalized, so it stays byte-for-
+    byte comparable against the same ref a Sigstore certificate's own
+    signed claim would carry."""
+    return os.environ.get("GITHUB_REF") or _OFF_CI_SENTINEL
+
+
 def _clean_sha256(raw_sha: str) -> str:
     """Normalize hex digest to 64-char lowercase string."""
     s = raw_sha.strip().lower()
@@ -371,6 +404,8 @@ def build_statement(
             "run_attempt": _ambient_run_attempt(),
             "workflow_ref": _ambient_workflow_ref(),
             "runner_environment": _ambient_runner_environment(),
+            "trigger_event": _ambient_trigger_event(),
+            "trigger_ref": _ambient_trigger_ref(),
             "started_at": _now_iso(),
             "finished_at": _now_iso(),
         },

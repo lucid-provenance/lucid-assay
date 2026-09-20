@@ -127,6 +127,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -145,6 +146,27 @@ _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 # a merge graph, the same "fixed bound, not a tight/unbounded loop"
 # discipline cli.oidc_signer's OIDC fetch retries already apply.
 _MAX_WEB_FLOW_WALK_BACK_HOPS = 5
+
+# _fetch_associated_pr_number's own retry, added 2026-09-20 for the same
+# real, documented race .github/workflows/assay.yml's "Resolve PR Context
+# for a Push-Triggered Run" step already retries around (confirmed for
+# real, 2026-09-03, lucid-dsse-collector: right after a merge, GitHub's
+# own "list PRs associated with commit" endpoint can report zero
+# associated PRs for a few seconds while backend indexing catches up --
+# a transient race, not a persistent state). That YAML step retries the
+# malformed/empty-*response-body* shape of this race; this Python path
+# hits the equivalent shape one layer up -- a well-formed, valid empty
+# JSON array (`[]`), which is *also* this function's own honest signal
+# for "no PR is associated with this commit at all" (a real, legitimate,
+# non-error outcome -- an admin-privileged direct push has none). The two
+# can't be told apart from the response alone, so this retries the same
+# 5 attempts / 3s apart the YAML step already uses (provably bounded,
+# never an unbounded/tight loop) before concluding "no PR" for real --
+# never escalated to an error even after every attempt is empty, since
+# that conclusion is still a legitimate one, just less likely to be a
+# false negative caused by the race.
+_PR_LOOKUP_RETRY_ATTEMPTS = 5
+_PR_LOOKUP_RETRY_DELAY_SECONDS = 3
 
 
 @dataclass
@@ -285,20 +307,31 @@ def _fetch_associated_pr_number(
     uses to recover PR context on a push-triggered run. Returns
     (pr_number, None) on success, (None, None) when GitHub reports no
     associated PR at all (a legitimate, distinct outcome -- not a
-    failure), or (None, failure_reason) on any transport/shape failure."""
+    failure) *after* retrying the indexing-lag race (see
+    _PR_LOOKUP_RETRY_ATTEMPTS's own docstring), or (None, failure_reason)
+    on any transport/shape failure -- those are never retried here, only
+    the "genuinely empty list" shape is, since that's the one this race
+    actually produces."""
     url = f"{GITHUB_API_BASE}/repos/{repository}/commits/{urllib.parse.quote(commit_sha, safe='')}/pulls"
     req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        return None, f"GitHub API request failed (HTTP {e.code}) resolving the PR associated with {commit_sha}: {_extract_http_error_detail(e)}"
-    except urllib.error.URLError as e:
-        return None, f"GitHub API request failed resolving the PR associated with {commit_sha}: {e.reason}"
-    except (json.JSONDecodeError, ValueError, OSError, RecursionError) as e:
-        return None, f"GitHub API request failed resolving the PR associated with {commit_sha}: {e}"
-    if not isinstance(body, list) or not body:
+    for attempt in range(_PR_LOOKUP_RETRY_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return None, f"GitHub API request failed (HTTP {e.code}) resolving the PR associated with {commit_sha}: {_extract_http_error_detail(e)}"
+        except urllib.error.URLError as e:
+            return None, f"GitHub API request failed resolving the PR associated with {commit_sha}: {e.reason}"
+        except (json.JSONDecodeError, ValueError, OSError, RecursionError) as e:
+            return None, f"GitHub API request failed resolving the PR associated with {commit_sha}: {e}"
+        if isinstance(body, list) and body:
+            break
+        if attempt < _PR_LOOKUP_RETRY_ATTEMPTS - 1:
+            time.sleep(_PR_LOOKUP_RETRY_DELAY_SECONDS)
+    else:
         return None, None
+    # Reached only via the loop's own `break` above -- body is guaranteed
+    # a real, non-empty list at this point, never via the `else` branch.
     first = body[0]
     if not isinstance(first, dict) or not isinstance(first.get("number"), int):
         return None, f"unexpected response shape resolving the PR associated with {commit_sha}"

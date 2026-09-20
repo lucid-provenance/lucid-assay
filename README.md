@@ -276,7 +276,24 @@ checked, avoidable gap, not an unavoidable "nothing to say." It now grades
 `degraded` (the same 0.85 multiplier a real tool crash/timeout already
 takes) and is a real degradation trigger (`mutation_testing:not_configured`,
 **not** allowlisted for `--disallow-degraded`), exactly like the
-skip/failure cases below. **Skipping mutation testing (`--skip-mutation-testing`) or a
+skip/failure cases below.
+
+**A diff that touches *both* a configured language and an unconfigured
+one is capped at "degraded," never rescued by the configured language's
+own good score (added 2026-09-20, Bill's own zero-trust policy: "If a PR
+sneaks in 500 lines of Go alongside 5 lines of Python, the Python suite
+passing cannot sign off on the safety of the commit").** This is a strict
+*cap*, not an override: a 90% Python kill rate paired with an unconfigured
+Go file caps down from `passed` to `degraded` (0.85x) — but a genuinely
+30% Python kill rate (already `failed`, 0.50x) is **not** improved up to
+`degraded` just because Go also went unassessed; the worse of the two
+always wins. Reported as its own `reason_code:
+"unconfigured_language_present"`, distinct from `not_configured` (that
+one is *every* touched language being unconfigured; this one is a mix)
+— also **not** allowlisted for `--disallow-degraded`. Raw
+killed/survived/timeout/by_language counts stay the real, unmodified
+numbers from whatever language(s) actually ran; only the grade/multiplier/
+reason get capped. **Skipping mutation testing (`--skip-mutation-testing`) or a
 genuine tool failure/timeout never defaults to full credit** — both apply
 the same 0.85 multiplier as the weak tier, fail-closed, so opting out is
 never the cheap way to dodge the control meant to stop exactly that. The

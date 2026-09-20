@@ -33,6 +33,8 @@
         "run_attempt": { "type": "integer", "minimum": 1 },
         "workflow_ref": { "type": "string", "minLength": 1, "description": "e.g. org/repo/.github/workflows/ci.yml@refs/heads/main" },
         "runner_environment": { "type": "string", "enum": ["github-hosted", "self-hosted", "gitlab-shared", "gitlab-self-managed", "unknown"], "default": "unknown" },
+        "trigger_event": { "type": "string", "minLength": 1, "description": "e.g. push/pull_request/workflow_dispatch (GITHUB_EVENT_NAME) -- the real trigger type, distinct from vcs.branch which a pull_request event always resolves to the PR's base branch." },
+        "trigger_ref": { "type": "string", "minLength": 1, "description": "e.g. refs/heads/main on a real push, or the synthetic refs/pull/N/merge on a pull_request event (GITHUB_REF, unresolved) -- the field to check for whether a run genuinely came from a branch push, not vcs.branch." },
         "started_at": { "type": "string", "format": "date-time" },
         "finished_at": { "type": "string", "format": "date-time" }
       }

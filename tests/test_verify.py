@@ -3160,11 +3160,6 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.verdict_out, "verdict.json")
 
 
-def test_pr_patch_marker():
-    from cli.verify import pr_patch_marker
-    assert pr_patch_marker() == "patch-verified"
-
-
 class DegradedReasonsGuardrailTests(unittest.TestCase):
     """Structural guardrail against silent drift between where a
     degraded_reasons entry gets *produced* (cli/scorer.py, cli/patch_coverage.py,

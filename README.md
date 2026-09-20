@@ -403,11 +403,19 @@ of which language(s) contributed).
   "read the target repo's own tool config" principle as mutmut: this
   module never injects a test-runner config of its own, it requires the
   target repo to already carry a complete, working Stryker config (a
-  repo with none gets `not_applicable`, not a guess). Scopes via
-  `--mutate <files>` (confirmed empirically: "Found 1 of 5 file(s) to be
-  mutated"). Unlike Python, Stryker's own JSON reporter gives
-  `location.start.line` and a real `mutatorName` per mutant out of the
-  box -- no AST-based line resolution needed. `.stryker-tmp/`, its
+  repo with none gets `reason_code: "not_configured"`, graded `degraded`
+  since 2026-09-19 -- a real, avoidable gap, not a full-credit guess).
+  Scopes via `--mutate <files>` (confirmed empirically: "Found 1 of 5
+  file(s) to be mutated"). Unlike Python, Stryker's own JSON reporter
+  gives `location.start.line` and a real `mutatorName` per mutant out of
+  the box -- no AST-based line resolution needed. Stryker's own
+  `"NoCoverage"` status (a mutant generated but never executed by any
+  test at all -- worse than `"Survived"`) folds into `survived` (fixed
+  2026-09-19, mirroring `go_runner.py`'s own `"NOT COVERED"` handling) --
+  found via a real, empirical run against lucid-console's own codebase,
+  where it had been silently escaping killed/survived/timeout entirely
+  and letting a genuinely zero-coverage file misclassify as the
+  full-credit zero-mutant exemption. `.stryker-tmp/`, its
   sandbox working directory, is confirmed empirically to survive in the
   target repo after a run unless cleaned explicitly -- deleted both
   before and after every invocation (`--cleanTempDir always` plus a

@@ -312,19 +312,26 @@ class CollectFromReportTests(unittest.TestCase):
         self.assertEqual(result.status, "ran")
         self.assertEqual(result.language, LANGUAGE_TSJS)
         self.assertEqual(result.killed, 2)
-        self.assertEqual(result.survived, 1)
+        # NoCoverage folds into survived (2026-09-19 fix, mirroring
+        # go_runner.py's "NOT COVERED" -- a mutant no test ever touched is
+        # every bit as undetected as one a test ran and missed): the real
+        # "Survived" (B) plus the "NoCoverage" one (D) = 2.
+        self.assertEqual(result.survived, 2)
         self.assertEqual(result.timeout, 2)
-        # NoCoverage/CompileError count toward total_generated (they were
-        # in the scoped file) but land in no bucket and produce no detail.
+        # CompileError alone counts toward total_generated (it was in the
+        # scoped file) but lands in no bucket and produces no detail.
         self.assertEqual(result.total_generated, 7)
         self.assertEqual(result.scoped_files, ["src/mathy.js"])
-        self.assertEqual(len(result.surviving_mutants), 3)
+        self.assertEqual(len(result.surviving_mutants), 4)
 
-        survived, timeout_1, timeout_2 = result.surviving_mutants
+        # Detail order follows the mutants list's own iteration order
+        # (B, C, C2, D), not grouped by status.
+        survived, timeout_1, timeout_2, no_coverage = result.surviving_mutants
         expected = [
             (survived, "B", "survived", "B: replaced with `>=`", 3),
             (timeout_1, "C", "timeout", "C: replaced with ``", 4),
             (timeout_2, "C2", "timeout", "C2: replaced with ``", 5),
+            (no_coverage, "D", "survived", "D: replaced with ``", 6),
         ]
         for detail, function, status, diff, line in expected:
             self.assertEqual(detail.language, LANGUAGE_TSJS)
@@ -333,6 +340,27 @@ class CollectFromReportTests(unittest.TestCase):
             self.assertEqual(detail.status, status)
             self.assertEqual(detail.diff, diff)
             self.assertEqual(detail.line, line)
+
+    def test_a_file_with_only_nocoverage_mutants_is_a_real_gap_not_no_coverable_lines(self):
+        # Found via a real, empirical Stryker run against lucid-console's
+        # own repo (2026-09-19): a file with real mutable code but truly
+        # zero test coverage generates only "NoCoverage" mutants -- before
+        # this fix, killed+survived+timeout was 0 for such a file, so it
+        # misclassified as REASON_CODE_NO_COVERABLE_LINES (full credit),
+        # identical to a comment-only diff. That's wrong: real, uncovered
+        # code is the worst gap this control exists to catch, not nothing.
+        report = {"files": {"src/uncovered.tsx": {"mutants": [
+            {"mutatorName": "BlockStatement", "status": "NoCoverage", "location": {"start": {"line": 22}}},
+            {"mutatorName": "ConditionalExpression", "status": "NoCoverage", "location": {"start": {"line": 24}}},
+        ]}}}
+        result = _collect_from_report(report, ["src/uncovered.tsx"], 5)
+        self.assertEqual(result.status, "ran")
+        self.assertIsNone(result.reason)
+        self.assertEqual(result.killed, 0)
+        self.assertEqual(result.survived, 2)
+        self.assertEqual(result.total_generated, 2)
+        self.assertEqual(len(result.surviving_mutants), 2)
+        self.assertTrue(all(m.status == "survived" for m in result.surviving_mutants))
 
     def test_files_outside_scoped_files_are_ignored(self):
         report = {

@@ -1589,6 +1589,12 @@ def _format_pipeline_lines(pipeline: Dict[str, Any]) -> List[str]:
     ]
     if pipeline.get("workflow_ref"):
         lines.append(f"Workflow Ref:  {pipeline['workflow_ref']}")
+    if pipeline.get("trigger_event") or pipeline.get("trigger_ref"):
+        # trigger_ref is the real "did this come from main" signal --
+        # vcs.branch above is NOT (a pull_request event always resolves
+        # it to the PR's base branch). Render both together since
+        # trigger_event alone ("pull_request") doesn't say which PR/ref.
+        lines.append(f"Trigger:       {pipeline.get('trigger_event', '-')} @ {pipeline.get('trigger_ref', '-')}")
     return lines
 
 

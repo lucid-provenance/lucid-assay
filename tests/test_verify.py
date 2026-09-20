@@ -46,6 +46,7 @@ from cli.verify import (
     _format_gate_params,
     _format_mutation_testing_report,
     _format_pct,
+    _format_pipeline_lines,
     _format_vcs_lines,
     _format_s2c2f_report,
     _format_signing_report,
@@ -1905,6 +1906,56 @@ class FormatVcsLinesTests(unittest.TestCase):
     def test_pull_request_not_a_dict_is_treated_as_absent(self):
         vcs = {"repository": "r", "provider": "p", "branch": "b", "commit_sha": "c", "pull_request": "not-a-dict"}
         self.assertEqual(len(_format_vcs_lines(vcs)), 3)
+
+
+class FormatPipelineLinesTests(unittest.TestCase):
+    """Structural line assertions (exact strings), same discipline as
+    FormatVcsLinesTests above -- pins the "Trigger:" line added 2026-09-20
+    (trigger_event/trigger_ref, see cli/builder.py's _ambient_trigger_ref
+    docstring) alongside the pre-existing CI Run/Workflow Ref lines."""
+
+    def test_empty_pipeline_renders_nothing(self):
+        self.assertEqual(_format_pipeline_lines({}), [])
+        self.assertEqual(_format_pipeline_lines(None), [])
+
+    def test_base_pipeline_with_no_trigger_fields_omits_the_trigger_line(self):
+        pipeline = {"ci_provider": "github-actions", "run_id": "123", "run_attempt": 1}
+        self.assertEqual(
+            _format_pipeline_lines(pipeline),
+            ["CI Run:        github-actions run 123 (attempt 1)"],
+        )
+
+    def test_workflow_ref_appends_a_second_line_only_when_present(self):
+        pipeline = {"ci_provider": "p", "run_id": "1", "run_attempt": 1, "workflow_ref": "org/repo/.github/workflows/x.yml@refs/heads/main"}
+        lines = _format_pipeline_lines(pipeline)
+        self.assertEqual(lines[1], "Workflow Ref:  org/repo/.github/workflows/x.yml@refs/heads/main")
+
+    def test_trigger_event_and_ref_render_together_as_the_final_line(self):
+        pipeline = {
+            "ci_provider": "github-actions", "run_id": "1", "run_attempt": 1,
+            "trigger_event": "push", "trigger_ref": "refs/heads/main",
+        }
+        self.assertEqual(_format_pipeline_lines(pipeline)[-1], "Trigger:       push @ refs/heads/main")
+
+    def test_trigger_line_renders_even_when_only_event_is_present(self):
+        # `or` in the guard, not `and` -- a partial signal still renders
+        # (with a dash for the missing half) rather than being silently
+        # dropped entirely.
+        pipeline = {"ci_provider": "p", "run_id": "1", "run_attempt": 1, "trigger_event": "push"}
+        self.assertEqual(_format_pipeline_lines(pipeline)[-1], "Trigger:       push @ -")
+
+    def test_trigger_line_renders_even_when_only_ref_is_present(self):
+        pipeline = {"ci_provider": "p", "run_id": "1", "run_attempt": 1, "trigger_ref": "refs/heads/main"}
+        self.assertEqual(_format_pipeline_lines(pipeline)[-1], "Trigger:       - @ refs/heads/main")
+
+    def test_pull_request_trigger_carries_the_synthetic_merge_ref_verbatim(self):
+        # The real regression this field exists to prevent: a PR targeting
+        # main must never render identically to a real push to main.
+        pipeline = {
+            "ci_provider": "p", "run_id": "1", "run_attempt": 1,
+            "trigger_event": "pull_request", "trigger_ref": "refs/pull/42/merge",
+        }
+        self.assertEqual(_format_pipeline_lines(pipeline)[-1], "Trigger:       pull_request @ refs/pull/42/merge")
 
 
 class FormatGateParamsTests(unittest.TestCase):

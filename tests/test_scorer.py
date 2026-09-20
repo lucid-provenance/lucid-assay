@@ -282,6 +282,28 @@ class RCSScorerTests(unittest.TestCase):
         self.assertIn("mutation_testing:not_configured", result.degraded_reasons)
         self.assertEqual(result.mutation_multiplier, 0.85)
 
+    def test_unconfigured_language_present_is_also_a_real_degraded_gap(self):
+        # Bill's own zero-trust policy, 2026-09-20: a mixed diff (one
+        # language ran and scored well, another had no tool configured at
+        # all) is capped at "degraded" by cli.mutation itself -- this test
+        # confirms that capped result then flows through scorer.py as a
+        # real degradation too, same as the all-not_configured case above,
+        # not a second silent exemption.
+        result = score_pipeline(**_base_kwargs(
+            mutation_report=_mutation_report(
+                available=True, grade="degraded", multiplier=0.85, mutation_score=90.0,
+                killed=9, survived=1, timeout=0, total_generated=10,
+                reason="no discount -- 90% mutation kill rate (10 mutant(s) tested) -- capped: "
+                "typescript_javascript also changed in this diff but has no mutation-testing tool "
+                "configured; unassessed code cannot be certified safe by a different language's "
+                "own passing suite",
+                reason_code="unconfigured_language_present",
+            ),
+        ))
+        self.assertTrue(result.degraded)
+        self.assertIn("mutation_testing:unconfigured_language_present", result.degraded_reasons)
+        self.assertEqual(result.mutation_multiplier, 0.85)
+
     def test_no_coverable_lines_is_degraded_but_full_credit(self):
         # Mirrors patch_coverage:no_coverable_lines -- a docs/comment-only
         # diff must not take any real penalty, but is still flagged

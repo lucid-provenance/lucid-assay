@@ -93,6 +93,7 @@ from .common import (
     REASON_CODE_NOT_CONFIGURED,
     REASON_CODE_SKIPPED,
     REASON_CODE_UNAVAILABLE,
+    REASON_CODE_UNCONFIGURED_LANGUAGE_PRESENT,
     REASON_CODE_WEAK,
     SurvivingMutant,
     discount_reason,
@@ -233,11 +234,44 @@ def run_mutation_testing(
     return report
 
 
+def _cap_for_unconfigured_language(report: MutationTestReport, not_configured: List[LanguageRunResult]) -> None:
+    """Bill's own zero-trust policy, 2026-09-20: a diff that touches both
+    a configured language (real killed/survived/timeout data) *and* an
+    unconfigured one (no data at all) must never be credited as if the
+    configured language's own passing score speaks for the whole diff --
+    "Unassessed code is unverified code. If a PR sneaks in 500 lines of
+    Go alongside 5 lines of Python, the Python suite passing cannot sign
+    off on the safety of the commit." This is a strict *cap*, not a
+    blanket override: it can knock a would-be "passed"/"not_applicable"/
+    "insufficient_sample" grade down to "degraded" (multiplier capped at
+    MULTIPLIER_DEGRADED), but it never *improves* a grade the configured
+    language(s) already earned worse than that on their own -- a real
+    30% kill rate stays "failed" (0.50), not rescued up to 0.85 just
+    because something else also went unassessed. Mutates `report` in
+    place (grade/multiplier/reason/reason_code only -- killed/survived/
+    timeout/by_language stay the real, unmodified numbers from whatever
+    did run, for transparency)."""
+    if not not_configured:
+        return
+    unconfigured_languages = ", ".join(sorted({r.language for r in not_configured}))
+    if report.multiplier > MULTIPLIER_DEGRADED:
+        report.multiplier = MULTIPLIER_DEGRADED
+    if report.grade in ("passed", "not_applicable", "insufficient_sample"):
+        report.grade = "degraded"
+    report.reason_code = REASON_CODE_UNCONFIGURED_LANGUAGE_PRESENT
+    report.reason = (
+        f"{report.reason} -- capped: {unconfigured_languages} also changed in this diff but has "
+        "no mutation-testing tool configured; unassessed code cannot be certified safe by a "
+        "different language's own passing suite"
+    )
+
+
 def _combine_results(
     results: List[LanguageRunResult], *, min_sample_size: int, max_surviving_detail: int
 ) -> MutationTestReport:
     ran = [r for r in results if r.status == "ran"]
     unavailable = [r for r in results if r.status == "unavailable"]
+    not_configured = [r for r in results if r.status == "not_configured"]
 
     if not ran:
         if unavailable:
@@ -291,12 +325,13 @@ def _combine_results(
         report.scoped_files = scoped_files
         report.total_generated = total_generated
         report.by_language = by_language_detail
+        _cap_for_unconfigured_language(report, not_configured)
         return report
 
     score = (killed / denom * 100.0) if denom else None
 
     if tested < min_sample_size or score is None:
-        return MutationTestReport(
+        report = MutationTestReport(
             available=True,
             grade="insufficient_sample",
             multiplier=MULTIPLIER_NOT_APPLICABLE,
@@ -313,10 +348,12 @@ def _combine_results(
             scoped_files=scoped_files,
             by_language=by_language_detail,
         )
+        _cap_for_unconfigured_language(report, not_configured)
+        return report
 
     grade, multiplier, reason_code = grade_from_score(score)
 
-    return MutationTestReport(
+    report = MutationTestReport(
         available=True,
         grade=grade,
         multiplier=multiplier,
@@ -331,6 +368,8 @@ def _combine_results(
         surviving_mutants=surviving_mutants,
         by_language=by_language_detail,
     )
+    _cap_for_unconfigured_language(report, not_configured)
+    return report
 
 
 def _write_report(report: MutationTestReport, report_out: Optional[str]) -> None:

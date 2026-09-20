@@ -18,6 +18,8 @@ from cli.verify import (
     GITHUB_ACTIONS_OIDC_ISSUER,
     SLSA_PROVENANCE_PREDICATE_TYPE,
     _SECTION_DIVIDER,
+    _ALLOWED_DEGRADED_REASONS,
+    _DEGRADED_REASONS_BLOCKED_DELIBERATELY,
     TRUSTED_HOSTED_BUILDER_IDS,
     VerificationResult,
     main,
@@ -63,6 +65,37 @@ from cli.verify import (
     _slsa_level_result,
     _static_analysis_tools_by_name,
     _verify_sigstore_identity,
+)
+
+# Only for DegradedReasonsGuardrailTests below -- cross-checking every
+# real REASON_CODE_*/DEGRADED_REASON_* constant these modules define
+# against cli.verify's own two hardcoded literal sets. cli/verify.py
+# itself deliberately never imports these (see that module's own comment
+# on _ALLOWED_DEGRADED_REASONS for why) -- a test is exactly where
+# importing the real source of truth to catch drift is the right call.
+from cli.mutation.common import (
+    REASON_CODE_DECORATIVE as _MUT_DECORATIVE,
+    REASON_CODE_INSUFFICIENT_SAMPLE as _MUT_INSUFFICIENT_SAMPLE,
+    REASON_CODE_NO_COVERABLE_LINES as _MUT_NO_COVERABLE_LINES,
+    REASON_CODE_NO_SOURCE_CHANGES as _MUT_NO_SOURCE_CHANGES,
+    REASON_CODE_NOT_CONFIGURED as _MUT_NOT_CONFIGURED,
+    REASON_CODE_SKIPPED as _MUT_SKIPPED,
+    REASON_CODE_UNAVAILABLE as _MUT_UNAVAILABLE,
+    REASON_CODE_UNCONFIGURED_LANGUAGE_PRESENT as _MUT_UNCONFIGURED_LANGUAGE_PRESENT,
+    REASON_CODE_WEAK as _MUT_WEAK,
+)
+from cli.parsers.github_rules import (
+    REASON_CODE_PLATFORM_UNSUPPORTED_TIER as _GOV_PLATFORM_UNSUPPORTED_TIER,
+)
+from cli.patch_coverage import (
+    REASON_CODE_NO_COVERABLE_LINES as _PATCH_NO_COVERABLE_LINES,
+)
+from cli.scorer import (
+    DEGRADED_REASON_BRANCH_GOVERNANCE_BYPASS,
+    DEGRADED_REASON_BRANCH_GOVERNANCE_UNVERIFIED,
+    DEGRADED_REASON_NO_PR_CONTEXT,
+    DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE,
+    DEGRADED_REASON_SARIF_UNAVAILABLE,
 )
 
 SUBJECT_DIGEST = "a" * 64
@@ -2056,6 +2089,52 @@ class FormatMutationTestingReportTests(unittest.TestCase):
         lines = _format_mutation_testing_report(_mutation_evidence(grade="not_applicable"))
         self.assertTrue(lines[1].startswith("[-] "), lines[1])
 
+    def test_degraded_with_a_real_measured_score_still_marks_bang(self):
+        # weak_assertion_coverage (grade_from_score's own tag for a real
+        # 60-79% kill rate) is the one degraded case that IS a real
+        # measured signal -- must keep the ordinary "!" mark, never "?".
+        lines = _format_mutation_testing_report(
+            _mutation_evidence(grade="degraded", reason_code="weak_assertion_coverage")
+        )
+        self.assertTrue(lines[1].startswith("[!] "), lines[1])
+
+    def test_degraded_with_no_real_score_marks_question_not_bang(self):
+        # Fixed 2026-09-20: "[!] degraded" alone can't tell a real, if
+        # modest, weak spot apart from a tool that never produced a score
+        # at all. Each of these four reason_codes shares the identical
+        # grade/multiplier (0.85x) with a real measured weak score, but
+        # none of them is one -- confirmed for the exact partition
+        # cli/mutation itself produces (grade_from_score is the only
+        # producer of a real degraded score, and it always tags
+        # weak_assertion_coverage, never any of these four).
+        for reason_code in ("unavailable", "skipped", "not_configured", "unconfigured_language_present"):
+            with self.subTest(reason_code=reason_code):
+                lines = _format_mutation_testing_report(
+                    _mutation_evidence(grade="degraded", reason_code=reason_code)
+                )
+                self.assertTrue(lines[1].startswith("[?] "), lines[1])
+
+    def test_failed_grade_is_unaffected_by_reason_code(self):
+        # "failed" only ever comes from a real, low, measured score
+        # (grade_from_score's decorative_coverage tag) -- unlike
+        # "degraded", there is no ambiguous "no real score" path to
+        # "failed" at all, so it must always mark "✗" regardless of
+        # reason_code.
+        lines = _format_mutation_testing_report(
+            _mutation_evidence(grade="failed", reason_code="decorative_coverage")
+        )
+        self.assertTrue(lines[1].startswith("[✗] "), lines[1])
+
+    def test_degraded_header_line_and_reason_text_are_unaffected_by_the_mark_fix(self):
+        # This is a render-only fix -- the header's own grade=/score=
+        # summary and the free-text reason must still read exactly as
+        # before, only the leading mark character changes.
+        lines = _format_mutation_testing_report(
+            _mutation_evidence(grade="degraded", mutation_score=None, reason="mutation testing refused: unsafe repo_dir", reason_code="unavailable")
+        )
+        self.assertEqual(lines[0], "=== Mutation Testing (diff-scoped, grade=degraded, score=n/a) ===")
+        self.assertEqual(lines[1], "[?] mutation testing refused: unsafe repo_dir")
+
     def test_no_status_line_rendered(self):
         # Purely informational like the Dependency Materialization
         # Evidence section -- no cumulative PASSED/FAILED Status line.
@@ -3081,11 +3160,109 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.verdict_out, "verdict.json")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-# Verified PR gate trigger test
-
 def test_pr_patch_marker():
     from cli.verify import pr_patch_marker
     assert pr_patch_marker() == "patch-verified"
+
+
+class DegradedReasonsGuardrailTests(unittest.TestCase):
+    """Structural guardrail against silent drift between where a
+    degraded_reasons entry gets *produced* (cli/scorer.py, cli/patch_coverage.py,
+    cli/mutation/common.py, cli/parsers/github_rules.py -- each with their
+    own REASON_CODE_*/DEGRADED_REASON_* constants) and where
+    --disallow-degraded decides whether to *exempt* it
+    (cli/verify.py's _ALLOWED_DEGRADED_REASONS, a hand-maintained literal
+    set with no import-time link back to those source constants, by
+    cli/verify.py's own deliberate design -- see that constant's own
+    comment for why).
+
+    Without this test, a brand new REASON_CODE_* added to any of those
+    four modules is simply invisible to --disallow-degraded's own gate
+    logic until it happens to get exercised by a real run -- it would
+    silently block (or silently pass) depending on which literal set a
+    contributor remembered, or forgot, to update. This test doesn't
+    re-derive the *correct* answer for a new code (that's still a real
+    policy decision a human makes) -- it forces the decision to be made
+    and recorded in one of cli/verify.py's own two sets, by failing loudly
+    the moment a new constant appears in neither."""
+
+    # Every real, currently-defined reason_code/degraded_reason string
+    # these four modules can actually produce, namespaced exactly the way
+    # cli/scorer.py's score_pipeline() namespaces it before appending to
+    # degraded_reasons. REASON_CODE_NO_SOURCE_CHANGES/
+    # REASON_CODE_INSUFFICIENT_SAMPLE are deliberately absent from this
+    # list too -- cli/scorer.py filters them out before they're ever
+    # namespaced at all (see its own comment), so there is no
+    # "mutation_testing:no_source_changes"/"mutation_testing:insufficient_sample"
+    # string for this gate to ever see in the first place; asserting they
+    # never reach degraded_reasons is its own separate, existing test
+    # (RCSScorerTests) and would be redundant here.
+    _EVERY_REAL_DEGRADED_REASON = frozenset({
+        f"patch_coverage:{_PATCH_NO_COVERABLE_LINES}",
+        f"mutation_testing:{_MUT_WEAK}",
+        f"mutation_testing:{_MUT_DECORATIVE}",
+        f"mutation_testing:{_MUT_UNAVAILABLE}",
+        f"mutation_testing:{_MUT_SKIPPED}",
+        f"mutation_testing:{_MUT_NO_COVERABLE_LINES}",
+        f"mutation_testing:{_MUT_NOT_CONFIGURED}",
+        f"mutation_testing:{_MUT_UNCONFIGURED_LANGUAGE_PRESENT}",
+        f"branch_governance:{_GOV_PLATFORM_UNSUPPORTED_TIER}",
+        DEGRADED_REASON_PATCH_COVERAGE_UNAVAILABLE,
+        DEGRADED_REASON_NO_PR_CONTEXT,
+        DEGRADED_REASON_SARIF_UNAVAILABLE,
+        DEGRADED_REASON_BRANCH_GOVERNANCE_UNVERIFIED,
+        DEGRADED_REASON_BRANCH_GOVERNANCE_BYPASS,
+    })
+
+    def test_every_real_reason_lands_in_exactly_one_of_verifys_two_sets(self):
+        for reason in sorted(self._EVERY_REAL_DEGRADED_REASON):
+            in_allowed = reason in _ALLOWED_DEGRADED_REASONS
+            in_blocked = reason in _DEGRADED_REASONS_BLOCKED_DELIBERATELY
+            self.assertTrue(
+                in_allowed or in_blocked,
+                f"{reason!r} is in neither _ALLOWED_DEGRADED_REASONS nor "
+                "_DEGRADED_REASONS_BLOCKED_DELIBERATELY in cli/verify.py -- "
+                "a real reason_code exists with no recorded --disallow-degraded "
+                "decision. Add it to exactly one of those two sets.",
+            )
+            self.assertFalse(
+                in_allowed and in_blocked,
+                f"{reason!r} is in *both* sets -- a reason_code can't be both "
+                "exempted and deliberately blocking at once; remove it from one.",
+            )
+
+    def test_verifys_two_sets_contain_no_stale_or_invented_reasons(self):
+        # The reverse direction: every literal string in either of
+        # cli/verify.py's own sets must correspond to a real, still-defined
+        # reason_code above -- catches a source constant being renamed or
+        # removed (or a typo in verify.py's own literal) leaving a stale
+        # entry that silently stops matching anything a real run could
+        # ever produce.
+        every_listed = _ALLOWED_DEGRADED_REASONS | _DEGRADED_REASONS_BLOCKED_DELIBERATELY
+        stale = every_listed - self._EVERY_REAL_DEGRADED_REASON
+        self.assertEqual(
+            stale, set(),
+            f"cli/verify.py lists {stale!r} but no current REASON_CODE_*/"
+            "DEGRADED_REASON_* constant produces that string -- stale entry, "
+            "renamed source constant, or a typo.",
+        )
+
+    def test_the_two_sets_are_themselves_disjoint(self):
+        self.assertEqual(_ALLOWED_DEGRADED_REASONS & _DEGRADED_REASONS_BLOCKED_DELIBERATELY, set())
+
+    def test_no_source_changes_and_insufficient_sample_are_not_in_either_set(self):
+        # These two are exempted at the source (cli/scorer.py never
+        # namespaces/appends them at all -- see RCSScorerTests for that
+        # behavior directly) -- they must never appear in either of
+        # cli/verify.py's sets, since neither set is where their exemption
+        # actually happens; a stray entry here would be a second,
+        # redundant (and eventually contradictory, if the two ever
+        # diverged) source of truth for the same decision.
+        for code in (_MUT_NO_SOURCE_CHANGES, _MUT_INSUFFICIENT_SAMPLE):
+            namespaced = f"mutation_testing:{code}"
+            self.assertNotIn(namespaced, _ALLOWED_DEGRADED_REASONS)
+            self.assertNotIn(namespaced, _DEGRADED_REASONS_BLOCKED_DELIBERATELY)
+
+
+if __name__ == "__main__":
+    unittest.main()

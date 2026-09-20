@@ -217,13 +217,44 @@ class EnvelopeTooLargeError(Exception):
 # --disallow-degraded when *every* entry in degraded_reasons is a member
 # of this set -- any other cause present still blocks. Notably absent:
 # mutation_testing:weak_assertion_coverage / decorative_coverage /
-# unavailable / skipped -- all four are real, fixable gaps (or a control
-# someone opted out of), not unavoidable platform limitations, so they
-# still block by design.
+# unavailable / skipped / not_configured / unconfigured_language_present --
+# all six are real, fixable gaps (or a control someone opted out of), not
+# unavoidable platform limitations, so they still block by design.
 _ALLOWED_DEGRADED_REASONS = frozenset({
     "branch_governance:platform_unsupported_tier",
     "patch_coverage:no_coverable_lines",
     "mutation_testing:no_coverable_lines",
+})
+
+# The deliberate flip side of the set above -- every other reason_code any
+# of cli/scorer.py, cli/patch_coverage.py, cli/mutation/common.py, or
+# cli/parsers/github_rules.py can actually produce, confirmed to still
+# block --disallow-degraded on purpose, not by omission. Exists so a
+# future addition to any of those modules' own REASON_CODE_*/
+# DEGRADED_REASON_* constants can't silently change what this gate
+# exempts without anyone noticing: tests/test_verify.py's
+# DegradedReasonsGuardrailTests imports every one of those constants
+# directly and asserts each one (namespaced the same way score_pipeline()
+# namespaces it) lands in exactly one of these two sets -- a genuinely new
+# constant that isn't in either fails that test loudly, forcing the
+# decision to be made and recorded here rather than drifting in by
+# accident. REASON_CODE_NO_SOURCE_CHANGES/REASON_CODE_INSUFFICIENT_SAMPLE
+# (cli.mutation) are deliberately absent from *both* sets -- cli/scorer.py
+# filters them out before they're ever namespaced/appended to
+# degraded_reasons at all, so they never reach this gate in the first
+# place; they're exempted at the source, not by omission here either.
+_DEGRADED_REASONS_BLOCKED_DELIBERATELY = frozenset({
+    "patch_coverage_unavailable",
+    "no_pr_context",
+    "sarif_unavailable",
+    "branch_governance_unverified",
+    "branch_governance_bypass_permitted",
+    "mutation_testing:weak_assertion_coverage",
+    "mutation_testing:decorative_coverage",
+    "mutation_testing:unavailable",
+    "mutation_testing:skipped",
+    "mutation_testing:not_configured",
+    "mutation_testing:unconfigured_language_present",
 })
 
 
@@ -1450,6 +1481,33 @@ def _format_dependency_governance_report(items: List[Dict[str, Any]]) -> List[st
 
 _MUTATION_GRADE_MARK = {"passed": "✓", "degraded": "!", "failed": "✗"}
 
+# grade="degraded" is genuinely ambiguous between two very different
+# situations, both landing at the identical grade/multiplier (0.85x) --
+# see cli/mutation/common.py's grade_from_score (the ONLY producer of a
+# real, measured degraded score, always tagged REASON_CODE_WEAK) vs.
+# unavailable_report/_cap_for_unconfigured_language (never a measured
+# score -- a real tool crash/timeout, an explicit --skip, a language with
+# no tool configured at all, or an unconfigured language capping an
+# otherwise-fine diff). A reviewer glancing at "[!] degraded" alone can't
+# tell "this diff has a real, if modest, weak spot" from "this run just
+# needs a re-run" or "this repo genuinely has no tool set up" without
+# reading the free-text `reason` closely. Fixed 2026-09-20 by giving the
+# second family its own mark ("?", never confusable with "!") -- the
+# underlying grade/multiplier/degraded_reasons semantics are completely
+# unchanged, this is a render-only fix.
+_MUTATION_DEGRADED_NO_REAL_SCORE_REASON_CODES = frozenset({
+    "unavailable",
+    "skipped",
+    "not_configured",
+    "unconfigured_language_present",
+})
+
+
+def _mutation_grade_mark(grade: str, reason_code: Optional[str]) -> str:
+    if grade == "degraded" and reason_code in _MUTATION_DEGRADED_NO_REAL_SCORE_REASON_CODES:
+        return "?"
+    return _MUTATION_GRADE_MARK.get(grade, "-")
+
 
 def _format_mutation_testing_report(evidence: Dict[str, Any]) -> List[str]:
     """Renders the Mutation Testing section: the real kill-rate signal
@@ -1462,7 +1520,11 @@ def _format_mutation_testing_report(evidence: Dict[str, Any]) -> List[str]:
     as every other optional section here. not_applicable/
     insufficient_sample render as a plain informational line
     (✓-equivalent, no discount, not a pass/fail claim) since neither is
-    a real signal one way or the other. `by_language`, when present,
+    a real signal one way or the other. A "degraded" grade with no real
+    measured score behind it (an unavailable tool, an explicit skip, a
+    language with no tool configured) renders "[?]", not "[!]" -- see
+    _mutation_grade_mark's own docstring for why the two must not look
+    identical. `by_language`, when present,
     renders as one line per language that actually ran -- absent
     entirely on an older, single-language-only attestation, or when
     every language's tool reported the same not_applicable/unavailable
@@ -1473,7 +1535,7 @@ def _format_mutation_testing_report(evidence: Dict[str, Any]) -> List[str]:
     score = evidence.get("mutation_score")
     score_str = f"{score:.0f}%" if isinstance(score, (int, float)) else "n/a"
     lines = [f"=== Mutation Testing (diff-scoped, grade={grade}, score={score_str}) ==="]
-    mark = _MUTATION_GRADE_MARK.get(grade, "-")
+    mark = _mutation_grade_mark(grade, evidence.get("reason_code"))
     lines.append(f"[{mark}] {evidence.get('reason', '')}")
     by_language = evidence.get("by_language")
     if isinstance(by_language, dict) and by_language:

@@ -105,8 +105,10 @@ class MainTests(unittest.TestCase):
 
     def test_output_is_deterministic_sorted_json(self):
         args = ("--repo-dir", str(self.dir), "--functional-tier", "ci")
-        self.assertEqual(self._run(*args)[1], self._run(*args)[1])
-        keys = list(json.loads(self._run(*args)[1]).keys())
+        first_run = self._run(*args)[1]
+        second_run = self._run(*args)[1]
+        self.assertEqual(first_run, second_run)
+        keys = list(json.loads(first_run).keys())
         self.assertEqual(keys, sorted(keys))
 
     def test_repeatable_reports_are_aggregated(self):

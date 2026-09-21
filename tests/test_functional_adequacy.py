@@ -8,6 +8,18 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cli.parsers.functional_adequacy import (
+    _CONFIG_PATH,
+    _JOURNEY_DESCRIPTION_MAX_LEN,
+    _JOURNEY_NAME_MAX_LEN,
+    _load_contract,
+    _normalize_report_paths,
+    _parse_reports,
+    _ReportFailure,
+    _optional_text,
+    _tier_fields,
+    JourneyDeclaration,
+    REASON_CODE_CONFIG_INVALID,
+    REASON_CODE_EXECUTION_ABORTED,
     ADEQUACY_STATUS_EVALUATED,
     ADEQUACY_STATUS_NOT_CONFIGURED,
     ADEQUACY_STATUS_UNAVAILABLE,
@@ -1044,3 +1056,574 @@ class EvaluateFunctionalAdequacyTests(TempRepoTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Tiers (contract v2), multi-report aggregation, execution_aborted
+# ---------------------------------------------------------------------------
+
+
+def _junit_xml(cases):
+    """cases: [(name, status, [journey ids])] -> a pytest-style JUnit document
+    whose tagged tests carry @cuj:<id> properties (what tests/conftest.py-style
+    plumbing emits)."""
+    out = ['<testsuites><testsuite name="s">']
+    for name, status, tags in cases:
+        props = "".join(f'<property name="cuj" value="@cuj:{t}"/>' for t in tags)
+        inner = f"<properties>{props}</properties>" if props else ""
+        if status == "failed":
+            inner += '<failure message="boom"/>'
+        elif status == "skipped":
+            inner += "<skipped/>"
+        out.append(f'<testcase classname="t" name="{name}">{inner}</testcase>')
+    out.append("</testsuite></testsuites>")
+    return "".join(out)
+
+
+_MIXED_CONTRACT = {
+    "framework": "pytest",
+    "journeys": [
+        {"id": "a", "tier": "ci", "name": "Alpha", "description": "the a journey"},
+        {"id": "b", "tier": "cd"},
+        {"id": "c", "tier": "both", "name": "Cee"},
+    ],
+}
+
+
+class ContractV2LoadingTests(TempRepoTestCase):
+    def test_v2_journeys_load_with_every_field_and_are_marked_tiered(self):
+        self._write_config({**_MIXED_CONTRACT, "min_adequacy_pct": 80})
+        config, invalid = _load_contract(self.repo_dir)
+        self.assertIsNone(invalid)
+        self.assertIs(config.tiered, True)
+        self.assertEqual(config.framework, "pytest")
+        self.assertEqual(config.min_adequacy_pct, 80.0)
+        self.assertEqual(
+            config.journeys,
+            [
+                JourneyDeclaration(id="a", tier="ci", name="Alpha", description="the a journey"),
+                JourneyDeclaration(id="b", tier="cd", name=None, description=None),
+                JourneyDeclaration(id="c", tier="both", name="Cee", description=None),
+            ],
+        )
+        self.assertEqual(config.declared_journeys, ["a", "b", "c"])
+
+    def test_legacy_flat_list_reads_as_all_ci_and_is_not_tiered(self):
+        self._write_config({"framework": "pytest", "declared_journeys": ["x", " y "]})
+        config, invalid = _load_contract(self.repo_dir)
+        self.assertIsNone(invalid)
+        self.assertIs(config.tiered, False)
+        self.assertEqual(config.journeys, [JourneyDeclaration(id="x", tier="ci"), JourneyDeclaration(id="y", tier="ci")])
+
+    def test_journeys_wins_when_both_forms_are_present(self):
+        self._write_config({"framework": "pytest", "declared_journeys": ["legacy"], "journeys": [{"id": "new", "tier": "cd"}]})
+        config, _ = _load_contract(self.repo_dir)
+        self.assertEqual(config.declared_journeys, ["new"])
+        self.assertTrue(config.tiered)
+
+    def test_an_empty_journeys_array_is_not_configured_not_invalid(self):
+        self._write_config({"framework": "pytest", "journeys": []})
+        self.assertEqual(_load_contract(self.repo_dir), (None, None))
+
+    def test_a_present_but_empty_journeys_does_not_fall_back_to_the_legacy_list(self):
+        self._write_config({"framework": "pytest", "journeys": [], "declared_journeys": ["legacy"]})
+        self.assertEqual(_load_contract(self.repo_dir), (None, None))
+
+    def test_invalid_declarations_are_reported_with_the_specific_reason_never_repaired(self):
+        cases = {
+            "not a list": ({"journeys": "a"}, "`journeys` must be a JSON array of journey objects"),
+            "object not list": ({"journeys": {"id": "a", "tier": "ci"}}, "`journeys` must be a JSON array of journey objects"),
+            "item not object": ({"journeys": ["a"]}, "journeys[0] must be an object with an id and a tier"),
+            "missing id": ({"journeys": [{"tier": "ci"}]}, "journeys[0].id must be a non-empty string of letters, digits, '_' or '-'"),
+            "blank id": ({"journeys": [{"id": "  ", "tier": "ci"}]}, "journeys[0].id must be a non-empty string of letters, digits, '_' or '-'"),
+            "non-string id": ({"journeys": [{"id": 7, "tier": "ci"}]}, "journeys[0].id must be a non-empty string of letters, digits, '_' or '-'"),
+            "bad chars": ({"journeys": [{"id": "has space", "tier": "ci"}]}, "journeys[0].id must be a non-empty string of letters, digits, '_' or '-'"),
+            "bad chars 2": ({"journeys": [{"id": "a.b", "tier": "ci"}]}, "journeys[0].id must be a non-empty string of letters, digits, '_' or '-'"),
+            "duplicate": ({"journeys": [{"id": "a", "tier": "ci"}, {"id": "a", "tier": "cd"}]}, "journeys[1].id 'a' is declared more than once"),
+            "missing tier": ({"journeys": [{"id": "a"}]}, "journeys[0].tier must be one of ['ci', 'cd', 'both'], got None"),
+            "unknown tier": ({"journeys": [{"id": "a", "tier": "staging"}]}, "journeys[0].tier must be one of ['ci', 'cd', 'both'], got 'staging'"),
+            "tier wrong case": ({"journeys": [{"id": "a", "tier": "CI"}]}, "journeys[0].tier must be one of ['ci', 'cd', 'both'], got 'CI'"),
+            "tier wrong type": ({"journeys": [{"id": "a", "tier": 1}]}, "journeys[0].tier must be one of ['ci', 'cd', 'both'], got 1"),
+            "second entry bad": ({"journeys": [{"id": "a", "tier": "ci"}, {"id": "b", "tier": "x"}]}, "journeys[1].tier must be one of ['ci', 'cd', 'both'], got 'x'"),
+        }
+        for label, (doc, expected) in cases.items():
+            with self.subTest(label=label):
+                self._write_config({"framework": "pytest", **doc})
+                self.assertEqual(_load_contract(self.repo_dir), (None, expected))
+
+    def test_an_invalid_journey_is_never_dropped_to_leave_the_valid_ones(self):
+        self._write_config({"framework": "pytest", "journeys": [{"id": "good", "tier": "ci"}, {"id": "bad", "tier": "nope"}]})
+        config, invalid = _load_contract(self.repo_dir)
+        self.assertIsNone(config)
+        self.assertIsNotNone(invalid)
+
+    def test_the_legacy_loader_returns_none_for_an_invalid_v2_contract(self):
+        self._write_config({"framework": "pytest", "journeys": [{"id": "a", "tier": "nope"}]})
+        self.assertIsNone(load_functional_verification_config(self.repo_dir))
+
+    def test_the_legacy_loader_still_returns_the_config_for_a_valid_contract(self):
+        self._write_config(_MIXED_CONTRACT)
+        self.assertEqual(load_functional_verification_config(self.repo_dir).declared_journeys, ["a", "b", "c"])
+
+    def test_missing_unreadable_malformed_and_non_object_files_are_not_configured_not_invalid(self):
+        self.assertEqual(_load_contract(self.repo_dir), (None, None))
+        lucid = Path(self.repo_dir) / ".lucid"
+        lucid.mkdir()
+        (lucid / "functional-verification.json").write_text("{not json", encoding="utf-8")
+        self.assertEqual(_load_contract(self.repo_dir), (None, None))
+        (lucid / "functional-verification.json").write_text("[1, 2]", encoding="utf-8")
+        self.assertEqual(_load_contract(self.repo_dir), (None, None))
+
+    def test_name_and_description_are_stripped_and_capped_but_never_invalidate_the_contract(self):
+        self._write_config({"framework": "pytest", "journeys": [
+            {"id": "a", "tier": "ci", "name": "  " + "n" * 200 + "  ", "description": "d" * 900},
+            {"id": "b", "tier": "ci", "name": 5, "description": ["x"]},
+            {"id": "c", "tier": "ci", "name": "   ", "description": ""},
+        ]})
+        config, invalid = _load_contract(self.repo_dir)
+        self.assertIsNone(invalid)
+        self.assertEqual(config.journeys[0].name, "n" * _JOURNEY_NAME_MAX_LEN)
+        self.assertEqual(config.journeys[0].description, "d" * _JOURNEY_DESCRIPTION_MAX_LEN)
+        self.assertEqual((config.journeys[1].name, config.journeys[1].description), (None, None))
+        self.assertEqual((config.journeys[2].name, config.journeys[2].description), (None, None))
+
+    def test_optional_text_boundaries(self):
+        self.assertEqual(_JOURNEY_NAME_MAX_LEN, 120)
+        self.assertEqual(_JOURNEY_DESCRIPTION_MAX_LEN, 500)
+        self.assertEqual(_optional_text("abc", 3), "abc")
+        self.assertEqual(_optional_text("abcd", 3), "abc")
+        self.assertEqual(_optional_text("  ab ", 10), "ab")
+        self.assertIsNone(_optional_text("", 3))
+        self.assertIsNone(_optional_text(None, 3))
+        self.assertIsNone(_optional_text(1, 3))
+
+    def test_min_adequacy_pct_defaults_and_ignores_bools_in_the_v2_form_too(self):
+        for raw, expected in ((None, 100.0), (True, 100.0), ("80", 100.0), (60, 60.0), (72.5, 72.5)):
+            with self.subTest(raw=raw):
+                doc = {"framework": "pytest", "journeys": [{"id": "a", "tier": "ci"}]}
+                if raw is not None:
+                    doc["min_adequacy_pct"] = raw
+                self._write_config(doc)
+                self.assertEqual(_load_contract(self.repo_dir)[0].min_adequacy_pct, expected)
+
+
+class TierEvaluationTests(TempRepoTestCase):
+    def test_ci_tier_scores_ci_and_both_and_defers_cd(self):
+        self._write_config(_MIXED_CONTRACT)
+        report = self._write_report("r.xml", _junit_xml([("t1", "passed", ["a"]), ("t2", "passed", ["c"]), ("t3", "passed", ["b"])]))
+        result = evaluate_functional_adequacy(self.repo_dir, report, target_env="ci", tier="ci")
+        self.assertEqual(
+            result.as_dict(),
+            {
+                "available": True,
+                "met": True,
+                "framework": "pytest",
+                "target_env": "ci",
+                "metrics": {"total": 3, "passed": 3, "failed": 0, "skipped": 0},
+                "adequacy": {
+                    "status": "evaluated",
+                    "metric_type": "cuj_coverage",
+                    "score_pct": 100.0,
+                    "declared": ["a", "c"],
+                    "covered": ["a", "c"],
+                    "missing": [],
+                    "tier": "ci",
+                    "deferred": ["b"],
+                    "journeys": [
+                        {"id": "a", "tier": "ci", "status": "covered", "name": "Alpha", "description": "the a journey"},
+                        {"id": "b", "tier": "cd", "status": "deferred"},
+                        {"id": "c", "tier": "both", "status": "covered", "name": "Cee"},
+                    ],
+                },
+                "report_uri": None,
+                "reason": "2/2 declared journey(s) covered (100.0% >= 100.0% required), 0 failed test(s)",
+                "reason_code": None,
+            },
+        )
+
+    def test_cd_tier_scores_cd_and_both_and_defers_ci(self):
+        self._write_config(_MIXED_CONTRACT)
+        report = self._write_report("r.xml", _junit_xml([("t1", "passed", ["b"]), ("t2", "passed", ["a"])]))
+        result = evaluate_functional_adequacy(self.repo_dir, report, tier="cd")
+        adequacy = result.as_dict()["adequacy"]
+        self.assertEqual((adequacy["declared"], adequacy["covered"], adequacy["missing"]), (["b", "c"], ["b"], ["c"]))
+        self.assertEqual(adequacy["score_pct"], 50.0)
+        self.assertEqual((adequacy["tier"], adequacy["deferred"]), ("cd", ["a"]))
+        self.assertEqual([(j["id"], j["status"]) for j in adequacy["journeys"]], [("a", "deferred"), ("b", "covered"), ("c", "missing")])
+        self.assertFalse(result.met)
+        self.assertEqual(result.reason_code, REASON_CODE_PARTIAL_ADEQUACY)
+        self.assertEqual(result.reason, "only 1/2 declared journey(s) covered (50.0% < 100.0% required); missing: ['c']")
+
+    def test_a_both_journey_must_be_proven_at_each_tier_separately(self):
+        self._write_config({"framework": "pytest", "journeys": [{"id": "x", "tier": "both"}]})
+        good = self._write_report("good.xml", _junit_xml([("t", "passed", ["x"])]))
+        empty = self._write_report("empty.xml", _junit_xml([("t", "passed", [])]))
+        self.assertTrue(evaluate_functional_adequacy(self.repo_dir, good, tier="ci").met)
+        self.assertTrue(evaluate_functional_adequacy(self.repo_dir, good, tier="cd").met)
+        self.assertFalse(evaluate_functional_adequacy(self.repo_dir, empty, tier="ci").met)
+        self.assertFalse(evaluate_functional_adequacy(self.repo_dir, empty, tier="cd").met)
+
+    def test_a_legacy_contract_at_ci_emits_none_of_the_new_fields(self):
+        self._write_config({"framework": "pytest", "declared_journeys": ["a", "b"]})
+        report = self._write_report("r.xml", _junit_xml([("t1", "passed", ["a"]), ("t2", "passed", ["b"])]))
+        adequacy = evaluate_functional_adequacy(self.repo_dir, report).as_dict()["adequacy"]
+        self.assertEqual(set(adequacy), {"status", "metric_type", "score_pct", "declared", "covered", "missing"})
+
+    def test_a_legacy_contract_at_cd_is_not_configured_for_that_tier_never_100_percent_of_zero(self):
+        self._write_config({"framework": "pytest", "declared_journeys": ["a", "b"]})
+        report = self._write_report("r.xml", _junit_xml([("t1", "passed", ["a"])]))
+        result = evaluate_functional_adequacy(self.repo_dir, report, tier="cd")
+        d = result.as_dict()
+        self.assertFalse(result.available)
+        self.assertFalse(result.met)
+        self.assertEqual(d["adequacy"]["status"], "not_configured")
+        self.assertEqual(result.reason_code, REASON_CODE_NOT_CONFIGURED)
+        self.assertEqual(d["adequacy"]["declared"], [])
+        self.assertEqual(d["adequacy"]["score_pct"], 0.0)
+        self.assertEqual(d["adequacy"]["tier"], "cd")
+        self.assertEqual(d["adequacy"]["deferred"], ["a", "b"])
+        self.assertEqual([j["status"] for j in d["adequacy"]["journeys"]], ["deferred", "deferred"])
+        self.assertEqual(
+            result.reason,
+            f"{_CONFIG_PATH} declares no journeys for tier 'cd' -- functional test adequacy is not evaluated at this tier (reported as unmet, not a silent pass)",
+        )
+        self.assertEqual(d["framework"], "pytest")
+
+    def test_a_v2_contract_with_no_journeys_for_the_tier_is_not_configured_for_it(self):
+        self._write_config({"framework": "pytest", "journeys": [{"id": "only-cd", "tier": "cd"}]})
+        result = evaluate_functional_adequacy(self.repo_dir, None, tier="ci")
+        self.assertEqual(result.adequacy_status, ADEQUACY_STATUS_NOT_CONFIGURED)
+        self.assertEqual(result.deferred, ["only-cd"])
+
+    def test_min_adequacy_pct_applies_to_the_tiers_own_denominator(self):
+        self._write_config({"framework": "pytest", "min_adequacy_pct": 50, "journeys": [
+            {"id": "a", "tier": "ci"}, {"id": "b", "tier": "ci"}, {"id": "z", "tier": "cd"}]})
+        report = self._write_report("r.xml", _junit_xml([("t", "passed", ["a"])]))
+        result = evaluate_functional_adequacy(self.repo_dir, report, tier="ci")
+        self.assertEqual(result.score_pct, 50.0)
+        self.assertTrue(result.met)
+        self.assertEqual(result.reason, "1/2 declared journey(s) covered (50.0% >= 50.0% required), 0 failed test(s)")
+
+    def test_a_failing_test_blocks_met_even_at_full_coverage(self):
+        self._write_config({"framework": "pytest", "journeys": [{"id": "a", "tier": "ci"}]})
+        report = self._write_report("r.xml", _junit_xml([("t1", "passed", ["a"]), ("t2", "failed", [])]))
+        result = evaluate_functional_adequacy(self.repo_dir, report, tier="ci")
+        self.assertFalse(result.met)
+        self.assertEqual(result.reason_code, REASON_CODE_TEST_FAILURES)
+
+    def test_an_unknown_tier_is_a_caller_bug_and_raises(self):
+        for bad in ("both", "staging", "", None, "CI"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError) as ctx:
+                evaluate_functional_adequacy(self.repo_dir, None, tier=bad)
+            self.assertEqual(str(ctx.exception), f"tier must be one of ['ci', 'cd'], got {bad!r}")
+
+    def test_an_invalid_contract_is_config_invalid_amber_never_not_configured(self):
+        self._write_config({"framework": "pytest", "journeys": [{"id": "a", "tier": "staging"}]})
+        result = evaluate_functional_adequacy(self.repo_dir, None, target_env="ci", report_uri="https://x")
+        self.assertEqual(
+            result.as_dict(),
+            {
+                "available": False,
+                "met": False,
+                "framework": None,
+                "target_env": "ci",
+                "metrics": {"total": 0, "passed": 0, "failed": 0, "skipped": 0},
+                "adequacy": {
+                    "status": "unavailable",
+                    "metric_type": "cuj_coverage",
+                    "score_pct": 0.0,
+                    "declared": [],
+                    "covered": [],
+                    "missing": [],
+                },
+                "report_uri": "https://x",
+                "reason": f"{_CONFIG_PATH} is invalid and was not evaluated: journeys[0].tier must be one of ['ci', 'cd', 'both'], got 'staging'",
+                "reason_code": "config_invalid",
+            },
+        )
+
+    def test_an_invalid_contract_reports_config_invalid_at_either_tier(self):
+        self._write_config({"framework": "pytest", "journeys": [{"id": "a"}]})
+        for tier in ("ci", "cd"):
+            with self.subTest(tier=tier):
+                self.assertEqual(evaluate_functional_adequacy(self.repo_dir, None, tier=tier).reason_code, REASON_CODE_CONFIG_INVALID)
+
+    def test_report_missing_and_unsupported_framework_carry_the_tier_fields_for_a_v2_contract(self):
+        self._write_config({"framework": "pytest", "journeys": [{"id": "a", "tier": "ci"}, {"id": "b", "tier": "cd"}]})
+        no_report = evaluate_functional_adequacy(self.repo_dir, None, tier="ci")
+        self.assertEqual(no_report.reason_code, REASON_CODE_REPORT_MISSING)
+        self.assertEqual((no_report.tier, no_report.deferred), ("ci", ["b"]))
+        self.assertEqual(no_report.declared, ["a"])
+        self._write_config({"framework": "cypress", "journeys": [{"id": "a", "tier": "ci"}]})
+        unsupported = evaluate_functional_adequacy(self.repo_dir, "x.xml", tier="ci")
+        self.assertEqual(unsupported.reason_code, REASON_CODE_UNSUPPORTED_FRAMEWORK)
+        self.assertEqual(unsupported.tier, "ci")
+
+
+class TierFieldsDirectTests(unittest.TestCase):
+    def _config(self, journeys, tiered=True):
+        return FunctionalVerificationConfig(framework="pytest", min_adequacy_pct=100.0, journeys=journeys, tiered=tiered)
+
+    def test_legacy_config_at_ci_yields_no_fields(self):
+        self.assertEqual(_tier_fields(self._config([JourneyDeclaration("a", "ci")], tiered=False), "ci", []), {})
+
+    def test_legacy_config_at_cd_still_yields_fields(self):
+        fields = _tier_fields(self._config([JourneyDeclaration("a", "ci")], tiered=False), "cd", [])
+        self.assertEqual(fields["tier"], "cd")
+
+    def test_name_and_description_are_only_present_when_declared(self):
+        fields = _tier_fields(self._config([JourneyDeclaration("a", "ci"), JourneyDeclaration("b", "cd", "B", "desc")]), "ci", ["a"])
+        self.assertEqual(fields["journeys"][0], {"id": "a", "tier": "ci", "status": "covered"})
+        self.assertEqual(fields["journeys"][1], {"id": "b", "tier": "cd", "status": "deferred", "name": "B", "description": "desc"})
+
+    def test_a_declared_but_uncovered_in_tier_journey_is_missing_not_deferred(self):
+        fields = _tier_fields(self._config([JourneyDeclaration("a", "both")]), "cd", [])
+        self.assertEqual(fields["journeys"][0]["status"], "missing")
+        self.assertEqual(fields["deferred"], [])
+
+
+class _MultiReportFixture(TempRepoTestCase):
+    """Shared setup: a cd-tier contract with journeys a/b, two good reports, and
+    files that don't exist / can't be parsed. Holds no tests itself."""
+
+    def setUp(self):
+        super().setUp()
+        self._write_config({"framework": "pytest", "journeys": [{"id": "a", "tier": "cd"}, {"id": "b", "tier": "cd"}]})
+        self.good_a = self._write_report("a.xml", _junit_xml([("t1", "passed", ["a"])]))
+        self.good_b = self._write_report("b.xml", _junit_xml([("t2", "passed", ["b"])]))
+        self.missing = os.path.join(self.repo_dir, "never-written.xml")
+        self.missing2 = os.path.join(self.repo_dir, "never-written-2.xml")
+        self.bad_xml = self._write_report("bad.xml", "<not-closed")
+
+
+class MultiReportAndExecutionAbortedTests(_MultiReportFixture):
+    def test_normalize_report_paths_shapes(self):
+        self.assertEqual(_normalize_report_paths(None), [])
+        self.assertEqual(_normalize_report_paths(""), [])
+        self.assertEqual(_normalize_report_paths([]), [])
+        self.assertEqual(_normalize_report_paths("a.xml"), ["a.xml"])
+        self.assertEqual(_normalize_report_paths(["a.xml", "", "b.xml"]), ["a.xml", "b.xml"])
+        self.assertEqual(_normalize_report_paths(Path("a.xml")), ["a.xml"])
+        self.assertEqual(_normalize_report_paths(("a.xml", "b.xml")), ["a.xml", "b.xml"])
+
+    def test_several_reports_are_aggregated_into_one_evaluation(self):
+        result = evaluate_functional_adequacy(self.repo_dir, [self.good_a, self.good_b], tier="cd")
+        self.assertTrue(result.met)
+        self.assertEqual((result.total, result.passed), (2, 2))
+        self.assertEqual(result.covered, ["a", "b"])
+
+    def test_a_single_string_path_still_works_exactly_as_a_one_element_list(self):
+        one = evaluate_functional_adequacy(self.repo_dir, self.good_a, tier="cd")
+        listed = evaluate_functional_adequacy(self.repo_dir, [self.good_a], tier="cd")
+        self.assertEqual(one.as_dict(), listed.as_dict())
+
+    def test_cd_with_no_report_at_all_is_report_missing_not_aborted(self):
+        result = evaluate_functional_adequacy(self.repo_dir, [], tier="cd")
+        self.assertEqual(result.reason_code, REASON_CODE_REPORT_MISSING)
+
+    def test_cd_with_every_report_file_missing_is_execution_aborted(self):
+        result = evaluate_functional_adequacy(self.repo_dir, [self.missing, self.missing2], target_env="staging", tier="cd")
+        self.assertFalse(result.available)
+        self.assertFalse(result.met)
+        self.assertEqual(result.adequacy_status, ADEQUACY_STATUS_UNAVAILABLE)
+        self.assertEqual(result.reason_code, REASON_CODE_EXECUTION_ABORTED)
+        self.assertEqual(
+            result.reason,
+            f"execution aborted: none of the 2 --functional-report file(s) exist ({self.missing!r}, {self.missing2!r}) "
+            "-- the suite did not run far enough to write a report",
+        )
+        self.assertEqual(result.missing, ["a", "b"])
+        self.assertEqual(result.covered, [])
+        self.assertEqual(result.target_env, "staging")
+
+    def test_cd_with_some_files_missing_evaluates_the_rest_but_can_never_be_met(self):
+        result = evaluate_functional_adequacy(self.repo_dir, [self.good_a, self.missing, self.good_b], tier="cd")
+        self.assertIs(result.available, True)
+        self.assertIs(result.met, False)
+        self.assertEqual(result.adequacy_status, ADEQUACY_STATUS_EVALUATED)
+        self.assertEqual(result.reason_code, REASON_CODE_EXECUTION_ABORTED)
+        self.assertEqual(result.covered, ["a", "b"])
+        self.assertEqual(result.score_pct, 100.0)
+        self.assertTrue(result.reason.startswith("execution aborted: 1 of 3 --functional-report file(s) could not be read ("))
+        self.assertIn(repr(self.missing), result.reason)
+        self.assertTrue(result.reason.endswith("coverage reflects only the readable report(s): 2/2 declared journey(s) covered, 0 failed test(s)"))
+
+    def test_the_readable_partial_run_reports_real_missing_journeys(self):
+        result = evaluate_functional_adequacy(self.repo_dir, [self.good_a, self.missing], tier="cd")
+        self.assertEqual((result.covered, result.missing, result.score_pct), (["a"], ["b"], 50.0))
+        self.assertEqual(result.reason_code, REASON_CODE_EXECUTION_ABORTED)
+
+    def test_cd_with_a_malformed_file_is_report_malformed_not_aborted(self):
+        result = evaluate_functional_adequacy(self.repo_dir, [self.good_a, self.bad_xml], tier="cd")
+        self.assertEqual(result.reason_code, REASON_CODE_REPORT_MALFORMED)
+        self.assertIs(result.met, False)
+        self.assertFalse(result.reason.startswith("execution aborted"))
+
+    def test_cd_where_every_file_is_malformed_is_report_malformed(self):
+        result = evaluate_functional_adequacy(self.repo_dir, [self.bad_xml, self.bad_xml], tier="cd")
+        self.assertEqual(result.reason_code, REASON_CODE_REPORT_MALFORMED)
+        self.assertFalse(result.available)
+        self.assertTrue(result.reason.startswith(f"none of the 2 --functional-report files could be read as a 'pytest' report: {self.bad_xml!r}: "))
+
+    def test_cd_with_a_missing_and_a_malformed_file_is_report_malformed_because_not_all_are_missing(self):
+        result = evaluate_functional_adequacy(self.repo_dir, [self.missing, self.bad_xml], tier="cd")
+        self.assertEqual(result.reason_code, REASON_CODE_REPORT_MALFORMED)
+
+    def test_cd_missing_plus_malformed_plus_good_is_still_aborted_because_a_file_is_missing(self):
+        result = evaluate_functional_adequacy(self.repo_dir, [self.good_a, self.missing, self.bad_xml], tier="cd")
+        self.assertEqual(result.reason_code, REASON_CODE_EXECUTION_ABORTED)
+
+    def test_ci_with_a_missing_report_keeps_the_pre_tier_report_malformed_behavior(self):
+        self._write_config({"framework": "pytest", "declared_journeys": ["a"]})
+        result = evaluate_functional_adequacy(self.repo_dir, self.missing)
+        self.assertEqual(result.reason_code, REASON_CODE_REPORT_MALFORMED)
+        self.assertTrue(result.reason.startswith(f"--functional-report {self.missing!r} could not be read as a 'pytest' report: "))
+
+    def test_ci_partial_failure_is_report_malformed_never_execution_aborted(self):
+        self._write_config({"framework": "pytest", "journeys": [{"id": "a", "tier": "ci"}]})
+        result = evaluate_functional_adequacy(self.repo_dir, [self.good_a, self.missing], tier="ci")
+        self.assertEqual(result.reason_code, REASON_CODE_REPORT_MALFORMED)
+        self.assertIs(result.met, False)
+        self.assertFalse(result.reason.startswith("execution aborted"))
+
+    def test_test_failures_in_a_readable_report_still_surface_alongside_an_abort(self):
+        failing = self._write_report("f.xml", _junit_xml([("t", "failed", ["a"])]))
+        result = evaluate_functional_adequacy(self.repo_dir, [failing, self.missing], tier="cd")
+        self.assertEqual(result.reason_code, REASON_CODE_EXECUTION_ABORTED)
+        self.assertEqual(result.failed, 1)
+        self.assertIn("1 failed test(s)", result.reason)
+
+    def test_zero_executed_tests_message_names_the_first_report(self):
+        empty = self._write_report("empty.xml", "<testsuites></testsuites>")
+        result = evaluate_functional_adequacy(self.repo_dir, [empty], tier="cd")
+        self.assertEqual(result.reason_code, REASON_CODE_NO_TESTS_EXECUTED)
+        self.assertEqual(result.reason, f"'pytest' report at {empty!r} parsed but contained zero executed tests")
+
+
+class ReportFailureDetailTests(_MultiReportFixture):
+    """Direct-field pins for the failure records and the exact joined reason
+    strings -- the parts an aggregate assertion like startswith() lets drift."""
+
+    def _expected_message(self, path):
+        try:
+            _parse_junit_functional_report(path)
+        except Exception as e:  # noqa: BLE001 -- reproducing exactly what _parse_reports catches
+            return str(e)
+        raise AssertionError("expected the parse to fail")
+
+    def test_parse_reports_records_a_missing_file_exactly(self):
+        cases, failures = _parse_reports(_parse_junit_functional_report, [self.missing])
+        self.assertEqual(cases, [])
+        self.assertEqual(failures, [_ReportFailure(path=self.missing, missing=True, message=self._expected_message(self.missing))])
+        self.assertIn("No such file", failures[0].message)
+
+    def test_parse_reports_records_a_malformed_file_exactly(self):
+        _, failures = _parse_reports(_parse_junit_functional_report, [self.bad_xml])
+        self.assertEqual(len(failures), 1)
+        self.assertIs(failures[0].missing, False)
+        self.assertEqual(failures[0].path, self.bad_xml)
+        self.assertEqual(failures[0].message, self._expected_message(self.bad_xml))
+        self.assertNotEqual(failures[0].message, "None")
+
+    def test_parse_reports_keeps_good_cases_and_only_the_failures(self):
+        cases, failures = _parse_reports(_parse_junit_functional_report, [self.good_a, self.missing, self.good_b])
+        self.assertEqual(len(cases), 2)
+        self.assertEqual([f.path for f in failures], [self.missing])
+
+    def test_all_malformed_reason_joins_each_failure_with_a_semicolon_and_space(self):
+        second_bad = self._write_report("bad2.xml", "<also-not-closed")
+        result = evaluate_functional_adequacy(self.repo_dir, [self.bad_xml, second_bad], tier="cd")
+        self.assertEqual(
+            result.reason,
+            "none of the 2 --functional-report files could be read as a 'pytest' report: "
+            f"{self.bad_xml!r}: {self._expected_message(self.bad_xml)}; "
+            f"{second_bad!r}: {self._expected_message(second_bad)}",
+        )
+
+    def test_partial_failure_reason_lists_every_unreadable_file_joined_by_semicolon_space(self):
+        result = evaluate_functional_adequacy(self.repo_dir, [self.good_a, self.missing, self.missing2], tier="cd")
+        self.assertIn(
+            f"({self.missing!r}: {self._expected_message(self.missing)}; {self.missing2!r}: {self._expected_message(self.missing2)})",
+            result.reason,
+        )
+        self.assertTrue(result.reason.startswith("execution aborted: 2 of 3 --functional-report file(s) could not be read ("))
+
+    def test_a_partial_failure_is_forced_unmet_even_at_full_coverage(self):
+        result = evaluate_functional_adequacy(self.repo_dir, [self.good_a, self.good_b, self.missing], tier="cd")
+        self.assertEqual(result.score_pct, 100.0)
+        self.assertIs(result.met, False)
+
+    def test_an_all_failed_result_still_carries_the_tier_fields_for_a_v2_contract(self):
+        result = evaluate_functional_adequacy(self.repo_dir, [self.missing, self.missing2], tier="cd")
+        self.assertEqual(result.tier, "cd")
+        self.assertEqual(result.deferred, [])
+        self.assertEqual(
+            result.journeys,
+            [{"id": "a", "tier": "cd", "status": "missing"}, {"id": "b", "tier": "cd", "status": "missing"}],
+        )
+        self.assertEqual(result.as_dict()["adequacy"]["tier"], "cd")
+
+
+class PassThroughFieldTests(TempRepoTestCase):
+    def test_no_contract_passes_target_env_and_report_uri_through(self):
+        result = evaluate_functional_adequacy(self.repo_dir, None, target_env="staging", report_uri="https://ci/1")
+        self.assertEqual((result.target_env, result.report_uri), ("staging", "https://ci/1"))
+
+    def test_no_journeys_for_the_tier_passes_target_env_and_report_uri_through(self):
+        self._write_config({"framework": "pytest", "journeys": [{"id": "x", "tier": "cd"}]})
+        result = evaluate_functional_adequacy(self.repo_dir, None, target_env="staging", report_uri="https://ci/1", tier="ci")
+        self.assertEqual((result.target_env, result.report_uri, result.framework), ("staging", "https://ci/1", "pytest"))
+
+    def test_no_journeys_for_the_tier_carries_the_tier_fields(self):
+        self._write_config({"framework": "pytest", "journeys": [{"id": "x", "tier": "cd"}]})
+        result = evaluate_functional_adequacy(self.repo_dir, None, tier="ci")
+        self.assertEqual(result.tier, "ci")
+        self.assertEqual(result.journeys, [{"id": "x", "tier": "cd", "status": "deferred"}])
+
+
+class FunctionalVerificationSchemaTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            import jsonschema  # noqa: F401
+        except ImportError:  # pragma: no cover
+            self.skipTest("jsonschema not installed")
+        schema_path = Path(__file__).resolve().parent.parent / "schema" / "lucid-attestation-v1.schema.json"
+        self.schema = json.loads(schema_path.read_text(encoding="utf-8"))["properties"]["functional_verification"]
+
+    def _validate(self, doc):
+        import jsonschema
+        jsonschema.validate(doc, self.schema)
+
+    def test_a_legacy_shaped_result_still_validates(self):
+        self._validate(_unavailable_report(
+            framework="pytest", target_env=None, declared_journeys=["a"], report_uri=None,
+            reason="x", reason_code="report_missing").as_dict())
+
+    def test_a_v2_result_with_tier_deferred_and_journeys_validates(self):
+        with tempfile.TemporaryDirectory() as d:
+            lucid = Path(d) / ".lucid"
+            lucid.mkdir()
+            (lucid / "functional-verification.json").write_text(json.dumps(_MIXED_CONTRACT), encoding="utf-8")
+            report = Path(d) / "r.xml"
+            report.write_text(_junit_xml([("t", "passed", ["a"])]), encoding="utf-8")
+            self._validate(evaluate_functional_adequacy(d, str(report), tier="ci").as_dict())
+            self._validate(evaluate_functional_adequacy(d, str(report), tier="cd").as_dict())
+
+    def test_the_new_reason_codes_validate(self):
+        for code in ("config_invalid", "execution_aborted"):
+            with self.subTest(code=code):
+                self._validate(_unavailable_report(
+                    framework=None, target_env=None, declared_journeys=[], report_uri=None,
+                    reason="x", reason_code=code).as_dict())
+
+    def test_an_unknown_journey_status_or_tier_is_rejected(self):
+        import jsonschema
+        doc = _unavailable_report(framework="pytest", target_env=None, declared_journeys=["a"], report_uri=None,
+                                  reason="x", reason_code="report_missing").as_dict()
+        doc["adequacy"].update({"tier": "ci", "deferred": [], "journeys": [{"id": "a", "tier": "ci", "status": "bogus"}]})
+        with self.assertRaises(jsonschema.ValidationError):
+            self._validate(doc)
+        doc["adequacy"].update({"tier": "staging", "journeys": []})
+        with self.assertRaises(jsonschema.ValidationError):
+            self._validate(doc)
+

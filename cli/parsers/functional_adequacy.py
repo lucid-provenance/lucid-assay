@@ -40,10 +40,31 @@ Hardened against:
     adequacy.status == "not_configured", not a failure)
   - An unrecognized per-test status string in a generic_json report
     (treated as failed, never silently dropped or credited as a pass)
+  - An invalid v2 `journeys` contract (bad/duplicate id, missing or
+    unknown `tier`, wrong types) -- reported as an explicit, amber
+    `config_invalid` result, never silently dropped from the denominator
+    or defaulted to a tier (a typo must not shrink what is required)
+  - A missing post-deploy report file at the `cd` tier -- reported as
+    `execution_aborted` (met=false), never as a silent pass, and never
+    allowed to vanish: the caller submits the result so an operational
+    failure is visible rather than indistinguishable from "not run yet"
+
+Tiers (contract v2): a journey declares where it must be proven -- `ci`
+(before the artifact is attested), `cd` (after deployment, against a real
+environment), or `both`. `evaluate_functional_adequacy(..., tier=...)`
+scores only the journeys responsible at that tier (`ci` = ci + both,
+`cd` = cd + both) and lists the rest as `deferred`, so a 100% at one tier
+can never hide work still owed at the other. The legacy flat
+`declared_journeys` list reads as all-`ci`, and a legacy contract
+evaluated at `ci` produces byte-identical output to before tiers existed
+(the new `tier`/`deferred`/`journeys` fields are emitted only for a v2
+contract or a non-default tier) -- existing pipelines and stored
+attestations are unaffected.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -71,6 +92,35 @@ REASON_CODE_UNSUPPORTED_FRAMEWORK = "unsupported_framework"
 REASON_CODE_NO_TESTS_EXECUTED = "no_tests_executed"
 REASON_CODE_TEST_FAILURES = "test_failures"
 REASON_CODE_PARTIAL_ADEQUACY = "partial_adequacy"
+REASON_CODE_CONFIG_INVALID = "config_invalid"
+REASON_CODE_EXECUTION_ABORTED = "execution_aborted"
+
+TIER_CI = "ci"
+TIER_CD = "cd"
+TIER_BOTH = "both"
+# The tiers a run can be evaluated *at* (`both` is a declaration, not a stage).
+EVALUATION_TIERS = (TIER_CI, TIER_CD)
+DECLARED_TIERS = (TIER_CI, TIER_CD, TIER_BOTH)
+
+JOURNEY_STATUS_COVERED = "covered"
+JOURNEY_STATUS_MISSING = "missing"
+JOURNEY_STATUS_DEFERRED = "deferred"
+
+_JOURNEY_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# Display-only free text authored in the repo; capped so a hostile or
+# careless contract can't bloat the signed predicate or a UI built on it.
+_JOURNEY_NAME_MAX_LEN = 120
+_JOURNEY_DESCRIPTION_MAX_LEN = 500
+
+
+@dataclass
+class JourneyDeclaration:
+    """One declared Critical User Journey. `name`/`description` are
+    display-only metadata -- never scored, never used for matching."""
+    id: str
+    tier: str
+    name: Optional[str] = None
+    description: Optional[str] = None
 
 
 @dataclass
@@ -79,10 +129,18 @@ class FunctionalVerificationConfig:
     `framework` is carried through verbatim (even if not one this module
     recognizes) so evaluate_functional_adequacy() can report an honest
     "unsupported framework" outcome rather than the loader silently
-    normalizing/guessing at it."""
+    normalizing/guessing at it. `tiered` is True only when the contract
+    used the v2 `journeys` object form -- a legacy flat `declared_journeys`
+    list reads as all-`ci` journeys with `tiered=False`."""
     framework: str
     min_adequacy_pct: float
-    declared_journeys: List[str]
+    journeys: List[JourneyDeclaration]
+    tiered: bool = False
+
+    @property
+    def declared_journeys(self) -> List[str]:
+        """Every declared journey id, all tiers (the legacy flat view)."""
+        return [j.id for j in self.journeys]
 
 
 @dataclass
@@ -110,9 +168,14 @@ class FunctionalVerificationReport:
     covered: List[str] = field(default_factory=list)
     missing: List[str] = field(default_factory=list)
     report_uri: Optional[str] = None
+    # Set together, and only for a v2 contract or a non-default tier -- None
+    # keeps a legacy contract's output byte-identical to pre-tier releases.
+    tier: Optional[str] = None
+    deferred: Optional[List[str]] = None
+    journeys: Optional[List[Dict[str, Any]]] = None
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
+        out: Dict[str, Any] = {
             "available": self.available,
             "met": self.met,
             "framework": self.framework,
@@ -135,32 +198,98 @@ class FunctionalVerificationReport:
             "reason": self.reason,
             "reason_code": self.reason_code,
         }
+        if self.journeys is not None:
+            out["adequacy"]["tier"] = self.tier
+            out["adequacy"]["deferred"] = list(self.deferred or [])
+            out["adequacy"]["journeys"] = self.journeys
+        return out
 
 
-def load_functional_verification_config(repo_dir: str) -> Optional[FunctionalVerificationConfig]:
-    """Returns the declared functional-verification contract from
-    .lucid/functional-verification.json, or None when genuinely
-    unconfigured (missing file, unreadable, malformed JSON, not a JSON
-    object, or no non-empty declared_journeys list) -- the caller
-    reports this as adequacy.status == "not_configured", never a
-    failure. Never raises."""
+def _optional_text(value: Any, max_len: int) -> Optional[str]:
+    """Display-only free text from the contract: a stripped, length-capped
+    string, or None when absent/blank/not a string. Never an error -- this
+    metadata is never scored, so a bad value must not invalidate a contract
+    whose scoring fields are fine."""
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped[:max_len] if stripped else None
+
+
+def _parse_journey_objects(raw: Any) -> Tuple[Optional[List[JourneyDeclaration]], Optional[str]]:
+    """Parses the v2 `journeys` array. Returns (journeys, None) on success,
+    (None, None) for an explicitly empty array (nothing declared -- the same
+    "not configured" the legacy empty list already means), or
+    (None, <specific reason>) for an invalid declaration. Invalid is never
+    silently repaired or dropped: skipping an entry would shrink the
+    denominator, and defaulting a missing/typo'd `tier` would quietly move a
+    journey to a tier its author never chose."""
+    if not isinstance(raw, list):
+        return None, "`journeys` must be a JSON array of journey objects"
+    if not raw:
+        return None, None
+    journeys: List[JourneyDeclaration] = []
+    seen: set = set()
+    for index, item in enumerate(raw):
+        where = f"journeys[{index}]"
+        if not isinstance(item, dict):
+            return None, f"{where} must be an object with an id and a tier"
+        raw_id = item.get("id")
+        journey_id = raw_id.strip() if isinstance(raw_id, str) else ""
+        if not _JOURNEY_ID_RE.match(journey_id):
+            return None, f"{where}.id must be a non-empty string of letters, digits, '_' or '-'"
+        if journey_id in seen:
+            return None, f"{where}.id {journey_id!r} is declared more than once"
+        seen.add(journey_id)
+        tier = item.get("tier")
+        if tier not in DECLARED_TIERS:
+            return None, f"{where}.tier must be one of {list(DECLARED_TIERS)}, got {tier!r}"
+        journeys.append(
+            JourneyDeclaration(
+                id=journey_id,
+                tier=tier,
+                name=_optional_text(item.get("name"), _JOURNEY_NAME_MAX_LEN),
+                description=_optional_text(item.get("description"), _JOURNEY_DESCRIPTION_MAX_LEN),
+            )
+        )
+    return journeys, None
+
+
+def _load_contract(repo_dir: str) -> Tuple[Optional[FunctionalVerificationConfig], Optional[str]]:
+    """Reads .lucid/functional-verification.json. Returns (config, None) for
+    a usable contract, (None, None) when genuinely unconfigured (missing
+    file, unreadable, malformed JSON, not an object, or nothing declared --
+    reported as adequacy.status == "not_configured"), or (None, reason) when
+    the v2 `journeys` form is present but invalid (reported as
+    `config_invalid`). When both `journeys` and the legacy `declared_journeys`
+    are present, `journeys` wins. Never raises."""
     try:
         text = (Path(repo_dir) / _CONFIG_PATH).read_text(encoding="utf-8")
     except OSError:
-        return None
+        return None, None
     try:
         doc = json.loads(text)
     except json.JSONDecodeError:
-        return None
+        return None, None
     if not isinstance(doc, dict):
-        return None
+        return None, None
 
-    raw_journeys = doc.get("declared_journeys")
-    if not isinstance(raw_journeys, list):
-        return None
-    declared_journeys = [j.strip() for j in raw_journeys if isinstance(j, str) and j.strip()]
-    if not declared_journeys:
-        return None
+    if "journeys" in doc:
+        journeys, invalid_reason = _parse_journey_objects(doc["journeys"])
+        if invalid_reason is not None:
+            return None, invalid_reason
+        if not journeys:
+            return None, None
+        tiered = True
+    else:
+        raw_journeys = doc.get("declared_journeys")
+        if not isinstance(raw_journeys, list):
+            return None, None
+        ids = [j.strip() for j in raw_journeys if isinstance(j, str) and j.strip()]
+        if not ids:
+            return None, None
+        journeys = [JourneyDeclaration(id=journey_id, tier=TIER_CI) for journey_id in ids]
+        tiered = False
 
     framework_raw = doc.get("framework")
     framework = framework_raw.strip() if isinstance(framework_raw, str) and framework_raw.strip() else ""
@@ -171,11 +300,22 @@ def load_functional_verification_config(repo_dir: str) -> Optional[FunctionalVer
     else:
         min_adequacy_pct = float(min_adequacy_pct_raw)
 
-    return FunctionalVerificationConfig(
-        framework=framework,
-        min_adequacy_pct=min_adequacy_pct,
-        declared_journeys=declared_journeys,
+    return (
+        FunctionalVerificationConfig(
+            framework=framework,
+            min_adequacy_pct=min_adequacy_pct,
+            journeys=journeys,
+            tiered=tiered,
+        ),
+        None,
     )
+
+
+def load_functional_verification_config(repo_dir: str) -> Optional[FunctionalVerificationConfig]:
+    """Returns the declared contract, or None when unconfigured *or*
+    invalid -- the caller that needs to tell those apart (and report
+    `config_invalid`) uses _load_contract() directly. Never raises."""
+    return _load_contract(repo_dir)[0]
 
 
 def _extract_cuj_tags(*texts: str) -> Tuple[str, ...]:
@@ -396,6 +536,59 @@ def _compute_adequacy(
     return total, passed, failed, skipped, covered, missing
 
 
+@dataclass
+class _ReportFailure:
+    path: str
+    missing: bool  # the file does not exist (vs. exists but can't be parsed)
+    message: str
+
+
+def _normalize_report_paths(report_path: Any) -> List[str]:
+    """`--functional-report` is one path at CI and repeatable at CD (one
+    JUnit file per live stage). Accepts None, one path, or a sequence."""
+    if not report_path:
+        return []
+    if isinstance(report_path, (str, os.PathLike)):
+        return [os.fspath(report_path)]
+    return [os.fspath(p) for p in report_path if p]
+
+
+def _parse_reports(parse: Any, paths: List[str]) -> Tuple[List[_NormalizedCase], List[_ReportFailure]]:
+    cases: List[_NormalizedCase] = []
+    failures: List[_ReportFailure] = []
+    for path in paths:
+        try:
+            cases.extend(parse(path))
+        except FileNotFoundError as e:
+            failures.append(_ReportFailure(path=path, missing=True, message=str(e)))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, ET.ParseError) as e:
+            failures.append(_ReportFailure(path=path, missing=False, message=str(e)))
+    return cases, failures
+
+
+def _tier_fields(config: FunctionalVerificationConfig, tier: str, covered: List[str]) -> Dict[str, Any]:
+    """The v2-only output fields, or {} for a legacy contract at the default
+    tier (keeping its output byte-identical to pre-tier releases)."""
+    if not config.tiered and tier == TIER_CI:
+        return {}
+    covered_set = set(covered)
+    rows: List[Dict[str, Any]] = []
+    deferred: List[str] = []
+    for journey in config.journeys:
+        if journey.tier in (tier, TIER_BOTH):
+            status = JOURNEY_STATUS_COVERED if journey.id in covered_set else JOURNEY_STATUS_MISSING
+        else:
+            status = JOURNEY_STATUS_DEFERRED
+            deferred.append(journey.id)
+        row: Dict[str, Any] = {"id": journey.id, "tier": journey.tier, "status": status}
+        if journey.name:
+            row["name"] = journey.name
+        if journey.description:
+            row["description"] = journey.description
+        rows.append(row)
+    return {"tier": tier, "deferred": deferred, "journeys": rows}
+
+
 def _unavailable_report(
     *,
     framework: Optional[str],
@@ -404,6 +597,7 @@ def _unavailable_report(
     report_uri: Optional[str],
     reason: str,
     reason_code: str,
+    tier_fields: Optional[Dict[str, Any]] = None,
 ) -> FunctionalVerificationReport:
     return FunctionalVerificationReport(
         available=False,
@@ -422,25 +616,86 @@ def _unavailable_report(
         report_uri=report_uri,
         reason=reason,
         reason_code=reason_code,
+        **(tier_fields or {}),
+    )
+
+
+def _not_configured_report(
+    *, target_env: Optional[str], report_uri: Optional[str], framework: Optional[str], reason: str,
+    tier_fields: Optional[Dict[str, Any]] = None,
+) -> FunctionalVerificationReport:
+    return FunctionalVerificationReport(
+        available=False,
+        met=False,
+        framework=framework,
+        target_env=target_env,
+        total=0,
+        passed=0,
+        failed=0,
+        skipped=0,
+        adequacy_status=ADEQUACY_STATUS_NOT_CONFIGURED,
+        score_pct=0.0,
+        declared=[],
+        covered=[],
+        missing=[],
+        report_uri=report_uri,
+        reason=reason,
+        reason_code=REASON_CODE_NOT_CONFIGURED,
+        **(tier_fields or {}),
+    )
+
+
+def _all_reports_failed(
+    *, framework: str, tier: str, paths: List[str], failures: List[_ReportFailure],
+) -> Tuple[str, str]:
+    """(reason, reason_code) when not one --functional-report file could be
+    used. At the `cd` tier, files that simply don't exist mean the live
+    suite never ran far enough to write a report: `execution_aborted`.
+    Everything else -- including any missing file at `ci`, unchanged from
+    before tiers -- stays `report_malformed`."""
+    if tier == TIER_CD and all(f.missing for f in failures):
+        names = ", ".join(repr(f.path) for f in failures)
+        return (
+            f"execution aborted: none of the {len(paths)} --functional-report file(s) exist ({names}) -- "
+            "the suite did not run far enough to write a report",
+            REASON_CODE_EXECUTION_ABORTED,
+        )
+    if len(paths) == 1:
+        return (
+            f"--functional-report {paths[0]!r} could not be read as a {framework!r} report: {failures[0].message}",
+            REASON_CODE_REPORT_MALFORMED,
+        )
+    detail = "; ".join(f"{f.path!r}: {f.message}" for f in failures)
+    return (
+        f"none of the {len(paths)} --functional-report files could be read as a {framework!r} report: {detail}",
+        REASON_CODE_REPORT_MALFORMED,
     )
 
 
 def evaluate_functional_adequacy(
     repo_dir: str,
-    report_path: Optional[str],
+    report_path: Any,
     *,
     target_env: Optional[str] = None,
     report_uri: Optional[str] = None,
+    tier: str = TIER_CI,
 ) -> FunctionalVerificationReport:
     """Evaluates functional test adequacy for this run: Declared
-    Operational Surface (.lucid/functional-verification.json's
-    declared_journeys) vs. Executed Scenarios (--functional-report,
-    parsed per the config's declared `framework`).
+    Operational Surface (.lucid/functional-verification.json's journeys)
+    vs. Executed Scenarios (--functional-report, parsed per the config's
+    declared `framework`), scoped to the journeys responsible at `tier`.
 
-    Never raises. Every failure mode -- no config, no report path, an
-    unsupported framework, or a report that can't be read/parsed --
-    degrades to an honest, explicit outcome rather than crashing the
-    pipeline or silently granting full credit for an unmet contract.
+    `report_path` is one path, or several (the `cd` tier's post-deploy
+    suite writes one JUnit file per stage); their cases are aggregated.
+    `tier` is the stage being evaluated (`ci` or `cd`) -- an unknown value
+    is a caller bug and raises ValueError, the one exception to "never
+    raises" below (the CLI restricts it with argparse choices).
+
+    Never raises otherwise. Every failure mode -- no config, an invalid
+    contract, no report path, an unsupported framework, or a report that
+    can't be read/parsed -- degrades to an honest, explicit outcome rather
+    than crashing the pipeline or silently granting full credit for an
+    unmet contract.
 
     `met` is a concrete, non-nullable bool in every outcome, "not
     configured" included -- it is never true unless a real, passing
@@ -459,44 +714,59 @@ def evaluate_functional_adequacy(
     bare pass/fail claim a console could render directly), whereas `met`
     here is exactly the kind of direct boolean gate signal a console or a
     future --require-functional-adequacy flag would read at face value."""
-    config = load_functional_verification_config(repo_dir)
-    if config is None:
-        return FunctionalVerificationReport(
-            available=False,
-            met=False,
+    if tier not in EVALUATION_TIERS:
+        raise ValueError(f"tier must be one of {list(EVALUATION_TIERS)}, got {tier!r}")
+
+    config, invalid_reason = _load_contract(repo_dir)
+    if invalid_reason is not None:
+        return _unavailable_report(
             framework=None,
             target_env=target_env,
-            total=0,
-            passed=0,
-            failed=0,
-            skipped=0,
-            adequacy_status=ADEQUACY_STATUS_NOT_CONFIGURED,
-            score_pct=0.0,
-            declared=[],
-            covered=[],
-            missing=[],
+            declared_journeys=[],
             report_uri=report_uri,
+            reason=f"{_CONFIG_PATH} is invalid and was not evaluated: {invalid_reason}",
+            reason_code=REASON_CODE_CONFIG_INVALID,
+        )
+    if config is None:
+        return _not_configured_report(
+            target_env=target_env,
+            report_uri=report_uri,
+            framework=None,
             reason=(
                 f"no declared_journeys configured at {_CONFIG_PATH} -- functional test adequacy is "
                 "not evaluated for this run (reported as unmet, not a silent pass, to avoid a false "
                 "'evaluated and passed' signal for a control that never actually ran)"
             ),
-            reason_code=REASON_CODE_NOT_CONFIGURED,
         )
 
     framework = config.framework
+    declared = [j.id for j in config.journeys if j.tier in (tier, TIER_BOTH)]
 
-    if not report_path:
+    if not declared:
+        return _not_configured_report(
+            target_env=target_env,
+            report_uri=report_uri,
+            framework=framework,
+            reason=(
+                f"{_CONFIG_PATH} declares no journeys for tier {tier!r} -- functional test adequacy is "
+                f"not evaluated at this tier (reported as unmet, not a silent pass)"
+            ),
+            tier_fields=_tier_fields(config, tier, []),
+        )
+
+    paths = _normalize_report_paths(report_path)
+    if not paths:
         return _unavailable_report(
             framework=framework,
             target_env=target_env,
-            declared_journeys=config.declared_journeys,
+            declared_journeys=declared,
             report_uri=report_uri,
             reason=(
-                f"{_CONFIG_PATH} declares {len(config.declared_journeys)} journey(s), but "
+                f"{_CONFIG_PATH} declares {len(declared)} journey(s), but "
                 "--functional-report was not provided for this run"
             ),
             reason_code=REASON_CODE_REPORT_MISSING,
+            tier_fields=_tier_fields(config, tier, []),
         )
 
     parse = _PARSERS.get(framework)
@@ -504,40 +774,42 @@ def evaluate_functional_adequacy(
         return _unavailable_report(
             framework=framework,
             target_env=target_env,
-            declared_journeys=config.declared_journeys,
+            declared_journeys=declared,
             report_uri=report_uri,
             reason=(
                 f"{_CONFIG_PATH} declares an unsupported framework {framework!r} "
                 f"(expected one of {sorted(_PARSERS)})"
             ),
             reason_code=REASON_CODE_UNSUPPORTED_FRAMEWORK,
+            tier_fields=_tier_fields(config, tier, []),
         )
 
-    try:
-        cases = parse(report_path)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError, ET.ParseError) as e:
+    cases, failures = _parse_reports(parse, paths)
+    if len(failures) == len(paths):
+        reason, reason_code = _all_reports_failed(framework=framework, tier=tier, paths=paths, failures=failures)
         return _unavailable_report(
             framework=framework,
             target_env=target_env,
-            declared_journeys=config.declared_journeys,
+            declared_journeys=declared,
             report_uri=report_uri,
-            reason=f"--functional-report {report_path!r} could not be read as a {framework!r} report: {e}",
-            reason_code=REASON_CODE_REPORT_MALFORMED,
+            reason=reason,
+            reason_code=reason_code,
+            tier_fields=_tier_fields(config, tier, []),
         )
 
-    total, passed, failed, skipped, covered, missing = _compute_adequacy(cases, config.declared_journeys)
-    score_pct = round((len(covered) / len(config.declared_journeys)) * 100.0, 2)
+    total, passed, failed, skipped, covered, missing = _compute_adequacy(cases, declared)
+    score_pct = round((len(covered) / len(declared)) * 100.0, 2)
 
     met = total > 0 and failed == 0 and score_pct >= config.min_adequacy_pct
 
     if met:
         reason = (
-            f"{len(covered)}/{len(config.declared_journeys)} declared journey(s) covered "
+            f"{len(covered)}/{len(declared)} declared journey(s) covered "
             f"({score_pct:.1f}% >= {config.min_adequacy_pct:.1f}% required), 0 failed test(s)"
         )
         reason_code = None
     elif total == 0:
-        reason = f"{framework!r} report at {report_path!r} parsed but contained zero executed tests"
+        reason = f"{framework!r} report at {paths[0]!r} parsed but contained zero executed tests"
         reason_code = REASON_CODE_NO_TESTS_EXECUTED
     elif failed > 0:
         reason = (
@@ -547,10 +819,24 @@ def evaluate_functional_adequacy(
         reason_code = REASON_CODE_TEST_FAILURES
     else:
         reason = (
-            f"only {len(covered)}/{len(config.declared_journeys)} declared journey(s) covered "
+            f"only {len(covered)}/{len(declared)} declared journey(s) covered "
             f"({score_pct:.1f}% < {config.min_adequacy_pct:.1f}% required); missing: {missing}"
         )
         reason_code = REASON_CODE_PARTIAL_ADEQUACY
+
+    if failures:
+        # Some report files were unusable: whatever the readable ones say,
+        # the run is incomplete, so it can never be `met`. Coverage above
+        # still reflects only real, readable evidence.
+        aborted = tier == TIER_CD and any(f.missing for f in failures)
+        unreadable = "; ".join(f"{f.path!r}: {f.message}" for f in failures)
+        reason = (
+            f"{'execution aborted: ' if aborted else ''}{len(failures)} of {len(paths)} --functional-report "
+            f"file(s) could not be read ({unreadable}) -- coverage reflects only the readable report(s): "
+            f"{len(covered)}/{len(declared)} declared journey(s) covered, {failed} failed test(s)"
+        )
+        reason_code = REASON_CODE_EXECUTION_ABORTED if aborted else REASON_CODE_REPORT_MALFORMED
+        met = False
 
     return FunctionalVerificationReport(
         available=True,
@@ -563,10 +849,11 @@ def evaluate_functional_adequacy(
         skipped=skipped,
         adequacy_status=ADEQUACY_STATUS_EVALUATED,
         score_pct=score_pct,
-        declared=list(config.declared_journeys),
+        declared=declared,
         covered=covered,
         missing=missing,
         report_uri=report_uri,
         reason=reason,
         reason_code=reason_code,
+        **_tier_fields(config, tier, covered),
     )

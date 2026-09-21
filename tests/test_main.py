@@ -647,15 +647,30 @@ class EvaluateFunctionalAdequacyDirectTests(unittest.TestCase):
             "report.json",
             target_env="staging",
             report_uri="https://ci/1",
+            tier="ci",
         )
         self.assertIs(result, sentinel_return)
+
+    def test_forwards_functional_tier_when_the_namespace_carries_one(self):
+        args = self._args(functional_tier="cd")
+        fake_evaluate = MagicMock(return_value=None)
+        with patch("cli.main.evaluate_functional_adequacy", fake_evaluate):
+            _evaluate_functional_adequacy(args, {})
+        self.assertEqual(fake_evaluate.call_args.kwargs["tier"], "cd")
+
+    def test_missing_functional_tier_attribute_defaults_to_ci_not_an_error(self):
+        # A Namespace built before --functional-tier existed has no such attribute.
+        fake_evaluate = MagicMock(return_value=None)
+        with patch("cli.main.evaluate_functional_adequacy", fake_evaluate):
+            _evaluate_functional_adequacy(self._args(), {})
+        self.assertEqual(fake_evaluate.call_args.kwargs["tier"], "ci")
 
     def test_none_functional_report_env_and_uri_pass_through_as_none(self):
         args = self._args(functional_report=None, functional_env=None, functional_report_uri=None)
         fake_evaluate = MagicMock(return_value=None)
         with patch("cli.main.evaluate_functional_adequacy", fake_evaluate):
             _evaluate_functional_adequacy(args, {})
-        fake_evaluate.assert_called_once_with(".", None, target_env=None, report_uri=None)
+        fake_evaluate.assert_called_once_with(".", None, target_env=None, report_uri=None, tier="ci")
 
     def test_records_elapsed_time_under_the_exact_functional_adequacy_evaluation_stage_key(self):
         args = self._args()
@@ -668,3 +683,38 @@ class EvaluateFunctionalAdequacyDirectTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FunctionalTierFlagTests(unittest.TestCase):
+    """--functional-tier / repeatable --functional-report on the main pipeline's parse_args."""
+
+    _BASE = ["--junit-xml", "j.xml", "--coverage-report", "c.xml", "--image-ref", "r", "--image-digest", "sha256:" + "a" * 64,
+             "--head-sha", "a" * 40, "--repository", "org/repo", "--branch", "main", "--out", "o.json"]
+
+    def test_functional_tier_defaults_to_ci(self):
+        self.assertEqual(parse_args(self._BASE).functional_tier, "ci")
+
+    def test_functional_tier_accepts_cd(self):
+        self.assertEqual(parse_args(self._BASE + ["--functional-tier", "cd"]).functional_tier, "cd")
+
+    def test_functional_tier_rejects_both_and_unknown_values(self):
+        for bad in ("both", "staging", ""):
+            with self.subTest(bad=bad), patch("sys.stderr"), self.assertRaises(SystemExit):
+                parse_args(self._BASE + ["--functional-tier", bad])
+
+    def test_functional_report_is_none_when_omitted_and_a_list_when_given(self):
+        self.assertIsNone(parse_args(self._BASE).functional_report)
+        self.assertEqual(parse_args(self._BASE + ["--functional-report", "a.xml"]).functional_report, ["a.xml"])
+
+    def test_functional_report_is_repeatable_and_keeps_order(self):
+        args = parse_args(self._BASE + ["--functional-report", "a.xml", "--functional-report", "b.xml"])
+        self.assertEqual(args.functional_report, ["a.xml", "b.xml"])
+
+
+class FunctionalAdequacySubcommandDispatchTests(unittest.TestCase):
+    def test_functional_adequacy_dispatches_with_the_remaining_argv_and_returns_its_exit_code(self):
+        with patch("cli.functional.main", return_value=7) as fake_main:
+            result = _dispatch_standalone_subcommand(["functional-adequacy", "--functional-tier", "cd"])
+        self.assertEqual(result, 7)
+        fake_main.assert_called_once_with(["--functional-tier", "cd"])
+

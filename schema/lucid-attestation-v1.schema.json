@@ -672,12 +672,30 @@
             "score_pct": { "type": "number", "minimum": 0, "maximum": 100 },
             "declared": { "type": "array", "items": { "type": "string" }, "description": "Every journey id declared in .lucid/functional-verification.json's declared_journeys." },
             "covered": { "type": "array", "items": { "type": "string" }, "description": "Declared journeys with at least one passing associated test and zero failing ones." },
-            "missing": { "type": "array", "items": { "type": "string" }, "description": "Declared journeys not covered -- never executed, or executed with at least one failure." }
+            "missing": { "type": "array", "items": { "type": "string" }, "description": "Declared journeys not covered -- never executed, or executed with at least one failure." },
+            "tier": { "type": "string", "enum": ["ci", "cd"], "description": "The stage this result was evaluated at (--functional-tier / the functional-adequacy subcommand). Present only for a v2 `journeys` contract or a non-default tier; absent means the legacy all-ci evaluation. `declared`/`covered`/`missing` above are scoped to this tier: a journey declared `ci` or `both` is scored at `ci`, one declared `cd` or `both` at `cd`." },
+            "deferred": { "type": "array", "items": { "type": "string" }, "description": "Journey ids declared for the other tier only -- still owed elsewhere, deliberately not in `declared` here, so a 100% at this tier never hides work still owed at the other. Present alongside `tier`." },
+            "journeys": {
+              "type": "array",
+              "description": "Every declared journey, all tiers, with its status at this tier. Present alongside `tier`. `name`/`description` are display-only text authored in the contract (length-capped), never scored.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "tier", "status"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "tier": { "type": "string", "enum": ["ci", "cd", "both"], "description": "The tier(s) this journey declared it must be proven at." },
+                  "status": { "type": "string", "enum": ["covered", "missing", "deferred"], "description": "covered/missing at this result's tier, or deferred when the journey is declared for the other tier only." },
+                  "name": { "type": "string" },
+                  "description": { "type": "string" }
+                }
+              }
+            }
           }
         },
         "report_uri": { "type": ["string", "null"], "description": "Optional external-storage link to the full --functional-report artifact, from --functional-report-uri; never fetched or validated by this pipeline." },
         "reason": { "type": "string" },
-        "reason_code": { "type": ["string", "null"], "enum": ["not_configured", "report_missing", "report_malformed", "unsupported_framework", "no_tests_executed", "test_failures", "partial_adequacy", null] }
+        "reason_code": { "type": ["string", "null"], "enum": ["not_configured", "report_missing", "report_malformed", "unsupported_framework", "no_tests_executed", "test_failures", "partial_adequacy", "config_invalid", "execution_aborted", null], "description": "config_invalid: the v2 `journeys` contract is present but invalid (never silently repaired or dropped). execution_aborted: at the cd tier, one or more expected report files do not exist, so the suite did not run to completion -- met is always false." }
       }
     }
   },

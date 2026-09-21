@@ -317,6 +317,13 @@ class VerificationResult:
     # dedicated gate than --disallow-degraded, which would also block on
     # every *other* unrelated degraded reason at once.
     mutation_evidence: Dict[str, Any] = field(default_factory=dict)
+    # predicate.functional_verification, verbatim (cli/parsers/
+    # functional_adequacy.py) -- Declared Operational Surface vs. Executed
+    # Scenarios, scored at this attestation's own tier (`ci` for the build
+    # statement). Display only, like mutation_evidence: a set of journeys
+    # with one verdict, not a gate (no --require-* flag exists for it).
+    # {} when the predicate predates the field.
+    functional_evidence: Dict[str, Any] = field(default_factory=dict)
     # The signed envelope's own _rekor.logIndex/logUrl (cli/oidc_signer.py)
     # -- not part of the signed predicate (see _extract_rekor_info's
     # docstring for why). Both None on --dry-run-sign or an envelope
@@ -397,6 +404,7 @@ class VerificationResult:
             "dependency_governance_items": self.dependency_governance_items,
             "repository_governance_items": self.repository_governance_items,
             "mutation_evidence": self.mutation_evidence,
+            "functional_evidence": self.functional_evidence,
             "rekor_log_index": self.rekor_log_index,
             "rekor_log_url": self.rekor_log_url,
             "source_highest_level": self.source_highest_level,
@@ -713,6 +721,17 @@ def _extract_mutation_evidence(predicate: Dict[str, Any]) -> Dict[str, Any]:
     exactly one signal here (mutation_score/grade), not a set of
     independent pass/fail items."""
     evidence = predicate.get("mutation_testing")
+    return evidence if isinstance(evidence, dict) else {}
+
+
+def _extract_functional_evidence(predicate: Dict[str, Any]) -> Dict[str, Any]:
+    """predicate.functional_verification, verbatim (cli/parsers/
+    functional_adequacy.py) -- for display purposes only, same defensive
+    contract as _extract_mutation_evidence: {} (never a fabricated shape)
+    when the field is missing or not an object, so the renderer can tell
+    "predates the field" apart from a genuine result -- including the
+    honest "not configured" one, which is present and rendered."""
+    evidence = predicate.get("functional_verification")
     return evidence if isinstance(evidence, dict) else {}
 
 
@@ -1562,6 +1581,78 @@ def _format_mutation_testing_report(evidence: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _string_list(value: Any) -> List[str]:
+    """`value` if it is a list of strings, else [] -- never raises on a malformed block."""
+    return list(value) if isinstance(value, list) and all(isinstance(v, str) for v in value) else []
+
+
+def _functional_journey_lines(adequacy: Dict[str, Any], tier: str) -> List[str]:
+    """One checklist line per declared journey. A v2 result (adequacy.journeys)
+    lists every journey, all tiers, by its contract name with the id in
+    parentheses; a legacy result (no journeys list) falls back to declared/
+    covered. A journey whose status isn't recognized is never credited: it
+    renders [✗], the same fail-closed default the evaluator itself uses."""
+    other_tier = "CI" if tier == "cd" else "CD"
+    journeys = adequacy.get("journeys")
+    if isinstance(journeys, list) and journeys:
+        lines: List[str] = []
+        for journey in journeys:
+            if not isinstance(journey, dict) or not isinstance(journey.get("id"), str):
+                continue
+            name = journey.get("name")
+            label = f"{name} ({journey['id']})" if isinstance(name, str) and name else journey["id"]
+            status = journey.get("status")
+            if status == "covered":
+                lines.append(f"[✓] {label}")
+            elif status == "deferred":
+                lines.append(f"[-] {label} -- deferred to {other_tier}")
+            else:
+                lines.append(f"[✗] {label}")
+        return lines
+    covered = set(_string_list(adequacy.get("covered")))
+    return [f"[{'✓' if journey_id in covered else '✗'}] {journey_id}" for journey_id in _string_list(adequacy.get("declared"))]
+
+
+def _format_functional_verification_report(evidence: Dict[str, Any]) -> List[str]:
+    """Renders the Functional Verification section: which declared Critical
+    User Journeys this attestation's own tier proved (see
+    _extract_functional_evidence). [] (no section at all) when the predicate
+    predates the field -- same "nothing to show" convention as every other
+    optional section here. A present-but-unconfigured or failed result still
+    renders, marked [✗]/NOT MET with the evaluator's own reason: a detectable
+    gap is shown, never omitted. Journeys deferred to the other tier are
+    listed too ([-]), so a full score at this tier never hides work still owed
+    at the other. Informational only -- not a gate."""
+    if not evidence:
+        return []
+    adequacy = evidence.get("adequacy") if isinstance(evidence.get("adequacy"), dict) else {}
+    tier = "cd" if adequacy.get("tier") == "cd" else "ci"
+    declared = _string_list(adequacy.get("declared"))
+    covered = _string_list(adequacy.get("covered"))
+    summary = f"{len(covered)}/{len(declared)} journeys covered" if declared else "no journeys evaluated"
+    lines = [f"=== Functional Verification ({tier.upper()} tier -- {summary}) ==="]
+    lines.extend(_functional_journey_lines(adequacy, tier))
+    reason = evidence.get("reason", "")
+    if evidence.get("met") is True:
+        lines.append(f"Status: MET -- {reason}")
+    else:
+        code = evidence.get("reason_code")
+        lines.append(f"Status: NOT MET{f' ({code})' if isinstance(code, str) else ''} -- {reason}")
+    metrics = evidence.get("metrics") if isinstance(evidence.get("metrics"), dict) else {}
+    details = [d for d in (evidence.get("framework"), f"environment: {evidence['target_env']}" if evidence.get("target_env") else None) if isinstance(d, str) and d]
+    total = metrics.get("total")
+    if isinstance(total, int) and not isinstance(total, bool) and total > 0:
+        noun = "test" if total == 1 else "tests"
+        details.append(
+            f"{total} {noun} executed ({metrics.get('passed', 0)} passed, "
+            f"{metrics.get('failed', 0)} failed, {metrics.get('skipped', 0)} skipped)"
+        )
+    if details:
+        lines.append(f"    {' | '.join(details)}")
+    lines.append(_SECTION_DIVIDER)
+    return lines
+
+
 def _format_signing_report(result: "VerificationResult") -> List[str]:
     """Renders the CD/signing summary: Sigstore identity verification
     (result.identity_status/identity_detail, already computed by
@@ -2117,6 +2208,7 @@ def _build_verify_json_payload(result: VerificationResult) -> Dict[str, Any]:
             "items": result.dependency_governance_items,
         },
         "mutation_testing": result.mutation_evidence,
+        "functional_verification": result.functional_evidence,
         "repository_governance": {
             "items": result.repository_governance_items,
         },
@@ -2805,6 +2897,7 @@ class _StatementDerivedFields:
     dependency_governance_items: List[Dict[str, Any]]
     repository_governance_items: List[Dict[str, Any]]
     mutation_evidence: Dict[str, Any]
+    functional_evidence: Dict[str, Any]
     schema_validation_status: str
     predicate: Dict[str, Any]
 
@@ -2871,6 +2964,7 @@ def _evaluate_decoded_statement(
     dependency_governance_items = _extract_dependency_evidence(predicate)
     repository_governance_items = _extract_repository_governance(predicate)
     mutation_evidence = _extract_mutation_evidence(predicate)
+    functional_evidence = _extract_functional_evidence(predicate)
 
     # --require-commit-signing: same opt-in-gate shape as
     # --require-slsa-build-l3 (see that flag's own handling), but
@@ -2932,6 +3026,7 @@ def _evaluate_decoded_statement(
         dependency_governance_items=dependency_governance_items,
         repository_governance_items=repository_governance_items,
         mutation_evidence=mutation_evidence,
+        functional_evidence=functional_evidence,
         schema_validation_status=schema_validation_status,
         predicate=predicate,
     )
@@ -3041,6 +3136,7 @@ def verify_dsse_attestation(
     dependency_governance_items: List[Dict[str, Any]] = []
     repository_governance_items: List[Dict[str, Any]] = []
     mutation_evidence: Dict[str, Any] = {}
+    functional_evidence: Dict[str, Any] = {}
     schema_validation_status = "skipped"
 
     predicate: Dict[str, Any] = {}
@@ -3066,6 +3162,7 @@ def verify_dsse_attestation(
         dependency_governance_items = fields.dependency_governance_items
         repository_governance_items = fields.repository_governance_items
         mutation_evidence = fields.mutation_evidence
+        functional_evidence = fields.functional_evidence
         schema_validation_status = fields.schema_validation_status
         predicate = fields.predicate
 
@@ -3133,6 +3230,7 @@ def verify_dsse_attestation(
         dependency_governance_items=dependency_governance_items,
         repository_governance_items=repository_governance_items,
         mutation_evidence=mutation_evidence,
+        functional_evidence=functional_evidence,
         rekor_log_index=rekor_log_index,
         rekor_log_url=rekor_log_url,
         schema_validation_status=schema_validation_status,
@@ -3412,6 +3510,11 @@ def _render_track_sections(result: VerificationResult) -> List[str]:
     if mutation_lines:
         lines.append("")
         lines.extend(mutation_lines)
+
+    functional_lines = _format_functional_verification_report(result.functional_evidence)
+    if functional_lines:
+        lines.append("")
+        lines.extend(functional_lines)
 
     s2c2f_lines = _format_s2c2f_report(result.s2c2f_controls)
     if s2c2f_lines:

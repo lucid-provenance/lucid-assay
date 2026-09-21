@@ -38,7 +38,10 @@ from cli.verify import (
     _evaluate_slsa_l3,
     _extract_cert_ref,
     _extract_dependency_evidence,
+    _extract_functional_evidence,
     _extract_mutation_evidence,
+    _format_functional_verification_report,
+    _string_list,
     _extract_rekor_info,
     _extract_s2c2f_controls,
     _pem_to_der_b64,
@@ -125,6 +128,7 @@ def _statement(
     resolved_dependencies=None,
     sbom=None,
     mutation_testing=None,
+    functional_verification=None,
 ):
     rcs_block = {
         "value": rcs_value,
@@ -152,6 +156,8 @@ def _statement(
         predicate["artifact"] = {"sbom": sbom}
     if mutation_testing is not None:
         predicate["mutation_testing"] = mutation_testing
+    if functional_verification is not None:
+        predicate["functional_verification"] = functional_verification
     return {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [
@@ -2332,6 +2338,293 @@ class DependencyGovernanceIntegrationTests(unittest.TestCase):
         json.dumps(payload)  # must remain JSON-serializable end to end
 
 
+# The shape of a real CI-tier block (lucid-dsse-collector's own build attestation, 2026-09-21).
+def _functional_evidence(**overrides) -> Dict[str, Any]:
+    evidence: Dict[str, Any] = {
+        "available": True,
+        "met": True,
+        "framework": "pytest",
+        "target_env": "ci",
+        "metrics": {"total": 183, "passed": 183, "failed": 0, "skipped": 0},
+        "adequacy": {
+            "status": "evaluated",
+            "metric_type": "cuj_coverage",
+            "score_pct": 100.0,
+            "declared": ["ingest-rejects-invalid-bundle", "internal-metrics-auth"],
+            "covered": ["ingest-rejects-invalid-bundle", "internal-metrics-auth"],
+            "missing": [],
+            "tier": "ci",
+            "deferred": ["attestation-lifecycle-live"],
+            "journeys": [
+                {"id": "ingest-rejects-invalid-bundle", "tier": "ci", "status": "covered", "name": "Ingest Ingress Gating"},
+                {"id": "internal-metrics-auth", "tier": "ci", "status": "covered", "name": "Internal Telemetry Gating"},
+                {"id": "attestation-lifecycle-live", "tier": "cd", "status": "deferred", "name": "Live Envelope Processing & Retrieval"},
+            ],
+        },
+        "report_uri": None,
+        "reason": "2/2 declared journey(s) covered (100.0% >= 100.0% required), 0 failed test(s)",
+        "reason_code": None,
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+class ExtractFunctionalEvidenceTests(unittest.TestCase):
+    def test_missing_field_is_empty(self):
+        self.assertEqual(_extract_functional_evidence({}), {})
+
+    def test_non_object_is_empty_never_a_fabricated_shape(self):
+        for bad in ("nope", 5, None, [1], True):
+            with self.subTest(bad=bad):
+                self.assertEqual(_extract_functional_evidence({"functional_verification": bad}), {})
+
+    def test_an_object_is_returned_verbatim(self):
+        evidence = _functional_evidence()
+        self.assertIs(_extract_functional_evidence({"functional_verification": evidence}), evidence)
+
+
+class StringListTests(unittest.TestCase):
+    def test_a_list_of_strings_passes_through_as_a_copy(self):
+        source = ["a", "b"]
+        result = _string_list(source)
+        self.assertEqual(result, ["a", "b"])
+        self.assertIsNot(result, source)
+
+    def test_anything_else_is_empty(self):
+        for bad in (None, "ab", 5, ["a", 1], [None], {"a": 1}, ("a",)):
+            with self.subTest(bad=bad):
+                self.assertEqual(_string_list(bad), [])
+
+    def test_an_empty_list_is_empty(self):
+        self.assertEqual(_string_list([]), [])
+
+
+class FormatFunctionalVerificationReportTests(unittest.TestCase):
+    def test_no_section_when_the_predicate_predates_the_field(self):
+        self.assertEqual(_format_functional_verification_report({}), [])
+
+    def test_a_real_ci_tier_result_renders_exactly(self):
+        self.assertEqual(
+            _format_functional_verification_report(_functional_evidence()),
+            [
+                "=== Functional Verification (CI tier -- 2/2 journeys covered) ===",
+                "[✓] Ingest Ingress Gating (ingest-rejects-invalid-bundle)",
+                "[✓] Internal Telemetry Gating (internal-metrics-auth)",
+                "[-] Live Envelope Processing & Retrieval (attestation-lifecycle-live) -- deferred to CD",
+                "Status: MET -- 2/2 declared journey(s) covered (100.0% >= 100.0% required), 0 failed test(s)",
+                "    pytest | environment: ci | 183 tests executed (183 passed, 0 failed, 0 skipped)",
+                _SECTION_DIVIDER,
+            ],
+        )
+
+    def test_a_cd_tier_result_says_its_deferred_journeys_are_owed_to_ci(self):
+        evidence = _functional_evidence()
+        evidence["adequacy"]["tier"] = "cd"
+        lines = _format_functional_verification_report(evidence)
+        self.assertEqual(lines[0], "=== Functional Verification (CD tier -- 2/2 journeys covered) ===")
+        self.assertIn("[-] Live Envelope Processing & Retrieval (attestation-lifecycle-live) -- deferred to CI", lines)
+
+    def test_a_legacy_result_with_no_journeys_list_falls_back_to_declared_and_covered(self):
+        evidence = _functional_evidence()
+        del evidence["adequacy"]["journeys"]
+        evidence["adequacy"]["covered"] = ["ingest-rejects-invalid-bundle"]
+        evidence["adequacy"]["missing"] = ["internal-metrics-auth"]
+        lines = _format_functional_verification_report(evidence)
+        self.assertEqual(lines[0], "=== Functional Verification (CI tier -- 1/2 journeys covered) ===")
+        self.assertEqual(lines[1:3], ["[✓] ingest-rejects-invalid-bundle", "[✗] internal-metrics-auth"])
+
+    def test_an_unmet_result_marks_the_missing_journey_and_names_the_reason_code(self):
+        evidence = _functional_evidence(
+            met=False,
+            reason_code="partial_adequacy",
+            reason="only 1/2 declared journey(s) covered (50.0% < 100.0% required); missing: ['internal-metrics-auth']",
+        )
+        evidence["adequacy"]["covered"] = ["ingest-rejects-invalid-bundle"]
+        evidence["adequacy"]["missing"] = ["internal-metrics-auth"]
+        evidence["adequacy"]["journeys"][1]["status"] = "missing"
+        lines = _format_functional_verification_report(evidence)
+        self.assertIn("[✗] Internal Telemetry Gating (internal-metrics-auth)", lines)
+        self.assertIn(
+            "Status: NOT MET (partial_adequacy) -- only 1/2 declared journey(s) covered (50.0% < 100.0% required); "
+            "missing: ['internal-metrics-auth']",
+            lines,
+        )
+
+    def test_a_not_configured_result_still_renders_amber_never_omitted(self):
+        evidence = _functional_evidence(
+            available=False, met=False, framework=None, target_env=None,
+            metrics={"total": 0, "passed": 0, "failed": 0, "skipped": 0},
+            adequacy={"status": "not_configured", "metric_type": "cuj_coverage", "score_pct": 0.0, "declared": [], "covered": [], "missing": []},
+            reason="no declared_journeys configured", reason_code="not_configured",
+        )
+        self.assertEqual(
+            _format_functional_verification_report(evidence),
+            [
+                "=== Functional Verification (CI tier -- no journeys evaluated) ===",
+                "Status: NOT MET (not_configured) -- no declared_journeys configured",
+                _SECTION_DIVIDER,
+            ],
+        )
+
+    def test_an_aborted_result_says_so(self):
+        evidence = _functional_evidence(met=False, available=False, reason_code="execution_aborted", reason="execution aborted: none of the 9 files exist")
+        evidence["adequacy"].update({"tier": "cd", "covered": [], "missing": ["internal-metrics-auth", "ingest-rejects-invalid-bundle"]})
+        lines = _format_functional_verification_report(evidence)
+        self.assertIn("Status: NOT MET (execution_aborted) -- execution aborted: none of the 9 files exist", lines)
+
+    def test_met_must_be_exactly_true_to_read_as_met(self):
+        for not_true in ("yes", 1, None, "true"):
+            with self.subTest(met=not_true):
+                lines = _format_functional_verification_report(_functional_evidence(met=not_true))
+                self.assertTrue(any(line.startswith("Status: NOT MET") for line in lines))
+                self.assertFalse(any(line.startswith("Status: MET") for line in lines))
+
+    def test_an_unrecognized_journey_status_is_never_credited(self):
+        evidence = _functional_evidence()
+        evidence["adequacy"]["journeys"][0]["status"] = "something-new"
+        self.assertIn("[✗] Ingest Ingress Gating (ingest-rejects-invalid-bundle)", _format_functional_verification_report(evidence))
+
+    def test_a_journey_with_no_name_shows_just_its_id(self):
+        evidence = _functional_evidence()
+        del evidence["adequacy"]["journeys"][0]["name"]
+        evidence["adequacy"]["journeys"][1]["name"] = ""
+        lines = _format_functional_verification_report(evidence)
+        self.assertIn("[✓] ingest-rejects-invalid-bundle", lines)
+        self.assertIn("[✓] internal-metrics-auth", lines)
+
+    def test_malformed_journey_entries_are_skipped_not_fatal(self):
+        evidence = _functional_evidence()
+        evidence["adequacy"]["journeys"] = ["nope", {"tier": "ci", "status": "covered"}, {"id": 5, "status": "covered"},
+                                            {"id": "good", "status": "covered", "name": "Good"}]
+        lines = _format_functional_verification_report(evidence)
+        self.assertEqual([l for l in lines if l.startswith("[")], ["[✓] Good (good)"])
+
+    def test_an_empty_journeys_list_falls_back_to_declared(self):
+        evidence = _functional_evidence()
+        evidence["adequacy"]["journeys"] = []
+        lines = _format_functional_verification_report(evidence)
+        self.assertEqual(lines[1:3], ["[✓] ingest-rejects-invalid-bundle", "[✓] internal-metrics-auth"])
+
+    def test_a_malformed_adequacy_block_renders_without_raising(self):
+        for bad in (None, "x", [], 5):
+            with self.subTest(bad=bad):
+                lines = _format_functional_verification_report(_functional_evidence(adequacy=bad))
+                self.assertEqual(lines[0], "=== Functional Verification (CI tier -- no journeys evaluated) ===")
+
+    def test_an_unknown_tier_defaults_to_ci(self):
+        evidence = _functional_evidence()
+        evidence["adequacy"]["tier"] = "staging"
+        self.assertTrue(_format_functional_verification_report(evidence)[0].startswith("=== Functional Verification (CI tier"))
+
+    def test_the_details_line_shows_only_what_is_real(self):
+        base = _functional_evidence()
+        cases = {
+            "all": (base, "    pytest | environment: ci | 183 tests executed (183 passed, 0 failed, 0 skipped)"),
+            "framework only": (_functional_evidence(target_env=None, metrics={"total": 0}), "    pytest"),
+            "env only": (_functional_evidence(framework=None, metrics={"total": 0}), "    environment: ci"),
+            "counts only": (_functional_evidence(framework=None, target_env=None), "    183 tests executed (183 passed, 0 failed, 0 skipped)"),
+        }
+        for label, (evidence, expected_line) in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(expected_line, _format_functional_verification_report(evidence))
+
+    def test_no_details_line_at_all_when_there_is_nothing_real_to_show(self):
+        evidence = _functional_evidence(framework=None, target_env=None, metrics={"total": 0, "passed": 0, "failed": 0, "skipped": 0})
+        lines = _format_functional_verification_report(evidence)
+        self.assertFalse(any(line.startswith("    ") for line in lines))
+
+    def test_a_non_integer_test_total_is_ignored_and_bool_is_not_a_count(self):
+        for bad_total in ("183", None, 1.5, True):
+            with self.subTest(total=bad_total):
+                lines = _format_functional_verification_report(_functional_evidence(metrics={"total": bad_total}))
+                self.assertFalse(any("tests executed" in line for line in lines))
+
+    def test_exactly_one_executed_test_is_shown_and_uses_the_singular(self):
+        evidence = _functional_evidence(metrics={"total": 1, "passed": 1, "failed": 0, "skipped": 0})
+        self.assertIn("    pytest | environment: ci | 1 test executed (1 passed, 0 failed, 0 skipped)", _format_functional_verification_report(evidence))
+
+    def test_two_executed_tests_use_the_plural(self):
+        evidence = _functional_evidence(metrics={"total": 2, "passed": 2, "failed": 0, "skipped": 0})
+        self.assertIn("2 tests executed (2 passed", "\n".join(_format_functional_verification_report(evidence)))
+
+    def test_a_non_string_framework_is_never_shown(self):
+        for bad in (5, ["pytest"], {"n": 1}, True):
+            with self.subTest(framework=bad):
+                lines = _format_functional_verification_report(_functional_evidence(framework=bad, target_env=None, metrics={"total": 0}))
+                self.assertFalse(any(line.startswith("    ") for line in lines))
+
+    def test_an_empty_string_framework_is_never_shown(self):
+        lines = _format_functional_verification_report(_functional_evidence(framework="", target_env=None, metrics={"total": 0}))
+        self.assertFalse(any(line.startswith("    ") for line in lines))
+
+    def test_only_a_cd_tier_reads_as_cd_everything_else_is_ci(self):
+        for tier, header in (("cd", "CD tier"), ("ci", "CI tier"), ("CI", "CI tier"), ("CD", "CI tier"), (None, "CI tier"), (5, "CI tier")):
+            with self.subTest(tier=tier):
+                evidence = _functional_evidence()
+                evidence["adequacy"]["tier"] = tier
+                self.assertIn(f"({header} --", _format_functional_verification_report(evidence)[0])
+
+    def test_failed_and_skipped_counts_are_shown_as_recorded(self):
+        evidence = _functional_evidence(metrics={"total": 10, "passed": 7, "failed": 2, "skipped": 1})
+        self.assertIn("    pytest | environment: ci | 10 tests executed (7 passed, 2 failed, 1 skipped)", _format_functional_verification_report(evidence))
+
+    def test_a_non_string_reason_code_is_left_out(self):
+        lines = _format_functional_verification_report(_functional_evidence(met=False, reason_code=5, reason="r"))
+        self.assertIn("Status: NOT MET -- r", lines)
+
+    def test_a_missing_reason_renders_an_empty_tail_not_a_crash(self):
+        evidence = _functional_evidence()
+        del evidence["reason"]
+        self.assertIn("Status: MET -- ", _format_functional_verification_report(evidence))
+
+    def test_the_section_ends_with_the_shared_divider(self):
+        self.assertEqual(_format_functional_verification_report(_functional_evidence())[-1], _SECTION_DIVIDER)
+
+
+class FunctionalVerificationInTheFullReportTests(unittest.TestCase):
+    def _result(self, **statement_overrides):
+        envelope = _envelope(_statement(**statement_overrides))
+        return verify_dsse_attestation(envelope, min_rcs=0, dry_run=True)
+
+    def test_the_result_carries_the_block_verbatim(self):
+        evidence = _functional_evidence()
+        self.assertEqual(self._result(functional_verification=evidence).functional_evidence, evidence)
+
+    def test_a_predicate_without_the_field_yields_an_empty_result_and_no_section(self):
+        result = self._result()
+        self.assertEqual(result.functional_evidence, {})
+        self.assertFalse(any("Functional Verification" in line for line in _render_track_sections(result)))
+
+    def test_the_section_appears_in_the_rendered_report(self):
+        lines = _render_track_sections(self._result(functional_verification=_functional_evidence()))
+        self.assertIn("=== Functional Verification (CI tier -- 2/2 journeys covered) ===", lines)
+        self.assertIn("[✓] Ingest Ingress Gating (ingest-rejects-invalid-bundle)", lines)
+
+    def test_the_section_sits_right_after_mutation_testing_and_before_s2c2f(self):
+        result = self._result(mutation_testing=_mutation_evidence(), functional_verification=_functional_evidence(), s2c2f={"controls": [{"id": "ING-1", "label": "Package Managers", "level": 1, "status": "met", "detail": "d"}]})
+        lines = _render_track_sections(result)
+        headers = [i for i, l in enumerate(lines) if l.startswith("=== ")]
+        titles = [lines[i] for i in headers]
+        mutation = next(i for i, t in enumerate(titles) if t.startswith("=== Mutation Testing"))
+        functional = next(i for i, t in enumerate(titles) if t.startswith("=== Functional Verification"))
+        self.assertEqual(functional, mutation + 1)
+        self.assertTrue(titles[functional + 1].startswith("=== S2C2F"))
+
+    def test_the_json_payload_carries_it_verbatim_and_empty_when_absent(self):
+        evidence = _functional_evidence()
+        self.assertEqual(_build_verify_json_payload(self._result(functional_verification=evidence))["functional_verification"], evidence)
+        self.assertEqual(_build_verify_json_payload(self._result())["functional_verification"], {})
+
+    def test_it_is_informational_only_and_never_changes_the_gate(self):
+        unmet = _functional_evidence(met=False, reason_code="partial_adequacy", reason="r")
+        with_unmet = self._result(functional_verification=unmet)
+        without = self._result()
+        self.assertEqual((with_unmet.passed, with_unmet.violations), (without.passed, without.violations))
+
+    def test_as_dict_includes_it(self):
+        self.assertEqual(self._result(functional_verification=_functional_evidence()).as_dict()["functional_evidence"], _functional_evidence())
+
+
 class BuildVerifyJsonPayloadTests(unittest.TestCase):
     """Direct structural assertions on the --format json payload -- exact
     key sets at every level, not just that a couple of fields are present,
@@ -2353,7 +2646,7 @@ class BuildVerifyJsonPayloadTests(unittest.TestCase):
                 "envelope", "run_identity", "gate_params",
                 "source", "slsa", "release_confidence_score", "test_coverage",
                 "static_analysis", "s2c2f", "dependency_governance",
-                "mutation_testing", "repository_governance", "identity",
+                "mutation_testing", "functional_verification", "repository_governance", "identity",
                 "signing", "violations", "warnings",
             },
         )

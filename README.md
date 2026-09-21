@@ -1145,6 +1145,68 @@ design; see `--license-curations`/`.lucid/denylist.json`/
 }
 ```
 
+**Tiers (contract v2).** A journey can also declare *where* it must be
+proven — `ci` (before the artifact is attested), `cd` (after deployment,
+against a real environment), or `both` — using the richer `journeys`
+form. The flat `declared_journeys` list above still works exactly as
+before and reads as all-`ci`:
+
+```json
+{
+  "framework": "pytest",
+  "min_adequacy_pct": 100,
+  "journeys": [
+    { "id": "ingest-rejects-invalid-bundle", "name": "Ingest ingress gating", "tier": "ci",
+      "description": "Adversarial payloads and oversized bundles fail fast." },
+    { "id": "attestation-lifecycle-live", "name": "Live envelope processing", "tier": "cd",
+      "description": "A signed envelope is processed, stored, and retrievable." }
+  ]
+}
+```
+
+- `id` matches `[A-Za-z0-9_-]+` and is unique; `tier` is **required** and
+  must be `ci`, `cd` or `both`. `name`/`description` are display-only
+  (trimmed and length-capped at 120/500), never scored. When both
+  `journeys` and `declared_journeys` are present, `journeys` wins.
+- `--functional-tier {ci,cd}` (default `ci`) says which stage a run's
+  `--functional-report` belongs to. `ci` scores the `ci` and `both`
+  journeys; `cd` scores the `cd` and `both` ones. The rest are listed as
+  `adequacy.deferred`, so a 100% at one tier can never hide work still
+  owed at the other. `adequacy.journeys` lists every declared journey with
+  its `status` at this tier (`covered`, `missing`, or `deferred`).
+- **Legacy output is byte-identical.** `adequacy.tier`/`deferred`/`journeys`
+  are emitted only for a `journeys` contract or a non-default tier, so an
+  existing flat-list contract evaluated at `ci` produces exactly what it
+  always did. A legacy contract evaluated at `cd` has no `cd` journeys and
+  reports `not_configured` for that tier — never "100% of zero".
+- An invalid `journeys` contract (bad or duplicate id, missing or unknown
+  `tier`, wrong types) is reported as `reason_code: "config_invalid"`
+  (`adequacy.status: "unavailable"`, amber) and is **never** silently
+  repaired or dropped — skipping an entry would shrink the denominator, and
+  defaulting a typo'd `tier` would move a journey to a stage its author
+  never chose.
+- `--functional-report` is repeatable (a post-deploy suite typically writes
+  one JUnit file per stage); the cases are aggregated. At the **`cd` tier**,
+  report files that do not exist mean the live suite did not run to
+  completion: `reason_code: "execution_aborted"`, `met: false` — recorded,
+  not silent. With no readable file at all the result is `unavailable`;
+  with some readable, coverage is reported from those and `met` is forced
+  `false`. A file that exists but can't be parsed stays `report_malformed`.
+  (At `ci`, a missing report keeps its pre-tier `report_malformed`.)
+
+For a caller outside the attestation pipeline — a repo's post-deploy job,
+which runs after the build statement is already signed —
+`lucid-assay functional-adequacy --functional-tier cd --functional-report
+<junit.xml> [--functional-report ...] [--repo-dir .] [--functional-env
+staging] [--out result.json]` runs the same evaluator and prints the
+`predicate.functional_verification` JSON. It exits `0` whenever it produced
+a result — including `met: false`, `execution_aborted` and `config_invalid`,
+which are results to record and show, not tool failures (`2` for unusable
+arguments, `1` for an unsafe `--out`). `--functional-tier` is required there
+so a post-deploy caller can never silently evaluate the wrong tier.
+
+The sections below describe the `ci` behavior and apply per-tier.
+
 `declared_journeys` is the **Declared Operational Surface** — the
 denominator. Absent, empty, or the config file missing entirely all mean
 the same honest thing: `predicate.functional_verification.adequacy.status
@@ -1201,7 +1263,8 @@ its own `reason_code` rather than a shared, ambiguous one:
 `--functional-report` wasn't passed this run), `unsupported_framework`
 (the config names something other than `playwright`/`pytest`/
 `generic_json`), `report_malformed` (unreadable/unparseable input),
-`no_tests_executed`, `test_failures`, and `partial_adequacy`.
+`no_tests_executed`, `test_failures`, `partial_adequacy`, and — with
+tiers — `config_invalid` and `execution_aborted` (above).
 
 This section is scoring-independent by design — it never feeds
 `release_confidence_score`, the same posture `predicate.s2c2f` and
@@ -2133,7 +2196,10 @@ python3 -m cli.main \
 # checked into the target repo declaring its framework/declared_journeys (see
 # "Functional test adequacy evaluation" above) -- without one, this flag is a
 # no-op and predicate.functional_verification reports adequacy.status=
-# "not_configured" rather than failing the run.
+# "not_configured" rather than failing the run. --functional-report is repeatable
+# and --functional-tier {ci,cd} (default ci) selects which declared journeys are
+# scored; `lucid-assay functional-adequacy --functional-tier cd ...` runs the same
+# evaluator standalone (see the section above).
 #
 # --coverage-contexts is generated by:
 #   pytest --cov=cli --cov-context=test --cov-report=xml:build/coverage.xml tests/

@@ -27,7 +27,12 @@ from .parsers.ast import inspect_test_suite
 from .parsers.commit_author import CommitAuthorReport, inspect_commit_author
 from .parsers.coverage import parse_cobertura, parse_jacoco, parse_lcov
 from .parsers.coverage_contexts import parse_coverage_contexts
-from .parsers.functional_adequacy import FunctionalVerificationReport, evaluate_functional_adequacy
+from .parsers.functional_adequacy import (
+    EVALUATION_TIERS,
+    TIER_CI,
+    FunctionalVerificationReport,
+    evaluate_functional_adequacy,
+)
 from .parsers.github_rules import BranchGovernanceReport, bypass_permits_unreviewed_change, inspect_branch_governance
 from .parsers.junit import parse_junit_xml
 from .parsers.lockfiles import detect_and_parse_dependencies
@@ -580,6 +585,9 @@ def _evaluate_functional_adequacy(
             args.functional_report,
             target_env=args.functional_env,
             report_uri=args.functional_report_uri,
+            # getattr: callers/tests that build their own Namespace predate
+            # this flag; the default is the pre-tier behavior (ci).
+            tier=getattr(args, "functional_tier", TIER_CI),
         )
 
 
@@ -787,13 +795,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--functional-report",
+        action="append",
         default=None,
         help="path to a structured functional/end-to-end test report (Playwright JSON reporter output, "
         "JUnit XML, or this project's own generic_json shape -- see cli/parsers/functional_adequacy.py) "
-        "evaluated against .lucid/functional-verification.json's declared_journeys contract. A no-op "
+        "evaluated against .lucid/functional-verification.json's declared journeys. Repeatable: several "
+        "reports (e.g. one JUnit file per post-deploy stage) are aggregated. A no-op "
         "(predicate.functional_verification reports adequacy.status='not_configured') when that config "
         "file is absent; a configured contract with no --functional-report is an honest 'unavailable' "
         "result, not a silent pass.",
+    )
+    p.add_argument(
+        "--functional-tier",
+        choices=list(EVALUATION_TIERS),
+        default=TIER_CI,
+        help="which stage this run's --functional-report belongs to: scores only the journeys declared "
+        "for this tier in .lucid/functional-verification.json ('ci' = ci + both, 'cd' = cd + both) and "
+        "lists the rest as deferred. A legacy flat declared_journeys contract is all-'ci' (default: ci)",
     )
     p.add_argument(
         "--functional-env",
@@ -963,7 +981,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def _dispatch_standalone_subcommand(raw_argv: List[str]) -> Optional[int]:
-    """Dispatches `lucid-assay {verify,sign,provenance} ...` to their
+    """Dispatches `lucid-assay {verify,sign,provenance,functional-adequacy} ...` to their
     standalone subcommand entry points, each of which owns its own
     argument parsing entirely separately from parse_args()/the
     attestation-building pipeline below. Returns the subcommand's exit
@@ -1004,6 +1022,16 @@ def _dispatch_standalone_subcommand(raw_argv: List[str]) -> Optional[int]:
         from .provenance import main as provenance_main
 
         return provenance_main(raw_argv[1:])
+
+    # `lucid-assay functional-adequacy ...` dispatches to the standalone
+    # functional-adequacy evaluator (cli/functional.py) -- evaluates a
+    # tier's journeys against real report file(s) and prints the
+    # predicate.functional_verification JSON, for a caller (e.g. a
+    # repo's post-deploy job) that runs outside the attestation pipeline.
+    if raw_argv[0] == "functional-adequacy":
+        from .functional import main as functional_main
+
+        return functional_main(raw_argv[1:])
 
     return None
 

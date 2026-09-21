@@ -1266,6 +1266,22 @@ its own `reason_code` rather than a shared, ambiguous one:
 `no_tests_executed`, `test_failures`, `partial_adequacy`, and — with
 tiers — `config_invalid` and `execution_aborted` (above).
 
+**In the `verify` report.** `lucid-assay verify` renders this block as its
+own **Functional Verification** section (terminal report, the
+`$GITHUB_STEP_SUMMARY` markdown — the two share one renderer — and
+`--format json` under `functional_verification`), placed right after Mutation
+Testing. Each declared journey is one checklist line — `[✓]` covered, `[✗]`
+missing, `[-]` deferred to the other tier — labelled by its contract `name`
+with the id in parentheses, followed by a `Status: MET`/`NOT MET (<reason_code>)`
+line carrying the evaluator's own reason and, when present, the framework,
+environment and executed-test counts. It is **informational only**: no
+`--require-*` flag folds it into the gate, and an unmet result never changes
+`passed`/the exit code. A present-but-unmet result (including
+`not_configured`, `config_invalid` and `execution_aborted`) still renders
+`NOT MET` — a detectable gap is shown, never omitted; the section is omitted
+only when the predicate predates the field. A journey status the renderer does
+not recognize is never credited (`[✗]`).
+
 This section is scoring-independent by design — it never feeds
 `release_confidence_score`, the same posture `predicate.s2c2f` and
 `predicate.resolved_dependencies` already take, since a repo without any
@@ -1782,6 +1798,16 @@ Status: FAILED (SLSA Build Level 3)
 [✓] Materialized Resolved Dependencies (142 packages recorded)
 [✓] Materialized Locked Dependencies (140 packages locked to hash, 2 floating (no sha256/sha512 digest))
 [✗] Canonical SBOM Attached -- predicate.artifact.sbom is absent -- no --sbom was ingested for this run
+=====================================
+
+=== Functional Verification (CI tier -- 4/4 journeys covered) ===
+[✓] Ingest Ingress Gating (ingest-rejects-invalid-bundle)
+[✓] Lookup Parameter Validation (report-lookup-validates-id)
+[✓] Origin & Identity Verification (ingest-identity-gating)
+[✓] Internal Telemetry Gating (internal-metrics-auth)
+[-] Live Envelope Processing & Retrieval (attestation-lifecycle-live) -- deferred to CD
+Status: MET -- 4/4 declared journey(s) covered (100.0% >= 100.0% required), 0 failed test(s)
+    pytest | environment: ci | 183 tests executed (183 passed, 0 failed, 0 skipped)
 =====================================
 
 === Assay Health & Governance Metrics ===

@@ -64,6 +64,7 @@ attestations are unaffected.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -186,7 +187,7 @@ def _clean_duration(value: Any) -> Optional[float]:
         seconds = float(value)
     except (TypeError, ValueError):
         return None
-    if seconds != seconds or seconds in (float("inf"), float("-inf")) or seconds < 0:
+    if not math.isfinite(seconds) or seconds < 0:
         return None
     return round(seconds, 3)
 

@@ -158,6 +158,27 @@ its own decision, not a side effect. Gate flags are opt-in and off by default
 predicate schema, degraded reasons or admission rules is not done until
 `README.md` reflects it.
 
+**13. Functional verification is scored per tier, and deferred work is never hidden.**
+`predicate.functional_verification` scores a caller's declared journeys at the
+stage they must be proven at: `ci` journeys at build time, `cd` journeys after
+deploy, `both` at each. The other tier's journeys come back as `deferred`, so a
+100% at one stage cannot hide work still owed at the other. An invalid contract
+(bad or duplicate id, missing or unknown tier) is reported as `config_invalid`
+and never silently repaired, since dropping an entry would shrink the
+denominator. Legacy flat-contract output stays byte-identical. Test <-> journey
+is many-to-many by construction: a test carries a *set* of `@cuj` tags, and a
+journey is covered when at least one tagged test passed and none failed.
+
+**14. Per-test results are bounded and carry no captured output.**
+The same block carries a `tests` list (name, class, status, duration, a
+truncated failure message, journey tags) so a consumer can show which tests ran
+and why one failed. It is capped (1000 rows, failed first, so a cap only ever
+drops passing tests) with exact totals always in `metrics` and `tests_truncated`
+saying when it is a subset. `message` is only ever the report's own `message`
+attribute -- never a traceback or `<system-out>`/`<system-err>`, which can carry
+secrets from the run's environment -- and it is single-line, control-character
+free and length-capped. A test asserts a planted secret never reaches the output.
+
 ## 4. Directory architecture
 
 | Path | Owns |

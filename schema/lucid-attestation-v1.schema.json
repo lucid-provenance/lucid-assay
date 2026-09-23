@@ -693,6 +693,25 @@
             }
           }
         },
+        "tests": {
+          "type": "array",
+          "maxItems": 1000,
+          "description": "Per-test results from the --functional-report(s), for a consumer to render which tests ran and why one failed. Emitted only alongside adequacy.tier/journeys (a legacy flat contract's output is unchanged). Failed tests first, then skipped, then passed; capped, with the true totals always in `metrics` and `tests_truncated` set when this is a subset. `message` is a failure/error/skip reason taken from the report's own message attribute (never a traceback or captured output), single-line and truncated.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "status", "journeys"],
+            "properties": {
+              "name": { "type": "string", "maxLength": 300 },
+              "classname": { "type": "string", "maxLength": 200 },
+              "status": { "type": "string", "enum": ["passed", "failed", "skipped"] },
+              "duration_s": { "type": "number", "minimum": 0 },
+              "message": { "type": "string", "maxLength": 500 },
+              "journeys": { "type": "array", "items": { "type": "string" }, "description": "Declared journey ids this test is tagged with (@cuj:<id>)." }
+            }
+          }
+        },
+        "tests_truncated": { "type": "boolean", "description": "True when `tests` omits some tests because the suite exceeded the cap. Present whenever `tests` is." },
         "report_uri": { "type": ["string", "null"], "description": "Optional external-storage link to the full --functional-report artifact, from --functional-report-uri; never fetched or validated by this pipeline." },
         "reason": { "type": "string" },
         "reason_code": { "type": ["string", "null"], "enum": ["not_configured", "report_missing", "report_malformed", "unsupported_framework", "no_tests_executed", "test_failures", "partial_adequacy", "config_invalid", "execution_aborted", null], "description": "config_invalid: the v2 `journeys` contract is present but invalid (never silently repaired or dropped). execution_aborted: at the cd tier, one or more expected report files do not exist, so the suite did not run to completion -- met is always false." }

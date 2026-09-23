@@ -1179,6 +1179,21 @@ before and reads as all-`ci`:
   existing flat-list contract evaluated at `ci` produces exactly what it
   always did. A legacy contract evaluated at `cd` has no `cd` journeys and
   reports `not_configured` for that tier — never "100% of zero".
+- **Per-test results (`tests`, `tests_truncated`).** Alongside the tier
+  fields (and only there, so legacy output stays byte-identical), the result
+  carries one row per test the report ran: `name`, `classname`, `status`
+  (`passed`/`failed`/`skipped`), `duration_s`, a `message`, and the `journeys`
+  it is tagged with — enough for a consumer such as the console to render
+  *which* tests ran and why one failed, without the raw report. Bounded
+  on every axis because the predicate is signed and stored: failed tests
+  come first, then skipped, then passed, capped at 1000 rows
+  (`tests_truncated: true` when the suite was larger; `metrics` always
+  carries the true totals), names/messages are cut to 300/500 characters,
+  and control characters become spaces. `message` is the outcome element's
+  own `message` (or `type`) attribute — **never** the traceback body or
+  captured stdout/stderr, which can carry secrets from the run's
+  environment. JUnit supplies every field; Playwright and `generic_json`
+  supply the name (and `generic_json` an optional `message`).
 - An invalid `journeys` contract (bad or duplicate id, missing or unknown
   `tier`, wrong types) is reported as `reason_code: "config_invalid"`
   (`adequacy.status: "unavailable"`, amber) and is **never** silently

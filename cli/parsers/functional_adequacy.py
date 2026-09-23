@@ -64,6 +64,7 @@ attestations are unaffected.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -143,10 +144,90 @@ class FunctionalVerificationConfig:
         return [j.id for j in self.journeys]
 
 
+# Per-test results carried in the signed predicate (`functional_verification.tests`),
+# so a consumer can render *which* tests ran and why one failed without the raw
+# report. Bounded on every axis: the predicate is signed and stored, so a huge
+# suite or a huge failure message must not balloon it. `metrics` always carries
+# the true totals, and `tests_truncated` says when the list is a subset.
+MAX_REPORTED_TESTS = 1000
+_TEST_NAME_MAX_LEN = 300
+_TEST_CLASSNAME_MAX_LEN = 200
+_TEST_MESSAGE_MAX_LEN = 500
+_TEST_TRUNCATION_MARK = "..."
+# C0 controls (bar tab), DEL, and C1 controls: never useful in a test name or
+# message and a nuisance for anything that renders it (or a terminal).
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_TEST_STATUS_ORDER = {"failed": 0, "skipped": 1, "passed": 2}
+
+
+def _clean_test_text(value: Any, max_len: int) -> Optional[str]:
+    """A short, printable, single-line rendering of a test name/message, or
+    None for anything that isn't non-empty text. Newlines and other control
+    characters become spaces (a multi-line assertion message stays readable
+    on one line), and an over-long value is cut and marked -- never silently
+    dropped, so a reader can tell it was shortened.
+
+    Only ever fed an *attribute* (a failure's own `message`), never element
+    text: the text body of a JUnit <failure> is the full traceback, and
+    captured stdout/stderr live in <system-out>/<system-err>, either of which
+    can carry secrets from the run's environment."""
+    if not isinstance(value, str):
+        return None
+    text = " ".join(_CONTROL_CHARS_RE.sub(" ", value).split())
+    if not text:
+        return None
+    if len(text) > max_len:
+        text = text[: max_len - len(_TEST_TRUNCATION_MARK)].rstrip() + _TEST_TRUNCATION_MARK
+    return text
+
+
+def _clean_duration(value: Any) -> Optional[float]:
+    """Seconds as a finite, non-negative float rounded to milliseconds, or None."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return round(seconds, 3)
+
+
 @dataclass
 class _NormalizedCase:
     status: str  # "passed" | "failed" | "skipped"
     journeys: Tuple[str, ...]
+    # Display-only fields for the per-test list. Optional so a parser that can't
+    # supply one (or a hand-built case in a test) keeps working unchanged.
+    name: str = ""
+    classname: Optional[str] = None
+    duration_s: Optional[float] = None
+    message: Optional[str] = None
+
+
+def _test_rows(cases: List[_NormalizedCase]) -> Tuple[List[Dict[str, Any]], bool]:
+    """The bounded per-test list for the predicate, and whether it is a subset.
+    Failed tests come first, then skipped, then passed (report order within
+    each), so a cap can only ever drop passing tests, never the failures a
+    reader most needs to see."""
+    ordered = sorted(cases, key=lambda c: _TEST_STATUS_ORDER.get(c.status, 0))  # stable
+    rows: List[Dict[str, Any]] = []
+    for case in ordered[:MAX_REPORTED_TESTS]:
+        row: Dict[str, Any] = {
+            "name": _clean_test_text(case.name, _TEST_NAME_MAX_LEN) or "(unnamed test)",
+            "status": case.status,
+        }
+        classname = _clean_test_text(case.classname, _TEST_CLASSNAME_MAX_LEN)
+        if classname:
+            row["classname"] = classname
+        duration = _clean_duration(case.duration_s)
+        if duration is not None:
+            row["duration_s"] = duration
+        message = _clean_test_text(case.message, _TEST_MESSAGE_MAX_LEN)
+        if message:
+            row["message"] = message
+        row["journeys"] = list(case.journeys)
+        rows.append(row)
+    return rows, len(cases) > MAX_REPORTED_TESTS
 
 
 @dataclass
@@ -173,6 +254,11 @@ class FunctionalVerificationReport:
     tier: Optional[str] = None
     deferred: Optional[List[str]] = None
     journeys: Optional[List[Dict[str, Any]]] = None
+    # Per-test rows (see _test_rows). None -- and so absent from the output --
+    # unless the tier fields are also emitted, keeping a legacy flat-contract
+    # attestation byte-identical to earlier releases.
+    tests: Optional[List[Dict[str, Any]]] = None
+    tests_truncated: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -202,6 +288,9 @@ class FunctionalVerificationReport:
             out["adequacy"]["tier"] = self.tier
             out["adequacy"]["deferred"] = list(self.deferred or [])
             out["adequacy"]["journeys"] = self.journeys
+        if self.tests is not None:
+            out["tests"] = self.tests
+            out["tests_truncated"] = self.tests_truncated
         return out
 
 
@@ -412,7 +501,7 @@ def _walk_playwright_suite(suite: Dict[str, Any], title_prefix: str, out: List[_
                 continue
             test_journeys = spec_journeys | _journeys_from_tag_array(test.get("tags"))
             status = _playwright_final_status(test.get("results", []) or [])
-            out.append(_NormalizedCase(status=status, journeys=tuple(sorted(test_journeys))))
+            out.append(_NormalizedCase(status=status, journeys=tuple(sorted(test_journeys)), name=spec_title))
 
     for nested_suite in suite.get("suites", []) or []:
         _walk_playwright_suite(nested_suite, title, out)
@@ -451,13 +540,32 @@ def _junit_case_journeys(elem: ET.Element) -> Tuple[str, ...]:
     return _extract_cuj_tags(*haystack_parts)
 
 
+def _junit_case_message(elem: ET.Element) -> Optional[str]:
+    """The failure/error/skip reason: the outcome element's own `message`
+    attribute (or `type`), never its text body -- see _clean_test_text."""
+    for tag in ("failure", "error", "skipped"):
+        child = elem.find(tag)
+        if child is not None:
+            return child.get("message") or child.get("type")
+    return None
+
+
 def _parse_junit_functional_report(path: str) -> List[_NormalizedCase]:
     cases: List[_NormalizedCase] = []
     context = ET.iterparse(path, events=("end",))
     for _, elem in context:
         if elem.tag != "testcase":
             continue
-        cases.append(_NormalizedCase(status=_junit_case_status(elem), journeys=_junit_case_journeys(elem)))
+        cases.append(
+            _NormalizedCase(
+                status=_junit_case_status(elem),
+                journeys=_junit_case_journeys(elem),
+                name=elem.get("name", ""),
+                classname=elem.get("classname"),
+                duration_s=_clean_duration(elem.get("time")),
+                message=_junit_case_message(elem),
+            )
+        )
         elem.clear()  # safe: already read; bounds memory the same way cli.parsers.junit does
     return cases
 
@@ -501,7 +609,14 @@ def _parse_generic_json_report(path: str) -> List[_NormalizedCase]:
         tagged_journeys = set(_extract_cuj_tags(str(test.get("name", ""))))
         journeys = tuple(sorted(explicit_journeys | tagged_journeys))
 
-        cases.append(_NormalizedCase(status=status, journeys=journeys))
+        cases.append(
+            _NormalizedCase(
+                status=status,
+                journeys=journeys,
+                name=str(test.get("name", "")),
+                message=test.get("message") if isinstance(test.get("message"), str) else None,
+            )
+        )
     return cases
 
 
@@ -838,6 +953,12 @@ def evaluate_functional_adequacy(
         reason_code = REASON_CODE_EXECUTION_ABORTED if aborted else REASON_CODE_REPORT_MALFORMED
         met = False
 
+    tier_fields = _tier_fields(config, tier, covered)
+    test_fields: Dict[str, Any] = {}
+    if tier_fields:  # only where the tier fields are emitted too -- see FunctionalVerificationReport.tests
+        rows, truncated = _test_rows(cases)
+        test_fields = {"tests": rows, "tests_truncated": truncated}
+
     return FunctionalVerificationReport(
         available=True,
         met=met,
@@ -855,5 +976,6 @@ def evaluate_functional_adequacy(
         report_uri=report_uri,
         reason=reason,
         reason_code=reason_code,
-        **_tier_fields(config, tier, covered),
+        **tier_fields,
+        **test_fields,
     )

@@ -8,7 +8,14 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cli.parsers.functional_adequacy import (
+    MAX_REPORTED_TESTS,
     _CONFIG_PATH,
+    _TEST_MESSAGE_MAX_LEN,
+    _TEST_NAME_MAX_LEN,
+    _clean_duration,
+    _clean_test_text,
+    _junit_case_message,
+    _test_rows,
     _JOURNEY_DESCRIPTION_MAX_LEN,
     _JOURNEY_NAME_MAX_LEN,
     _load_contract,
@@ -1238,6 +1245,12 @@ class TierEvaluationTests(TempRepoTestCase):
                 "report_uri": None,
                 "reason": "2/2 declared journey(s) covered (100.0% >= 100.0% required), 0 failed test(s)",
                 "reason_code": None,
+                "tests": [
+                    {"name": "t1", "classname": "t", "status": "passed", "journeys": ["a"]},
+                    {"name": "t2", "classname": "t", "status": "passed", "journeys": ["c"]},
+                    {"name": "t3", "classname": "t", "status": "passed", "journeys": ["b"]},
+                ],
+                "tests_truncated": False,
             },
         )
 
@@ -1581,6 +1594,193 @@ class PassThroughFieldTests(TempRepoTestCase):
         self.assertEqual(result.journeys, [{"id": "x", "tier": "cd", "status": "deferred"}])
 
 
+class CleanTestTextTests(unittest.TestCase):
+    def test_non_strings_and_blank_values_are_none(self):
+        for value in (None, 5, b"x", ["a"], "", "   ", "\n\t "):
+            with self.subTest(value=value):
+                self.assertIsNone(_clean_test_text(value, 50))
+
+    def test_whitespace_and_newlines_collapse_to_single_spaces(self):
+        self.assertEqual(_clean_test_text("  assert 1 ==\n\t2   here ", 50), "assert 1 == 2 here")
+
+    def test_control_characters_become_spaces_not_part_of_the_text(self):
+        self.assertEqual(_clean_test_text("a\x00b\x1bc\x7fd\x9fe", 50), "a b c d e")
+
+    def test_a_value_at_the_limit_is_kept_whole(self):
+        self.assertEqual(_clean_test_text("x" * 10, 10), "x" * 10)
+
+    def test_an_over_long_value_is_cut_to_exactly_the_limit_and_marked(self):
+        out = _clean_test_text("x" * 11, 10)
+        self.assertEqual(out, "x" * 7 + "...")
+        self.assertEqual(len(out), 10)
+
+    def test_the_cut_does_not_leave_trailing_space_before_the_mark(self):
+        self.assertEqual(_clean_test_text("abcdef gh ijkl", 10), "abcdef...")
+
+
+class CleanDurationTests(unittest.TestCase):
+    def test_valid_values_round_to_milliseconds(self):
+        self.assertEqual(_clean_duration("0.123456"), 0.123)
+        self.assertEqual(_clean_duration(2), 2.0)
+        self.assertEqual(_clean_duration("0"), 0.0)
+
+    def test_invalid_values_are_none(self):
+        for value in (None, "", "abc", "-0.1", "nan", "inf", "-inf", [1]):
+            with self.subTest(value=value):
+                self.assertIsNone(_clean_duration(value))
+
+
+class TestRowsTests(unittest.TestCase):
+    def _case(self, name, status, **kw):
+        return _NormalizedCase(status=status, journeys=kw.pop("journeys", ()), name=name, **kw)
+
+    def test_a_row_carries_every_field_present_and_omits_the_absent_ones(self):
+        rows, truncated = _test_rows([
+            self._case("t", "failed", classname="mod.Cls", duration_s=1.25, message="boom", journeys=("a", "b")),
+            self._case("bare", "passed"),
+        ])
+        self.assertFalse(truncated)
+        self.assertEqual(rows, [
+            {"name": "t", "classname": "mod.Cls", "status": "failed", "duration_s": 1.25, "message": "boom",
+             "journeys": ["a", "b"]},
+            {"name": "bare", "status": "passed", "journeys": []},
+        ])
+
+    def test_failed_come_first_then_skipped_then_passed_preserving_report_order(self):
+        rows, _ = _test_rows([
+            self._case("p1", "passed"), self._case("s1", "skipped"), self._case("f1", "failed"),
+            self._case("p2", "passed"), self._case("f2", "failed"),
+        ])
+        self.assertEqual([r["name"] for r in rows], ["f1", "f2", "s1", "p1", "p2"])
+
+    def test_an_empty_or_unnameable_test_gets_a_placeholder_name(self):
+        rows, _ = _test_rows([self._case("", "passed"), self._case("\x00\n", "passed")])
+        self.assertEqual([r["name"] for r in rows], ["(unnamed test)", "(unnamed test)"])
+
+    def test_long_names_and_messages_are_bounded(self):
+        rows, _ = _test_rows([self._case("n" * 999, "failed", message="m" * 999, classname="c" * 999)])
+        self.assertEqual(len(rows[0]["name"]), _TEST_NAME_MAX_LEN)
+        self.assertEqual(len(rows[0]["message"]), _TEST_MESSAGE_MAX_LEN)
+        self.assertEqual(len(rows[0]["classname"]), 200)
+
+    def test_the_list_is_capped_and_only_ever_drops_passing_tests(self):
+        cases = [self._case(f"p{i}", "passed") for i in range(MAX_REPORTED_TESTS)]
+        cases.append(self._case("late-failure", "failed"))
+        rows, truncated = _test_rows(cases)
+        self.assertTrue(truncated)
+        self.assertEqual(len(rows), MAX_REPORTED_TESTS)
+        self.assertEqual(rows[0]["name"], "late-failure")
+        self.assertNotIn(f"p{MAX_REPORTED_TESTS - 1}", [r["name"] for r in rows])
+
+    def test_exactly_at_the_cap_is_not_truncated(self):
+        rows, truncated = _test_rows([self._case(f"p{i}", "passed") for i in range(MAX_REPORTED_TESTS)])
+        self.assertEqual(len(rows), MAX_REPORTED_TESTS)
+        self.assertFalse(truncated)
+
+
+class JunitCaseMessageTests(unittest.TestCase):
+    def _elem(self, inner):
+        import xml.etree.ElementTree as ET
+        return ET.fromstring(f"<testcase>{inner}</testcase>")
+
+    def test_the_message_attribute_wins_then_type_then_none(self):
+        self.assertEqual(_junit_case_message(self._elem('<failure message="m" type="T">body</failure>')), "m")
+        self.assertEqual(_junit_case_message(self._elem('<error type="ValueError"/>')), "ValueError")
+        self.assertEqual(_junit_case_message(self._elem("<skipped/>")), None)
+        self.assertEqual(_junit_case_message(self._elem("")), None)
+
+    def test_failure_is_preferred_over_error_over_skipped(self):
+        self.assertEqual(_junit_case_message(self._elem('<skipped message="s"/><error message="e"/><failure message="f"/>')), "f")
+        self.assertEqual(_junit_case_message(self._elem('<skipped message="s"/><error message="e"/>')), "e")
+
+    def test_element_text_is_never_used(self):
+        self.assertIsNone(_junit_case_message(self._elem("<failure>Traceback: SECRET_TOKEN=abc</failure>")))
+
+
+class PerTestResultsEvaluationTests(TempRepoTestCase):
+    def _evaluate(self, xml, tier="ci", contract=None):
+        self._write_config(contract or _MIXED_CONTRACT)
+        return evaluate_functional_adequacy(self.repo_dir, self._write_report("r.xml", xml), tier=tier).as_dict()
+
+    def test_rows_carry_name_class_status_duration_message_and_journeys_from_junit(self):
+        xml = (
+            '<testsuites><testsuite>'
+            '<testcase classname="tests.test_a" name="test_ok" time="0.0125"><properties>'
+            '<property name="cuj" value="@cuj:a"/></properties></testcase>'
+            '<testcase classname="tests.test_a" name="test_bad" time="2"><failure message="assert 1 == 2"/></testcase>'
+            '<testcase classname="tests.test_b" name="test_skip"><skipped message="needs a db"/></testcase>'
+            '</testsuite></testsuites>'
+        )
+        out = self._evaluate(xml)
+        self.assertEqual(out["tests"], [
+            {"name": "test_bad", "classname": "tests.test_a", "status": "failed", "duration_s": 2.0,
+             "message": "assert 1 == 2", "journeys": []},
+            {"name": "test_skip", "classname": "tests.test_b", "status": "skipped", "message": "needs a db",
+             "journeys": []},
+            {"name": "test_ok", "classname": "tests.test_a", "status": "passed", "duration_s": 0.013,
+             "journeys": ["a"]},
+        ])
+        self.assertIs(out["tests_truncated"], False)
+        self.assertEqual(out["metrics"], {"total": 3, "passed": 1, "failed": 1, "skipped": 1})
+
+    def test_tracebacks_and_captured_output_never_reach_the_predicate(self):
+        xml = (
+            '<testsuites><testsuite><testcase classname="c" name="t">'
+            '<failure message="assert False">Traceback (most recent call last): TOKEN=hunter2</failure>'
+            '<system-out>API_KEY=abc123</system-out><system-err>PASSWORD=xyz</system-err>'
+            '</testcase></testsuite></testsuites>'
+        )
+        blob = json.dumps(self._evaluate(xml))
+        for secret in ("hunter2", "abc123", "xyz", "Traceback"):
+            self.assertNotIn(secret, blob)
+        self.assertIn("assert False", blob)
+
+    def test_the_cd_tier_carries_rows_too(self):
+        out = self._evaluate(_junit_xml([("live1", "passed", ["b"])]), tier="cd")
+        self.assertEqual([r["name"] for r in out["tests"]], ["live1"])
+
+    def test_a_legacy_flat_contract_at_the_default_tier_stays_byte_identical(self):
+        out = self._evaluate(
+            _junit_xml([("t", "passed", ["a"])]),
+            contract={"framework": "pytest", "declared_journeys": ["a"]},
+        )
+        self.assertNotIn("tests", out)
+        self.assertNotIn("tests_truncated", out)
+        self.assertNotIn("tier", out["adequacy"])
+
+    def test_a_legacy_contract_evaluated_at_cd_is_not_a_result_with_rows(self):
+        out = self._evaluate(
+            _junit_xml([("t", "passed", ["a"])]),
+            contract={"framework": "pytest", "declared_journeys": ["a"]},
+            tier="cd",
+        )
+        self.assertNotIn("tests", out)
+
+    def test_an_unavailable_result_has_no_rows(self):
+        self._write_config(_MIXED_CONTRACT)
+        out = evaluate_functional_adequacy(self.repo_dir, str(Path(self.repo_dir) / "missing.xml"), tier="ci").as_dict()
+        self.assertNotIn("tests", out)
+
+    def test_an_aborted_cd_run_still_reports_the_tests_that_did_run(self):
+        self._write_config(_MIXED_CONTRACT)
+        good = self._write_report("g.xml", _junit_xml([("ran", "passed", ["b"])]))
+        missing = str(Path(self.repo_dir) / "never-written.xml")
+        out = evaluate_functional_adequacy(self.repo_dir, [good, missing], tier="cd").as_dict()
+        self.assertEqual(out["reason_code"], REASON_CODE_EXECUTION_ABORTED)
+        self.assertFalse(out["met"])
+        self.assertEqual([r["name"] for r in out["tests"]], ["ran"])
+
+    def test_generic_json_and_playwright_supply_names(self):
+        generic = _parse_generic_json_report(
+            self._write_json_report("g.json", {"tests": [{"name": "gen", "status": "failed", "message": "why"}]})
+        )
+        self.assertEqual((generic[0].name, generic[0].message), ("gen", "why"))
+        pw = _parse_playwright_report(
+            self._write_json_report("p.json", _playwright_doc(("a spec", "passed")))
+        )
+        self.assertEqual(pw[0].name, "e2e a spec")
+
+
 class FunctionalVerificationSchemaTests(unittest.TestCase):
     def setUp(self):
         try:
@@ -1608,6 +1808,33 @@ class FunctionalVerificationSchemaTests(unittest.TestCase):
             report.write_text(_junit_xml([("t", "passed", ["a"])]), encoding="utf-8")
             self._validate(evaluate_functional_adequacy(d, str(report), tier="ci").as_dict())
             self._validate(evaluate_functional_adequacy(d, str(report), tier="cd").as_dict())
+
+    def test_a_result_carrying_per_test_rows_validates_and_a_malformed_row_does_not(self):
+        import jsonschema
+        with tempfile.TemporaryDirectory() as d:
+            lucid = Path(d) / ".lucid"
+            lucid.mkdir()
+            (lucid / "functional-verification.json").write_text(json.dumps(_MIXED_CONTRACT), encoding="utf-8")
+            report = Path(d) / "r.xml"
+            report.write_text(
+                '<testsuites><testsuite><testcase classname="c" name="n" time="0.5">'
+                '<failure message="boom"/></testcase></testsuite></testsuites>',
+                encoding="utf-8",
+            )
+            doc = evaluate_functional_adequacy(d, str(report), tier="ci").as_dict()
+        self.assertEqual(doc["tests"][0]["duration_s"], 0.5)
+        self._validate(doc)
+        for bad in (
+            {"name": "n", "status": "bogus", "journeys": []},        # unknown status
+            {"name": "n", "status": "passed"},                        # journeys required
+            {"name": "n", "status": "passed", "journeys": [], "x": 1},  # no extra properties
+            {"name": "n" * (_TEST_NAME_MAX_LEN + 1), "status": "passed", "journeys": []},
+            {"name": "n", "status": "passed", "journeys": [], "message": "m" * (_TEST_MESSAGE_MAX_LEN + 1)},
+        ):
+            with self.subTest(bad=bad):
+                broken = dict(doc, tests=[bad])
+                with self.assertRaises(jsonschema.ValidationError):
+                    self._validate(broken)
 
     def test_the_new_reason_codes_validate(self):
         for code in ("config_invalid", "execution_aborted"):

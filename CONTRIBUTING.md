@@ -144,3 +144,20 @@ a contract of its own.** If you change the evaluator, the contract format (`ci` 
 is `additionalProperties: false`) in the same PR. Callers pin this repo by
 commit, so a new flag must merge and be re-pinned by a caller *before* that
 caller starts passing it.
+
+**Per-test results (`tests` / `tests_truncated`)** are part of that signed block, and
+lucid-console renders them, so treat their shape as a contract:
+
+- The evaluator keeps each case's `name`/`classname`/`status`/`duration_s`/`message`/
+  `journeys` (`_NormalizedCase`) and `_test_rows` emits the bounded list. It is emitted
+  only alongside the tier fields, so a legacy flat contract stays byte-identical.
+- `message` comes from the outcome element's own attribute, never element text. Keep it
+  that way: the text body is the traceback, and captured output can hold secrets. The
+  `PerTestResultsEvaluationTests` case plants a secret in all three places and asserts it
+  never reaches the output -- don't weaken it.
+- Changing a field, a cap or the ordering means the schema (`additionalProperties: false`),
+  the README section, and lucid-console's `parseTestResults` all change together, and a
+  console change must tolerate records without the new shape (a missing `tests` means "not
+  recorded", never "zero tests").
+- New behavior gets direct-field tests (exact equality on every field), because the
+  mutation gate scores the whole touched function.
